@@ -3,12 +3,55 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+}
+
+impl Profile {
+    /// Create a new profile with a unique ID derived from the name and current time.
+    pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let slug: String = name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let id = format!("{}_{}", slug, timestamp);
+        Self { id, name }
+    }
+
+    pub fn default_profile() -> Self {
+        Self {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+        }
+    }
+}
+
+fn default_profiles() -> Vec<Profile> {
+    vec![Profile::default_profile()]
+}
+
+fn default_active_profile_id() -> String {
+    "default".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub version: u32,
     pub first_run: bool,
     pub current_game_id: Option<String>,
     pub nexus_api_key: Option<String>,
     pub games: Vec<Game>,
+    #[serde(default = "default_profiles")]
+    pub profiles: Vec<Profile>,
+    #[serde(default = "default_active_profile_id")]
+    pub active_profile_id: String,
 }
 
 impl Default for AppConfig {
@@ -19,6 +62,8 @@ impl Default for AppConfig {
             current_game_id: None,
             nexus_api_key: None,
             games: Vec::new(),
+            profiles: default_profiles(),
+            active_profile_id: default_active_profile_id(),
         }
     }
 }
