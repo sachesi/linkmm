@@ -22,11 +22,11 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     };
     header.set_title_widget(Some(&title_widget));
 
-    // Sort button (placeholder for future LOOT integration)
+    // Sort button – sorts non-vanilla plugins by type (ESM → ESL → ESP) then
+    // alphabetically, matching the baseline LOOT sorting strategy.
     let sort_btn = gtk4::Button::new();
     sort_btn.set_icon_name("view-sort-ascending-symbolic");
-    sort_btn.set_tooltip_text(Some("Sort by LOOT rules (coming soon)"));
-    sort_btn.set_sensitive(false); // disabled until LOOT is integrated
+    sort_btn.set_sensitive(game.is_some());
     header.pack_end(&sort_btn);
 
     toolbar_view.add_top_bar(&header);
@@ -36,6 +36,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
 
     match game {
         None => {
+            sort_btn.set_tooltip_text(Some("No game selected"));
             let status = adw::StatusPage::builder()
                 .title("No Game Selected")
                 .description("Select a game from the sidebar to manage its load order.")
@@ -45,7 +46,29 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             content_container.append(&status);
         }
         Some(g) => {
+            sort_btn.set_tooltip_text(Some(
+                "Sort plugins by type: ESM → ESL → ESP, then alphabetically",
+            ));
             let game_rc = Rc::new(g.clone());
+
+            // Connect sort button
+            {
+                let game_c = Rc::clone(&game_rc);
+                let container_c = content_container.clone();
+                sort_btn.connect_clicked(move |_| {
+                    let mut db = ModDatabase::load(&game_c);
+                    if db.plugin_load_order.is_empty() {
+                        db.sync_from_plugins_txt(&game_c);
+                    }
+                    db.sort_plugins_by_type(&game_c);
+                    db.save(&game_c);
+                    if let Err(e) = db.write_plugins_txt(&game_c) {
+                        log::warn!("Failed to write plugins.txt after sort: {e}");
+                    }
+                    refresh_load_order_content(&container_c, &game_c);
+                });
+            }
+
             refresh_load_order_content(&content_container, &game_rc);
         }
     };
