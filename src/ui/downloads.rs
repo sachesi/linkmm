@@ -12,8 +12,8 @@ use crate::core::config::AppConfig;
 use crate::core::games::Game;
 use crate::core::installer::{
     DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
-    InstallStrategy, PluginDependencies, PluginType, detect_strategy, install_mod_from_archive,
-    parse_fomod_from_zip, read_archive_file_bytes,
+    InstallStep, InstallStrategy, PluginDependencies, PluginType, detect_strategy,
+    install_mod_from_archive, parse_fomod_from_zip, read_archive_file_bytes,
 };
 use crate::core::mods::ModDatabase;
 
@@ -459,6 +459,9 @@ fn collect_active_flags(
         if si > up_to_step_inclusive {
             break;
         }
+        if !step_is_visible_with_flags(step, &flags) {
+            continue;
+        }
         for (gi, group) in step.groups.iter().enumerate() {
             let Some(selected) = selections.get(si).and_then(|s| s.get(gi)) else {
                 continue;
@@ -490,24 +493,40 @@ fn flag_dependency_matches(
     }
 }
 
+fn dependencies_match(
+    dependencies: &PluginDependencies,
+    active_flags: &HashMap<String, HashSet<String>>,
+) -> bool {
+    if dependencies.flags.is_empty() {
+        return true;
+    }
+    match dependencies.operator {
+        DependencyOperator::And => dependencies
+            .flags
+            .iter()
+            .all(|dep| flag_dependency_matches(dep, active_flags)),
+        DependencyOperator::Or => dependencies
+            .flags
+            .iter()
+            .any(|dep| flag_dependency_matches(dep, active_flags)),
+    }
+}
+
+fn step_is_visible_with_flags(step: &InstallStep, active_flags: &HashMap<String, HashSet<String>>) -> bool {
+    let Some(visible) = &step.visible else {
+        return true;
+    };
+    dependencies_match(visible, active_flags)
+}
+
 fn plugin_is_visible(
     plugin: &FomodPlugin,
     active_flags: &HashMap<String, HashSet<String>>,
 ) -> bool {
-    let Some(PluginDependencies { operator, flags }) = &plugin.dependencies else {
+    let Some(deps) = &plugin.dependencies else {
         return true;
     };
-    if flags.is_empty() {
-        return true;
-    }
-    match operator {
-        DependencyOperator::And => flags
-            .iter()
-            .all(|dep| flag_dependency_matches(dep, active_flags)),
-        DependencyOperator::Or => flags
-            .iter()
-            .any(|dep| flag_dependency_matches(dep, active_flags)),
-    }
+    dependencies_match(deps, active_flags)
 }
 
 fn sanitize_step_selection(
@@ -576,6 +595,14 @@ fn resolve_fomod_files(fomod: &FomodConfig, selections: &FomodSelections) -> Vec
         sanitize_step_selection(fomod, &mut normalized, si);
     }
     for (si, step) in fomod.steps.iter().enumerate() {
+        let step_flags = if si == 0 {
+            HashMap::new()
+        } else {
+            collect_active_flags(fomod, &normalized, si - 1)
+        };
+        if !step_is_visible_with_flags(step, &step_flags) {
+            continue;
+        }
         for (gi, group) in step.groups.iter().enumerate() {
             if let Some(selected) = normalized.get(si).and_then(|s| s.get(gi)) {
                 for &pi in selected {
@@ -584,6 +611,16 @@ fn resolve_fomod_files(fomod: &FomodConfig, selections: &FomodSelections) -> Vec
                     }
                 }
             }
+        }
+    }
+    let active_flags = if fomod.steps.is_empty() {
+        HashMap::new()
+    } else {
+        collect_active_flags(fomod, &normalized, fomod.steps.len() - 1)
+    };
+    for conditional in &fomod.conditional_file_installs {
+        if dependencies_match(&conditional.dependencies, &active_flags) {
+            files.extend(conditional.files.iter().cloned());
         }
     }
     files
@@ -741,10 +778,32 @@ fn show_fomod_wizard(
             title.add_css_class("title-2");
             title.set_halign(gtk4::Align::Start);
             sc.append(&title);
+            let step_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+            step_row.set_hexpand(true);
+            step_row.set_vexpand(true);
             let scrolled = gtk4::ScrolledWindow::new();
             scrolled.set_vexpand(true);
             scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
             let groups_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+            let preview_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+            preview_box.set_halign(gtk4::Align::Fill);
+            preview_box.set_valign(gtk4::Align::Start);
+            preview_box.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, -1);
+            let preview_label = gtk4::Label::new(Some("Preview"));
+            preview_label.add_css_class("dim-label");
+            preview_label.add_css_class("caption");
+            preview_label.set_halign(gtk4::Align::Start);
+            let preview_name = gtk4::Label::new(Some(""));
+            preview_name.set_wrap(true);
+            preview_name.set_halign(gtk4::Align::Start);
+            let preview_picture = gtk4::Picture::new();
+            preview_picture.set_content_fit(gtk4::ContentFit::Contain);
+            preview_picture.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
+            preview_box.append(&preview_label);
+            preview_box.append(&preview_picture);
+            preview_box.append(&preview_name);
+            let mut has_step_preview = false;
+            let mut default_preview: Option<(gtk4::gdk::Texture, String)> = None;
             for (gi, group) in step.groups.iter().enumerate() {
                 let type_desc = match group.group_type {
                     GroupType::SelectExactlyOne => "select one",
@@ -754,8 +813,6 @@ fn show_fomod_wizard(
                     GroupType::SelectAny => "select any",
                 };
                 let frame = gtk4::Frame::new(Some(&format!("{} ({type_desc})", group.name)));
-                let row_and_preview = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-                row_and_preview.set_hexpand(true);
                 let lb = gtk4::ListBox::new();
                 lb.add_css_class("boxed-list");
                 lb.set_selection_mode(gtk4::SelectionMode::None);
@@ -765,26 +822,6 @@ fn show_fomod_wizard(
                     GroupType::SelectExactlyOne | GroupType::SelectAtMostOne
                 );
                 let mut first_radio_button: Option<gtk4::CheckButton> = None;
-                let preview_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-                preview_box.set_halign(gtk4::Align::Fill);
-                preview_box.set_valign(gtk4::Align::Start);
-                preview_box.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, -1);
-                let preview_label = gtk4::Label::new(Some("Preview"));
-                preview_label.add_css_class("dim-label");
-                preview_label.add_css_class("caption");
-                preview_label.set_halign(gtk4::Align::Start);
-                let preview_name = gtk4::Label::new(Some(""));
-                preview_name.set_wrap(true);
-                preview_name.set_halign(gtk4::Align::Start);
-                let preview_picture = gtk4::Picture::new();
-                preview_picture.set_content_fit(gtk4::ContentFit::Contain);
-                preview_picture
-                    .set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
-                preview_box.append(&preview_label);
-                preview_box.append(&preview_picture);
-                preview_box.append(&preview_name);
-                let mut has_group_preview = false;
-                let mut initial_preview: Option<(gtk4::gdk::Texture, String)> = None;
                 for (pi, plugin) in group.plugins.iter().enumerate() {
                     if !plugin_is_visible(plugin, &active_flags) {
                         continue;
@@ -837,9 +874,9 @@ fn show_fomod_wizard(
                     if let Some(ref image_path) = plugin.image_path {
                         if let Some(texture) = load_fomod_option_image(&ap, image_path, &img_cache)
                         {
-                            has_group_preview = true;
-                            if check.is_active() || initial_preview.is_none() {
-                                initial_preview = Some((texture.clone(), plugin.name.clone()));
+                            has_step_preview = true;
+                            if check.is_active() || default_preview.is_none() {
+                                default_preview = Some((texture.clone(), plugin.name.clone()));
                             }
                             let hover_pic = preview_picture.clone();
                             let hover_name = preview_name.clone();
@@ -879,19 +916,19 @@ fn show_fomod_wizard(
                     }
                     lb.append(&row);
                 }
-                row_and_preview.append(&lb);
-                if has_group_preview {
-                    if let Some((texture, plugin_name)) = initial_preview {
-                        preview_picture.set_paintable(Some(&texture));
-                        preview_name.set_label(&plugin_name);
-                    }
-                    row_and_preview.append(&preview_box);
-                }
-                frame.set_child(Some(&row_and_preview));
+                frame.set_child(Some(&lb));
                 groups_box.append(&frame);
             }
             scrolled.set_child(Some(&groups_box));
-            sc.append(&scrolled);
+            step_row.append(&scrolled);
+            if has_step_preview {
+                if let Some((texture, plugin_name)) = default_preview {
+                    preview_picture.set_paintable(Some(&texture));
+                    preview_name.set_label(&plugin_name);
+                }
+                step_row.append(&preview_box);
+            }
+            sc.append(&step_row);
         })
     };
     render_step(0);
@@ -1164,9 +1201,11 @@ mod tests {
             mod_name: Some("Test".to_string()),
             required_files: Vec::new(),
             steps: Vec::new(),
+            conditional_file_installs: Vec::new(),
         };
         config.steps.push(InstallStep {
             name: "Flags".to_string(),
+            visible: None,
             groups: vec![PluginGroup {
                 name: "Feature".to_string(),
                 group_type: GroupType::SelectExactlyOne,
@@ -1194,6 +1233,7 @@ mod tests {
         });
         config.steps.push(InstallStep {
             name: "Variant".to_string(),
+            visible: None,
             groups: vec![PluginGroup {
                 name: "Pick".to_string(),
                 group_type: GroupType::SelectAny,
@@ -1240,8 +1280,10 @@ mod tests {
         let config = FomodConfig {
             mod_name: Some("Test".to_string()),
             required_files: Vec::new(),
+            conditional_file_installs: Vec::new(),
             steps: vec![InstallStep {
                 name: "Main".to_string(),
+                visible: None,
                 groups: vec![
                     PluginGroup {
                         name: "Exactly one".to_string(),
@@ -1270,5 +1312,79 @@ mod tests {
         let mut empty_at_most_one = vec![vec![vec![1], vec![]]];
         sanitize_step_selection(&config, &mut empty_at_most_one, 0);
         assert_eq!(empty_at_most_one[0][1], Vec::<usize>::new());
+    }
+
+    #[test]
+    fn resolve_fomod_files_applies_step_visibility_and_conditional_files() {
+        let config = FomodConfig {
+            mod_name: Some("Test".to_string()),
+            required_files: Vec::new(),
+            steps: vec![
+                InstallStep {
+                    name: "Flags".to_string(),
+                    visible: None,
+                    groups: vec![PluginGroup {
+                        name: "Feature".to_string(),
+                        group_type: GroupType::SelectExactlyOne,
+                        plugins: vec![
+                            test_plugin(
+                                "Enable Underwear",
+                                "underwear-on.txt",
+                                vec![ConditionFlag {
+                                    name: "bUnderwear".to_string(),
+                                    value: "On".to_string(),
+                                }],
+                                None,
+                            ),
+                            test_plugin("Disable Underwear", "underwear-off.txt", Vec::new(), None),
+                        ],
+                    }],
+                },
+                InstallStep {
+                    name: "Underwear Options".to_string(),
+                    visible: Some(PluginDependencies {
+                        operator: DependencyOperator::And,
+                        flags: vec![FlagDependency {
+                            flag: "bUnderwear".to_string(),
+                            value: "On".to_string(),
+                        }],
+                    }),
+                    groups: vec![PluginGroup {
+                        name: "Color".to_string(),
+                        group_type: GroupType::SelectExactlyOne,
+                        plugins: vec![test_plugin("Black", "underwear-black.txt", Vec::new(), None)],
+                    }],
+                },
+            ],
+            conditional_file_installs: vec![crate::core::installer::ConditionalFileInstall {
+                dependencies: PluginDependencies {
+                    operator: DependencyOperator::And,
+                    flags: vec![FlagDependency {
+                        flag: "bUnderwear".to_string(),
+                        value: "On".to_string(),
+                    }],
+                },
+                files: vec![FomodFile {
+                    source: "conditional-underwear.txt".to_string(),
+                    destination: "Data".to_string(),
+                    priority: 0,
+                }],
+            }],
+        };
+
+        // Step 1 picks "Disable Underwear". Step 2 has stale selection but should
+        // not contribute because the step is hidden.
+        let hidden_step_selections = vec![vec![vec![1]], vec![vec![0]]];
+        let hidden_files = resolve_fomod_files(&config, &hidden_step_selections);
+        let hidden_sources: Vec<String> = hidden_files.into_iter().map(|f| f.source).collect();
+        assert!(!hidden_sources.contains(&"underwear-black.txt".to_string()));
+        assert!(!hidden_sources.contains(&"conditional-underwear.txt".to_string()));
+
+        // Step 1 picks "Enable Underwear", so step 2 and conditional files apply.
+        let visible_step_selections = vec![vec![vec![0]], vec![vec![0]]];
+        let visible_files = resolve_fomod_files(&config, &visible_step_selections);
+        let visible_sources: Vec<String> = visible_files.into_iter().map(|f| f.source).collect();
+        assert!(visible_sources.contains(&"underwear-black.txt".to_string()));
+        assert!(visible_sources.contains(&"conditional-underwear.txt".to_string()));
     }
 }
