@@ -108,8 +108,13 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 }
             }
 
-            // Then deploy all enabled mods. Bottom-most mod has highest priority,
-            // so we deploy from bottom to top.
+            // Then deploy all enabled mods.
+            //
+            // The linker helpers skip creating a new link when a destination
+            // file already exists, so the first deployed mod "wins" each
+            // conflicting path. Because UI priority is defined as
+            // top(lowest) -> bottom(highest), we deploy in reverse visual
+            // order to ensure the bottom-most enabled mod wins conflicts.
             let mut deployed_count = 0usize;
             for m in db.mods.iter().rev().filter(|m| m.enabled) {
                 if let Err(e) = ModManager::enable_mod(&game_c, m) {
@@ -542,7 +547,6 @@ fn build_mod_row(
                         archive_stem != mod_name_lower
                     });
                     cfg.save();
-                    drop(cfg);
                 }
             }
             if selected_c
@@ -577,12 +581,13 @@ fn build_mod_row(
         let selected_sel = Rc::clone(&selected_mod_id);
         let mod_id_sel = mod_entry.id.clone();
         left_click.connect_pressed(move |_, _, _, _| {
-            let mut selected = selected_sel.borrow_mut();
-            if selected.as_ref() == Some(&mod_id_sel) {
-                return;
+            {
+                let mut selected = selected_sel.borrow_mut();
+                if selected.as_ref() == Some(&mod_id_sel) {
+                    return;
+                }
+                *selected = Some(mod_id_sel.clone());
             }
-            *selected = Some(mod_id_sel.clone());
-            drop(selected);
             refresh_library_content_with_search(
                 &container_sel,
                 &game_sel,
@@ -664,6 +669,11 @@ fn build_mod_row(
     row
 }
 
+/// Compute target insertion index after removing an item from `src_pos`.
+///
+/// If `src_pos < target_idx`, removing the source shifts subsequent indices
+/// down by one, so the insertion position must be decremented to preserve the
+/// intended visual drop target.
 fn adjusted_insert_pos(src_pos: usize, target_idx: usize) -> usize {
     if src_pos < target_idx {
         target_idx.saturating_sub(1)
@@ -705,6 +715,9 @@ fn compute_conflict_states(
             continue;
         }
 
+        // Library order is top -> bottom, while deploy applies enabled mods in
+        // reverse order so bottom-most mods win conflicts. Therefore, a mod
+        // with a greater index has higher overwrite priority.
         if idx > selected_idx {
             states.entry(m.id.clone()).or_default().overwrites = true;
             states
@@ -897,6 +910,6 @@ mod tests {
         assert!(overwriter.files.contains("data/textures/sky.dds"));
         assert!(!states.contains_key("c"));
 
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
