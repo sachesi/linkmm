@@ -1,0 +1,22 @@
+[package]
+name = "linkmm"
+version = "0.1.0"
+edition = "2021"
+description = "Link Mod Manager - A mod manager for Bethesda games"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "linkmm"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_14"] }
+libadwaita = { version = "0.7", features = ["v1_5"] }
+glib = "0.20"
+gio = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+log = "0.4"
+env_logger = "0.11"
+ureq = { version = "2", features = ["json"] }
