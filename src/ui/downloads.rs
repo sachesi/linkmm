@@ -14,7 +14,7 @@ use crate::core::games::Game;
 use crate::core::installer::{
     DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
     InstallStep, InstallStrategy, PluginDependencies, PluginType, detect_strategy,
-    install_mod_from_archive, install_mod_from_archive_with_nexus, parse_fomod_from_zip,
+    install_mod_from_archive, install_mod_from_archive_with_nexus, parse_fomod_from_archive,
     read_archive_file_bytes,
 };
 use crate::core::mods::ModDatabase;
@@ -461,7 +461,7 @@ fn show_install_dialog(
     };
 
     if let InstallStrategy::Fomod(_) = &strategy {
-        match parse_fomod_from_zip(archive_path) {
+        match parse_fomod_from_archive(archive_path) {
             Ok(fomod_config) => {
                 let parent = anchor
                     .root()

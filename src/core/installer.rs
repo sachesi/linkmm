@@ -135,7 +135,10 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         return Err(format!("Cannot open archive: {}", archive_path.display()));
     }
     if !has_zip_extension(archive_path) {
-        return Ok(InstallStrategy::Data);
+        return match parse_fomod_from_archive(archive_path) {
+            Ok(config) => Ok(InstallStrategy::Fomod(config.required_files.clone())),
+            Err(_) => Ok(InstallStrategy::Data),
+        };
     }
 
     let file =
@@ -220,6 +223,33 @@ fn archive_has_data_folder(archive_path: &Path) -> bool {
 
 // ── FOMOD XML parser ──────────────────────────────────────────────────────────
 
+/// Parse a FOMOD `ModuleConfig.xml` from a supported archive.
+pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, String> {
+    if has_zip_extension(archive_path) {
+        return parse_fomod_from_zip(archive_path);
+    }
+
+    let tmp_extract = create_temp_extract_dir()?;
+    extract_archive_with_7z(archive_path, &tmp_extract)?;
+
+    let result = (|| {
+        let config_path = find_fomod_config_in_dir(&tmp_extract)
+            .ok_or_else(|| "No fomod/ModuleConfig.xml found in archive".to_string())?;
+        let xml_bytes = std::fs::read(&config_path)
+            .map_err(|e| format!("Failed to read fomod config {}: {e}", config_path.display()))?;
+        parse_fomod_xml(&xml_bytes)
+    })();
+
+    if let Err(e) = std::fs::remove_dir_all(&tmp_extract) {
+        log::warn!(
+            "Failed to remove temporary extraction directory {}: {e}",
+            tmp_extract.display()
+        );
+    }
+
+    result
+}
+
 /// Parse a FOMOD `ModuleConfig.xml` from inside a zip archive.
 pub fn parse_fomod_from_zip(archive_path: &Path) -> Result<FomodConfig, String> {
     let file =
@@ -239,6 +269,34 @@ pub fn parse_fomod_from_zip(archive_path: &Path) -> Result<FomodConfig, String> 
         .map_err(|e| format!("Failed to read fomod config: {e}"))?;
 
     parse_fomod_xml(&xml_bytes)
+}
+
+fn find_fomod_config_in_dir(root: &Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let rel = path.strip_prefix(root).ok()?;
+            let rel_lower = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+                .join("/");
+            if rel_lower == "fomod/moduleconfig.xml" || rel_lower.ends_with("/fomod/moduleconfig.xml")
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn find_fomod_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String, String> {
@@ -1289,6 +1347,43 @@ mod tests {
         archive_path
     }
 
+    fn has_7z() -> bool {
+        Command::new("7z").arg("--help").output().is_ok()
+    }
+
+    fn create_test_7z(root: &Path, archive_name: &str) -> Option<PathBuf> {
+        if !has_7z() {
+            return None;
+        }
+        let archive_path = root.join(archive_name);
+        let staging = root.join("staging");
+        std::fs::create_dir_all(staging.join("fomod")).ok()?;
+        std::fs::create_dir_all(staging.join("Data/textures")).ok()?;
+        std::fs::write(
+            staging.join("fomod/ModuleConfig.xml"),
+            r#"<config>
+  <requiredInstallFiles>
+    <file source="Data/textures/sky.dds" destination="Data/textures/sky.dds" />
+  </requiredInstallFiles>
+</config>"#,
+        )
+        .ok()?;
+        std::fs::write(staging.join("Data/textures/sky.dds"), "dds").ok()?;
+        let output = Command::new("7z")
+            .current_dir(&staging)
+            .arg("a")
+            .arg("-y")
+            .arg(&archive_path)
+            .arg(".")
+            .output()
+            .ok()?;
+        if output.status.success() {
+            Some(archive_path)
+        } else {
+            None
+        }
+    }
+
     #[test]
     fn detect_strategy_data_for_loose_files() {
         let tmp = tempdir();
@@ -1324,6 +1419,26 @@ mod tests {
         std::fs::write(&archive, b"fake").unwrap();
         let strategy = detect_strategy(&archive).unwrap();
         assert!(matches!(strategy, InstallStrategy::Data));
+    }
+
+    #[test]
+    fn detect_strategy_non_zip_with_fomod_uses_fomod_strategy() {
+        let tmp = tempdir();
+        let Some(archive) = create_test_7z(&tmp, "mod.7z") else {
+            return;
+        };
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(matches!(strategy, InstallStrategy::Fomod(_)));
+    }
+
+    #[test]
+    fn parse_fomod_from_archive_reads_non_zip_module_config() {
+        let tmp = tempdir();
+        let Some(archive) = create_test_7z(&tmp, "mod.7z") else {
+            return;
+        };
+        let cfg = parse_fomod_from_archive(&archive).unwrap();
+        assert!(!cfg.required_files.is_empty());
     }
 
     #[test]

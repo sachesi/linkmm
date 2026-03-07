@@ -561,7 +561,7 @@ fn build_mod_row(
         let search_sel = Rc::clone(&search_state);
         let selected_sel = Rc::clone(&selected_mod_id);
         let mod_id_sel = mod_entry.id.clone();
-        left_click.connect_pressed(move |_, _, _, _| {
+        left_click.connect_released(move |_, _, _, _| {
             {
                 let mut selected = selected_sel.borrow_mut();
                 if selected.as_ref() == Some(&mod_id_sel) {
@@ -572,14 +572,23 @@ fn build_mod_row(
                     *selected = Some(mod_id_sel.clone());
                 }
             }
-            refresh_library_content_with_search(
-                &container_sel,
-                &game_sel,
-                Rc::clone(&config_sel),
-                &search_sel.borrow(),
-                Rc::clone(&search_sel),
-                Rc::clone(&selected_sel),
-            );
+            // Defer refresh so switch/button default handlers run first; this
+            // keeps row toggles and other left-click controls responsive.
+            let container_idle = container_sel.clone();
+            let game_idle = Rc::clone(&game_sel);
+            let config_idle = Rc::clone(&config_sel);
+            let search_idle = Rc::clone(&search_sel);
+            let selected_idle = Rc::clone(&selected_sel);
+            gtk4::glib::idle_add_local_once(move || {
+                refresh_library_content_with_search(
+                    &container_idle,
+                    &game_idle,
+                    Rc::clone(&config_idle),
+                    &search_idle.borrow(),
+                    Rc::clone(&search_idle),
+                    Rc::clone(&selected_idle),
+                );
+            });
         });
     }
     row.add_controller(left_click);
@@ -720,18 +729,19 @@ fn compute_conflict_states(
     mods: &[Mod],
     selected_id: Option<&str>,
 ) -> HashMap<String, ConflictState> {
-    let mut states: HashMap<String, ConflictState> = HashMap::new();
+    let global_states = compute_global_conflict_states(mods);
 
     if let Some(selected_id) = selected_id {
         let Some(selected_idx) = mods.iter().position(|m| m.id == selected_id) else {
-            return HashMap::new();
+            return global_states;
         };
 
         let selected_files = collect_mod_target_files(&mods[selected_idx]);
         if selected_files.is_empty() {
-            return HashMap::new();
+            return global_states;
         }
 
+        let mut states: HashMap<String, ConflictState> = HashMap::new();
         for (idx, m) in mods.iter().enumerate() {
             if idx == selected_idx {
                 continue;
@@ -792,53 +802,62 @@ fn compute_conflict_states(
                 }
             }
         }
+        // If selected mod has no conflicts, keep the global blue conflict mode.
+        if states.is_empty() {
+            global_states
+        } else {
+            states
+        }
     } else {
-        // No selected mod: mark any mod that participates in conflicts as blue.
-        let all_files: Vec<BTreeSet<String>> = mods.iter().map(collect_mod_target_files).collect();
+        global_states
+    }
+}
 
-        for i in 0..mods.len() {
-            if all_files[i].is_empty() {
+fn compute_global_conflict_states(mods: &[Mod]) -> HashMap<String, ConflictState> {
+    let mut states: HashMap<String, ConflictState> = HashMap::new();
+    let all_files: Vec<BTreeSet<String>> = mods.iter().map(collect_mod_target_files).collect();
+
+    for i in 0..mods.len() {
+        if all_files[i].is_empty() {
+            continue;
+        }
+        for j in (i + 1)..mods.len() {
+            if all_files[j].is_empty() {
                 continue;
             }
-            for j in (i + 1)..mods.len() {
-                if all_files[j].is_empty() {
-                    continue;
-                }
-                let shared: BTreeSet<String> =
-                    all_files[i].intersection(&all_files[j]).cloned().collect();
-                if shared.is_empty() {
-                    continue;
-                }
+            let shared: BTreeSet<String> = all_files[i].intersection(&all_files[j]).cloned().collect();
+            if shared.is_empty() {
+                continue;
+            }
 
-                states
-                    .entry(mods[i].id.clone())
-                    .or_default()
-                    .files
-                    .extend(shared.iter().cloned());
-                {
-                    let entry = states.entry(mods[i].id.clone()).or_default();
-                    for file in &shared {
-                        entry
-                            .conflict_mods_by_file
-                            .entry(file.clone())
-                            .or_default()
-                            .insert(mods[j].name.clone());
-                    }
+            states
+                .entry(mods[i].id.clone())
+                .or_default()
+                .files
+                .extend(shared.iter().cloned());
+            {
+                let entry = states.entry(mods[i].id.clone()).or_default();
+                for file in &shared {
+                    entry
+                        .conflict_mods_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(mods[j].name.clone());
                 }
-                states
-                    .entry(mods[j].id.clone())
-                    .or_default()
-                    .files
-                    .extend(shared.iter().cloned());
-                {
-                    let entry = states.entry(mods[j].id.clone()).or_default();
-                    for file in &shared {
-                        entry
-                            .conflict_mods_by_file
-                            .entry(file.clone())
-                            .or_default()
-                            .insert(mods[i].name.clone());
-                    }
+            }
+            states
+                .entry(mods[j].id.clone())
+                .or_default()
+                .files
+                .extend(shared.iter().cloned());
+            {
+                let entry = states.entry(mods[j].id.clone()).or_default();
+                for file in &shared {
+                    entry
+                        .conflict_mods_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(mods[i].name.clone());
                 }
             }
         }
@@ -1093,6 +1112,43 @@ mod tests {
         assert!(!selected.overwrites);
         assert!(other.overwrites);
         assert!(!other.overwritten);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compute_conflict_states_keeps_global_blue_conflicts_when_selected_mod_has_none() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("linkmm-conflict-fallback-test-{unique}"));
+        let mod_a = root.join("a");
+        let mod_b = root.join("b");
+        let mod_c = root.join("c");
+
+        std::fs::create_dir_all(mod_a.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_b.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_c.join("Data/meshes")).unwrap();
+        std::fs::write(mod_a.join("Data/textures/sky.dds"), "a").unwrap();
+        std::fs::write(mod_b.join("Data/textures/sky.dds"), "b").unwrap();
+        std::fs::write(mod_c.join("Data/meshes/rock.nif"), "c").unwrap();
+
+        let mods = vec![
+            sample_mod("a", "A", &mod_a.to_string_lossy()),
+            sample_mod("b", "B", &mod_b.to_string_lossy()),
+            sample_mod("c", "C", &mod_c.to_string_lossy()),
+        ];
+
+        // Select C (no conflicts) -> A/B must still remain in blue-mode data.
+        let states = compute_conflict_states(&mods, Some("c"));
+        let a = states.get("a").unwrap();
+        let b = states.get("b").unwrap();
+        assert!(a.files.contains("data/textures/sky.dds"));
+        assert!(b.files.contains("data/textures/sky.dds"));
+        assert!(!a.overwrites && !a.overwritten);
+        assert!(!b.overwrites && !b.overwritten);
+        assert!(!states.contains_key("c"));
 
         std::fs::remove_dir_all(root).unwrap();
     }
