@@ -45,7 +45,7 @@ pub fn show_setup_wizard(
     stack.add_named(&game_page, Some("select_game"));
 
     // --- Page 3: NexusMods API Key ---
-    let (nexus_page, api_key_row) =
+    let (nexus_page, _api_key_row) =
         build_nexus_page(&dialog, Rc::clone(&config), Rc::clone(&selected_game_clone));
     stack.add_named(&nexus_page, Some("nexus_key"));
 
@@ -66,7 +66,6 @@ pub fn show_setup_wizard(
         }
     }
 
-    let _ = api_key_row; // suppress warning
     dialog.present();
 }
 
@@ -374,7 +373,7 @@ fn build_nexus_page(
 
     // Make it act like a password field
     let visibility_btn = gtk4::ToggleButton::new();
-    visibility_btn.set_icon_name("eye-open-negative-filled-symbolic");
+    visibility_btn.set_icon_name("view-reveal-symbolic");
     visibility_btn.set_valign(gtk4::Align::Center);
     api_key_row.add_suffix(&visibility_btn);
 
