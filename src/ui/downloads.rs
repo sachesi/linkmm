@@ -15,9 +15,12 @@ use crate::core::installer::{
     InstallStrategy, PluginType,
 };
 
-// ── Archive extensions we recognise as mod archives ──────────────────────────
+// ── Archive extensions ────────────────────────────────────────────────────────
 
+/// All archive file types the Downloads page can clean from cache.
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
+/// Archive types that are currently installable by the app.
+const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip"];
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
@@ -223,51 +226,43 @@ fn build_entry_row(
         row.add_suffix(&badge);
     }
 
-    // Install button (when a game is selected, for supported archives)
+    // Install button (when a game is selected)
     if !is_installed {
         if let Some(ref g) = **game {
             let ext = entry.path.extension()
                 .and_then(|e| e.to_str())
                 .map(|s| s.to_lowercase())
                 .unwrap_or_default();
-            // Show install button for zip files (others are listed but can't be
-            // installed yet since extraction only supports zip)
-            if ext == "zip" {
-                let install_btn = gtk4::Button::new();
-                install_btn.set_icon_name("emblem-system-symbolic");
-                install_btn.set_tooltip_text(Some("Install mod"));
-                install_btn.set_valign(gtk4::Align::Center);
-                install_btn.add_css_class("flat");
-                install_btn.add_css_class("suggested-action");
-
-                let path_c = entry.path.clone();
-                let name_c = entry.name.clone();
-                let game_c = g.clone();
-                let config_c = Rc::clone(config);
-                let container_c = container.clone();
-                let game_rc_c = Rc::clone(game);
-                let hide_installed_c = hide_installed;
-                install_btn.connect_clicked(move |btn| {
-                    show_install_dialog(
-                        btn,
-                        &path_c,
-                        &name_c,
-                        &game_c,
-                        &config_c,
-                        &container_c,
-                        hide_installed_c,
-                        &game_rc_c,
-                    );
-                });
-                row.add_suffix(&install_btn);
-            } else {
-                // Non-zip archives: show a label indicating unsupported format
-                let unsup_label = gtk4::Label::new(Some("zip only"));
-                unsup_label.add_css_class("dim-label");
-                unsup_label.add_css_class("caption");
-                unsup_label.set_valign(gtk4::Align::Center);
-                row.add_suffix(&unsup_label);
+            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+                return row;
             }
+            let install_btn = gtk4::Button::new();
+            install_btn.set_icon_name("emblem-system-symbolic");
+            install_btn.set_tooltip_text(Some("Install mod"));
+            install_btn.set_valign(gtk4::Align::Center);
+            install_btn.add_css_class("flat");
+            install_btn.add_css_class("suggested-action");
+
+            let path_c = entry.path.clone();
+            let name_c = entry.name.clone();
+            let game_c = g.clone();
+            let config_c = Rc::clone(config);
+            let container_c = container.clone();
+            let game_rc_c = Rc::clone(game);
+            let hide_installed_c = hide_installed;
+            install_btn.connect_clicked(move |btn| {
+                show_install_dialog(
+                    btn,
+                    &path_c,
+                    &name_c,
+                    &game_c,
+                    &config_c,
+                    &container_c,
+                    hide_installed_c,
+                    &game_rc_c,
+                );
+            });
+            row.add_suffix(&install_btn);
         }
     }
 
@@ -744,7 +739,7 @@ fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
             let path = item.path();
             if !path.is_file() { continue; }
             let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
-            if !ARCHIVE_EXTENSIONS.contains(&ext.as_str()) { continue; }
+            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) { continue; }
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             entries.push(DownloadEntry { name, path, size_bytes });

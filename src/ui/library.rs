@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 
 use gio;
@@ -373,6 +374,19 @@ fn build_mod_row(
             if let Some(m) = db.mods.iter().find(|m| m.id == mod_id_c) {
                 if let Err(e) = ModManager::uninstall_mod(&game_c, m) {
                     log::error!("Failed to uninstall mod: {e}");
+                } else {
+                    // Keep downloaded archives on disk, but clear install marker
+                    // so Downloads reflects that this mod is no longer installed.
+                    let mod_name_lower = m.name.to_lowercase();
+                    let mut cfg = config_c.borrow_mut();
+                    cfg.installed_archives.retain(|archive| {
+                        let archive_stem = Path::new(archive)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_lowercase())
+                            .unwrap_or_default();
+                        archive_stem != mod_name_lower
+                    });
+                    cfg.save();
                 }
             }
             refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
