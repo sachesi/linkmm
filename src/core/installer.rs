@@ -99,7 +99,16 @@ pub struct PluginGroup {
 #[derive(Debug, Clone)]
 pub struct InstallStep {
     pub name: String,
+    pub visible: Option<PluginDependencies>,
     pub groups: Vec<PluginGroup>,
+}
+
+/// Conditional files selected by dependency flags under
+/// `<conditionalFileInstalls>`.
+#[derive(Debug, Clone)]
+pub struct ConditionalFileInstall {
+    pub dependencies: PluginDependencies,
+    pub files: Vec<FomodFile>,
 }
 
 /// Parsed FOMOD configuration.
@@ -108,6 +117,7 @@ pub struct FomodConfig {
     pub mod_name: Option<String>,
     pub required_files: Vec<FomodFile>,
     pub steps: Vec<InstallStep>,
+    pub conditional_file_installs: Vec<ConditionalFileInstall>,
 }
 
 // ── Strategy detection ────────────────────────────────────────────────────────
@@ -293,6 +303,7 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
         mod_name: None,
         required_files: Vec::new(),
         steps: Vec::new(),
+        conditional_file_installs: Vec::new(),
     };
 
     let mut buf = Vec::new();
@@ -305,6 +316,10 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
     let mut current_text = String::new();
     let mut current_condition_flag_name: Option<String> = None;
     let mut in_required = false;
+    let mut in_visible = false;
+    let mut in_pattern = false;
+    let mut current_pattern_dependencies: Option<PluginDependencies> = None;
+    let mut current_pattern_files: Vec<FomodFile> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -321,8 +336,17 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         let name = get_attr(e, "name").unwrap_or_default();
                         current_step = Some(InstallStep {
                             name,
+                            visible: None,
                             groups: Vec::new(),
                         });
+                    }
+                    "visible" => {
+                        in_visible = true;
+                    }
+                    "pattern" => {
+                        in_pattern = true;
+                        current_pattern_dependencies = None;
+                        current_pattern_files.clear();
                     }
                     "group" => {
                         let name = get_attr(e, "name").unwrap_or_default();
@@ -371,7 +395,9 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                             priority,
                         };
 
-                        if in_required && current_plugin.is_none() {
+                        if in_pattern {
+                            current_pattern_files.push(fomod_file);
+                        } else if in_required && current_plugin.is_none() {
                             config.required_files.push(fomod_file);
                         } else if let Some(ref mut plugin) = current_plugin {
                             plugin.files.push(fomod_file);
@@ -391,27 +417,56 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         }
                     }
                     "dependencies" => {
-                        if let Some(ref mut plugin) = current_plugin {
-                            let operator = match get_attr(e, "operator")
-                                .unwrap_or_else(|| "And".to_string())
-                                .to_lowercase()
-                                .as_str()
-                            {
-                                "or" => DependencyOperator::Or,
-                                _ => DependencyOperator::And,
-                            };
-                            plugin.dependencies = Some(PluginDependencies {
-                                operator,
-                                flags: Vec::new(),
-                            });
+                        let operator = match get_attr(e, "operator")
+                            .unwrap_or_else(|| "And".to_string())
+                            .to_lowercase()
+                            .as_str()
+                        {
+                            "or" => DependencyOperator::Or,
+                            _ => DependencyOperator::And,
+                        };
+                        let deps = PluginDependencies {
+                            operator,
+                            flags: Vec::new(),
+                        };
+                        if in_pattern {
+                            current_pattern_dependencies = Some(deps);
+                        } else if in_visible {
+                            if let Some(ref mut step) = current_step {
+                                step.visible = Some(deps);
+                            }
+                        } else if let Some(ref mut plugin) = current_plugin {
+                            plugin.dependencies = Some(deps);
                         }
                     }
                     "flagdependency" => {
-                        if let Some(ref mut plugin) = current_plugin {
-                            if let Some(ref mut deps) = plugin.dependencies {
-                                let flag = get_attr(e, "flag").unwrap_or_default();
-                                let value = get_attr(e, "value").unwrap_or_default();
-                                if !flag.is_empty() {
+                        let flag = get_attr(e, "flag").unwrap_or_default();
+                        let value = get_attr(e, "value").unwrap_or_default();
+                        if !flag.is_empty() {
+                            if in_pattern {
+                                if current_pattern_dependencies.is_none() {
+                                    current_pattern_dependencies = Some(PluginDependencies {
+                                        operator: DependencyOperator::And,
+                                        flags: Vec::new(),
+                                    });
+                                }
+                                if let Some(ref mut deps) = current_pattern_dependencies {
+                                    deps.flags.push(FlagDependency { flag, value });
+                                }
+                            } else if in_visible {
+                                if let Some(ref mut step) = current_step {
+                                    if step.visible.is_none() {
+                                        step.visible = Some(PluginDependencies {
+                                            operator: DependencyOperator::And,
+                                            flags: Vec::new(),
+                                        });
+                                    }
+                                    if let Some(ref mut deps) = step.visible {
+                                        deps.flags.push(FlagDependency { flag, value });
+                                    }
+                                }
+                            } else if let Some(ref mut plugin) = current_plugin {
+                                if let Some(ref mut deps) = plugin.dependencies {
                                     deps.flags.push(FlagDependency { flag, value });
                                 }
                             }
@@ -442,7 +497,9 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                             priority,
                         };
 
-                        if in_required && current_plugin.is_none() {
+                        if in_pattern {
+                            current_pattern_files.push(fomod_file);
+                        } else if in_required && current_plugin.is_none() {
                             config.required_files.push(fomod_file);
                         } else if let Some(ref mut plugin) = current_plugin {
                             plugin.files.push(fomod_file);
@@ -460,19 +517,26 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         }
                     }
                     "dependencies" => {
-                        if let Some(ref mut plugin) = current_plugin {
-                            let operator = match get_attr(e, "operator")
-                                .unwrap_or_else(|| "And".to_string())
-                                .to_lowercase()
-                                .as_str()
-                            {
-                                "or" => DependencyOperator::Or,
-                                _ => DependencyOperator::And,
-                            };
-                            plugin.dependencies = Some(PluginDependencies {
-                                operator,
-                                flags: Vec::new(),
-                            });
+                        let operator = match get_attr(e, "operator")
+                            .unwrap_or_else(|| "And".to_string())
+                            .to_lowercase()
+                            .as_str()
+                        {
+                            "or" => DependencyOperator::Or,
+                            _ => DependencyOperator::And,
+                        };
+                        let deps = PluginDependencies {
+                            operator,
+                            flags: Vec::new(),
+                        };
+                        if in_pattern {
+                            current_pattern_dependencies = Some(deps);
+                        } else if in_visible {
+                            if let Some(ref mut step) = current_step {
+                                step.visible = Some(deps);
+                            }
+                        } else if let Some(ref mut plugin) = current_plugin {
+                            plugin.dependencies = Some(deps);
                         }
                     }
                     "image" => {
@@ -493,11 +557,33 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         }
                     }
                     "flagdependency" => {
-                        if let Some(ref mut plugin) = current_plugin {
-                            if let Some(ref mut deps) = plugin.dependencies {
-                                let flag = get_attr(e, "flag").unwrap_or_default();
-                                let value = get_attr(e, "value").unwrap_or_default();
-                                if !flag.is_empty() {
+                        let flag = get_attr(e, "flag").unwrap_or_default();
+                        let value = get_attr(e, "value").unwrap_or_default();
+                        if !flag.is_empty() {
+                            if in_pattern {
+                                if current_pattern_dependencies.is_none() {
+                                    current_pattern_dependencies = Some(PluginDependencies {
+                                        operator: DependencyOperator::And,
+                                        flags: Vec::new(),
+                                    });
+                                }
+                                if let Some(ref mut deps) = current_pattern_dependencies {
+                                    deps.flags.push(FlagDependency { flag, value });
+                                }
+                            } else if in_visible {
+                                if let Some(ref mut step) = current_step {
+                                    if step.visible.is_none() {
+                                        step.visible = Some(PluginDependencies {
+                                            operator: DependencyOperator::And,
+                                            flags: Vec::new(),
+                                        });
+                                    }
+                                    if let Some(ref mut deps) = step.visible {
+                                        deps.flags.push(FlagDependency { flag, value });
+                                    }
+                                }
+                            } else if let Some(ref mut plugin) = current_plugin {
+                                if let Some(ref mut deps) = plugin.dependencies {
                                     deps.flags.push(FlagDependency { flag, value });
                                 }
                             }
@@ -548,13 +634,30 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         }
                     }
                     "dependencies" => {
-                        if let Some(ref mut plugin) = current_plugin {
+                        if in_pattern {
+                            if let Some(ref deps) = current_pattern_dependencies {
+                                if deps.flags.is_empty() {
+                                    current_pattern_dependencies = None;
+                                }
+                            }
+                        } else if in_visible {
+                            if let Some(ref mut step) = current_step {
+                                if let Some(ref deps) = step.visible {
+                                    if deps.flags.is_empty() {
+                                        step.visible = None;
+                                    }
+                                }
+                            }
+                        } else if let Some(ref mut plugin) = current_plugin {
                             if let Some(ref deps) = plugin.dependencies {
                                 if deps.flags.is_empty() {
                                     plugin.dependencies = None;
                                 }
                             }
                         }
+                    }
+                    "visible" => {
+                        in_visible = false;
                     }
                     "plugin" => {
                         if let Some(plugin) = current_plugin.take() {
@@ -574,6 +677,25 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         if let Some(step) = current_step.take() {
                             config.steps.push(step);
                         }
+                    }
+                    "pattern" => {
+                        let dependencies = current_pattern_dependencies.take().unwrap_or(
+                            PluginDependencies {
+                                operator: DependencyOperator::And,
+                                flags: Vec::new(),
+                            },
+                        );
+                        if !current_pattern_files.is_empty() {
+                            config
+                                .conditional_file_installs
+                                .push(ConditionalFileInstall {
+                                    dependencies,
+                                    files: std::mem::take(&mut current_pattern_files),
+                                });
+                        } else {
+                            current_pattern_files.clear();
+                        }
+                        in_pattern = false;
                     }
                     _ => {}
                 }
@@ -873,19 +995,17 @@ fn install_fomod_files(
                 .map_err(|e| format!("Cannot read entry {entry_name}: {e}"))?;
 
             if entry.is_dir() {
-                std::fs::create_dir_all(&out_path)
-                    .map_err(|e| format!("Failed to create dir: {e}"))?;
-            } else {
-                if let Some(parent) = out_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("Failed to create parent dir: {e}"))?;
-                }
-
-                let mut out_file = std::fs::File::create(&out_path)
-                    .map_err(|e| format!("Failed to create file: {e}"))?;
-                std::io::copy(&mut entry, &mut out_file)
-                    .map_err(|e| format!("Failed to extract: {e}"))?;
+                continue;
             }
+
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dir: {e}"))?;
+            }
+
+            let mut out_file =
+                std::fs::File::create(&out_path).map_err(|e| format!("Failed to create file: {e}"))?;
+            std::io::copy(&mut entry, &mut out_file).map_err(|e| format!("Failed to extract: {e}"))?;
         }
     }
 
@@ -1264,6 +1384,37 @@ mod tests {
     }
 
     #[test]
+    fn install_fomod_files_skips_empty_directory_entries() {
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("textures/", b""),
+                ("textures/armor.dds", b"dds_data"),
+                ("textures/empty/", b""),
+                ("fomod/", b""),
+                ("fomod/ModuleConfig.xml", b"<config/>"),
+            ],
+        );
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[FomodFile {
+                source: "textures".to_string(),
+                destination: "Data/textures".to_string(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+
+        assert!(dest.join("textures").join("armor.dds").exists());
+        assert!(!dest.join("textures").join("empty").exists());
+    }
+
+    #[test]
     fn parse_fomod_xml_parses_plugin_dependencies_flags_and_image() {
         let xml = br#"
             <config>
@@ -1314,6 +1465,73 @@ mod tests {
                 }],
             })
         );
+        assert!(cfg.steps[0].visible.is_none());
+        assert!(cfg.conditional_file_installs.is_empty());
+    }
+
+    #[test]
+    fn parse_fomod_xml_parses_step_visibility_and_conditional_files() {
+        let xml = br#"
+            <config>
+              <moduleName>Example Mod</moduleName>
+              <installSteps>
+                <installStep name="Underwear Options">
+                  <visible>
+                    <flagDependency flag="bUnderwear" value="On" />
+                  </visible>
+                  <optionalFileGroups>
+                    <group name="Color" type="SelectExactlyOne">
+                      <plugins>
+                        <plugin name="Black">
+                          <files>
+                            <folder source="16 Underwear" destination="" priority="0"/>
+                          </files>
+                        </plugin>
+                      </plugins>
+                    </group>
+                  </optionalFileGroups>
+                </installStep>
+              </installSteps>
+              <conditionalFileInstalls>
+                <patterns>
+                  <pattern>
+                    <dependencies>
+                      <flagDependency flag="bUnderwear" value="On"/>
+                    </dependencies>
+                    <files>
+                      <folder source="22 Underwear Dark Purple" destination=""/>
+                    </files>
+                  </pattern>
+                </patterns>
+              </conditionalFileInstalls>
+            </config>
+        "#;
+
+        let cfg = parse_fomod_xml(xml).unwrap();
+        assert_eq!(cfg.steps.len(), 1);
+        assert_eq!(
+            cfg.steps[0].visible,
+            Some(PluginDependencies {
+                operator: DependencyOperator::And,
+                flags: vec![FlagDependency {
+                    flag: "bUnderwear".to_string(),
+                    value: "On".to_string(),
+                }],
+            })
+        );
+        assert_eq!(cfg.conditional_file_installs.len(), 1);
+        assert_eq!(
+            cfg.conditional_file_installs[0].dependencies,
+            PluginDependencies {
+                operator: DependencyOperator::And,
+                flags: vec![FlagDependency {
+                    flag: "bUnderwear".to_string(),
+                    value: "On".to_string(),
+                }],
+            }
+        );
+        assert_eq!(cfg.conditional_file_installs[0].files.len(), 1);
+        assert_eq!(cfg.conditional_file_installs[0].files[0].source, "22 Underwear Dark Purple");
     }
 
     #[test]
