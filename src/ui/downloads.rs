@@ -442,16 +442,19 @@ fn do_install(
 
 // ── FOMOD wizard ──────────────────────────────────────────────────────────────
 
+/// Selected plugin indices by `[step_index][group_index][plugin_indices]`.
 type FomodSelections = Vec<Vec<Vec<usize>>>;
+const OPTION_IMAGE_WIDTH: i32 = 128;
+const OPTION_IMAGE_HEIGHT: i32 = 72;
 
 fn collect_active_flags(
     fomod: &FomodConfig,
     selections: &FomodSelections,
-    upto_step_inclusive: usize,
+    up_to_step_inclusive: usize,
 ) -> HashMap<String, HashSet<String>> {
     let mut flags: HashMap<String, HashSet<String>> = HashMap::new();
     for (si, step) in fomod.steps.iter().enumerate() {
-        if si > upto_step_inclusive {
+        if si > up_to_step_inclusive {
             break;
         }
         for (gi, group) in step.groups.iter().enumerate() {
@@ -478,10 +481,11 @@ fn flag_dependency_matches(
     dep: &FlagDependency,
     active_flags: &HashMap<String, HashSet<String>>,
 ) -> bool {
-    active_flags
-        .get(&dep.flag)
-        .map(|values| values.contains(&dep.value))
-        .unwrap_or(false)
+    if let Some(values) = active_flags.get(&dep.flag) {
+        values.contains(&dep.value)
+    } else {
+        false
+    }
 }
 
 fn plugin_is_visible(
@@ -789,7 +793,6 @@ fn show_fomod_wizard(
                         check.set_sensitive(false);
                     }
                     let sel_cc = Rc::clone(&sel_c);
-                    let fc_cc = Rc::clone(&fc);
                     let is_radio = use_radio;
                     let si = idx;
                     check.connect_toggled(move |btn| {
@@ -806,7 +809,6 @@ fn show_fomod_wizard(
                                 gs.retain(|&x| x != pi);
                             }
                         }
-                        sanitize_step_selection(&fc_cc, &mut sel, si);
                     });
                     check.set_valign(gtk4::Align::Center);
                     row.add_prefix(&check);
@@ -817,7 +819,7 @@ fn show_fomod_wizard(
                             let pic = gtk4::Picture::new();
                             pic.set_paintable(Some(&texture));
                             pic.set_content_fit(gtk4::ContentFit::Contain);
-                            pic.set_size_request(128, 72);
+                            pic.set_size_request(OPTION_IMAGE_WIDTH, OPTION_IMAGE_HEIGHT);
                             row.add_suffix(&pic);
                         }
                     }

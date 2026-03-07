@@ -18,6 +18,7 @@ pub enum InstallStrategy {
 }
 
 // ── FOMOD types ───────────────────────────────────────────────────────────────
+const FOMOD_DIR_PREFIX: &str = "fomod/";
 
 /// A single file/folder mapping inside a FOMOD config.
 #[derive(Debug, Clone)]
@@ -251,8 +252,11 @@ pub fn read_archive_file_bytes(
     if target_lower.is_empty() {
         return Err("Empty archive path".to_string());
     }
-    let fomod_target = format!("fomod/{target_lower}");
+    let fomod_target = format!("{FOMOD_DIR_PREFIX}{target_lower}");
 
+    // FOMOD image paths are often relative to `fomod/`, while some archives
+    // store them at the root or inside a wrapped top-level folder. Match both
+    // direct and `fomod/`-prefixed variants, including wrapped prefixes.
     for i in 0..zip.len() {
         let mut entry = zip
             .by_index(i)
@@ -553,13 +557,6 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         }
                     }
                     "plugin" => {
-                        if let Some(ref mut plugin) = current_plugin {
-                            if let Some(ref deps) = plugin.dependencies {
-                                if deps.flags.is_empty() {
-                                    plugin.dependencies = None;
-                                }
-                            }
-                        }
                         if let Some(plugin) = current_plugin.take() {
                             if let Some(ref mut group) = current_group {
                                 group.plugins.push(plugin);
