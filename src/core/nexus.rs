@@ -238,6 +238,36 @@ impl NexusClient {
         Ok(data.into_iter().map(|l| (l.short_name, l.uri)).collect())
     }
 
+    /// Get CDN download links using NXM key/expires parameters.
+    ///
+    /// This is used when the app receives an `nxm://` URL from the browser.
+    /// Any Nexus account can use this endpoint when valid key/expires are
+    /// provided.
+    pub fn get_download_links_nxm(
+        &self,
+        game_domain: &str,
+        mod_id: u32,
+        file_id: u64,
+        key: &str,
+        expires: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let url = format!(
+            "https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}/files/{file_id}/download_link.json"
+        );
+        // Use ureq query parameters to avoid URL injection
+        let response = ureq::get(&url)
+            .set("apikey", &self.api_key)
+            .set("User-Agent", "Linkmm/0.1.0")
+            .query("key", key)
+            .query("expires", expires)
+            .call()
+            .map_err(|e| format!("Request failed: {e}"))?;
+        let data: Vec<NexusDownloadLink> = response
+            .into_json()
+            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        Ok(data.into_iter().map(|l| (l.short_name, l.uri)).collect())
+    }
+
     /// Return the public Nexus Mods page URL for the given mod.
     pub fn mod_page_url(game_domain: &str, mod_id: u64) -> String {
         format!("https://www.nexusmods.com/{game_domain}/mods/{mod_id}")

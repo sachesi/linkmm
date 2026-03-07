@@ -30,6 +30,12 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     deploy_btn.set_tooltip_text(Some("Apply all enabled mods by linking their files into the game directory"));
     header.pack_end(&deploy_btn);
 
+    // Undeploy button – removes all mod symlinks from the game directory
+    let undeploy_btn = gtk4::Button::with_label("Undeploy");
+    undeploy_btn.add_css_class("destructive-action");
+    undeploy_btn.set_tooltip_text(Some("Remove all mod symlinks from the game directory"));
+    header.pack_end(&undeploy_btn);
+
     // Add-mod button
     let add_mod_btn = gtk4::Button::new();
     add_mod_btn.set_icon_name("list-add-symbolic");
@@ -78,6 +84,44 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         });
     }
 
+    // Wire Undeploy button: remove all mod symlinks from the game directory
+    {
+        let game_c = Rc::clone(&game_rc);
+        let container_c = content_container.clone();
+        let config_c = Rc::clone(&config);
+        undeploy_btn.connect_clicked(move |btn| {
+            let db = ModDatabase::load(&game_c);
+            let mut errors: Vec<String> = Vec::new();
+            let mut count = 0;
+            for m in db.mods.iter().filter(|m| m.enabled) {
+                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+                    errors.push(format!("{}: {}", m.name, e));
+                } else {
+                    count += 1;
+                }
+            }
+
+            // Mark all mods as disabled in the database
+            let mut db = ModDatabase::load(&game_c);
+            for m in db.mods.iter_mut() {
+                m.enabled = false;
+            }
+            db.save(&game_c);
+            let _ = db.write_plugins_txt(&game_c);
+
+            let msg = if errors.is_empty() {
+                format!("Undeployed {count} mod(s)")
+            } else {
+                for e in &errors {
+                    log::error!("Undeploy error: {e}");
+                }
+                format!("Undeploy finished with {} error(s)", errors.len())
+            };
+            show_toast(btn.upcast_ref(), &msg);
+            refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
+        });
+    }
+
     toolbar_view.upcast()
 }
 
@@ -96,7 +140,7 @@ fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<Re
         let status = adw::StatusPage::builder()
             .title("No Mods Installed")
             .description(&format!(
-                "Add mods for {} by clicking the button below or dragging an archive onto this window.",
+                "Install mods for {} from the Downloads page or by clicking the \u{201c}+\u{201d} button to select a mod archive.",
                 game.name
             ))
             .icon_name("package-x-generic-symbolic")
@@ -155,26 +199,90 @@ fn wire_add_mod_button(
     btn.connect_clicked(move |b| {
         let parent = b.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
         let dialog = gtk4::FileDialog::new();
-        dialog.set_title("Select Mod Folder");
+        dialog.set_title("Select Mod Archive");
+
+        // Only allow zip archives
+        let filter = gtk4::FileFilter::new();
+        filter.set_name(Some("Mod archives (*.zip)"));
+        filter.add_pattern("*.zip");
+        let filters = gio::ListStore::new::<gtk4::FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
 
         let game2 = Rc::clone(&game_clone);
         let container2 = container_clone.clone();
         let config2 = Rc::clone(&config_clone);
-        dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+        dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
             if let Ok(file) = result {
                 if let Some(path) = file.path() {
-                    let mod_name = path
+                    if !path.is_file() {
+                        return;
+                    }
+
+                    let archive_name = path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Unknown Mod".to_string());
+                        .unwrap_or_else(|| "Unknown".to_string());
 
-                    let mut db = ModDatabase::load(&game2);
-                    let new_mod = crate::core::mods::Mod::new(mod_name, path);
-                    db.mods.push(new_mod);
-                    db.save(&game2);
-                    config2.borrow().save();
+                    let ext = path.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_default();
 
-                    refresh_library_content(&container2, &game2, Rc::clone(&config2));
+                    if ext != "zip" {
+                        log::error!("Only .zip archives are supported for installation");
+                        return;
+                    }
+
+                    let strategy = match crate::core::installer::detect_strategy(&path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::error!("Failed to detect install strategy: {e}");
+                            return;
+                        }
+                    };
+
+                    let game_rc: Rc<Option<Game>> = Rc::new(Some((*game2).clone()));
+
+                    // For FOMOD mods, launch the wizard
+                    if let crate::core::installer::InstallStrategy::Fomod(_) = &strategy {
+                        if let Ok(fomod_config) = crate::core::installer::parse_fomod_from_zip(&path) {
+                            crate::ui::downloads::show_fomod_wizard_from_library(
+                                None,
+                                &path,
+                                &archive_name,
+                                &game2,
+                                &config2,
+                                &container2,
+                                &fomod_config,
+                                &game_rc,
+                            );
+                            return;
+                        }
+                    }
+
+                    // Non-FOMOD: use detected strategy directly
+                    let mod_name = std::path::Path::new(&archive_name)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| archive_name.clone());
+
+                    match crate::core::installer::install_mod_from_archive(
+                        &path, &game2, &mod_name, &strategy,
+                    ) {
+                        Ok(_) => {
+                            let mut cfg = config2.borrow_mut();
+                            if !cfg.installed_archives.contains(&archive_name) {
+                                cfg.installed_archives.push(archive_name.clone());
+                            }
+                            cfg.save();
+                            drop(cfg);
+                            refresh_library_content(&container2, &game2, Rc::clone(&config2));
+                        }
+                        Err(e) => {
+                            log::error!("Failed to install mod: {e}");
+                        }
+                    }
                 }
             }
         });
