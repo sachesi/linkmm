@@ -446,11 +446,12 @@ fn do_install(
 
 /// Selected plugin indices by `[step_index][group_index][plugin_indices]`.
 type FomodSelections = Vec<Vec<Vec<usize>>>;
-const GROUP_PREVIEW_IMAGE_WIDTH: i32 = 300;
-const GROUP_PREVIEW_IMAGE_HEIGHT: i32 = 180;
+const GROUP_PREVIEW_PANE_WIDTH: i32 = 340;
+const GROUP_PREVIEW_IMAGE_WIDTH: i32 = 316;
+const GROUP_PREVIEW_IMAGE_HEIGHT: i32 = 210;
 const GROUP_PREVIEW_NAME_WIDTH_CHARS: i32 = 34;
 const GROUP_PREVIEW_NAME_MAX_WIDTH_CHARS: i32 = 40;
-const FOMOD_CARD_EDGE_MARGIN: i32 = 1;
+const FOMOD_CARD_EDGE_MARGIN: i32 = 8;
 
 fn collect_active_flags(
     fomod: &FomodConfig,
@@ -679,8 +680,8 @@ fn show_fomod_wizard(
     let dialog = adw::Window::builder()
         .title(&format!("Install: {mod_display_name}"))
         .modal(true)
-        .default_width(600)
-        .default_height(500)
+        .default_width(900)
+        .default_height(620)
         .build();
     if let Some(p) = parent {
         dialog.set_transient_for(Some(p));
@@ -787,14 +788,20 @@ fn show_fomod_wizard(
             step_row.set_vexpand(true);
             let scrolled = gtk4::ScrolledWindow::new();
             scrolled.set_vexpand(true);
+            scrolled.set_hexpand(true);
             scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
             scrolled.add_css_class("card");
             let groups_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+            groups_box.set_margin_start(12);
+            groups_box.set_margin_end(12);
+            groups_box.set_margin_top(12);
+            groups_box.set_margin_bottom(12);
             let preview_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
             preview_box.add_css_class("card");
             preview_box.set_halign(gtk4::Align::Start);
-            preview_box.set_valign(gtk4::Align::Start);
-            preview_box.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, -1);
+            preview_box.set_valign(gtk4::Align::Fill);
+            preview_box.set_vexpand(true);
+            preview_box.set_size_request(GROUP_PREVIEW_PANE_WIDTH, -1);
             preview_box.set_margin_top(FOMOD_CARD_EDGE_MARGIN);
             preview_box.set_margin_bottom(FOMOD_CARD_EDGE_MARGIN);
             preview_box.set_margin_start(FOMOD_CARD_EDGE_MARGIN);
@@ -817,6 +824,8 @@ fn show_fomod_wizard(
             let preview_picture = gtk4::Picture::new();
             preview_picture.set_content_fit(gtk4::ContentFit::Contain);
             preview_picture.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
+            preview_picture.set_can_shrink(true);
+            preview_picture.set_hexpand(true);
             preview_picture.set_halign(gtk4::Align::Center);
             preview_picture.set_margin_start(12);
             preview_picture.set_margin_end(12);
@@ -951,8 +960,11 @@ fn show_fomod_wizard(
                     preview_picture.set_paintable(Some(&texture));
                     preview_name.set_label(&plugin_name);
                 }
-                step_row.append(&preview_box);
+            } else {
+                preview_picture.set_paintable(None::<&gtk4::gdk::Texture>);
+                preview_name.set_label("No preview available for this step");
             }
+            step_row.append(&preview_box);
             sc.append(&step_row);
         })
     };
