@@ -42,8 +42,39 @@ pub enum GroupType {
 pub struct FomodPlugin {
     pub name: String,
     pub description: Option<String>,
+    pub image_path: Option<String>,
     pub files: Vec<FomodFile>,
     pub type_descriptor: PluginType,
+    pub condition_flags: Vec<ConditionFlag>,
+    pub dependencies: Option<PluginDependencies>,
+}
+
+/// Condition flag contributed by a selected plugin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConditionFlag {
+    pub name: String,
+    pub value: String,
+}
+
+/// A single flag dependency for plugin visibility.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlagDependency {
+    pub flag: String,
+    pub value: String,
+}
+
+/// Logical operator used for plugin dependency checks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DependencyOperator {
+    And,
+    Or,
+}
+
+/// Plugin visibility dependencies declared in FOMOD.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginDependencies {
+    pub operator: DependencyOperator,
+    pub flags: Vec<FlagDependency>,
 }
 
 /// Default selection state of a FOMOD plugin.
@@ -204,6 +235,49 @@ fn find_fomod_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String, 
     Err("No fomod/ModuleConfig.xml found in archive".to_string())
 }
 
+/// Load a file from an archive by path, using case-insensitive matching and
+/// common FOMOD-relative fallbacks.
+pub fn read_archive_file_bytes(
+    archive_path: &Path,
+    relative_path: &str,
+) -> Result<Vec<u8>, String> {
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
+
+    let target = normalise_path(relative_path);
+    let target_lower = target.to_lowercase();
+    if target_lower.is_empty() {
+        return Err("Empty archive path".to_string());
+    }
+    let fomod_target = format!("fomod/{target_lower}");
+
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| format!("Cannot read zip entry: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name_norm = normalise_path(entry.name());
+        let name_lower = name_norm.to_lowercase();
+        let matches = name_lower == target_lower
+            || name_lower.ends_with(&format!("/{target_lower}"))
+            || name_lower == fomod_target
+            || name_lower.ends_with(&format!("/{fomod_target}"));
+        if matches {
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("Failed reading archive file {name_norm}: {e}"))?;
+            return Ok(bytes);
+        }
+    }
+
+    Err(format!("Archive file not found: {relative_path}"))
+}
+
 fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
@@ -225,6 +299,7 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
     let mut current_group: Option<PluginGroup> = None;
     let mut current_plugin: Option<FomodPlugin> = None;
     let mut current_text = String::new();
+    let mut current_condition_flag_name: Option<String> = None;
     let mut in_required = false;
 
     loop {
@@ -247,8 +322,8 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                     }
                     "group" => {
                         let name = get_attr(e, "name").unwrap_or_default();
-                        let type_str = get_attr(e, "type")
-                            .unwrap_or_else(|| "SelectAny".to_string());
+                        let type_str =
+                            get_attr(e, "type").unwrap_or_else(|| "SelectAny".to_string());
                         let group_type = match type_str.to_lowercase().as_str() {
                             "selectatleastone" => GroupType::SelectAtLeastOne,
                             "selectatmostone" => GroupType::SelectAtMostOne,
@@ -267,9 +342,17 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         current_plugin = Some(FomodPlugin {
                             name,
                             description: None,
+                            image_path: None,
                             files: Vec::new(),
                             type_descriptor: PluginType::Optional,
+                            condition_flags: Vec::new(),
+                            dependencies: None,
                         });
+                    }
+                    "image" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            plugin.image_path = get_attr(e, "path");
+                        }
                     }
                     "file" | "folder" => {
                         let source = get_attr(e, "source").unwrap_or_default();
@@ -294,14 +377,46 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         if current_plugin.is_some() {
                             let name = get_attr(e, "name").unwrap_or_default();
                             if let Some(ref mut plugin) = current_plugin {
-                                plugin.type_descriptor =
-                                    match name.to_lowercase().as_str() {
-                                        "required" => PluginType::Required,
-                                        "recommended" => PluginType::Recommended,
-                                        "notusable" | "couldbeusable" => PluginType::NotUsable,
-                                        _ => PluginType::Optional,
-                                    };
+                                plugin.type_descriptor = match name.to_lowercase().as_str() {
+                                    "required" => PluginType::Required,
+                                    "recommended" => PluginType::Recommended,
+                                    "notusable" | "couldbeusable" => PluginType::NotUsable,
+                                    _ => PluginType::Optional,
+                                };
                             }
+                        }
+                    }
+                    "dependencies" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            let operator = match get_attr(e, "operator")
+                                .unwrap_or_else(|| "And".to_string())
+                                .to_lowercase()
+                                .as_str()
+                            {
+                                "or" => DependencyOperator::Or,
+                                _ => DependencyOperator::And,
+                            };
+                            plugin.dependencies = Some(PluginDependencies {
+                                operator,
+                                flags: Vec::new(),
+                            });
+                        }
+                    }
+                    "flagdependency" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            if let Some(ref mut deps) = plugin.dependencies {
+                                let flag = get_attr(e, "flag").unwrap_or_default();
+                                let value = get_attr(e, "value").unwrap_or_default();
+                                if !flag.is_empty() {
+                                    deps.flags.push(FlagDependency { flag, value });
+                                }
+                            }
+                        }
+                    }
+                    "flag" => {
+                        let in_condition_flags = path_stack.iter().any(|p| p == "conditionflags");
+                        if in_condition_flags && current_plugin.is_some() {
+                            current_condition_flag_name = get_attr(e, "name");
                         }
                     }
                     _ => {}
@@ -332,23 +447,63 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                     "type" => {
                         if let Some(ref mut plugin) = current_plugin {
                             let name = get_attr(e, "name").unwrap_or_default();
-                            plugin.type_descriptor =
-                                match name.to_lowercase().as_str() {
-                                    "required" => PluginType::Required,
-                                    "recommended" => PluginType::Recommended,
-                                    "notusable" | "couldbeusable" => PluginType::NotUsable,
-                                    _ => PluginType::Optional,
-                                };
+                            plugin.type_descriptor = match name.to_lowercase().as_str() {
+                                "required" => PluginType::Required,
+                                "recommended" => PluginType::Recommended,
+                                "notusable" | "couldbeusable" => PluginType::NotUsable,
+                                _ => PluginType::Optional,
+                            };
+                        }
+                    }
+                    "dependencies" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            let operator = match get_attr(e, "operator")
+                                .unwrap_or_else(|| "And".to_string())
+                                .to_lowercase()
+                                .as_str()
+                            {
+                                "or" => DependencyOperator::Or,
+                                _ => DependencyOperator::And,
+                            };
+                            plugin.dependencies = Some(PluginDependencies {
+                                operator,
+                                flags: Vec::new(),
+                            });
+                        }
+                    }
+                    "image" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            plugin.image_path = get_attr(e, "path");
+                        }
+                    }
+                    "flag" => {
+                        let in_condition_flags = path_stack.iter().any(|p| p == "conditionflags");
+                        if in_condition_flags {
+                            if let Some(ref mut plugin) = current_plugin {
+                                let name = get_attr(e, "name").unwrap_or_default();
+                                let value = get_attr(e, "value").unwrap_or_default();
+                                if !name.is_empty() && !value.is_empty() {
+                                    plugin.condition_flags.push(ConditionFlag { name, value });
+                                }
+                            }
+                        }
+                    }
+                    "flagdependency" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            if let Some(ref mut deps) = plugin.dependencies {
+                                let flag = get_attr(e, "flag").unwrap_or_default();
+                                let value = get_attr(e, "value").unwrap_or_default();
+                                if !flag.is_empty() {
+                                    deps.flags.push(FlagDependency { flag, value });
+                                }
+                            }
                         }
                     }
                     _ => {}
                 }
             }
             Ok(Event::Text(ref e)) => {
-                current_text = e
-                    .unescape()
-                    .unwrap_or_default()
-                    .to_string();
+                current_text = e.unescape().unwrap_or_default().to_string();
             }
             Ok(Event::End(ref e)) => {
                 let tag = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
@@ -370,7 +525,41 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                             }
                         }
                     }
+                    "flag" => {
+                        let in_condition_flags = path_stack
+                            .last()
+                            .map(|p| p == "conditionflags")
+                            .unwrap_or(false);
+                        if in_condition_flags {
+                            if let Some(name) = current_condition_flag_name.take() {
+                                if let Some(ref mut plugin) = current_plugin {
+                                    if !current_text.is_empty() {
+                                        plugin.condition_flags.push(ConditionFlag {
+                                            name,
+                                            value: current_text.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "dependencies" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            if let Some(ref deps) = plugin.dependencies {
+                                if deps.flags.is_empty() {
+                                    plugin.dependencies = None;
+                                }
+                            }
+                        }
+                    }
                     "plugin" => {
+                        if let Some(ref mut plugin) = current_plugin {
+                            if let Some(ref deps) = plugin.dependencies {
+                                if deps.flags.is_empty() {
+                                    plugin.dependencies = None;
+                                }
+                            }
+                        }
                         if let Some(plugin) = current_plugin.take() {
                             if let Some(ref mut group) = current_group {
                                 group.plugins.push(plugin);
@@ -405,17 +594,10 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
     Ok(config)
 }
 
-fn get_attr(
-    event: &quick_xml::events::BytesStart<'_>,
-    name: &str,
-) -> Option<String> {
+fn get_attr(event: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
     for attr in event.attributes().flatten() {
         if attr.key.as_ref() == name.as_bytes() {
-            return Some(
-                attr.unescape_value()
-                    .unwrap_or_default()
-                    .to_string(),
-            );
+            return Some(attr.unescape_value().unwrap_or_default().to_string());
         }
     }
     None
@@ -814,10 +996,10 @@ mod tests {
     #[test]
     fn detect_strategy_data_for_loose_files() {
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("textures/sky.dds", b"dds"),
-            ("meshes/rock.nif", b"nif"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[("textures/sky.dds", b"dds"), ("meshes/rock.nif", b"nif")],
+        );
         let strategy = detect_strategy(&archive).unwrap();
         assert!(matches!(strategy, InstallStrategy::Data));
     }
@@ -827,11 +1009,14 @@ mod tests {
         // Archives that already contain a Data/ subfolder now also return Data,
         // not Root – the distinction is handled during extraction.
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("Data/", b""),
-            ("Data/textures/sky.dds", b"dds"),
-            ("Data/meshes/rock.nif", b"nif"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("Data/", b""),
+                ("Data/textures/sky.dds", b"dds"),
+                ("Data/meshes/rock.nif", b"nif"),
+            ],
+        );
         let strategy = detect_strategy(&archive).unwrap();
         assert!(matches!(strategy, InstallStrategy::Data));
     }
@@ -840,10 +1025,10 @@ mod tests {
     fn archive_has_data_folder_flat_content() {
         // Archive without Data/ subfolder – helper returns false.
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("textures/sky.dds", b"dds"),
-            ("plugin.esp", b"esp"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[("textures/sky.dds", b"dds"), ("plugin.esp", b"esp")],
+        );
         assert!(!archive_has_data_folder(&archive));
     }
 
@@ -853,11 +1038,14 @@ mod tests {
         // strips it, so after stripping the remaining entries no longer start
         // with Data/ → helper returns false → content is extracted into Data/.
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("Data/", b""),
-            ("Data/textures/sky.dds", b"dds"),
-            ("Data/meshes/rock.nif", b"nif"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("Data/", b""),
+                ("Data/textures/sky.dds", b"dds"),
+                ("Data/meshes/rock.nif", b"nif"),
+            ],
+        );
         assert!(!archive_has_data_folder(&archive));
     }
 
@@ -866,11 +1054,14 @@ mod tests {
         // Archive with a wrapper folder containing Data/ – after stripping the
         // wrapper the remaining path starts with Data/ → helper returns true.
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("MyMod/", b""),
-            ("MyMod/Data/", b""),
-            ("MyMod/Data/textures/sky.dds", b"dds"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("MyMod/", b""),
+                ("MyMod/Data/", b""),
+                ("MyMod/Data/textures/sky.dds", b"dds"),
+            ],
+        );
         assert!(archive_has_data_folder(&archive));
     }
 
@@ -878,10 +1069,13 @@ mod tests {
     fn install_flat_archive_places_files_under_data_subdir() {
         // Flat archive (textures/sky.dds) should land in dest/Data/textures/sky.dds
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("textures/sky.dds", b"dds_data"),
-            ("plugin.esp", b"esp_data"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("textures/sky.dds", b"dds_data"),
+                ("plugin.esp", b"esp_data"),
+            ],
+        );
         let dest = tmp.join("mod_dir");
         std::fs::create_dir_all(&dest).unwrap();
         let data_dest = dest.join("Data");
@@ -901,10 +1095,10 @@ mod tests {
         // Archive Data/textures/sky.dds: find_common_prefix strips Data/ so
         // extraction to mod_dir/Data/ gives mod_dir/Data/textures/sky.dds.
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("Data/", b""),
-            ("Data/textures/sky.dds", b"dds_data"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[("Data/", b""), ("Data/textures/sky.dds", b"dds_data")],
+        );
         let dest = tmp.join("mod_dir");
         std::fs::create_dir_all(&dest).unwrap();
         // archive_has_data_folder returns false for this archive (Data/ stripped)
@@ -922,11 +1116,14 @@ mod tests {
         // Archive MyMod/Data/textures/sky.dds: prefix MyMod/ stripped, remaining
         // starts with Data/ → extract to mod_dir/ → mod_dir/Data/textures/sky.dds.
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("MyMod/", b""),
-            ("MyMod/Data/", b""),
-            ("MyMod/Data/textures/sky.dds", b"dds_data"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("MyMod/", b""),
+                ("MyMod/Data/", b""),
+                ("MyMod/Data/textures/sky.dds", b"dds_data"),
+            ],
+        );
         let dest = tmp.join("mod_dir");
         std::fs::create_dir_all(&dest).unwrap();
         assert!(archive_has_data_folder(&archive));
@@ -938,11 +1135,14 @@ mod tests {
     #[test]
     fn extract_zip_strips_common_prefix() {
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("MyMod/", b""),
-            ("MyMod/textures/sky.dds", b"dds_data"),
-            ("MyMod/plugin.esp", b"esp_data"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("MyMod/", b""),
+                ("MyMod/textures/sky.dds", b"dds_data"),
+                ("MyMod/plugin.esp", b"esp_data"),
+            ],
+        );
         let dest = tmp.join("extracted");
         std::fs::create_dir_all(&dest).unwrap();
         extract_zip_to(&archive, &dest).unwrap();
@@ -982,11 +1182,14 @@ mod tests {
     #[test]
     fn install_fomod_files_falls_back_when_source_uses_data_prefix() {
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("fomod/", b""),
-            ("fomod/ModuleConfig.xml", b"<config/>"),
-            ("textures/sky.dds", b"dds_data"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("fomod/", b""),
+                ("fomod/ModuleConfig.xml", b"<config/>"),
+                ("textures/sky.dds", b"dds_data"),
+            ],
+        );
         let dest = tmp.join("mod_data");
         std::fs::create_dir_all(&dest).unwrap();
 
@@ -1007,11 +1210,14 @@ mod tests {
     #[test]
     fn install_fomod_files_data_root_fallback_skips_fomod_config_dir() {
         let tmp = tempdir();
-        let archive = create_test_zip(&tmp, &[
-            ("fomod/", b""),
-            ("fomod/ModuleConfig.xml", b"<config/>"),
-            ("plugin.esp", b"esp_data"),
-        ]);
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("fomod/", b""),
+                ("fomod/ModuleConfig.xml", b"<config/>"),
+                ("plugin.esp", b"esp_data"),
+            ],
+        );
         let dest = tmp.join("mod_data");
         std::fs::create_dir_all(&dest).unwrap();
 
@@ -1030,14 +1236,79 @@ mod tests {
         assert!(!dest.join("fomod").exists());
     }
 
+    #[test]
+    fn parse_fomod_xml_parses_plugin_dependencies_flags_and_image() {
+        let xml = br#"
+            <config>
+              <moduleName>Example Mod</moduleName>
+              <installSteps>
+                <installStep name="Variants">
+                  <optionalFileGroups>
+                    <group name="Main" type="SelectAny">
+                      <plugins>
+                        <plugin name="Plus Variant">
+                          <description>Use plus variant</description>
+                          <image path="images/plus.png"/>
+                          <conditionFlags>
+                            <flag name="VariantSign">+</flag>
+                          </conditionFlags>
+                          <dependencies operator="And">
+                            <flagDependency flag="FeaturePack" value="+"/>
+                          </dependencies>
+                          <files>
+                            <file source="plus/file.txt" destination="Data/file.txt"/>
+                          </files>
+                        </plugin>
+                      </plugins>
+                    </group>
+                  </optionalFileGroups>
+                </installStep>
+              </installSteps>
+            </config>
+        "#;
+
+        let cfg = parse_fomod_xml(xml).unwrap();
+        let plugin = &cfg.steps[0].groups[0].plugins[0];
+        assert_eq!(plugin.image_path.as_deref(), Some("images/plus.png"));
+        assert_eq!(
+            plugin.condition_flags,
+            vec![ConditionFlag {
+                name: "VariantSign".to_string(),
+                value: "+".to_string(),
+            }]
+        );
+        assert_eq!(
+            plugin.dependencies,
+            Some(PluginDependencies {
+                operator: DependencyOperator::And,
+                flags: vec![FlagDependency {
+                    flag: "FeaturePack".to_string(),
+                    value: "+".to_string(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn read_archive_file_bytes_finds_fomod_relative_image_path() {
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("MyMod/", b""),
+                ("MyMod/fomod/", b""),
+                ("MyMod/fomod/images/preview.png", b"pngdata"),
+            ],
+        );
+        let bytes = read_archive_file_bytes(&archive, "images/preview.png").unwrap();
+        assert_eq!(bytes, b"pngdata");
+    }
+
     fn tempdir() -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CTR: AtomicU32 = AtomicU32::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "linkmm_test_{}_{n}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("linkmm_test_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
