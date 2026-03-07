@@ -9,14 +9,18 @@ use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
 use crate::core::games::Game;
+use crate::core::mods::ModDatabase;
 use crate::core::installer::{
     detect_strategy, install_mod_from_archive, parse_fomod_from_zip, FomodFile, GroupType,
     InstallStrategy, PluginType,
 };
 
-// ── Archive extensions we recognise as mod archives ──────────────────────────
+// ── Archive extensions ────────────────────────────────────────────────────────
 
+/// All archive file types the Downloads page can clean from cache.
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
+/// Archive types that are currently installable by the app.
+const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip"];
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
@@ -123,10 +127,23 @@ fn refresh_content(
     }
 
     let installed_archives: Vec<String> = config.borrow().installed_archives.clone();
+    let installed_mod_names: Vec<String> = match game.as_ref() {
+        Some(g) => ModDatabase::load(g)
+            .mods
+            .into_iter()
+            .map(|m| m.name.to_lowercase())
+            .collect(),
+        None => Vec::new(),
+    };
     let entries = scan_downloads(&downloads_dir);
 
     let visible: Vec<&DownloadEntry> = if hide_installed {
-        entries.iter().filter(|e| !installed_archives.contains(&e.name)).collect()
+        entries
+            .iter()
+            .filter(|e| {
+                !entry_is_installed(e, &installed_archives, &installed_mod_names)
+            })
+            .collect()
     } else {
         entries.iter().collect()
     };
@@ -157,7 +174,15 @@ fn refresh_content(
     list_box.add_css_class("boxed-list");
     list_box.set_selection_mode(gtk4::SelectionMode::None);
     for entry in &visible {
-        let row = build_entry_row(entry, &installed_archives, config, container, hide_installed, game);
+        let row = build_entry_row(
+            entry,
+            &installed_archives,
+            &installed_mod_names,
+            config,
+            container,
+            hide_installed,
+            game,
+        );
         list_box.append(&row);
     }
 
@@ -181,12 +206,13 @@ fn refresh_content(
 fn build_entry_row(
     entry: &DownloadEntry,
     installed_archives: &[String],
+    installed_mod_names: &[String],
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: bool,
     game: &Rc<Option<Game>>,
 ) -> adw::ActionRow {
-    let is_installed = installed_archives.contains(&entry.name);
+    let is_installed = entry_is_installed(entry, installed_archives, installed_mod_names);
     let row = adw::ActionRow::builder()
         .title(&entry.name)
         .subtitle(&format_size(entry.size_bytes))
@@ -200,41 +226,43 @@ fn build_entry_row(
         row.add_suffix(&badge);
     }
 
-    // Install button (when a game is selected, for supported archives)
+    // Install button (when a game is selected)
     if !is_installed {
         if let Some(ref g) = **game {
             let ext = entry.path.extension()
                 .and_then(|e| e.to_str())
                 .map(|s| s.to_lowercase())
                 .unwrap_or_default();
-            // Show install button for zip files (others are listed but can't be
-            // installed yet since extraction only supports zip)
-            if ext == "zip" {
-                let install_btn = gtk4::Button::new();
-                install_btn.set_icon_name("emblem-system-symbolic");
-                install_btn.set_tooltip_text(Some("Install mod"));
-                install_btn.set_valign(gtk4::Align::Center);
-                install_btn.add_css_class("flat");
-                install_btn.add_css_class("suggested-action");
-
-                let path_c = entry.path.clone();
-                let name_c = entry.name.clone();
-                let game_c = g.clone();
-                let config_c = Rc::clone(config);
-                let container_c = container.clone();
-                let game_rc_c = Rc::clone(game);
-                install_btn.connect_clicked(move |btn| {
-                    show_install_dialog(btn, &path_c, &name_c, &game_c, &config_c, &container_c, &game_rc_c);
-                });
-                row.add_suffix(&install_btn);
-            } else {
-                // Non-zip archives: show a label indicating unsupported format
-                let unsup_label = gtk4::Label::new(Some("zip only"));
-                unsup_label.add_css_class("dim-label");
-                unsup_label.add_css_class("caption");
-                unsup_label.set_valign(gtk4::Align::Center);
-                row.add_suffix(&unsup_label);
+            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+                return row;
             }
+            let install_btn = gtk4::Button::new();
+            install_btn.set_icon_name("emblem-system-symbolic");
+            install_btn.set_tooltip_text(Some("Install mod"));
+            install_btn.set_valign(gtk4::Align::Center);
+            install_btn.add_css_class("flat");
+            install_btn.add_css_class("suggested-action");
+
+            let path_c = entry.path.clone();
+            let name_c = entry.name.clone();
+            let game_c = g.clone();
+            let config_c = Rc::clone(config);
+            let container_c = container.clone();
+            let game_rc_c = Rc::clone(game);
+            let hide_installed_c = hide_installed;
+            install_btn.connect_clicked(move |btn| {
+                show_install_dialog(
+                    btn,
+                    &path_c,
+                    &name_c,
+                    &game_c,
+                    &config_c,
+                    &container_c,
+                    hide_installed_c,
+                    &game_rc_c,
+                );
+            });
+            row.add_suffix(&install_btn);
         }
     }
 
@@ -274,6 +302,7 @@ fn show_install_dialog(
     game: &Game,
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
+    hide_installed: bool,
     game_rc: &Rc<Option<Game>>,
 ) {
     let strategy = match detect_strategy(archive_path) {
@@ -289,7 +318,17 @@ fn show_install_dialog(
         match parse_fomod_from_zip(archive_path) {
             Ok(fomod_config) => {
                 let parent = anchor.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-                show_fomod_wizard(parent.as_ref(), archive_path, archive_name, game, config, container, &fomod_config, game_rc);
+                show_fomod_wizard(
+                    parent.as_ref(),
+                    archive_path,
+                    archive_name,
+                    game,
+                    config,
+                    container,
+                    hide_installed,
+                    &fomod_config,
+                    game_rc,
+                );
                 return;
             }
             Err(e) => {
@@ -299,7 +338,17 @@ fn show_install_dialog(
     }
 
     let parent = anchor.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-    show_strategy_picker(parent.as_ref(), archive_path, archive_name, game, config, container, &strategy, game_rc);
+    show_strategy_picker(
+        parent.as_ref(),
+        archive_path,
+        archive_name,
+        game,
+        config,
+        container,
+        hide_installed,
+        &strategy,
+        game_rc,
+    );
 }
 
 fn show_strategy_picker(
@@ -309,6 +358,7 @@ fn show_strategy_picker(
     game: &Game,
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
+    hide_installed: bool,
     _detected: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
 ) {
@@ -328,10 +378,20 @@ fn show_strategy_picker(
     let gc = game.clone();
     let cc = Rc::clone(config);
     let cont = container.clone();
+    let hide = hide_installed;
     let grc = Rc::clone(game_rc);
     dialog.connect_response(None, move |_, response| {
         if response == "data" {
-            do_install(&ap, &an, &gc, &cc, &cont, &InstallStrategy::Data, &grc);
+            do_install(
+                &ap,
+                &an,
+                &gc,
+                &cc,
+                &cont,
+                hide,
+                &InstallStrategy::Data,
+                &grc,
+            );
         }
     });
     dialog.present(parent);
@@ -343,6 +403,7 @@ fn do_install(
     game: &Game,
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
+    hide_installed: bool,
     strategy: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
 ) {
@@ -361,7 +422,7 @@ fn do_install(
             drop(cfg);
             log::info!("Installed mod \"{mod_name}\" from \"{archive_name}\"");
             show_toast(container.upcast_ref(), &format!("Installed: {mod_name}"));
-            refresh_content(container, config, false, game_rc);
+            refresh_content(container, config, hide_installed, game_rc);
         }
         Err(e) => {
             log::error!("Failed to install mod \"{mod_name}\": {e}");
@@ -379,6 +440,7 @@ fn show_fomod_wizard(
     game: &Game,
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
+    hide_installed: bool,
     fomod: &crate::core::installer::FomodConfig,
     game_rc: &Rc<Option<Game>>,
 ) {
@@ -386,7 +448,16 @@ fn show_fomod_wizard(
 
     if fomod.steps.is_empty() {
         let strategy = InstallStrategy::Fomod(fomod.required_files.clone());
-        do_install(archive_path, archive_name, game, config, container, &strategy, game_rc);
+        do_install(
+            archive_path,
+            archive_name,
+            game,
+            config,
+            container,
+            hide_installed,
+            &strategy,
+            game_rc,
+        );
         return;
     }
 
@@ -548,6 +619,7 @@ fn show_fomod_wizard(
         let cc = Rc::clone(config);
         let cont = container.clone();
         let dlg = dialog.clone();
+        let hide = hide_installed;
         let grc = Rc::clone(game_rc);
         install_btn.connect_clicked(move |_| {
             let mut files: Vec<FomodFile> = fc.required_files.clone();
@@ -561,7 +633,16 @@ fn show_fomod_wizard(
                     }
                 }
             }
-            do_install(&ap, &an, &gc, &cc, &cont, &InstallStrategy::Fomod(files), &grc);
+            do_install(
+                &ap,
+                &an,
+                &gc,
+                &cc,
+                &cont,
+                hide,
+                &InstallStrategy::Fomod(files),
+                &grc,
+            );
             dlg.destroy();
         });
     }
@@ -583,7 +664,17 @@ pub fn show_fomod_wizard_from_library(
     fomod: &crate::core::installer::FomodConfig,
     game_rc: &Rc<Option<Game>>,
 ) {
-    show_fomod_wizard(parent, archive_path, archive_name, game, config, container, fomod, game_rc);
+    show_fomod_wizard(
+        parent,
+        archive_path,
+        archive_name,
+        game,
+        config,
+        container,
+        false,
+        fomod,
+        game_rc,
+    );
 }
 
 // ── Clean cache dialog ────────────────────────────────────────────────────────
@@ -648,7 +739,7 @@ fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
             let path = item.path();
             if !path.is_file() { continue; }
             let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
-            if !ARCHIVE_EXTENSIONS.contains(&ext.as_str()) { continue; }
+            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) { continue; }
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             entries.push(DownloadEntry { name, path, size_bytes });
@@ -656,6 +747,21 @@ fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
+}
+
+fn entry_is_installed(
+    entry: &DownloadEntry,
+    installed_archives: &[String],
+    installed_mod_names: &[String],
+) -> bool {
+    if installed_archives.contains(&entry.name) {
+        return true;
+    }
+    let mod_name = Path::new(&entry.name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    !mod_name.is_empty() && installed_mod_names.iter().any(|m| m == &mod_name)
 }
 
 fn format_size(bytes: u64) -> String {
