@@ -136,15 +136,23 @@ impl AppConfig {
 
     /// Returns the directory where downloaded archives are stored.
     ///
-    /// When `app_data_dir` is configured this is `<app_data_dir>/downloads/`;
-    /// otherwise it falls back to `~/.local/share/linkmm/downloads/`.
-    pub fn downloads_dir(&self) -> PathBuf {
-        match &self.app_data_dir {
+    /// When `app_data_dir` is configured this is
+    /// `<app_data_dir>/downloads/<managed_game>/`; otherwise it falls back to
+    /// `~/.local/share/linkmm/downloads/<managed_game>/`.
+    ///
+    /// When `managed_game` is `None` or empty (after trimming whitespace),
+    /// returns the base downloads directory without a game subfolder.
+    pub fn downloads_dir(&self, managed_game: Option<&str>) -> PathBuf {
+        let base = match &self.app_data_dir {
             Some(dir) => dir.join("downloads"),
             None => dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("linkmm")
                 .join("downloads"),
+        };
+        match managed_game.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(game_id) => base.join(game_id),
+            None => base,
         }
     }
 
@@ -158,5 +166,38 @@ impl AppConfig {
     pub fn current_game(&self) -> Option<&Game> {
         let id = self.current_game_id.as_deref()?;
         self.games.iter().find(|g| g.id == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downloads_dir_appends_managed_game_subdirectory() {
+        let cfg = AppConfig {
+            app_data_dir: Some(PathBuf::from("/tmp/linkmm")),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg.downloads_dir(Some("skyrim_se")),
+            PathBuf::from("/tmp/linkmm/downloads/skyrim_se")
+        );
+    }
+
+    #[test]
+    fn downloads_dir_without_game_returns_base_downloads_path() {
+        let cfg = AppConfig {
+            app_data_dir: Some(PathBuf::from("/tmp/linkmm")),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg.downloads_dir(None),
+            PathBuf::from("/tmp/linkmm/downloads")
+        );
+        assert_eq!(
+            cfg.downloads_dir(Some("   ")),
+            PathBuf::from("/tmp/linkmm/downloads")
+        );
     }
 }
