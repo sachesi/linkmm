@@ -220,16 +220,42 @@ fn build_main_window(
 
         nav_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
+            let game_info = {
+                let cfg = config_c.borrow();
+                cfg.current_game().cloned()
+            };
             match row.index() {
                 NAV_LIBRARY => {
+                    let new_library: gtk4::Widget = match &game_info {
+                        Some(g) => library::build_library_page(g, Rc::clone(&config_c)),
+                        None => build_no_game_page(
+                            "No Game Selected",
+                            "Select or add a game to manage its mods.",
+                        ),
+                    };
+                    if let Some(old) = content_stack_c.child_by_name("library") {
+                        content_stack_c.remove(&old);
+                    }
+                    content_stack_c.add_named(&new_library, Some("library"));
                     content_page_c.set_title("Library");
                     content_stack_c.set_visible_child_name("library");
                 }
                 NAV_LOAD_ORDER => {
+                    let new_load_order = load_order::build_load_order_page(game_info.as_ref());
+                    if let Some(old) = content_stack_c.child_by_name("load_order") {
+                        content_stack_c.remove(&old);
+                    }
+                    content_stack_c.add_named(&new_load_order, Some("load_order"));
                     content_page_c.set_title("Load Order");
                     content_stack_c.set_visible_child_name("load_order");
                 }
                 NAV_DOWNLOADS => {
+                    let new_downloads =
+                        downloads::build_downloads_page(game_info.as_ref(), Rc::clone(&config_c));
+                    if let Some(old) = content_stack_c.child_by_name("downloads") {
+                        content_stack_c.remove(&old);
+                    }
+                    content_stack_c.add_named(&new_downloads, Some("downloads"));
                     content_page_c.set_title("Downloads");
                     content_stack_c.set_visible_child_name("downloads");
                 }
