@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_state_lists_shared_files() {
+    fn compute_conflict_states_detects_shared_files_between_mods() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
