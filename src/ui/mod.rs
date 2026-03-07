@@ -50,6 +50,10 @@ fn build_main_window(
     register_about_action(app, &window);
 
     let split_view = adw::NavigationSplitView::new();
+    split_view.set_min_sidebar_width(200.0);
+    split_view.set_max_sidebar_width(320.0);
+    split_view.set_sidebar_width_fraction(0.24);
+    split_view.set_collapsed(false);
 
     // ── Sidebar ───────────────────────────────────────────────────────────
 
@@ -208,6 +212,18 @@ fn build_main_window(
         .child(&content_stack)
         .build();
     split_view.set_content(Some(&content_page));
+
+    // Allow mobile-like narrow layouts: collapse the sidebar when the window is small.
+    split_view.add_tick_callback(|sv, _| {
+        let should_collapse = sv.width() < 860;
+        if sv.is_collapsed() != should_collapse {
+            sv.set_collapsed(should_collapse);
+            if should_collapse {
+                sv.set_show_content(true);
+            }
+        }
+        glib::ControlFlow::Continue
+    });
 
     window.set_content(Some(&split_view));
 
