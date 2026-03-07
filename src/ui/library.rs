@@ -15,6 +15,8 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
+    overwrites: bool,
+    overwritten: bool,
     files: BTreeSet<String>,
 }
 
@@ -25,6 +27,25 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     let title_widget = adw::WindowTitle::new("Library", "");
     header.set_title_widget(Some(&title_widget));
+
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Search mods"));
+    search_entry.set_width_chars(24);
+    header.pack_start(&search_entry);
+
+    // Deploy button – applies all enabled mods by (re)linking their files
+    let deploy_btn = gtk4::Button::with_label("Deploy");
+    deploy_btn.add_css_class("suggested-action");
+    deploy_btn.set_tooltip_text(Some(
+        "Apply all enabled mods by linking their files into the game directory",
+    ));
+    header.pack_end(&deploy_btn);
+
+    // Undeploy button – removes all mod symlinks from the game directory
+    let undeploy_btn = gtk4::Button::with_label("Undeploy");
+    undeploy_btn.add_css_class("destructive-action");
+    undeploy_btn.set_tooltip_text(Some("Remove all mod symlinks from the game directory"));
+    header.pack_end(&undeploy_btn);
 
     toolbar_view.add_top_bar(&header);
 
@@ -45,6 +66,123 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     );
 
     toolbar_view.set_content(Some(&content_container));
+
+    {
+        let container_c = content_container.clone();
+        let game_c = Rc::clone(&game_rc);
+        let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_query);
+        let selected_c = Rc::clone(&selected_mod_id);
+        search_entry.connect_search_changed(move |entry| {
+            *search_c.borrow_mut() = entry.text().to_string();
+            refresh_library_content_with_search(
+                &container_c,
+                &game_c,
+                Rc::clone(&config_c),
+                &search_c.borrow(),
+                Rc::clone(&search_c),
+                Rc::clone(&selected_c),
+            );
+        });
+    }
+
+    // Wire Deploy button: undeploy everything, then deploy all enabled mods
+    {
+        let game_c = Rc::clone(&game_rc);
+        let container_c = content_container.clone();
+        let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_query);
+        let selected_c = Rc::clone(&selected_mod_id);
+        deploy_btn.connect_clicked(move |btn| {
+            let db = ModDatabase::load(&game_c);
+            let mut errors: Vec<String> = Vec::new();
+
+            // First, unlink all tracked mods so we start from a clean state
+            for m in &db.mods {
+                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+                    log::warn!("Undeploy warning for {}: {e}", m.name);
+                }
+            }
+
+            // Then deploy all enabled mods.
+            //
+            // The linker helpers skip creating a new link when a destination
+            // file already exists, so the first deployed mod "wins" each
+            // conflicting path. Because UI priority is defined as
+            // top(lowest) -> bottom(highest), we deploy in reverse visual
+            // order to ensure the bottom-most enabled mod wins conflicts.
+            let mut deployed_count = 0usize;
+            for m in db.mods.iter().rev().filter(|m| m.enabled) {
+                if let Err(e) = ModManager::enable_mod(&game_c, m) {
+                    errors.push(format!("{}: {}", m.name, e));
+                } else {
+                    deployed_count += 1;
+                }
+            }
+            let _ = db.write_plugins_txt(&game_c);
+
+            let msg = if errors.is_empty() {
+                format!("Deployed {deployed_count} mod(s)")
+            } else {
+                for e in &errors {
+                    log::error!("Deploy error: {e}");
+                }
+                format!("Deploy finished with {} error(s)", errors.len())
+            };
+            show_toast(btn.upcast_ref(), &msg);
+            refresh_library_content_with_search(
+                &container_c,
+                &game_c,
+                Rc::clone(&config_c),
+                &search_c.borrow(),
+                Rc::clone(&search_c),
+                Rc::clone(&selected_c),
+            );
+        });
+    }
+
+    // Wire Undeploy button: remove all mod symlinks from the game directory
+    {
+        let game_c = Rc::clone(&game_rc);
+        let container_c = content_container.clone();
+        let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_query);
+        let selected_c = Rc::clone(&selected_mod_id);
+        undeploy_btn.connect_clicked(move |btn| {
+            let db = ModDatabase::load(&game_c);
+            let mut errors: Vec<String> = Vec::new();
+            let mut count = 0;
+            // Unlink ALL mods regardless of enabled state so the game directory
+            // is fully clean.  The enabled state is intentionally preserved so
+            // the user can re-deploy with the same selection later.
+            for m in &db.mods {
+                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+                    errors.push(format!("{}: {}", m.name, e));
+                } else {
+                    count += 1;
+                }
+            }
+            let _ = db.write_plugins_txt(&game_c);
+
+            let msg = if errors.is_empty() {
+                format!("Undeployed {count} mod(s)")
+            } else {
+                for e in &errors {
+                    log::error!("Undeploy error: {e}");
+                }
+                format!("Undeploy finished with {} error(s)", errors.len())
+            };
+            show_toast(btn.upcast_ref(), &msg);
+            refresh_library_content_with_search(
+                &container_c,
+                &game_c,
+                Rc::clone(&config_c),
+                &search_c.borrow(),
+                Rc::clone(&search_c),
+                Rc::clone(&selected_c),
+            );
+        });
+    }
 
     toolbar_view.upcast()
 }
@@ -177,7 +315,11 @@ fn build_mod_row(
     row.add_prefix(&index_label);
 
     if let Some(state) = conflict_state {
-        if !state.files.is_empty() {
+        if state.overwritten {
+            row.add_css_class("error");
+        } else if state.overwrites {
+            row.add_css_class("success");
+        } else if !state.files.is_empty() {
             row.add_css_class("accent");
         }
     }
@@ -419,9 +561,10 @@ fn build_mod_row(
             {
                 let mut selected = selected_sel.borrow_mut();
                 if selected.as_ref() == Some(&mod_id_sel) {
-                    return;
+                    *selected = None;
+                } else {
+                    *selected = Some(mod_id_sel.clone());
                 }
-                *selected = Some(mod_id_sel.clone());
             }
             refresh_library_content_with_search(
                 &container_sel,
@@ -559,45 +702,88 @@ fn compute_conflict_states(
     mods: &[Mod],
     selected_id: Option<&str>,
 ) -> HashMap<String, ConflictState> {
-    let Some(selected_id) = selected_id else {
-        return HashMap::new();
-    };
-
-    let Some(selected_idx) = mods.iter().position(|m| m.id == selected_id) else {
-        return HashMap::new();
-    };
-
-    let selected_files = collect_mod_target_files(&mods[selected_idx]);
-    if selected_files.is_empty() {
-        return HashMap::new();
-    }
-
     let mut states: HashMap<String, ConflictState> = HashMap::new();
 
-    for (idx, m) in mods.iter().enumerate() {
-        if idx == selected_idx {
-            continue;
-        }
-        let files = collect_mod_target_files(m);
-        if files.is_empty() {
-            continue;
+    if let Some(selected_id) = selected_id {
+        let Some(selected_idx) = mods.iter().position(|m| m.id == selected_id) else {
+            return HashMap::new();
+        };
+
+        let selected_files = collect_mod_target_files(&mods[selected_idx]);
+        if selected_files.is_empty() {
+            return HashMap::new();
         }
 
-        let shared: BTreeSet<String> = selected_files.intersection(&files).cloned().collect();
-        if shared.is_empty() {
-            continue;
-        }
+        for (idx, m) in mods.iter().enumerate() {
+            if idx == selected_idx {
+                continue;
+            }
+            let files = collect_mod_target_files(m);
+            if files.is_empty() {
+                continue;
+            }
 
-        states
-            .entry(m.id.clone())
-            .or_default()
-            .files
-            .extend(shared.iter().cloned());
-        states
-            .entry(selected_id.to_string())
-            .or_default()
-            .files
-            .extend(shared.iter().cloned());
+            let shared: BTreeSet<String> = selected_files.intersection(&files).cloned().collect();
+            if shared.is_empty() {
+                continue;
+            }
+
+            // With selection active: preserve green/red directionality by order.
+            if idx > selected_idx {
+                states.entry(m.id.clone()).or_default().overwrites = true;
+                states
+                    .entry(selected_id.to_string())
+                    .or_default()
+                    .overwritten = true;
+            } else {
+                states.entry(m.id.clone()).or_default().overwritten = true;
+                states
+                    .entry(selected_id.to_string())
+                    .or_default()
+                    .overwrites = true;
+            }
+
+            states
+                .entry(m.id.clone())
+                .or_default()
+                .files
+                .extend(shared.iter().cloned());
+            states
+                .entry(selected_id.to_string())
+                .or_default()
+                .files
+                .extend(shared.iter().cloned());
+        }
+    } else {
+        // No selected mod: mark any mod that participates in conflicts as blue.
+        let all_files: Vec<BTreeSet<String>> = mods.iter().map(collect_mod_target_files).collect();
+
+        for i in 0..mods.len() {
+            if all_files[i].is_empty() {
+                continue;
+            }
+            for j in (i + 1)..mods.len() {
+                if all_files[j].is_empty() {
+                    continue;
+                }
+                let shared: BTreeSet<String> =
+                    all_files[i].intersection(&all_files[j]).cloned().collect();
+                if shared.is_empty() {
+                    continue;
+                }
+
+                states
+                    .entry(mods[i].id.clone())
+                    .or_default()
+                    .files
+                    .extend(shared.iter().cloned());
+                states
+                    .entry(mods[j].id.clone())
+                    .or_default()
+                    .files
+                    .extend(shared.iter().cloned());
+            }
+        }
     }
 
     states
@@ -674,6 +860,23 @@ fn open_in_file_manager(path: &Path) {
     let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
 }
 
+/// Show a brief in-app toast notification anchored to `widget`.
+fn show_toast(widget: &gtk4::Widget, message: &str) {
+    // Walk up to the nearest AdwToastOverlay
+    let mut ancestor: Option<gtk4::Widget> = Some(widget.clone());
+    while let Some(current) = ancestor {
+        if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
+            let toast = adw::Toast::new(message);
+            toast.set_timeout(3);
+            overlay.add_toast(toast);
+            return;
+        }
+        ancestor = current.parent();
+    }
+    // Fallback: log to stderr
+    log::info!("{message}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{adjusted_insert_pos, compute_conflict_states, matches_query};
@@ -744,6 +947,68 @@ mod tests {
         assert!(selected.files.contains("data/textures/sky.dds"));
         assert!(conflicting.files.contains("data/textures/sky.dds"));
         assert!(!states.contains_key("c"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compute_conflict_states_marks_all_conflicting_mods_when_nothing_selected() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("linkmm-conflict-none-test-{unique}"));
+        let mod_a = root.join("a");
+        let mod_b = root.join("b");
+
+        std::fs::create_dir_all(mod_a.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_b.join("Data/textures")).unwrap();
+        std::fs::write(mod_a.join("Data/textures/sky.dds"), "a").unwrap();
+        std::fs::write(mod_b.join("Data/textures/sky.dds"), "b").unwrap();
+
+        let mods = vec![
+            sample_mod("a", "A", &mod_a.to_string_lossy()),
+            sample_mod("b", "B", &mod_b.to_string_lossy()),
+        ];
+
+        let states = compute_conflict_states(&mods, None);
+        let a = states.get("a").unwrap();
+        let b = states.get("b").unwrap();
+        assert!(a.files.contains("data/textures/sky.dds"));
+        assert!(b.files.contains("data/textures/sky.dds"));
+        assert!(!a.overwrites && !a.overwritten);
+        assert!(!b.overwrites && !b.overwritten);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compute_conflict_states_classifies_overwrite_direction_with_selection() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("linkmm-conflict-dir-test-{unique}"));
+        let mod_a = root.join("a");
+        let mod_b = root.join("b");
+
+        std::fs::create_dir_all(mod_a.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_b.join("Data/textures")).unwrap();
+        std::fs::write(mod_a.join("Data/textures/sky.dds"), "a").unwrap();
+        std::fs::write(mod_b.join("Data/textures/sky.dds"), "b").unwrap();
+
+        let mods = vec![
+            sample_mod("a", "A", &mod_a.to_string_lossy()),
+            sample_mod("b", "B", &mod_b.to_string_lossy()),
+        ];
+
+        let states = compute_conflict_states(&mods, Some("a"));
+        let selected = states.get("a").unwrap();
+        let other = states.get("b").unwrap();
+        assert!(selected.overwritten);
+        assert!(!selected.overwrites);
+        assert!(other.overwrites);
+        assert!(!other.overwritten);
 
         std::fs::remove_dir_all(root).unwrap();
     }
