@@ -11,14 +11,10 @@ use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, ModManager};
 
 /// Build the full Library page for `game`.
-///
-/// The returned widget is an `adw::ToolbarView` with its own `adw::HeaderBar`
-/// (so it shows the window title-buttons on the content side of the split-view).
 pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
-    // "Library / <Game Name>" centred title
     let title_widget = adw::WindowTitle::new("Library", &game.name);
     header.set_title_widget(Some(&title_widget));
 
@@ -28,15 +24,20 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     search_btn.set_tooltip_text(Some("Search mods"));
     header.pack_start(&search_btn);
 
-    // Deploy button
+    // Deploy button – applies all enabled mods by (re)linking their files
     let deploy_btn = gtk4::Button::with_label("Deploy");
     deploy_btn.add_css_class("suggested-action");
-    deploy_btn.set_tooltip_text(Some("Apply all enabled mods"));
+    deploy_btn.set_tooltip_text(Some("Apply all enabled mods by linking their files into the game directory"));
     header.pack_end(&deploy_btn);
+
+    // Add-mod button
+    let add_mod_btn = gtk4::Button::new();
+    add_mod_btn.set_icon_name("list-add-symbolic");
+    add_mod_btn.set_tooltip_text(Some("Add Mod"));
+    header.pack_end(&add_mod_btn);
 
     toolbar_view.add_top_bar(&header);
 
-    // Scrollable content container that can be refreshed
     let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content_container.set_vexpand(true);
 
@@ -46,20 +47,42 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     toolbar_view.set_content(Some(&content_container));
 
-    // "Add Mod" via header button (for when the list is not empty)
-    let add_mod_btn = gtk4::Button::new();
-    add_mod_btn.set_icon_name("list-add-symbolic");
-    add_mod_btn.set_tooltip_text(Some("Add Mod"));
-    header.pack_end(&add_mod_btn);
-
     wire_add_mod_button(&add_mod_btn, &game_rc, &content_container, Rc::clone(&config));
+
+    // Wire Deploy button: re-enable all currently-enabled mods
+    {
+        let game_c = Rc::clone(&game_rc);
+        let container_c = content_container.clone();
+        let config_c = Rc::clone(&config);
+        deploy_btn.connect_clicked(move |btn| {
+            let db = ModDatabase::load(&game_c);
+            let mut errors: Vec<String> = Vec::new();
+            for m in db.mods.iter().filter(|m| m.enabled) {
+                if let Err(e) = ModManager::enable_mod(&game_c, m) {
+                    errors.push(format!("{}: {}", m.name, e));
+                }
+            }
+            // Write plugins.txt after deploy
+            let _ = db.write_plugins_txt(&game_c);
+
+            let msg = if errors.is_empty() {
+                format!("Deployed {} mod(s)", db.mods.iter().filter(|m| m.enabled).count())
+            } else {
+                for e in &errors {
+                    log::error!("Deploy error: {e}");
+                }
+                format!("Deploy finished with {} error(s)", errors.len())
+            };
+            show_toast(btn.upcast_ref(), &msg);
+            refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
+        });
+    }
 
     toolbar_view.upcast()
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Re-populate `container` from the current mod database for `game`.
 fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<RefCell<AppConfig>>) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -70,7 +93,6 @@ fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<Re
     db.save(game);
 
     if db.mods.is_empty() {
-        // Empty-state with "Add Mod…" button
         let status = adw::StatusPage::builder()
             .title("No Mods Installed")
             .description(&format!(
@@ -120,7 +142,6 @@ fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<Re
     }
 }
 
-/// Connect a button so it opens a folder-picker and adds the chosen folder as a new mod.
 fn wire_add_mod_button(
     btn: &gtk4::Button,
     game: &Rc<Game>,
@@ -170,8 +191,15 @@ fn build_mod_row(
         .active(mod_entry.enabled)
         .build();
 
-    if let Some(version) = &mod_entry.version {
-        row.set_subtitle(version.as_str());
+    // Subtitle: version and Nexus source indicator
+    let subtitle = match (&mod_entry.version, mod_entry.installed_from_nexus) {
+        (Some(v), true) => format!("{v} · From Nexus Mods"),
+        (Some(v), false) => v.clone(),
+        (None, true) => "From Nexus Mods".to_string(),
+        (None, false) => String::new(),
+    };
+    if !subtitle.is_empty() {
+        row.set_subtitle(&subtitle);
     }
 
     let mod_id = mod_entry.id.clone();
@@ -210,4 +238,21 @@ fn build_mod_row(
     });
 
     row
+}
+
+/// Show a brief in-app toast notification anchored to `widget`.
+fn show_toast(widget: &gtk4::Widget, message: &str) {
+    // Walk up to the nearest AdwToastOverlay
+    let mut ancestor: Option<gtk4::Widget> = Some(widget.clone());
+    while let Some(current) = ancestor {
+        if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
+            let toast = adw::Toast::new(message);
+            toast.set_timeout(3);
+            overlay.add_toast(toast);
+            return;
+        }
+        ancestor = current.parent();
+    }
+    // Fallback: log to stderr
+    log::info!("{message}");
 }
