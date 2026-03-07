@@ -623,11 +623,12 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
                 .first()
                 .ok_or_else(|| "No download links available".to_string())?;
 
-            download_state::set_active(file_name.clone());
+            let download_id = download_state::set_active(file_name.clone());
             let download_result = download::download_file(url, &dest_path, |downloaded, total| {
-                download_state::update_progress(downloaded, total);
+                download_state::update_progress(download_id, downloaded, total);
+                !download_state::is_cancel_requested(download_id)
             });
-            download_state::clear_active();
+            download_state::clear_active(download_id);
             download_result?;
 
             Ok(file_name)
@@ -647,9 +648,14 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
                 glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
-                log::error!("NXM download failed: {e}");
                 if let Some(window) = app_c.active_window() {
-                    show_nxm_toast(&window, &format!("Download failed: {e}"));
+                    if e == download::DOWNLOAD_CANCELLED_ERROR {
+                        log::info!("NXM download cancelled");
+                        show_nxm_toast(&window, "Download cancelled");
+                    } else {
+                        log::error!("NXM download failed: {e}");
+                        show_nxm_toast(&window, &format!("Download failed: {e}"));
+                    }
                 }
                 glib::ControlFlow::Break
             }

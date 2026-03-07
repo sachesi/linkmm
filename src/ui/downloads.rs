@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -23,7 +23,7 @@ use crate::core::mods::ModDatabase;
 /// All archive file types the Downloads page can clean from cache.
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 /// Archive types that are currently installable by the app.
-const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip"];
+const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z"];
 const DOWNLOAD_PROGRESS_POLL_INTERVAL_MS: u64 = 200;
 
 // ── Public entry-point ────────────────────────────────────────────────────────
@@ -51,56 +51,29 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
     clean_btn.set_tooltip_text(Some("Clean Cache"));
     header.pack_end(&clean_btn);
 
-    let refresh_btn = gtk4::Button::new();
-    refresh_btn.set_icon_name("view-refresh-symbolic");
-    refresh_btn.set_tooltip_text(Some("Refresh downloads list"));
-    header.pack_start(&refresh_btn);
-
     let search_entry = gtk4::SearchEntry::new();
     search_entry.set_placeholder_text(Some("Search downloads"));
     search_entry.set_width_chars(24);
     header.pack_start(&search_entry);
+
+    let refresh_btn = gtk4::Button::new();
+    refresh_btn.set_icon_name("view-refresh-symbolic");
+    refresh_btn.set_tooltip_text(Some("Refresh downloads list"));
+    header.pack_start(&refresh_btn);
 
     toolbar_view.add_top_bar(&header);
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.set_vexpand(true);
 
-    let progress_revealer = gtk4::Revealer::new();
-    progress_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-    progress_revealer.set_reveal_child(false);
-    progress_revealer.set_margin_start(12);
-    progress_revealer.set_margin_end(12);
-    progress_revealer.set_margin_top(12);
-
-    let progress_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    progress_box.add_css_class("card");
-    progress_box.set_margin_top(12);
-    progress_box.set_margin_bottom(12);
-    progress_box.set_margin_start(12);
-    progress_box.set_margin_end(12);
-
-    let progress_title = gtk4::Label::new(Some(""));
-    progress_title.set_xalign(0.0);
-    progress_title.add_css_class("heading");
-
-    let progress_bar = gtk4::ProgressBar::new();
-    progress_bar.set_show_text(true);
-    progress_bar.set_hexpand(true);
-
-    progress_box.append(&progress_title);
-    progress_box.append(&progress_bar);
-    progress_revealer.set_child(Some(&progress_box));
-
     let list_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     list_container.set_vexpand(true);
 
-    content.append(&progress_revealer);
     content.append(&list_container);
 
     let hide_installed = Rc::new(RefCell::new(false));
     let search_query = Rc::new(RefCell::new(String::new()));
-    let was_downloading = Rc::new(Cell::new(false));
+    let active_download_fingerprint = Rc::new(RefCell::new(String::new()));
     let game_rc: Rc<Option<Game>> = Rc::new(game.cloned());
 
     refresh_content_with_search(
@@ -177,45 +150,32 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
     }
 
     {
-        let progress_revealer_c = progress_revealer.clone();
-        let progress_title_c = progress_title.clone();
-        let progress_bar_c = progress_bar.clone();
         let container_c = list_container.clone();
         let config_c = Rc::clone(&config);
         let hide_c = Rc::clone(&hide_installed);
         let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
-        let was_downloading_c = Rc::clone(&was_downloading);
+        let active_download_fingerprint_c = Rc::clone(&active_download_fingerprint);
         gtk4::glib::timeout_add_local(
             std::time::Duration::from_millis(DOWNLOAD_PROGRESS_POLL_INTERVAL_MS),
             move || {
-                let active = download_state::current();
-                if let Some(progress) = active {
-                    progress_revealer_c.set_reveal_child(true);
-                    progress_title_c.set_label(&format!("Downloading {}", progress.file_name));
-                    if progress.total > 0 {
-                        let fraction =
-                            (progress.downloaded as f64 / progress.total as f64).clamp(0.0, 1.0);
-                        progress_bar_c.set_fraction(fraction);
-                        progress_bar_c.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
-                    } else {
-                        progress_bar_c.pulse();
-                        progress_bar_c.set_text(Some(&format_size(progress.downloaded)));
-                    }
-                    was_downloading_c.set(true);
-                } else {
-                    progress_revealer_c.set_reveal_child(false);
-                    progress_bar_c.set_fraction(0.0);
-                    progress_bar_c.set_text(None::<&str>);
-                    if was_downloading_c.replace(false) {
-                        refresh_content_with_search(
-                            &container_c,
-                            &config_c,
-                            *hide_c.borrow(),
-                            &game_c,
-                            &search_c.borrow(),
-                        );
-                    }
+                let active = download_state::all_active();
+                let mut download_state_key = String::new();
+                for (id, entry) in &active {
+                    download_state_key.push_str(&format!(
+                        "{id}:{}:{}:{}|",
+                        entry.file_name, entry.downloaded, entry.total
+                    ));
+                }
+                if *active_download_fingerprint_c.borrow() != download_state_key {
+                    *active_download_fingerprint_c.borrow_mut() = download_state_key;
+                    refresh_content_with_search(
+                        &container_c,
+                        &config_c,
+                        *hide_c.borrow(),
+                        &game_c,
+                        &search_c.borrow(),
+                    );
                 }
                 gtk4::glib::ControlFlow::Continue
             },
@@ -267,6 +227,7 @@ fn refresh_content_with_search(
         None => Vec::new(),
     };
     let entries = scan_downloads(&downloads_dir);
+    let active_downloads = download_state::all_active();
 
     let visible: Vec<&DownloadEntry> = entries
         .iter()
@@ -276,7 +237,7 @@ fn refresh_content_with_search(
         })
         .collect();
 
-    if visible.is_empty() {
+    if visible.is_empty() && active_downloads.is_empty() {
         let description = if !search_query.trim().is_empty() {
             "No downloads match your search."
         } else if hide_installed && !entries.is_empty() {
@@ -305,6 +266,10 @@ fn refresh_content_with_search(
     let list_box = gtk4::ListBox::new();
     list_box.add_css_class("boxed-list");
     list_box.set_selection_mode(gtk4::SelectionMode::None);
+    for (download_id, active) in active_downloads.iter().rev() {
+        let row = build_active_download_row(*download_id, active);
+        list_box.append(&row);
+    }
     for entry in &visible {
         let row = build_entry_row(
             entry,
@@ -332,6 +297,40 @@ fn refresh_content_with_search(
     scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
     scrolled.set_child(Some(&clamp));
     container.append(&scrolled);
+}
+
+fn build_active_download_row(download_id: u64, active: &download_state::ActiveDownload) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(&active.file_name)
+        .subtitle("Downloading…")
+        .build();
+    row.add_css_class("accent");
+
+    let progress = gtk4::ProgressBar::new();
+    progress.set_show_text(true);
+    progress.set_hexpand(true);
+    if active.total > 0 {
+        let fraction = (active.downloaded as f64 / active.total as f64).clamp(0.0, 1.0);
+        progress.set_fraction(fraction);
+        progress.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+    } else {
+        progress.pulse();
+        progress.set_text(Some(&format_size(active.downloaded)));
+    }
+    row.add_suffix(&progress);
+
+    let cancel_btn = gtk4::Button::new();
+    cancel_btn.set_icon_name("process-stop-symbolic");
+    cancel_btn.set_tooltip_text(Some("Discard download"));
+    cancel_btn.add_css_class("flat");
+    cancel_btn.add_css_class("destructive-action");
+    cancel_btn.set_valign(gtk4::Align::Center);
+    cancel_btn.connect_clicked(move |_| {
+        download_state::request_cancel(download_id);
+    });
+    row.add_suffix(&cancel_btn);
+
+    row
 }
 
 // ── Row builder ───────────────────────────────────────────────────────────────
@@ -1298,7 +1297,7 @@ fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_lowercase())
                 .unwrap_or_default();
-            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+            if !ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
                 continue;
             }
             let name = path
@@ -1382,6 +1381,7 @@ mod tests {
         ConditionFlag, DependencyOperator, FlagDependency, FomodPlugin, InstallStep,
         PluginDependencies, PluginGroup,
     };
+    use std::path::PathBuf;
 
     fn test_plugin(
         name: &str,
@@ -1402,6 +1402,16 @@ mod tests {
             condition_flags,
             dependencies,
         }
+    }
+
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("linkmm_downloads_test_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -1607,5 +1617,29 @@ mod tests {
         assert!(matches_query("MyCoolMod.zip", ""));
         assert!(matches_query("MyCoolMod.zip", "  cool "));
         assert!(!matches_query("MyCoolMod.zip", "armor"));
+    }
+
+    #[test]
+    fn installable_archive_extensions_include_rar_and_7z() {
+        assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"zip"));
+        assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"rar"));
+        assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"7z"));
+    }
+
+    #[test]
+    fn scan_downloads_includes_non_zip_archives() {
+        let tmp = tempdir();
+        std::fs::write(tmp.join("mod-a.zip"), b"zip").unwrap();
+        std::fs::write(tmp.join("mod-b.rar"), b"rar").unwrap();
+        std::fs::write(tmp.join("mod-c.7z"), b"7z").unwrap();
+        std::fs::write(tmp.join("notes.txt"), b"txt").unwrap();
+
+        let entries = scan_downloads(&tmp);
+        let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+
+        assert!(names.contains(&"mod-a.zip".to_string()));
+        assert!(names.contains(&"mod-b.rar".to_string()));
+        assert!(names.contains(&"mod-c.7z".to_string()));
+        assert!(!names.contains(&"notes.txt".to_string()));
     }
 }
