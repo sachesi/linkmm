@@ -1,5 +1,5 @@
+use crate::core::games::GameKind;
 use std::path::PathBuf;
-use crate::games::{GameKind};
 
 pub struct SteamLibrary {
     pub path: PathBuf,
@@ -15,8 +15,16 @@ pub fn find_steam_libraries() -> Vec<SteamLibrary> {
     let candidate_roots = vec![
         home.join(".steam").join("steam"),
         home.join(".local").join("share").join("Steam"),
-        home.join("snap").join("steam").join("common").join(".steam").join("steam"),
-        home.join(".var").join("app").join("com.valvesoftware.Steam").join(".steam").join("steam"),
+        home.join("snap")
+            .join("steam")
+            .join("common")
+            .join(".steam")
+            .join("steam"),
+        home.join(".var")
+            .join("app")
+            .join("com.valvesoftware.Steam")
+            .join(".steam")
+            .join("steam"),
     ];
 
     let mut libraries = Vec::new();
