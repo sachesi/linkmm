@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use gtk4::gdk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -107,12 +108,13 @@ fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
     }
 
     let count = plugins.len();
+    let vanilla_count = plugins.iter().filter(|p| p.is_vanilla).count();
     let list_box = gtk4::ListBox::new();
     list_box.add_css_class("boxed-list");
     list_box.set_selection_mode(gtk4::SelectionMode::None);
 
     for (idx, plugin) in plugins.iter().enumerate() {
-        let row = build_plugin_row(plugin, idx, count, game, container);
+        let row = build_plugin_row(plugin, idx, count, vanilla_count, game, container);
         list_box.append(&row);
     }
 
@@ -136,6 +138,7 @@ fn build_plugin_row(
     plugin: &PluginFile,
     idx: usize,
     total: usize,
+    vanilla_count: usize,
     game: &Rc<Game>,
     container: &gtk4::Box,
 ) -> adw::ActionRow {
@@ -150,6 +153,14 @@ fn build_plugin_row(
         .title(&plugin.name)
         .subtitle(&subtitle)
         .build();
+
+    // Drag handle (non-vanilla only) – shown at the far left to indicate draggability
+    if !plugin.is_vanilla {
+        let drag_handle = gtk4::Image::from_icon_name("list-drag-handle-symbolic");
+        drag_handle.add_css_class("dim-label");
+        drag_handle.set_tooltip_text(Some("Drag to reorder"));
+        row.add_prefix(&drag_handle);
+    }
 
     // Index prefix
     let index_label = gtk4::Label::new(Some(&format!("{}", idx + 1)));
@@ -209,7 +220,8 @@ fn build_plugin_row(
     up_btn.set_valign(gtk4::Align::Center);
     up_btn.add_css_class("flat");
     up_btn.set_tooltip_text(Some("Move up"));
-    up_btn.set_sensitive(idx > 0);
+    // Disable when this is the first non-vanilla plugin (can't move into vanilla territory)
+    up_btn.set_sensitive(idx > vanilla_count);
 
     let down_btn = gtk4::Button::new();
     down_btn.set_icon_name("go-down-symbolic");
@@ -269,5 +281,213 @@ fn build_plugin_row(
         });
     }
 
+    // ── Drag-and-drop ─────────────────────────────────────────────────────────
+
+    // DragSource: let the user drag this row to a new position
+    let drag_source = gtk4::DragSource::new();
+    drag_source.set_actions(gdk::DragAction::MOVE);
+    {
+        let plugin_name_drag = plugin.name.clone();
+        drag_source.connect_prepare(move |_, _, _| {
+            let value = plugin_name_drag.to_value();
+            Some(gdk::ContentProvider::for_value(&value))
+        });
+    }
+    {
+        let row_c = row.clone();
+        drag_source.connect_drag_begin(move |src, _| {
+            let paintable = gtk4::WidgetPaintable::new(Some(&row_c));
+            src.set_icon(Some(&paintable), 0, 0);
+        });
+    }
+    row.add_controller(drag_source);
+
+    // DropTarget: accept a dragged plugin name and move it here
+    let drop_target = gtk4::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+    {
+        let game_drop = Rc::clone(game);
+        let container_drop = container.clone();
+        let target_name = plugin.name.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            let Ok(source_name) = value.get::<String>() else {
+                return false;
+            };
+            if source_name == target_name {
+                return false;
+            }
+            let mut db = ModDatabase::load(&game_drop);
+            let mut ordered = db.get_ordered_plugins(&game_drop);
+            if let (Some(src_pos), Some(tgt_pos)) = (
+                ordered.iter().position(|p| p.name == source_name),
+                ordered.iter().position(|p| p.name == target_name),
+            ) {
+                if !ordered[src_pos].is_vanilla && !ordered[tgt_pos].is_vanilla {
+                    let plugin_to_move = ordered.remove(src_pos);
+                    // After removal the indices above src_pos shift down by one
+                    let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &ordered);
+                    ordered.insert(insert_pos, plugin_to_move);
+                    db.set_plugin_order(&ordered);
+                    db.save(&game_drop);
+                    let _ = db.write_plugins_txt(&game_drop);
+                    refresh_load_order_content(&container_drop, &game_drop);
+                }
+            }
+            true
+        });
+    }
+    row.add_controller(drop_target);
+
+    // ── Right-click context menu ──────────────────────────────────────────────
+    let right_click = gtk4::GestureClick::new();
+    right_click.set_button(3); // right mouse button
+    {
+        let row_c = row.clone();
+        let game_rclick = Rc::clone(game);
+        let container_rclick = container.clone();
+        let plugin_name_rclick = plugin.name.clone();
+        let current_idx = idx;
+        let vanilla_count_rclick = vanilla_count;
+        let total_rclick = total;
+
+        right_click.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+
+            let popover = gtk4::Popover::new();
+            popover.set_parent(&row_c);
+            let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            popover.set_pointing_to(Some(&rect));
+            popover.set_has_arrow(false);
+
+            let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            menu_box.set_margin_top(4);
+            menu_box.set_margin_bottom(4);
+            menu_box.set_margin_start(4);
+            menu_box.set_margin_end(4);
+
+            let move_item = gtk4::Button::with_label("Move to Position\u{2026}");
+            move_item.add_css_class("flat");
+            move_item.set_halign(gtk4::Align::Fill);
+            move_item.set_hexpand(true);
+            menu_box.append(&move_item);
+
+            popover.set_child(Some(&menu_box));
+
+            let popover_c = popover.clone();
+            let row_btn = row_c.clone();
+            let game_btn = Rc::clone(&game_rclick);
+            let container_btn = container_rclick.clone();
+            let plugin_name_btn = plugin_name_rclick.clone();
+
+            move_item.connect_clicked(move |_| {
+                popover_c.popdown();
+                if let Some(root) = row_btn.root() {
+                    if let Ok(window) = root.downcast::<gtk4::Window>() {
+                        show_move_to_position_dialog(
+                            &window,
+                            plugin_name_btn.clone(),
+                            current_idx,
+                            vanilla_count_rclick,
+                            total_rclick,
+                            Rc::clone(&game_btn),
+                            container_btn.clone(),
+                        );
+                    }
+                }
+            });
+
+            popover.popup();
+        });
+    }
+    row.add_controller(right_click);
+
     row
+}
+
+// ── Move-to-Position dialog ───────────────────────────────────────────────────
+
+/// Compute the insertion index after removing an element from `ordered`.
+///
+/// When `src_pos` is removed, all indices above it shift down by one.  The
+/// returned `insert_pos` maps the original `target_idx` to its correct
+/// post-removal slot, clamped so it never falls inside the vanilla region.
+fn adjusted_insert_pos(src_pos: usize, target_idx: usize, ordered: &[PluginFile]) -> usize {
+    let raw = if src_pos < target_idx {
+        target_idx - 1
+    } else {
+        target_idx
+    };
+    let first_non_vanilla = ordered
+        .iter()
+        .position(|p| !p.is_vanilla)
+        .unwrap_or(ordered.len());
+    raw.max(first_non_vanilla).min(ordered.len())
+}
+
+/// Show a modal dialog that lets the user type a load-order position number for
+/// `plugin_name`.  Vanilla masters (positions 1–`vanilla_count`) are protected;
+/// the valid input range is `vanilla_count + 1` to `total`.
+fn show_move_to_position_dialog(
+    parent: &gtk4::Window,
+    plugin_name: String,
+    current_idx: usize,
+    vanilla_count: usize,
+    total: usize,
+    game: Rc<Game>,
+    container: gtk4::Box,
+) {
+    let min_pos = vanilla_count + 1;
+
+    let body = if vanilla_count > 0 {
+        format!(
+            "Enter the new load order position for \"{plugin_name}\".\n\
+             Valid range: {min_pos}–{total} (positions 1–{vanilla_count} are vanilla masters).",
+        )
+    } else {
+        format!(
+            "Enter the new load order position for \"{plugin_name}\".\n\
+             Valid range: 1–{total}.",
+        )
+    };
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Move to Position")
+        .body(&body)
+        .build();
+
+    let spin = gtk4::SpinButton::with_range(min_pos as f64, total as f64, 1.0);
+    spin.set_value((current_idx + 1) as f64);
+    spin.set_numeric(true);
+    dialog.set_extra_child(Some(&spin));
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("move", "Move");
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("move"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |_, response| {
+        if response != "move" {
+            return;
+        }
+        let target_pos_1indexed = spin.value() as usize;
+        // Convert to 0-indexed
+        let target_idx = target_pos_1indexed.saturating_sub(1);
+
+        let mut db = ModDatabase::load(&game);
+        let mut ordered = db.get_ordered_plugins(&game);
+
+        if let Some(src_pos) = ordered.iter().position(|p| p.name == plugin_name) {
+            if !ordered[src_pos].is_vanilla && target_idx < ordered.len() {
+                let p = ordered.remove(src_pos);
+                let insert_pos = adjusted_insert_pos(src_pos, target_idx, &ordered);
+                ordered.insert(insert_pos, p);
+                db.set_plugin_order(&ordered);
+                db.save(&game);
+                let _ = db.write_plugins_txt(&game);
+                refresh_load_order_content(&container, &game);
+            }
+        }
+    });
+
+    dialog.present(Some(parent));
 }
