@@ -275,10 +275,12 @@ fn wire_add_mod_button(
         let dialog = gtk4::FileDialog::new();
         dialog.set_title("Select Mod Archive");
 
-        // Only allow zip archives
+        // Allow supported mod archive formats
         let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("Mod archives (*.zip)"));
+        filter.set_name(Some("Mod archives (*.zip, *.7z, *.rar)"));
         filter.add_pattern("*.zip");
+        filter.add_pattern("*.7z");
+        filter.add_pattern("*.rar");
         let filters = gio::ListStore::new::<gtk4::FileFilter>();
         filters.append(&filter);
         dialog.set_filters(Some(&filters));
@@ -304,8 +306,8 @@ fn wire_add_mod_button(
                         .map(|s| s.to_lowercase())
                         .unwrap_or_default();
 
-                    if ext != "zip" {
-                        log::error!("Only .zip archives are supported for installation");
+                    if !["zip", "7z", "rar"].contains(&ext.as_str()) {
+                        log::error!("Only .zip, .7z, and .rar archives are supported for installation");
                         return;
                     }
 
