@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -9,11 +10,12 @@ use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
 use crate::core::games::Game;
-use crate::core::mods::ModDatabase;
 use crate::core::installer::{
-    detect_strategy, install_mod_from_archive, parse_fomod_from_zip, FomodFile, GroupType,
-    InstallStrategy, PluginType,
+    DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
+    InstallStrategy, PluginDependencies, PluginType, detect_strategy, install_mod_from_archive,
+    parse_fomod_from_zip, read_archive_file_bytes,
 };
+use crate::core::mods::ModDatabase;
 
 // ── Archive extensions ────────────────────────────────────────────────────────
 
@@ -140,9 +142,7 @@ fn refresh_content(
     let visible: Vec<&DownloadEntry> = if hide_installed {
         entries
             .iter()
-            .filter(|e| {
-                !entry_is_installed(e, &installed_archives, &installed_mod_names)
-            })
+            .filter(|e| !entry_is_installed(e, &installed_archives, &installed_mod_names))
             .collect()
     } else {
         entries.iter().collect()
@@ -163,7 +163,9 @@ fn refresh_content(
         open_btn.add_css_class("pill");
         open_btn.set_halign(gtk4::Align::Center);
         let dir_clone = downloads_dir.clone();
-        open_btn.connect_clicked(move |_| { open_in_file_manager(&dir_clone); });
+        open_btn.connect_clicked(move |_| {
+            open_in_file_manager(&dir_clone);
+        });
         status.set_child(Some(&open_btn));
         status.set_vexpand(true);
         container.append(&status);
@@ -229,7 +231,9 @@ fn build_entry_row(
     // Install button (when a game is selected)
     if !is_installed {
         if let Some(ref g) = **game {
-            let ext = entry.path.extension()
+            let ext = entry
+                .path
+                .extension()
                 .and_then(|e| e.to_str())
                 .map(|s| s.to_lowercase())
                 .unwrap_or_default();
@@ -317,7 +321,9 @@ fn show_install_dialog(
     if let InstallStrategy::Fomod(_) = &strategy {
         match parse_fomod_from_zip(archive_path) {
             Ok(fomod_config) => {
-                let parent = anchor.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                let parent = anchor
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
                 show_fomod_wizard(
                     parent.as_ref(),
                     archive_path,
@@ -337,7 +343,9 @@ fn show_install_dialog(
         }
     }
 
-    let parent = anchor.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let parent = anchor
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
     show_strategy_picker(
         parent.as_ref(),
         archive_path,
@@ -365,7 +373,8 @@ fn show_strategy_picker(
     let dialog = adw::AlertDialog::builder()
         .heading("Install Mod")
         .body(&format!(
-            "Install \"{archive_name}\" into the game's Data folder?"))
+            "Install \"{archive_name}\" into the game's Data folder?"
+        ))
         .build();
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("data", "Install");
@@ -433,6 +442,167 @@ fn do_install(
 
 // ── FOMOD wizard ──────────────────────────────────────────────────────────────
 
+/// Selected plugin indices by `[step_index][group_index][plugin_indices]`.
+type FomodSelections = Vec<Vec<Vec<usize>>>;
+const OPTION_IMAGE_WIDTH: i32 = 128;
+const OPTION_IMAGE_HEIGHT: i32 = 72;
+
+fn collect_active_flags(
+    fomod: &FomodConfig,
+    selections: &FomodSelections,
+    up_to_step_inclusive: usize,
+) -> HashMap<String, HashSet<String>> {
+    let mut flags: HashMap<String, HashSet<String>> = HashMap::new();
+    for (si, step) in fomod.steps.iter().enumerate() {
+        if si > up_to_step_inclusive {
+            break;
+        }
+        for (gi, group) in step.groups.iter().enumerate() {
+            let Some(selected) = selections.get(si).and_then(|s| s.get(gi)) else {
+                continue;
+            };
+            for &pi in selected {
+                let Some(plugin) = group.plugins.get(pi) else {
+                    continue;
+                };
+                for flag in &plugin.condition_flags {
+                    flags
+                        .entry(flag.name.clone())
+                        .or_default()
+                        .insert(flag.value.clone());
+                }
+            }
+        }
+    }
+    flags
+}
+
+fn flag_dependency_matches(
+    dep: &FlagDependency,
+    active_flags: &HashMap<String, HashSet<String>>,
+) -> bool {
+    if let Some(values) = active_flags.get(&dep.flag) {
+        values.contains(&dep.value)
+    } else {
+        false
+    }
+}
+
+fn plugin_is_visible(
+    plugin: &FomodPlugin,
+    active_flags: &HashMap<String, HashSet<String>>,
+) -> bool {
+    let Some(PluginDependencies { operator, flags }) = &plugin.dependencies else {
+        return true;
+    };
+    if flags.is_empty() {
+        return true;
+    }
+    match operator {
+        DependencyOperator::And => flags
+            .iter()
+            .all(|dep| flag_dependency_matches(dep, active_flags)),
+        DependencyOperator::Or => flags
+            .iter()
+            .any(|dep| flag_dependency_matches(dep, active_flags)),
+    }
+}
+
+fn sanitize_step_selection(
+    fomod: &FomodConfig,
+    selections: &mut FomodSelections,
+    step_index: usize,
+) {
+    let Some(step) = fomod.steps.get(step_index) else {
+        return;
+    };
+    let active_flags = collect_active_flags(fomod, selections, step_index);
+    for (gi, group) in step.groups.iter().enumerate() {
+        let Some(selected) = selections.get_mut(step_index).and_then(|s| s.get_mut(gi)) else {
+            continue;
+        };
+        let visible: Vec<usize> = group
+            .plugins
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, plugin)| {
+                if plugin_is_visible(plugin, &active_flags) {
+                    Some(pi)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        selected.retain(|pi| visible.contains(pi));
+        match group.group_type {
+            GroupType::SelectAll => {
+                *selected = visible;
+            }
+            GroupType::SelectExactlyOne => {
+                if selected.len() > 1 {
+                    selected.truncate(1);
+                }
+                if selected.is_empty() {
+                    if let Some(first) = visible.first() {
+                        selected.push(*first);
+                    }
+                }
+            }
+            GroupType::SelectAtLeastOne => {
+                if selected.is_empty() {
+                    if let Some(first) = visible.first() {
+                        selected.push(*first);
+                    }
+                }
+            }
+            GroupType::SelectAtMostOne => {
+                if selected.len() > 1 {
+                    selected.truncate(1);
+                }
+            }
+            GroupType::SelectAny => {}
+        }
+        selected.sort();
+        selected.dedup();
+    }
+}
+
+fn resolve_fomod_files(fomod: &FomodConfig, selections: &FomodSelections) -> Vec<FomodFile> {
+    let mut files: Vec<FomodFile> = fomod.required_files.clone();
+    let mut normalized = selections.clone();
+    for si in 0..fomod.steps.len() {
+        sanitize_step_selection(fomod, &mut normalized, si);
+    }
+    for (si, step) in fomod.steps.iter().enumerate() {
+        for (gi, group) in step.groups.iter().enumerate() {
+            if let Some(selected) = normalized.get(si).and_then(|s| s.get(gi)) {
+                for &pi in selected {
+                    if let Some(plugin) = group.plugins.get(pi) {
+                        files.extend(plugin.files.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+    files
+}
+
+fn load_fomod_option_image(
+    archive_path: &Path,
+    image_path: &str,
+    cache: &Rc<RefCell<HashMap<String, gtk4::gdk::Texture>>>,
+) -> Option<gtk4::gdk::Texture> {
+    if let Some(texture) = cache.borrow().get(image_path).cloned() {
+        return Some(texture);
+    }
+    let bytes = read_archive_file_bytes(archive_path, image_path).ok()?;
+    let texture = gtk4::gdk::Texture::from_bytes(&gtk4::glib::Bytes::from_owned(bytes)).ok()?;
+    cache
+        .borrow_mut()
+        .insert(image_path.to_string(), texture.clone());
+    Some(texture)
+}
+
 fn show_fomod_wizard(
     parent: Option<&gtk4::Window>,
     archive_path: &Path,
@@ -441,10 +611,13 @@ fn show_fomod_wizard(
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: bool,
-    fomod: &crate::core::installer::FomodConfig,
+    fomod: &FomodConfig,
     game_rc: &Rc<Option<Game>>,
 ) {
-    let mod_display_name = fomod.mod_name.clone().unwrap_or_else(|| archive_name.to_string());
+    let mod_display_name = fomod
+        .mod_name
+        .clone()
+        .unwrap_or_else(|| archive_name.to_string());
 
     if fomod.steps.is_empty() {
         let strategy = InstallStrategy::Fomod(fomod.required_files.clone());
@@ -467,7 +640,9 @@ fn show_fomod_wizard(
         .default_width(600)
         .default_height(500)
         .build();
-    if let Some(p) = parent { dialog.set_transient_for(Some(p)); }
+    if let Some(p) = parent {
+        dialog.set_transient_for(Some(p));
+    }
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&adw::HeaderBar::new());
@@ -478,7 +653,7 @@ fn show_fomod_wizard(
     main_box.set_margin_top(12);
     main_box.set_margin_bottom(12);
 
-    let selections: Rc<RefCell<Vec<Vec<Vec<usize>>>>> = Rc::new(RefCell::new(Vec::new()));
+    let selections: Rc<RefCell<FomodSelections>> = Rc::new(RefCell::new(Vec::new()));
     {
         let mut sel = selections.borrow_mut();
         for step in &fomod.steps {
@@ -486,14 +661,19 @@ fn show_fomod_wizard(
             for group in &step.groups {
                 let mut gs: Vec<usize> = Vec::new();
                 for (idx, plugin) in group.plugins.iter().enumerate() {
-                    if matches!(plugin.type_descriptor, PluginType::Required | PluginType::Recommended)
-                        || group.group_type == GroupType::SelectAll
+                    if matches!(
+                        plugin.type_descriptor,
+                        PluginType::Required | PluginType::Recommended
+                    ) || group.group_type == GroupType::SelectAll
                     {
                         gs.push(idx);
                     }
                 }
                 if gs.is_empty()
-                    && matches!(group.group_type, GroupType::SelectExactlyOne | GroupType::SelectAtLeastOne)
+                    && matches!(
+                        group.group_type,
+                        GroupType::SelectExactlyOne | GroupType::SelectAtLeastOne
+                    )
                     && !group.plugins.is_empty()
                 {
                     gs.push(0);
@@ -524,20 +704,36 @@ fn show_fomod_wizard(
 
     let fomod_rc = Rc::new(fomod.clone());
     let step_count = fomod.steps.len();
+    let image_cache: Rc<RefCell<HashMap<String, gtk4::gdk::Texture>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     let render_step = {
         let sc = step_content.clone();
         let fc = Rc::clone(&fomod_rc);
         let sel_c = Rc::clone(&selections);
+        let img_cache = Rc::clone(&image_cache);
+        let ap = archive_path.to_path_buf();
         let bb = back_btn.clone();
         let nb = next_btn.clone();
         let ib = install_btn.clone();
         Rc::new(move |idx: usize| {
-            while let Some(child) = sc.first_child() { sc.remove(&child); }
+            while let Some(child) = sc.first_child() {
+                sc.remove(&child);
+            }
             bb.set_sensitive(idx > 0);
             nb.set_visible(idx + 1 < step_count);
             ib.set_visible(idx + 1 >= step_count);
-            if idx >= fc.steps.len() { return; }
+            if idx >= fc.steps.len() {
+                return;
+            }
+            {
+                let mut sel = sel_c.borrow_mut();
+                sanitize_step_selection(&fc, &mut sel, idx);
+            }
+            let active_flags = {
+                let sel = sel_c.borrow();
+                collect_active_flags(&fc, &sel, idx)
+            };
             let step = &fc.steps[idx];
             let title = gtk4::Label::new(Some(&step.name));
             title.add_css_class("title-2");
@@ -559,17 +755,43 @@ fn show_fomod_wizard(
                 let lb = gtk4::ListBox::new();
                 lb.add_css_class("boxed-list");
                 lb.set_selection_mode(gtk4::SelectionMode::None);
-                let use_radio = matches!(group.group_type, GroupType::SelectExactlyOne | GroupType::SelectAtMostOne);
-                let radio_group: Option<gtk4::CheckButton> = if use_radio { Some(gtk4::CheckButton::new()) } else { None };
+                let use_radio = matches!(
+                    group.group_type,
+                    GroupType::SelectExactlyOne | GroupType::SelectAtMostOne
+                );
+                let radio_group: Option<gtk4::CheckButton> = if use_radio {
+                    Some(gtk4::CheckButton::new())
+                } else {
+                    None
+                };
                 for (pi, plugin) in group.plugins.iter().enumerate() {
+                    if !plugin_is_visible(plugin, &active_flags) {
+                        continue;
+                    }
                     let row = adw::ActionRow::builder().title(&plugin.name).build();
-                    if let Some(ref d) = plugin.description { if !d.is_empty() { row.set_subtitle(d); } }
+                    if let Some(ref d) = plugin.description {
+                        if !d.is_empty() {
+                            row.set_subtitle(d);
+                        }
+                    }
                     let check = gtk4::CheckButton::new();
                     if use_radio {
-                        if let Some(ref rg) = radio_group { if pi > 0 { check.set_group(Some(rg)); } }
+                        if let Some(ref rg) = radio_group {
+                            if pi > 0 {
+                                check.set_group(Some(rg));
+                            }
+                        }
                     }
-                    { let sel = sel_c.borrow(); if let Some(gs) = sel.get(idx).and_then(|s| s.get(gi)) { check.set_active(gs.contains(&pi)); } }
-                    if group.group_type == GroupType::SelectAll { check.set_active(true); check.set_sensitive(false); }
+                    {
+                        let sel = sel_c.borrow();
+                        if let Some(gs) = sel.get(idx).and_then(|s| s.get(gi)) {
+                            check.set_active(gs.contains(&pi));
+                        }
+                    }
+                    if group.group_type == GroupType::SelectAll {
+                        check.set_active(true);
+                        check.set_sensitive(false);
+                    }
                     let sel_cc = Rc::clone(&sel_c);
                     let is_radio = use_radio;
                     let si = idx;
@@ -577,14 +799,30 @@ fn show_fomod_wizard(
                         let mut sel = sel_cc.borrow_mut();
                         if let Some(gs) = sel.get_mut(si).and_then(|s| s.get_mut(gi)) {
                             if btn.is_active() {
-                                if is_radio { gs.clear(); }
-                                if !gs.contains(&pi) { gs.push(pi); }
-                            } else { gs.retain(|&x| x != pi); }
+                                if is_radio {
+                                    gs.clear();
+                                }
+                                if !gs.contains(&pi) {
+                                    gs.push(pi);
+                                }
+                            } else {
+                                gs.retain(|&x| x != pi);
+                            }
                         }
                     });
                     check.set_valign(gtk4::Align::Center);
                     row.add_prefix(&check);
                     row.set_activatable_widget(Some(&check));
+                    if let Some(ref image_path) = plugin.image_path {
+                        if let Some(texture) = load_fomod_option_image(&ap, image_path, &img_cache)
+                        {
+                            let pic = gtk4::Picture::new();
+                            pic.set_paintable(Some(&texture));
+                            pic.set_content_fit(gtk4::ContentFit::Contain);
+                            pic.set_size_request(OPTION_IMAGE_WIDTH, OPTION_IMAGE_HEIGHT);
+                            row.add_suffix(&pic);
+                        }
+                    }
                     let tl = match plugin.type_descriptor {
                         PluginType::Required => Some("Required"),
                         PluginType::Recommended => Some("Recommended"),
@@ -608,8 +846,28 @@ fn show_fomod_wizard(
         })
     };
     render_step(0);
-    { let si = Rc::clone(&step_index); let rs = Rc::clone(&render_step); back_btn.connect_clicked(move |_| { let mut i = si.borrow_mut(); if *i > 0 { *i -= 1; rs(*i); } }); }
-    { let si = Rc::clone(&step_index); let rs = Rc::clone(&render_step); next_btn.connect_clicked(move |_| { let mut i = si.borrow_mut(); if *i + 1 < step_count { *i += 1; rs(*i); } }); }
+    {
+        let si = Rc::clone(&step_index);
+        let rs = Rc::clone(&render_step);
+        back_btn.connect_clicked(move |_| {
+            let mut i = si.borrow_mut();
+            if *i > 0 {
+                *i -= 1;
+                rs(*i);
+            }
+        });
+    }
+    {
+        let si = Rc::clone(&step_index);
+        let rs = Rc::clone(&render_step);
+        next_btn.connect_clicked(move |_| {
+            let mut i = si.borrow_mut();
+            if *i + 1 < step_count {
+                *i += 1;
+                rs(*i);
+            }
+        });
+    }
     {
         let sel_c = Rc::clone(&selections);
         let fc = Rc::clone(&fomod_rc);
@@ -622,17 +880,10 @@ fn show_fomod_wizard(
         let hide = hide_installed;
         let grc = Rc::clone(game_rc);
         install_btn.connect_clicked(move |_| {
-            let mut files: Vec<FomodFile> = fc.required_files.clone();
-            let sel = sel_c.borrow();
-            for (si, step) in fc.steps.iter().enumerate() {
-                for (gi, group) in step.groups.iter().enumerate() {
-                    if let Some(gs) = sel.get(si).and_then(|s| s.get(gi)) {
-                        for &pi in gs {
-                            if let Some(p) = group.plugins.get(pi) { files.extend(p.files.iter().cloned()); }
-                        }
-                    }
-                }
-            }
+            let files = {
+                let sel = sel_c.borrow();
+                resolve_fomod_files(&fc, &sel)
+            };
             do_install(
                 &ap,
                 &an,
@@ -688,7 +939,9 @@ fn show_clean_cache_dialog(
 ) {
     let dialog = adw::AlertDialog::new(
         Some("Clean Download Cache?"),
-        Some("All downloaded archive files will be permanently deleted.\nInstalled mods in your library will not be affected."),
+        Some(
+            "All downloaded archive files will be permanently deleted.\nInstalled mods in your library will not be affected.",
+        ),
     );
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("clean", "Clean Cache");
@@ -700,9 +953,14 @@ fn show_clean_cache_dialog(
     let hc = Rc::clone(hide_installed);
     let gc = Rc::clone(game);
     dialog.connect_response(None, move |_, response| {
-        if response == "clean" { delete_all_archives(&cc); refresh_content(&cont, &cc, *hc.borrow(), &gc); }
+        if response == "clean" {
+            delete_all_archives(&cc);
+            refresh_content(&cont, &cc, *hc.borrow(), &gc);
+        }
     });
-    let parent = anchor.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let parent = anchor
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
     dialog.present(parent.as_ref());
 }
 
@@ -711,8 +969,14 @@ fn delete_all_archives(config: &Rc<RefCell<AppConfig>>) {
     if let Ok(entries) = std::fs::read_dir(&downloads_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() { continue; }
-            let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
             if ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
                 let _ = std::fs::remove_file(&path);
             }
@@ -737,12 +1001,27 @@ fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for item in rd.flatten() {
             let path = item.path();
-            if !path.is_file() { continue; }
-            let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
-            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) { continue; }
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            entries.push(DownloadEntry { name, path, size_bytes });
+            entries.push(DownloadEntry {
+                name,
+                path,
+                size_bytes,
+            });
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -768,10 +1047,15 @@ fn format_size(bytes: u64) -> String {
     const KB: u64 = 1_024;
     const MB: u64 = 1_024 * KB;
     const GB: u64 = 1_024 * MB;
-    if bytes >= GB { format!("{:.1} GB", bytes as f64 / GB as f64) }
-    else if bytes >= MB { format!("{:.1} MB", bytes as f64 / MB as f64) }
-    else if bytes >= KB { format!("{:.1} KB", bytes as f64 / KB as f64) }
-    else { format!("{bytes} B") }
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn open_in_file_manager(path: &Path) {
@@ -792,4 +1076,111 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
         ancestor = current.parent();
     }
     log::info!("{message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::installer::{
+        ConditionFlag, DependencyOperator, FlagDependency, FomodPlugin, InstallStep,
+        PluginDependencies, PluginGroup,
+    };
+
+    fn test_plugin(
+        name: &str,
+        file_source: &str,
+        condition_flags: Vec<ConditionFlag>,
+        dependencies: Option<PluginDependencies>,
+    ) -> FomodPlugin {
+        FomodPlugin {
+            name: name.to_string(),
+            description: None,
+            image_path: None,
+            files: vec![FomodFile {
+                source: file_source.to_string(),
+                destination: "Data".to_string(),
+                priority: 0,
+            }],
+            type_descriptor: PluginType::Optional,
+            condition_flags,
+            dependencies,
+        }
+    }
+
+    #[test]
+    fn resolve_fomod_files_filters_plus_minus_variants_by_dependency_flags() {
+        let mut config = FomodConfig {
+            mod_name: Some("Test".to_string()),
+            required_files: Vec::new(),
+            steps: Vec::new(),
+        };
+        config.steps.push(InstallStep {
+            name: "Flags".to_string(),
+            groups: vec![PluginGroup {
+                name: "Feature".to_string(),
+                group_type: GroupType::SelectExactlyOne,
+                plugins: vec![
+                    test_plugin(
+                        "Enable +",
+                        "flags-plus.txt",
+                        vec![ConditionFlag {
+                            name: "FeaturePack".to_string(),
+                            value: "+".to_string(),
+                        }],
+                        None,
+                    ),
+                    test_plugin(
+                        "Enable -",
+                        "flags-minus.txt",
+                        vec![ConditionFlag {
+                            name: "FeaturePack".to_string(),
+                            value: "-".to_string(),
+                        }],
+                        None,
+                    ),
+                ],
+            }],
+        });
+        config.steps.push(InstallStep {
+            name: "Variant".to_string(),
+            groups: vec![PluginGroup {
+                name: "Pick".to_string(),
+                group_type: GroupType::SelectAny,
+                plugins: vec![
+                    test_plugin(
+                        "Plus variant",
+                        "plus-variant.txt",
+                        Vec::new(),
+                        Some(PluginDependencies {
+                            operator: DependencyOperator::And,
+                            flags: vec![FlagDependency {
+                                flag: "FeaturePack".to_string(),
+                                value: "+".to_string(),
+                            }],
+                        }),
+                    ),
+                    test_plugin(
+                        "Minus variant",
+                        "minus-variant.txt",
+                        Vec::new(),
+                        Some(PluginDependencies {
+                            operator: DependencyOperator::And,
+                            flags: vec![FlagDependency {
+                                flag: "FeaturePack".to_string(),
+                                value: "-".to_string(),
+                            }],
+                        }),
+                    ),
+                ],
+            }],
+        });
+
+        // Simulate stale UI state selecting both variants in step 2 while step 1
+        // has "+" selected.
+        let selections = vec![vec![vec![0]], vec![vec![0, 1]]];
+        let files = resolve_fomod_files(&config, &selections);
+        let sources: Vec<String> = files.into_iter().map(|f| f.source).collect();
+        assert!(sources.contains(&"plus-variant.txt".to_string()));
+        assert!(!sources.contains(&"minus-variant.txt".to_string()));
+    }
 }
