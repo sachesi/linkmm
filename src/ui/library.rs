@@ -15,8 +15,6 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
-    overwrites: bool,
-    overwritten: bool,
     files: BTreeSet<String>,
 }
 
@@ -27,29 +25,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     let title_widget = adw::WindowTitle::new("Library", "");
     header.set_title_widget(Some(&title_widget));
-
-    let search_entry = gtk4::SearchEntry::new();
-    search_entry.set_placeholder_text(Some("Search mods"));
-    search_entry.set_width_chars(24);
-    header.pack_start(&search_entry);
-
-    // Deploy button – applies all enabled mods by (re)linking their files
-    let deploy_btn = gtk4::Button::with_label("Deploy");
-    deploy_btn.add_css_class("suggested-action");
-    deploy_btn.set_tooltip_text(Some(
-        "Apply all enabled mods by linking their files into the game directory",
-    ));
-    header.pack_end(&deploy_btn);
-
-    // Undeploy button – removes all mod symlinks from the game directory
-    let undeploy_btn = gtk4::Button::with_label("Undeploy");
-    undeploy_btn.add_css_class("destructive-action");
-    undeploy_btn.set_tooltip_text(Some("Remove all mod symlinks from the game directory"));
-    header.pack_end(&undeploy_btn);
-
-    let find_mods_label = gtk4::Label::new(Some("Go find some mods =P"));
-    find_mods_label.add_css_class("dim-label");
-    header.pack_end(&find_mods_label);
 
     toolbar_view.add_top_bar(&header);
 
@@ -70,123 +45,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     );
 
     toolbar_view.set_content(Some(&content_container));
-
-    {
-        let container_c = content_container.clone();
-        let game_c = Rc::clone(&game_rc);
-        let config_c = Rc::clone(&config);
-        let search_c = Rc::clone(&search_query);
-        let selected_c = Rc::clone(&selected_mod_id);
-        search_entry.connect_search_changed(move |entry| {
-            *search_c.borrow_mut() = entry.text().to_string();
-            refresh_library_content_with_search(
-                &container_c,
-                &game_c,
-                Rc::clone(&config_c),
-                &search_c.borrow(),
-                Rc::clone(&search_c),
-                Rc::clone(&selected_c),
-            );
-        });
-    }
-
-    // Wire Deploy button: undeploy everything, then deploy all enabled mods
-    {
-        let game_c = Rc::clone(&game_rc);
-        let container_c = content_container.clone();
-        let config_c = Rc::clone(&config);
-        let search_c = Rc::clone(&search_query);
-        let selected_c = Rc::clone(&selected_mod_id);
-        deploy_btn.connect_clicked(move |btn| {
-            let db = ModDatabase::load(&game_c);
-            let mut errors: Vec<String> = Vec::new();
-
-            // First, unlink all tracked mods so we start from a clean state
-            for m in &db.mods {
-                if let Err(e) = ModManager::disable_mod(&game_c, m) {
-                    log::warn!("Undeploy warning for {}: {e}", m.name);
-                }
-            }
-
-            // Then deploy all enabled mods.
-            //
-            // The linker helpers skip creating a new link when a destination
-            // file already exists, so the first deployed mod "wins" each
-            // conflicting path. Because UI priority is defined as
-            // top(lowest) -> bottom(highest), we deploy in reverse visual
-            // order to ensure the bottom-most enabled mod wins conflicts.
-            let mut deployed_count = 0usize;
-            for m in db.mods.iter().rev().filter(|m| m.enabled) {
-                if let Err(e) = ModManager::enable_mod(&game_c, m) {
-                    errors.push(format!("{}: {}", m.name, e));
-                } else {
-                    deployed_count += 1;
-                }
-            }
-            let _ = db.write_plugins_txt(&game_c);
-
-            let msg = if errors.is_empty() {
-                format!("Deployed {deployed_count} mod(s)")
-            } else {
-                for e in &errors {
-                    log::error!("Deploy error: {e}");
-                }
-                format!("Deploy finished with {} error(s)", errors.len())
-            };
-            show_toast(btn.upcast_ref(), &msg);
-            refresh_library_content_with_search(
-                &container_c,
-                &game_c,
-                Rc::clone(&config_c),
-                &search_c.borrow(),
-                Rc::clone(&search_c),
-                Rc::clone(&selected_c),
-            );
-        });
-    }
-
-    // Wire Undeploy button: remove all mod symlinks from the game directory
-    {
-        let game_c = Rc::clone(&game_rc);
-        let container_c = content_container.clone();
-        let config_c = Rc::clone(&config);
-        let search_c = Rc::clone(&search_query);
-        let selected_c = Rc::clone(&selected_mod_id);
-        undeploy_btn.connect_clicked(move |btn| {
-            let db = ModDatabase::load(&game_c);
-            let mut errors: Vec<String> = Vec::new();
-            let mut count = 0;
-            // Unlink ALL mods regardless of enabled state so the game directory
-            // is fully clean.  The enabled state is intentionally preserved so
-            // the user can re-deploy with the same selection later.
-            for m in &db.mods {
-                if let Err(e) = ModManager::disable_mod(&game_c, m) {
-                    errors.push(format!("{}: {}", m.name, e));
-                } else {
-                    count += 1;
-                }
-            }
-            let _ = db.write_plugins_txt(&game_c);
-
-            let msg = if errors.is_empty() {
-                format!("Undeployed {count} mod(s)")
-            } else {
-                for e in &errors {
-                    log::error!("Undeploy error: {e}");
-                }
-                format!("Undeploy finished with {} error(s)", errors.len())
-            };
-            show_toast(btn.upcast_ref(), &msg);
-            refresh_library_content_with_search(
-                &container_c,
-                &game_c,
-                Rc::clone(&config_c),
-                &search_c.borrow(),
-                Rc::clone(&search_c),
-                Rc::clone(&selected_c),
-            );
-        });
-    }
 
     toolbar_view.upcast()
 }
@@ -235,7 +93,6 @@ fn refresh_library_content_with_search(
         }
         let status = adw::StatusPage::builder()
             .title("No Mods Installed")
-            .description("Go find some mods =P")
             .icon_name("package-x-generic-symbolic")
             .build();
         status.set_vexpand(true);
@@ -320,30 +177,8 @@ fn build_mod_row(
     row.add_prefix(&index_label);
 
     if let Some(state) = conflict_state {
-        if state.overwritten {
-            row.add_css_class("error");
-        } else if state.overwrites {
-            row.add_css_class("success");
-        }
-
         if !state.files.is_empty() {
-            let preview = state
-                .files
-                .iter()
-                .take(2)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            let label_text = if state.files.len() > 2 {
-                format!("{} conflict files ({preview}, …)", state.files.len())
-            } else {
-                format!("{} conflict files ({preview})", state.files.len())
-            };
-            let conflict_label = gtk4::Label::new(Some(&label_text));
-            conflict_label.add_css_class("accent");
-            conflict_label.add_css_class("caption");
-            conflict_label.set_valign(gtk4::Align::Center);
-            row.add_suffix(&conflict_label);
+            row.add_css_class("accent");
         }
     }
 
@@ -608,6 +443,9 @@ fn build_mod_row(
         let source_path = mod_entry.source_path.clone();
         let nexus_id = mod_entry.nexus_id;
         let game_c = Rc::clone(game);
+        let conflict_files = conflict_state
+            .map(|state| state.files.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
 
         right_click.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
@@ -637,6 +475,13 @@ fn build_mod_row(
             open_nexus_item.set_sensitive(nexus_id.is_some());
             menu_box.append(&open_nexus_item);
 
+            let show_conflicts_item = gtk4::Button::with_label("Show Conflicting Files");
+            show_conflicts_item.add_css_class("flat");
+            show_conflicts_item.set_halign(gtk4::Align::Fill);
+            show_conflicts_item.set_hexpand(true);
+            show_conflicts_item.set_sensitive(!conflict_files.is_empty());
+            menu_box.append(&show_conflicts_item);
+
             popover.set_child(Some(&menu_box));
 
             let popover_dir = popover.clone();
@@ -659,6 +504,34 @@ fn build_mod_row(
                     let _ =
                         gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
                 }
+            });
+
+            let popover_conflicts = popover.clone();
+            let row_for_dialog = row_c.clone();
+            let conflict_files_for_menu = conflict_files.clone();
+            show_conflicts_item.connect_clicked(move |_| {
+                popover_conflicts.popdown();
+                if conflict_files_for_menu.is_empty() {
+                    return;
+                }
+
+                let body = conflict_files_for_menu
+                    .iter()
+                    .map(|f| format!("• {f}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Conflicting Files")
+                    .body(&body)
+                    .build();
+                dialog.add_response("ok", "OK");
+                dialog.set_default_response(Some("ok"));
+                dialog.set_close_response("ok");
+                let parent = row_for_dialog
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                dialog.present(parent.as_ref());
             });
 
             popover.popup();
@@ -713,23 +586,6 @@ fn compute_conflict_states(
         let shared: BTreeSet<String> = selected_files.intersection(&files).cloned().collect();
         if shared.is_empty() {
             continue;
-        }
-
-        // Library order is top -> bottom, while deploy applies enabled mods in
-        // reverse order so bottom-most mods win conflicts. Therefore, a mod
-        // with a greater index has higher overwrite priority.
-        if idx > selected_idx {
-            states.entry(m.id.clone()).or_default().overwrites = true;
-            states
-                .entry(selected_id.to_string())
-                .or_default()
-                .overwritten = true;
-        } else {
-            states.entry(m.id.clone()).or_default().overwritten = true;
-            states
-                .entry(selected_id.to_string())
-                .or_default()
-                .overwrites = true;
         }
 
         states
@@ -818,23 +674,6 @@ fn open_in_file_manager(path: &Path) {
     let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
 }
 
-/// Show a brief in-app toast notification anchored to `widget`.
-fn show_toast(widget: &gtk4::Widget, message: &str) {
-    // Walk up to the nearest AdwToastOverlay
-    let mut ancestor: Option<gtk4::Widget> = Some(widget.clone());
-    while let Some(current) = ancestor {
-        if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
-            let toast = adw::Toast::new(message);
-            toast.set_timeout(3);
-            overlay.add_toast(toast);
-            return;
-        }
-        ancestor = current.parent();
-    }
-    // Fallback: log to stderr
-    log::info!("{message}");
-}
-
 #[cfg(test)]
 mod tests {
     use super::{adjusted_insert_pos, compute_conflict_states, matches_query};
@@ -876,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_state_is_classified_by_position() {
+    fn conflict_state_lists_shared_files() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -901,13 +740,9 @@ mod tests {
 
         let states = compute_conflict_states(&mods, Some("a"));
         let selected = states.get("a").unwrap();
-        let overwriter = states.get("b").unwrap();
-        assert!(selected.overwritten);
-        assert!(!selected.overwrites);
-        assert!(overwriter.overwrites);
-        assert!(!overwriter.overwritten);
+        let conflicting = states.get("b").unwrap();
         assert!(selected.files.contains("data/textures/sky.dds"));
-        assert!(overwriter.files.contains("data/textures/sky.dds"));
+        assert!(conflicting.files.contains("data/textures/sky.dds"));
         assert!(!states.contains_key("c"));
 
         std::fs::remove_dir_all(root).unwrap();
