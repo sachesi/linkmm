@@ -70,6 +70,55 @@ impl GameKind {
             GameKind::Oblivion => "oblivion",
         }
     }
+
+    /// Canonical vanilla master plugins for this game, in load-order priority.
+    pub fn vanilla_masters(&self) -> &'static [&'static str] {
+        match self {
+            GameKind::SkyrimSE | GameKind::SkyrimLE => &[
+                "Skyrim.esm",
+                "Update.esm",
+                "Dawnguard.esm",
+                "HearthFires.esm",
+                "Dragonborn.esm",
+            ],
+            GameKind::Fallout4 => &[
+                "Fallout4.esm",
+                "DLCRobot.esm",
+                "DLCworkshop01.esm",
+                "DLCCoast.esm",
+                "DLCworkshop02.esm",
+                "DLCworkshop03.esm",
+                "DLCNukaWorld.esm",
+            ],
+            GameKind::Fallout3 => &["Fallout3.esm"],
+            GameKind::FalloutNV => &[
+                "FalloutNV.esm",
+                "DeadMoney.esm",
+                "HonestHearts.esm",
+                "OldWorldBlues.esm",
+                "LonesomeRoad.esm",
+                "GunRunnersArsenal.esm",
+                "CaravanPack.esm",
+                "ClassicPack.esm",
+                "MercenaryPack.esm",
+                "TribalPack.esm",
+            ],
+            GameKind::Oblivion => &["Oblivion.esm"],
+        }
+    }
+
+    /// Sub-directory under `%LOCALAPPDATA%` (or its Linux/Proton equivalent)
+    /// where the game stores its `plugins.txt`.
+    pub fn local_app_data_folder(&self) -> &'static str {
+        match self {
+            GameKind::SkyrimSE => "Skyrim Special Edition",
+            GameKind::SkyrimLE => "Skyrim",
+            GameKind::Fallout4 => "Fallout4",
+            GameKind::Fallout3 => "Fallout3",
+            GameKind::FalloutNV => "FalloutNV",
+            GameKind::Oblivion => "Oblivion",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,5 +150,41 @@ impl Game {
             .join("linkmm")
             .join("mods")
             .join(&self.id)
+    }
+
+    /// Try to locate the directory that contains `plugins.txt` for this game.
+    ///
+    /// Checks Steam/Proton compatdata paths common on Linux.  Returns `None`
+    /// when no matching directory is found.
+    pub fn plugins_txt_dir(&self) -> Option<PathBuf> {
+        let app_id = self.kind.steam_app_id()?;
+        let home = dirs::home_dir()?;
+        let sub = self.kind.local_app_data_folder();
+
+        // Common Proton / Steam-on-Linux compatdata roots
+        let roots: &[&str] = &[
+            ".steam/steam/steamapps/compatdata",
+            ".local/share/Steam/steamapps/compatdata",
+            "snap/steam/common/.steam/steam/steamapps/compatdata",
+            ".var/app/com.valvesoftware.Steam/.steam/steam/steamapps/compatdata",
+        ];
+
+        for root in roots {
+            let path = home
+                .join(root)
+                .join(app_id.to_string())
+                .join("pfx/drive_c/users/steamuser/AppData/Local")
+                .join(sub);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Return the expected path of `plugins.txt`, even if it does not yet exist.
+    /// Returns `None` only if the AppData directory cannot be determined at all.
+    pub fn plugins_txt_path(&self) -> Option<PathBuf> {
+        Some(self.plugins_txt_dir()?.join("plugins.txt"))
     }
 }

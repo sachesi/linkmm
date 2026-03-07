@@ -2,6 +2,42 @@ use crate::core::games::Game;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+// ── Plugin types ─────────────────────────────────────────────────────────────
+
+/// Kind of a Bethesda plugin file, determined by file extension.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PluginKind {
+    /// `.esm` – Elder Scrolls Master / Fallout Master.  Loads before regular plugins.
+    Master,
+    /// `.esl` – Light master.  Shares the master load-order slot but has a 512-record limit.
+    Light,
+    /// `.esp` – Regular plugin.
+    Plugin,
+}
+
+impl PluginKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PluginKind::Master => "ESM",
+            PluginKind::Light => "ESL",
+            PluginKind::Plugin => "ESP",
+        }
+    }
+}
+
+/// A single plugin file found in the game's Data directory.
+#[derive(Debug, Clone)]
+pub struct PluginFile {
+    pub name: String,
+    pub kind: PluginKind,
+    /// Whether this plugin is active in `plugins.txt` (defaults to enabled if not tracked).
+    pub enabled: bool,
+    /// True for hardcoded vanilla game masters (e.g. `Skyrim.esm`).
+    pub is_vanilla: bool,
+}
+
+// ── Mod struct ────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
     pub id: String,
@@ -11,6 +47,9 @@ pub struct Mod {
     pub priority: i32,
     pub nexus_id: Option<u32>,
     pub source_path: PathBuf,
+    /// True when this mod was downloaded through the Downloads page via the Nexus API.
+    #[serde(default)]
+    pub installed_from_nexus: bool,
 }
 
 impl Mod {
@@ -35,14 +74,24 @@ impl Mod {
             priority: 0,
             nexus_id: None,
             source_path,
+            installed_from_nexus: false,
         }
     }
 }
 
+// ── ModDatabase ───────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModDatabase {
     pub mods: Vec<Mod>,
+    /// Ordered mod IDs (legacy – kept for compatibility).
     pub load_order: Vec<String>,
+    /// Ordered plugin file names for the Load Order page.
+    #[serde(default)]
+    pub plugin_load_order: Vec<String>,
+    /// Plugin file names that the user has explicitly *disabled* in the Load Order.
+    #[serde(default)]
+    pub plugin_disabled: Vec<String>,
 }
 
 impl ModDatabase {
@@ -105,6 +154,168 @@ impl ModDatabase {
                     self.mods.push(mod_entry);
                 }
             }
+        }
+    }
+
+    // ── Plugin / Load-Order helpers ──────────────────────────────────────────
+
+    /// Scan the game's `Data` directory for `.esm`, `.esl` and `.esp` files.
+    ///
+    /// `enabled` is derived from `plugin_disabled`: a plugin is enabled unless
+    /// it appears in that list.  Vanilla masters are always marked `is_vanilla = true`.
+    pub fn scan_plugins(&self, game: &Game) -> Vec<PluginFile> {
+        let mut plugins = Vec::new();
+        let data_dir = &game.data_path;
+        if !data_dir.is_dir() {
+            return plugins;
+        }
+        let vanilla = game.kind.vanilla_masters();
+        if let Ok(entries) = std::fs::read_dir(data_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let lower = name.to_lowercase();
+                let kind = if lower.ends_with(".esm") {
+                    PluginKind::Master
+                } else if lower.ends_with(".esl") {
+                    PluginKind::Light
+                } else if lower.ends_with(".esp") {
+                    PluginKind::Plugin
+                } else {
+                    continue;
+                };
+                let is_vanilla = vanilla.contains(&name.as_str());
+                let enabled = !self.plugin_disabled.contains(&name);
+                plugins.push(PluginFile {
+                    name,
+                    kind,
+                    enabled,
+                    is_vanilla,
+                });
+            }
+        }
+        plugins
+    }
+
+    /// Return plugins in load-order sequence.
+    ///
+    /// Vanilla masters come first (in their canonical game order), then the
+    /// remaining plugins follow `plugin_load_order`; any plugins not yet
+    /// tracked are appended at the end.
+    pub fn get_ordered_plugins(&self, game: &Game) -> Vec<PluginFile> {
+        let plugins = self.scan_plugins(game);
+
+        // Partition into vanilla masters and the rest
+        let vanilla_order = game.kind.vanilla_masters();
+        let (mut vanilla, mut rest): (Vec<_>, Vec<_>) =
+            plugins.into_iter().partition(|p| p.is_vanilla);
+
+        // Sort vanilla masters in their canonical order
+        vanilla.sort_by_key(|p| {
+            vanilla_order
+                .iter()
+                .position(|&v| v == p.name.as_str())
+                .unwrap_or(usize::MAX)
+        });
+
+        // Apply saved order to non-vanilla plugins
+        let mut ordered: Vec<PluginFile> = Vec::new();
+        for name in &self.plugin_load_order {
+            if let Some(idx) = rest.iter().position(|p| &p.name == name) {
+                ordered.push(rest.remove(idx));
+            }
+        }
+        // Any plugin not yet in plugin_load_order: sort by type then name
+        rest.sort_by(|a, b| {
+            let weight = |p: &PluginFile| match p.kind {
+                PluginKind::Master => 0u8,
+                PluginKind::Light => 1,
+                PluginKind::Plugin => 2,
+            };
+            weight(a).cmp(&weight(b)).then_with(|| a.name.cmp(&b.name))
+        });
+        ordered.extend(rest);
+
+        let mut result = vanilla;
+        result.extend(ordered);
+        result
+    }
+
+    /// Update `plugin_load_order` and `plugin_disabled` from the given ordered list.
+    pub fn set_plugin_order(&mut self, plugins: &[PluginFile]) {
+        self.plugin_load_order = plugins
+            .iter()
+            .filter(|p| !p.is_vanilla)
+            .map(|p| p.name.clone())
+            .collect();
+        self.plugin_disabled = plugins
+            .iter()
+            .filter(|p| !p.enabled)
+            .map(|p| p.name.clone())
+            .collect();
+    }
+
+    /// Write `plugins.txt` to the game's AppData directory (Proton/Windows path).
+    ///
+    /// Format follows limo/Bethesda convention: `*Plugin.esm` (enabled) or
+    /// `Plugin.esp` (disabled).  A comment header is included for clarity.
+    pub fn write_plugins_txt(&self, game: &Game) -> Result<(), String> {
+        let Some(plugins_path) = game.plugins_txt_path() else {
+            return Ok(()); // Path unknown – skip silently
+        };
+        if let Some(parent) = plugins_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create plugins directory: {e}"))?;
+        }
+        let plugins = self.get_ordered_plugins(game);
+        let mut content =
+            String::from("# This file is used by the game to determine which plugins are active.\n");
+        for plugin in &plugins {
+            if plugin.enabled {
+                content.push('*');
+            }
+            content.push_str(&plugin.name);
+            content.push('\n');
+        }
+        std::fs::write(&plugins_path, content)
+            .map_err(|e| format!("Failed to write plugins.txt: {e}"))
+    }
+
+    /// Read `plugins.txt` (if present) and synchronise `plugin_load_order` and
+    /// `plugin_disabled` with the order and activation state it declares.
+    pub fn sync_from_plugins_txt(&mut self, game: &Game) {
+        let Some(plugins_path) = game.plugins_txt_path() else {
+            return;
+        };
+        if !plugins_path.exists() {
+            return;
+        }
+        let Ok(contents) = std::fs::read_to_string(&plugins_path) else {
+            return;
+        };
+        let mut order: Vec<String> = Vec::new();
+        let mut disabled: Vec<String> = Vec::new();
+        for line in contents.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('*') {
+                order.push(name.to_string());
+            } else {
+                order.push(line.to_string());
+                disabled.push(line.to_string());
+            }
+        }
+        if !order.is_empty() {
+            self.plugin_load_order = order;
+            self.plugin_disabled = disabled;
         }
     }
 }

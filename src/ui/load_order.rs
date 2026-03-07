@@ -5,11 +5,13 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::games::Game;
-use crate::core::mods::ModDatabase;
+use crate::core::mods::{ModDatabase, PluginFile};
 
 /// Build the Load Order page for `game`.
 ///
-/// If `game` is `None`, shows an "no game selected" placeholder.
+/// Shows all `.esm` / `.esl` / `.esp` files found in the game's `Data`
+/// directory, ordered by `ModDatabase::get_ordered_plugins`.  Vanilla masters
+/// are pinned at the top and cannot be moved.
 pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -19,6 +21,13 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
         None => adw::WindowTitle::new("Load Order", ""),
     };
     header.set_title_widget(Some(&title_widget));
+
+    // Sort button (placeholder for future LOOT integration)
+    let sort_btn = gtk4::Button::new();
+    sort_btn.set_icon_name("view-sort-ascending-symbolic");
+    sort_btn.set_tooltip_text(Some("Sort by LOOT rules (coming soon)"));
+    sort_btn.set_sensitive(false); // disabled until LOOT is integrated
+    header.pack_end(&sort_btn);
 
     toolbar_view.add_top_bar(&header);
 
@@ -45,18 +54,28 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     toolbar_view.upcast()
 }
 
-/// Re-populate `container` from the current mod database for `game`.
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Re-populate `container` with the current plugin list for `game`.
 fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
 
-    let db = ModDatabase::load(game);
+    let mut db = ModDatabase::load(game);
+    // Initialise from plugins.txt if we have no saved order yet
+    if db.plugin_load_order.is_empty() {
+        db.sync_from_plugins_txt(game);
+    }
+    let plugins = db.get_ordered_plugins(game);
 
-    if db.load_order.is_empty() && db.mods.is_empty() {
+    if plugins.is_empty() {
         let status = adw::StatusPage::builder()
-            .title("No Mods in Load Order")
-            .description("Add mods in the Library tab to see them here.")
+            .title("No Plugins Found")
+            .description(
+                "No .esm / .esl / .esp files were found in the game's Data directory.\n\
+                 Install and deploy mods first, or check that the game path is correct.",
+            )
             .icon_name("format-justify-left-symbolic")
             .build();
         status.set_vexpand(true);
@@ -64,87 +83,13 @@ fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
         return;
     }
 
-    let ordered_ids = compute_ordered_ids(&db);
-    let count = ordered_ids.len();
-
+    let count = plugins.len();
     let list_box = gtk4::ListBox::new();
     list_box.add_css_class("boxed-list");
     list_box.set_selection_mode(gtk4::SelectionMode::None);
 
-    for (idx, mod_id) in ordered_ids.iter().enumerate() {
-        let Some(mod_entry) = db.mods.iter().find(|m| &m.id == mod_id) else {
-            continue;
-        };
-
-        let row = adw::ActionRow::builder()
-            .title(&mod_entry.name)
-            .subtitle(if mod_entry.enabled { "Enabled" } else { "Disabled" })
-            .build();
-
-        // Index prefix
-        let index_label = gtk4::Label::new(Some(&format!("{}", idx + 1)));
-        index_label.add_css_class("dim-label");
-        index_label.add_css_class("numeric");
-        index_label.set_width_chars(3);
-        row.add_prefix(&index_label);
-
-        // Move-up / move-down buttons
-        let up_btn = gtk4::Button::new();
-        up_btn.set_icon_name("go-up-symbolic");
-        up_btn.set_valign(gtk4::Align::Center);
-        up_btn.add_css_class("flat");
-        up_btn.set_tooltip_text(Some("Move up"));
-        up_btn.set_sensitive(idx > 0);
-
-        let down_btn = gtk4::Button::new();
-        down_btn.set_icon_name("go-down-symbolic");
-        down_btn.set_valign(gtk4::Align::Center);
-        down_btn.add_css_class("flat");
-        down_btn.set_tooltip_text(Some("Move down"));
-        down_btn.set_sensitive(idx + 1 < count);
-
-        row.add_suffix(&up_btn);
-        row.add_suffix(&down_btn);
-
-        // Connect up button — re-reads DB so position is always current
-        {
-            let game_c = Rc::clone(game);
-            let container_c = container.clone();
-            let mod_id_c = mod_id.clone();
-            up_btn.connect_clicked(move |_| {
-                let mut db = ModDatabase::load(&game_c);
-                let mut order = compute_ordered_ids(&db);
-                if let Some(pos) = order.iter().position(|id| id == &mod_id_c) {
-                    if pos > 0 {
-                        order.swap(pos, pos - 1);
-                        db.load_order = order;
-                        db.save(&game_c);
-                        refresh_load_order_content(&container_c, &game_c);
-                    }
-                }
-            });
-        }
-
-        // Connect down button — re-reads DB so position is always current
-        {
-            let game_c = Rc::clone(game);
-            let container_c = container.clone();
-            let mod_id_c = mod_id.clone();
-            down_btn.connect_clicked(move |_| {
-                let mut db = ModDatabase::load(&game_c);
-                let mut order = compute_ordered_ids(&db);
-                let len = order.len();
-                if let Some(pos) = order.iter().position(|id| id == &mod_id_c) {
-                    if pos + 1 < len {
-                        order.swap(pos, pos + 1);
-                        db.load_order = order;
-                        db.save(&game_c);
-                        refresh_load_order_content(&container_c, &game_c);
-                    }
-                }
-            });
-        }
-
+    for (idx, plugin) in plugins.iter().enumerate() {
+        let row = build_plugin_row(plugin, idx, count, game, container);
         list_box.append(&row);
     }
 
@@ -164,23 +109,142 @@ fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
     container.append(&scrolled);
 }
 
-/// Return mod IDs in load-order sequence.
-/// Uses `db.load_order` when populated; falls back to the natural mod list order.
-/// Any mods not referenced in `load_order` are appended at the end.
-fn compute_ordered_ids(db: &ModDatabase) -> Vec<String> {
-    if db.load_order.is_empty() {
-        return db.mods.iter().map(|m| m.id.clone()).collect();
+fn build_plugin_row(
+    plugin: &PluginFile,
+    idx: usize,
+    total: usize,
+    game: &Rc<Game>,
+    container: &gtk4::Box,
+) -> adw::ActionRow {
+    // Subtitle: type label + vanilla marker
+    let subtitle = if plugin.is_vanilla {
+        format!("{} · Vanilla master (pinned)", plugin.kind.label())
+    } else {
+        plugin.kind.label().to_string()
+    };
+
+    let row = adw::ActionRow::builder()
+        .title(&plugin.name)
+        .subtitle(&subtitle)
+        .build();
+
+    // Index prefix
+    let index_label = gtk4::Label::new(Some(&format!("{}", idx + 1)));
+    index_label.add_css_class("dim-label");
+    index_label.add_css_class("numeric");
+    index_label.set_width_chars(3);
+    row.add_prefix(&index_label);
+
+    // Type badge
+    let badge = gtk4::Label::new(Some(plugin.kind.label()));
+    badge.add_css_class("caption");
+    badge.add_css_class("dim-label");
+    badge.set_valign(gtk4::Align::Center);
+    row.add_suffix(&badge);
+
+    if plugin.is_vanilla {
+        // Vanilla masters: no controls, just a lock icon
+        let lock = gtk4::Image::from_icon_name("changes-prevent-symbolic");
+        lock.set_tooltip_text(Some("Vanilla master – cannot be moved or disabled"));
+        lock.add_css_class("dim-label");
+        row.add_suffix(&lock);
+        return row;
     }
-    let mut result: Vec<String> = db
-        .load_order
-        .iter()
-        .filter(|id| db.mods.iter().any(|m| &m.id == *id))
-        .cloned()
-        .collect();
-    for m in &db.mods {
-        if !result.contains(&m.id) {
-            result.push(m.id.clone());
-        }
+
+    // Enable/disable toggle
+    let enabled_btn = gtk4::CheckButton::new();
+    enabled_btn.set_active(plugin.enabled);
+    enabled_btn.set_tooltip_text(Some(if plugin.enabled {
+        "Disable plugin"
+    } else {
+        "Enable plugin"
+    }));
+    enabled_btn.set_valign(gtk4::Align::Center);
+
+    {
+        let game_c = Rc::clone(game);
+        let container_c = container.clone();
+        let plugin_name = plugin.name.clone();
+        enabled_btn.connect_toggled(move |btn| {
+            let enabled = btn.is_active();
+            let mut db = ModDatabase::load(&game_c);
+            if enabled {
+                db.plugin_disabled.retain(|n| n != &plugin_name);
+            } else if !db.plugin_disabled.contains(&plugin_name) {
+                db.plugin_disabled.push(plugin_name.clone());
+            }
+            db.save(&game_c);
+            let _ = db.write_plugins_txt(&game_c);
+            refresh_load_order_content(&container_c, &game_c);
+        });
     }
-    result
+    row.add_suffix(&enabled_btn);
+
+    // Move up / move down buttons (non-vanilla only)
+    let up_btn = gtk4::Button::new();
+    up_btn.set_icon_name("go-up-symbolic");
+    up_btn.set_valign(gtk4::Align::Center);
+    up_btn.add_css_class("flat");
+    up_btn.set_tooltip_text(Some("Move up"));
+    up_btn.set_sensitive(idx > 0);
+
+    let down_btn = gtk4::Button::new();
+    down_btn.set_icon_name("go-down-symbolic");
+    down_btn.set_valign(gtk4::Align::Center);
+    down_btn.add_css_class("flat");
+    down_btn.set_tooltip_text(Some("Move down"));
+    down_btn.set_sensitive(idx + 1 < total);
+
+    row.add_suffix(&up_btn);
+    row.add_suffix(&down_btn);
+
+    // Up button
+    {
+        let game_c = Rc::clone(game);
+        let container_c = container.clone();
+        let plugin_name = plugin.name.clone();
+        up_btn.connect_clicked(move |_| {
+            let mut db = ModDatabase::load(&game_c);
+            let mut ordered = db.get_ordered_plugins(&game_c);
+            // Only move within the non-vanilla section
+            if let Some(pos) = ordered
+                .iter()
+                .position(|p| p.name == plugin_name && !p.is_vanilla)
+            {
+                if pos > 0 && !ordered[pos - 1].is_vanilla {
+                    ordered.swap(pos, pos - 1);
+                    db.set_plugin_order(&ordered);
+                    db.save(&game_c);
+                    let _ = db.write_plugins_txt(&game_c);
+                    refresh_load_order_content(&container_c, &game_c);
+                }
+            }
+        });
+    }
+
+    // Down button
+    {
+        let game_c = Rc::clone(game);
+        let container_c = container.clone();
+        let plugin_name = plugin.name.clone();
+        down_btn.connect_clicked(move |_| {
+            let mut db = ModDatabase::load(&game_c);
+            let mut ordered = db.get_ordered_plugins(&game_c);
+            let len = ordered.len();
+            if let Some(pos) = ordered
+                .iter()
+                .position(|p| p.name == plugin_name && !p.is_vanilla)
+            {
+                if pos + 1 < len && !ordered[pos + 1].is_vanilla {
+                    ordered.swap(pos, pos + 1);
+                    db.set_plugin_order(&ordered);
+                    db.save(&game_c);
+                    let _ = db.write_plugins_txt(&game_c);
+                    refresh_load_order_content(&container_c, &game_c);
+                }
+            }
+        });
+    }
+
+    row
 }
