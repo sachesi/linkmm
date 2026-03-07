@@ -611,7 +611,11 @@ fn install_fomod_files(
 
     for fomod_file in &sorted_files {
         let source = normalise_path(&fomod_file.source);
-        let destination = normalise_path(&fomod_file.destination);
+        // Strip a leading "Data/" segment: FOMOD destinations are relative to
+        // the game root, but dest_dir is already mod_dir/Data/.  Without this
+        // stripping a destination of "Data/textures" would produce the double-
+        // nested mod_dir/Data/Data/textures/ layout.
+        let destination = strip_data_prefix(&normalise_path(&fomod_file.destination));
         let source_lower = source.to_lowercase();
 
         // Find matching entry indices
@@ -680,6 +684,26 @@ fn install_fomod_files(
 fn normalise_path(p: &str) -> String {
     let s = p.replace('\\', "/");
     s.strip_prefix('/').unwrap_or(&s).to_string()
+}
+
+/// Strip a leading `Data/` segment (case-insensitive) from a FOMOD destination
+/// path.
+///
+/// FOMOD `destination` attributes are relative to the **game root**, so a value
+/// of `"Data/textures"` means the game's `Data/textures` folder.  Because
+/// [`install_fomod_files`] already extracts into `mod_dir/Data/`, including the
+/// `Data/` segment verbatim would produce `mod_dir/Data/Data/textures/` — the
+/// classic double-nesting bug.  Stripping the leading `Data/` (or bare `Data`)
+/// avoids this.
+fn strip_data_prefix(s: &str) -> String {
+    let lower = s.to_lowercase();
+    if lower == "data" || lower == "data/" {
+        String::new()
+    } else if lower.starts_with("data/") {
+        s["data/".len()..].to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Check that a relative path is safe (no traversal above the root).
@@ -888,6 +912,23 @@ mod tests {
         assert!(is_safe_relative_path("foo/bar/baz"));
         assert!(is_safe_relative_path("textures/sky.dds"));
         assert!(is_safe_relative_path("a/../a/b")); // depth never goes negative
+    }
+
+    #[test]
+    fn strip_data_prefix_removes_leading_data_segment() {
+        // Bare "Data" with various casings / trailing slashes.
+        assert_eq!(strip_data_prefix("Data"), "");
+        assert_eq!(strip_data_prefix("data"), "");
+        assert_eq!(strip_data_prefix("DATA"), "");
+        assert_eq!(strip_data_prefix("Data/"), "");
+        // Leading "Data/" prefix is stripped; rest is preserved.
+        assert_eq!(strip_data_prefix("Data/textures"), "textures");
+        assert_eq!(strip_data_prefix("data/Textures/sky"), "Textures/sky");
+        assert_eq!(strip_data_prefix("DATA/meshes/rock.nif"), "meshes/rock.nif");
+        // Non-Data paths are returned unchanged.
+        assert_eq!(strip_data_prefix("textures/sky.dds"), "textures/sky.dds");
+        assert_eq!(strip_data_prefix(""), "");
+        assert_eq!(strip_data_prefix("SomeOtherFolder"), "SomeOtherFolder");
     }
 
     fn tempdir() -> PathBuf {
