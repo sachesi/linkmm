@@ -1670,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn read_nxm_mod_id_for_archive_reads_sidecar_for_matching_game() {
+    fn read_nxm_mod_id_for_archive_returns_id_for_matching_game_domain() {
         let tmp = tempdir();
         let archive_path = tmp.join("SomeMod.zip");
         std::fs::write(&archive_path, b"zip").unwrap();
