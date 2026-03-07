@@ -561,6 +561,9 @@ fn build_mod_row(
         let search_sel = Rc::clone(&search_state);
         let selected_sel = Rc::clone(&selected_mod_id);
         let mod_id_sel = mod_entry.id.clone();
+        // Use `released` (not `pressed`) so built-in SwitchRow controls process
+        // the click first; refreshing immediately on press can swallow toggle
+        // interactions and make row controls feel broken.
         left_click.connect_released(move |_, _, _, _| {
             {
                 let mut selected = selected_sel.borrow_mut();
