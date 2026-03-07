@@ -363,9 +363,10 @@ impl ModManager {
         if data_dir.is_dir() {
             // Link the contents of Data/ into the game Data directory.
             link_directory_contents(&data_dir, target_dir)?;
-            // Also link any files/dirs at the mod root alongside Data/ (e.g. loose
-            // .esp files that the archive author placed outside the Data/ folder).
-            link_items_alongside_data(&mod_entry.source_path, target_dir)?;
+            // Link any items at the mod root alongside Data/ into the game root
+            // directory (next to the game executable).  This covers libraries,
+            // ENB DLLs, SKSE root files, etc. that must live beside the exe.
+            link_items_alongside_data(&mod_entry.source_path, &game.root_path)?;
         } else {
             // Legacy flat layout: link from mod root directly.
             link_directory_contents(&mod_entry.source_path, target_dir)?;
@@ -377,13 +378,16 @@ impl ModManager {
         let target_dir = &game.data_path;
         let data_dir = mod_entry.source_path.join("Data");
         if data_dir.is_dir() {
-            // Unlink Data/ contents (current layout).
+            // Unlink Data/ contents (current layout: game_dir/Data/).
             unlink_directory_contents(&data_dir, target_dir)?;
-            // Unlink items at mod root alongside Data/.
+            // Unlink items alongside Data/ from the game root (current layout).
+            unlink_items_alongside_data(&mod_entry.source_path, &game.root_path)?;
+            // Migration: also try removing from game_dir/Data/ in case a previous
+            // version incorrectly deployed root items there.
             unlink_items_alongside_data(&mod_entry.source_path, target_dir)?;
-            // Migration: clean up the legacy nested Data/Data/ structure that was
-            // created when old deploy code used the entire mod directory as the link
-            // source against game_dir/Data, causing game_dir/Data/Data/ nesting.
+            // Migration: clean up the legacy nested Data/Data/ structure created
+            // when old deploy code used the entire mod directory as the link source
+            // against game_dir/Data, causing game_dir/Data/Data/ nesting.
             let legacy_nested = target_dir.join("Data");
             if legacy_nested.is_dir() {
                 unlink_directory_contents(&data_dir, &legacy_nested)?;
@@ -489,9 +493,10 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
         }
     }
 
-    // Remove the directory if it is now empty.  This only succeeds when the
-    // directory is truly empty so it is safe to call on any directory – real
-    // game directories that still contain vanilla files will not be removed.
+    // Remove the directory if it is now empty.  `remove_dir` is a no-op on
+    // non-empty directories (it returns an error which we intentionally
+    // discard), so real game directories that still contain vanilla files or
+    // other mods' symlinks are never touched.
     let _ = std::fs::remove_dir(dest);
 
     Ok(())
@@ -513,7 +518,7 @@ fn link_items_alongside_data(source_root: &Path, dest: &Path) -> Result<(), Stri
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         // Skip the Data/ subdirectory – its contents are linked separately.
-        if file_name.to_string_lossy().eq_ignore_ascii_case("data") {
+        if file_name.as_encoded_bytes().eq_ignore_ascii_case(b"data") {
             continue;
         }
         let src_path = entry.path();
@@ -564,7 +569,7 @@ fn unlink_items_alongside_data(source_root: &Path, dest: &Path) -> Result<(), St
 
     for entry in entries.flatten() {
         let file_name = entry.file_name();
-        if file_name.to_string_lossy().eq_ignore_ascii_case("data") {
+        if file_name.as_encoded_bytes().eq_ignore_ascii_case(b"data") {
             continue;
         }
         let src_path = entry.path();
@@ -707,24 +712,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn link_items_alongside_data_links_root_files_but_not_data_dir() {
+        // Items at mod root alongside Data/ are deployed to the game root
+        // directory (next to the exe), NOT to game_dir/Data/.
         let tmp = tempdir();
         let mod_root = tmp.join("mod");
-        let game_data = tmp.join("game_data");
+        let game_root = tmp.join("game_root"); // simulates game.root_path
         std::fs::create_dir_all(mod_root.join("Data").join("textures")).unwrap();
         std::fs::write(
             mod_root.join("Data").join("textures").join("sky.dds"),
             b"dds",
         )
         .unwrap();
-        std::fs::write(mod_root.join("SomeMod.esp"), b"esp").unwrap();
-        std::fs::create_dir_all(&game_data).unwrap();
+        // A loose DLL that belongs next to the game executable.
+        std::fs::write(mod_root.join("d3dx9_42.dll"), b"dll").unwrap();
+        std::fs::create_dir_all(&game_root).unwrap();
 
-        link_items_alongside_data(&mod_root, &game_data).unwrap();
+        link_items_alongside_data(&mod_root, &game_root).unwrap();
 
-        // Root-level .esp is linked.
-        assert!(game_data.join("SomeMod.esp").is_symlink());
-        // The Data/ directory itself is NOT linked (only its contents should be).
-        assert!(!game_data.join("Data").exists());
+        // Root-level DLL is linked into game root.
+        assert!(game_root.join("d3dx9_42.dll").is_symlink());
+        // The Data/ directory itself is NOT linked (its contents go elsewhere).
+        assert!(!game_root.join("Data").exists());
     }
 
     #[cfg(unix)]
@@ -732,25 +740,20 @@ mod tests {
     fn link_items_alongside_data_links_sibling_directories() {
         let tmp = tempdir();
         let mod_root = tmp.join("mod");
-        let game_data = tmp.join("game_data");
+        let game_root = tmp.join("game_root"); // simulates game.root_path
         std::fs::create_dir_all(mod_root.join("Data")).unwrap();
-        std::fs::create_dir_all(mod_root.join("meshes").join("actors")).unwrap();
-        std::fs::write(
-            mod_root.join("meshes").join("actors").join("rock.nif"),
-            b"nif",
-        )
-        .unwrap();
-        std::fs::create_dir_all(&game_data).unwrap();
+        std::fs::create_dir_all(mod_root.join("enbseries")).unwrap();
+        std::fs::write(mod_root.join("enbseries").join("enbseries.ini"), b"ini").unwrap();
+        std::fs::create_dir_all(&game_root).unwrap();
 
-        link_items_alongside_data(&mod_root, &game_data).unwrap();
+        link_items_alongside_data(&mod_root, &game_root).unwrap();
 
-        // meshes/ directory alongside Data/ is linked recursively.
-        assert!(game_data
-            .join("meshes")
-            .join("actors")
-            .join("rock.nif")
+        // enbseries/ directory alongside Data/ is linked recursively into game root.
+        assert!(game_root
+            .join("enbseries")
+            .join("enbseries.ini")
             .is_symlink());
-        assert!(!game_data.join("Data").exists());
+        assert!(!game_root.join("Data").exists());
     }
 
     #[cfg(unix)]
@@ -758,16 +761,16 @@ mod tests {
     fn unlink_items_alongside_data_removes_root_symlinks() {
         let tmp = tempdir();
         let mod_root = tmp.join("mod");
-        let game_data = tmp.join("game_data");
+        let game_root = tmp.join("game_root");
         std::fs::create_dir_all(mod_root.join("Data")).unwrap();
-        std::fs::write(mod_root.join("SomeMod.esp"), b"esp").unwrap();
-        std::fs::create_dir_all(&game_data).unwrap();
+        std::fs::write(mod_root.join("d3dx9_42.dll"), b"dll").unwrap();
+        std::fs::create_dir_all(&game_root).unwrap();
 
-        link_items_alongside_data(&mod_root, &game_data).unwrap();
-        assert!(game_data.join("SomeMod.esp").is_symlink());
+        link_items_alongside_data(&mod_root, &game_root).unwrap();
+        assert!(game_root.join("d3dx9_42.dll").is_symlink());
 
-        unlink_items_alongside_data(&mod_root, &game_data).unwrap();
-        assert!(!game_data.join("SomeMod.esp").exists());
+        unlink_items_alongside_data(&mod_root, &game_root).unwrap();
+        assert!(!game_root.join("d3dx9_42.dll").exists());
     }
 
     #[cfg(unix)]
