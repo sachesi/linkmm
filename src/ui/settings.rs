@@ -12,8 +12,12 @@ use crate::core::nexus::NexusClient;
 
 /// Show the Preferences / Settings dialog.
 pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
-    let dialog = adw::PreferencesDialog::new();
-    dialog.set_title("Preferences");
+    let dialog = adw::PreferencesDialog::builder()
+        .title("Preferences")
+        .follows_content_size(false)
+        .content_width(760)
+        .content_height(520)
+        .build();
 
     // ── General page ──────────────────────────────────────────────────────
     let general_page = adw::PreferencesPage::builder()
@@ -29,7 +33,7 @@ pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>
 
     // "Validate" button in the group header
     let validate_btn = gtk4::Button::with_label("Validate");
-    validate_btn.add_css_class("flat");
+    validate_btn.add_css_class("suggested-action");
     validate_btn.set_valign(gtk4::Align::Center);
     validate_btn.set_tooltip_text(Some("Test your API key against the NexusMods API"));
     nexus_group.set_header_suffix(Some(&validate_btn));

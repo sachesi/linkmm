@@ -618,28 +618,57 @@ fn install_fomod_files(
         let destination = strip_data_prefix(&normalise_path(&fomod_file.destination));
         let source_lower = source.to_lowercase();
 
-        // Find matching entry indices
-        let matching_indices: Vec<(String, usize)> = entry_map
-            .iter()
-            .filter(|(nl, _, _)| {
-                *nl == source_lower
-                    || nl.starts_with(&format!("{source_lower}/"))
-                    || nl.starts_with(&format!("{source_lower}\\"))
-            })
-            .map(|(_, orig, idx)| (orig.clone(), *idx))
-            .collect();
+        // Find matching entry indices. Some FOMODs reference files under
+        // "Data/..." while the archive has the same files at root (or vice
+        // versa), so try fallback source aliases.
+        let mut matched_source = source.clone();
+        let mut matching_indices = collect_matching_entries(&entry_map, &source_lower);
+
+        if matching_indices.is_empty() {
+            let stripped_source = strip_data_prefix(&source);
+            let stripped_lower = stripped_source.to_lowercase();
+            if !stripped_source.is_empty() && stripped_lower != source_lower {
+                matching_indices = collect_matching_entries(&entry_map, &stripped_lower);
+                if !matching_indices.is_empty() {
+                    matched_source = stripped_source;
+                }
+            } else if source_lower == "data" || source_lower == "data/" {
+                matching_indices = entry_map
+                    .iter()
+                    .filter(|(nl, _, _)| {
+                        !(nl == "fomod" || nl.starts_with("fomod/") || nl.contains("/fomod/"))
+                    })
+                    .map(|(_, orig, idx)| (orig.clone(), *idx))
+                    .collect();
+                if !matching_indices.is_empty() {
+                    matched_source = String::new();
+                }
+            }
+        }
+
+        if matching_indices.is_empty() && !source_lower.is_empty() {
+            let prefixed = format!("data/{source_lower}");
+            matching_indices = collect_matching_entries(&entry_map, &prefixed);
+            if !matching_indices.is_empty() {
+                matched_source = prefixed;
+            }
+        }
+
+        let matched_source_lower = matched_source.to_lowercase();
 
         for (entry_name, entry_idx) in matching_indices {
             let entry_lower = entry_name.to_lowercase();
             // Compute the relative portion after the source prefix
-            let rel = if entry_lower == source_lower {
+            let rel = if entry_lower == matched_source_lower {
                 // Single file
                 Path::new(&entry_name)
                     .file_name()
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_default()
             } else {
-                entry_name[source.len()..].trim_start_matches('/').to_string()
+                entry_name[matched_source.len()..]
+                    .trim_start_matches('/')
+                    .to_string()
             };
 
             if rel.is_empty() {
@@ -647,7 +676,11 @@ fn install_fomod_files(
             }
 
             // Zip-slip protection on the combined destination + rel path
-            let combined = format!("{}/{}", destination, rel);
+            let combined = if destination.is_empty() {
+                rel.clone()
+            } else {
+                format!("{destination}/{rel}")
+            };
             if !is_safe_relative_path(&combined) {
                 log::warn!("Skipping fomod entry with unsafe path: {combined}");
                 continue;
@@ -684,6 +717,21 @@ fn install_fomod_files(
 fn normalise_path(p: &str) -> String {
     let s = p.replace('\\', "/");
     s.strip_prefix('/').unwrap_or(&s).to_string()
+}
+
+fn collect_matching_entries(
+    entry_map: &[(String, String, usize)],
+    source_lower: &str,
+) -> Vec<(String, usize)> {
+    entry_map
+        .iter()
+        .filter(|(nl, _, _)| {
+            *nl == source_lower
+                || nl.starts_with(&format!("{source_lower}/"))
+                || nl.starts_with(&format!("{source_lower}\\"))
+        })
+        .map(|(_, orig, idx)| (orig.clone(), *idx))
+        .collect()
 }
 
 /// Strip a leading `Data/` segment (case-insensitive) from a FOMOD destination
@@ -929,6 +977,57 @@ mod tests {
         assert_eq!(strip_data_prefix("textures/sky.dds"), "textures/sky.dds");
         assert_eq!(strip_data_prefix(""), "");
         assert_eq!(strip_data_prefix("SomeOtherFolder"), "SomeOtherFolder");
+    }
+
+    #[test]
+    fn install_fomod_files_falls_back_when_source_uses_data_prefix() {
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("fomod/", b""),
+            ("fomod/ModuleConfig.xml", b"<config/>"),
+            ("textures/sky.dds", b"dds_data"),
+        ]);
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[FomodFile {
+                source: "Data/textures".to_string(),
+                destination: "Data/textures".to_string(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+
+        assert!(dest.join("textures").join("sky.dds").exists());
+    }
+
+    #[test]
+    fn install_fomod_files_data_root_fallback_skips_fomod_config_dir() {
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("fomod/", b""),
+            ("fomod/ModuleConfig.xml", b"<config/>"),
+            ("plugin.esp", b"esp_data"),
+        ]);
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[FomodFile {
+                source: "Data".to_string(),
+                destination: "Data".to_string(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+
+        assert!(dest.join("plugin.esp").exists());
+        assert!(!dest.join("fomod").exists());
     }
 
     fn tempdir() -> PathBuf {
