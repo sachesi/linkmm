@@ -172,7 +172,7 @@ fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<Re
         list_box.set_selection_mode(gtk4::SelectionMode::None);
 
         for mod_entry in &db.mods {
-            let row = build_mod_row(mod_entry, game);
+            let row = build_mod_row(mod_entry, game, container, Rc::clone(&config));
             list_box.append(&row);
         }
 
@@ -299,6 +299,8 @@ fn wire_add_mod_button(
 fn build_mod_row(
     mod_entry: &crate::core::mods::Mod,
     game: &Rc<Game>,
+    container: &gtk4::Box,
+    config: Rc<RefCell<AppConfig>>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title(&mod_entry.name)
@@ -326,6 +328,57 @@ fn build_mod_row(
             m.enabled = enabled;
             db.save(&game_clone);
         }
+    });
+
+    // ── Uninstall button ─────────────────────────────────────────────────────
+    let delete_btn = gtk4::Button::new();
+    delete_btn.set_icon_name("user-trash-symbolic");
+    delete_btn.set_tooltip_text(Some("Uninstall mod"));
+    delete_btn.add_css_class("flat");
+    delete_btn.set_valign(gtk4::Align::Center);
+    row.add_suffix(&delete_btn);
+
+    let mod_id_del = mod_entry.id.clone();
+    let mod_name_del = mod_entry.name.clone();
+    let game_del = Rc::clone(game);
+    let container_del = container.clone();
+    let config_del = Rc::clone(&config);
+
+    delete_btn.connect_clicked(move |btn| {
+        let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+
+        let dialog = adw::AlertDialog::builder()
+            .heading("Remove Mod?")
+            .body(format!(
+                "\u{201c}{}\u{201d} will be permanently removed from disk.",
+                mod_name_del
+            ))
+            .build();
+
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("remove", "Remove");
+        dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let mod_id_c = mod_id_del.clone();
+        let game_c = Rc::clone(&game_del);
+        let container_c = container_del.clone();
+        let config_c = Rc::clone(&config_del);
+        dialog.connect_response(None, move |_, response| {
+            if response != "remove" {
+                return;
+            }
+            let db = ModDatabase::load(&game_c);
+            if let Some(m) = db.mods.iter().find(|m| m.id == mod_id_c) {
+                if let Err(e) = ModManager::uninstall_mod(&game_c, m) {
+                    log::error!("Failed to uninstall mod: {e}");
+                }
+            }
+            refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
+        });
+
+        dialog.present(parent.as_ref());
     });
 
     row
