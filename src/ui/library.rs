@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -13,11 +13,14 @@ use crate::core::config::AppConfig;
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 
+const TOAST_TIMEOUT_SECONDS: u32 = 3;
+
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
     overwrites: bool,
     overwritten: bool,
     files: BTreeSet<String>,
+    conflict_mods_by_file: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Build the full Library page for `game`.
@@ -109,8 +112,9 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             // The linker helpers skip creating a new link when a destination
             // file already exists, so the first deployed mod "wins" each
             // conflicting path. Because UI priority is defined as
-            // top(lowest) -> bottom(highest), we deploy in reverse visual
-            // order to ensure the bottom-most enabled mod wins conflicts.
+            // top (lowest priority) -> bottom (highest priority), we deploy in
+            // reverse visual order to ensure the bottom-most enabled mod wins
+            // conflicts.
             let mut deployed_count = 0usize;
             for m in db.mods.iter().rev().filter(|m| m.enabled) {
                 if let Err(e) = ModManager::enable_mod(&game_c, m) {
@@ -561,6 +565,8 @@ fn build_mod_row(
             {
                 let mut selected = selected_sel.borrow_mut();
                 if selected.as_ref() == Some(&mod_id_sel) {
+                    // Clicking the same row again clears selection and returns
+                    // conflict highlighting to the global blue mode.
                     *selected = None;
                 } else {
                     *selected = Some(mod_id_sel.clone());
@@ -586,8 +592,14 @@ fn build_mod_row(
         let source_path = mod_entry.source_path.clone();
         let nexus_id = mod_entry.nexus_id;
         let game_c = Rc::clone(game);
-        let conflict_files = conflict_state
-            .map(|state| state.files.iter().cloned().collect::<Vec<_>>())
+        let conflict_entries = conflict_state
+            .map(|state| {
+                state
+                    .conflict_mods_by_file
+                    .iter()
+                    .map(|(file, mods)| (file.clone(), mods.iter().cloned().collect::<Vec<_>>()))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
 
         right_click.connect_pressed(move |gesture, _, x, y| {
@@ -622,7 +634,7 @@ fn build_mod_row(
             show_conflicts_item.add_css_class("flat");
             show_conflicts_item.set_halign(gtk4::Align::Fill);
             show_conflicts_item.set_hexpand(true);
-            show_conflicts_item.set_sensitive(!conflict_files.is_empty());
+            show_conflicts_item.set_sensitive(!conflict_entries.is_empty());
             menu_box.append(&show_conflicts_item);
 
             popover.set_child(Some(&menu_box));
@@ -651,16 +663,22 @@ fn build_mod_row(
 
             let popover_conflicts = popover.clone();
             let row_for_dialog = row_c.clone();
-            let conflict_files_for_menu = conflict_files.clone();
+            let conflict_entries_for_menu = conflict_entries.clone();
             show_conflicts_item.connect_clicked(move |_| {
                 popover_conflicts.popdown();
-                if conflict_files_for_menu.is_empty() {
+                if conflict_entries_for_menu.is_empty() {
                     return;
                 }
 
-                let body = conflict_files_for_menu
+                let body = conflict_entries_for_menu
                     .iter()
-                    .map(|f| format!("• {f}"))
+                    .map(|(file, mods)| {
+                        if mods.is_empty() {
+                            format!("• {file}")
+                        } else {
+                            format!("• {file}\n  conflicts with: {}", mods.join(", "))
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
 
@@ -748,11 +766,31 @@ fn compute_conflict_states(
                 .or_default()
                 .files
                 .extend(shared.iter().cloned());
+            {
+                let entry = states.entry(m.id.clone()).or_default();
+                for file in &shared {
+                    entry
+                        .conflict_mods_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(mods[selected_idx].name.clone());
+                }
+            }
             states
                 .entry(selected_id.to_string())
                 .or_default()
                 .files
                 .extend(shared.iter().cloned());
+            {
+                let entry = states.entry(selected_id.to_string()).or_default();
+                for file in &shared {
+                    entry
+                        .conflict_mods_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(m.name.clone());
+                }
+            }
         }
     } else {
         // No selected mod: mark any mod that participates in conflicts as blue.
@@ -777,11 +815,31 @@ fn compute_conflict_states(
                     .or_default()
                     .files
                     .extend(shared.iter().cloned());
+                {
+                    let entry = states.entry(mods[i].id.clone()).or_default();
+                    for file in &shared {
+                        entry
+                            .conflict_mods_by_file
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(mods[j].name.clone());
+                    }
+                }
                 states
                     .entry(mods[j].id.clone())
                     .or_default()
                     .files
                     .extend(shared.iter().cloned());
+                {
+                    let entry = states.entry(mods[j].id.clone()).or_default();
+                    for file in &shared {
+                        entry
+                            .conflict_mods_by_file
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(mods[i].name.clone());
+                    }
+                }
             }
         }
     }
@@ -867,7 +925,7 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
     while let Some(current) = ancestor {
         if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
             let toast = adw::Toast::new(message);
-            toast.set_timeout(3);
+            toast.set_timeout(TOAST_TIMEOUT_SECONDS);
             overlay.add_toast(toast);
             return;
         }
@@ -946,6 +1004,20 @@ mod tests {
         let conflicting = states.get("b").unwrap();
         assert!(selected.files.contains("data/textures/sky.dds"));
         assert!(conflicting.files.contains("data/textures/sky.dds"));
+        assert!(
+            selected
+                .conflict_mods_by_file
+                .get("data/textures/sky.dds")
+                .unwrap()
+                .contains("B")
+        );
+        assert!(
+            conflicting
+                .conflict_mods_by_file
+                .get("data/textures/sky.dds")
+                .unwrap()
+                .contains("A")
+        );
         assert!(!states.contains_key("c"));
 
         std::fs::remove_dir_all(root).unwrap();
@@ -976,6 +1048,18 @@ mod tests {
         let b = states.get("b").unwrap();
         assert!(a.files.contains("data/textures/sky.dds"));
         assert!(b.files.contains("data/textures/sky.dds"));
+        assert!(
+            a.conflict_mods_by_file
+                .get("data/textures/sky.dds")
+                .unwrap()
+                .contains("B")
+        );
+        assert!(
+            b.conflict_mods_by_file
+                .get("data/textures/sky.dds")
+                .unwrap()
+                .contains("A")
+        );
         assert!(!a.overwrites && !a.overwritten);
         assert!(!b.overwrites && !b.overwritten);
 
