@@ -140,8 +140,8 @@ impl AppConfig {
     /// `<app_data_dir>/downloads/<managed_game>/`; otherwise it falls back to
     /// `~/.local/share/linkmm/downloads/<managed_game>/`.
     ///
-    /// When `managed_game` is `None` or empty, returns the base downloads
-    /// directory without a game subfolder.
+    /// When `managed_game` is `None` or empty (after trimming whitespace),
+    /// returns the base downloads directory without a game subfolder.
     pub fn downloads_dir(&self, managed_game: Option<&str>) -> PathBuf {
         let base = match &self.app_data_dir {
             Some(dir) => dir.join("downloads"),
