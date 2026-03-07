@@ -19,16 +19,17 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     let title_widget = adw::WindowTitle::new("Library", &game.name);
     header.set_title_widget(Some(&title_widget));
 
-    // Search button (placeholder)
-    let search_btn = gtk4::Button::new();
-    search_btn.set_icon_name("system-search-symbolic");
-    search_btn.set_tooltip_text(Some("Search mods"));
-    header.pack_start(&search_btn);
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Search mods"));
+    search_entry.set_width_chars(24);
+    header.pack_start(&search_entry);
 
     // Deploy button – applies all enabled mods by (re)linking their files
     let deploy_btn = gtk4::Button::with_label("Deploy");
     deploy_btn.add_css_class("suggested-action");
-    deploy_btn.set_tooltip_text(Some("Apply all enabled mods by linking their files into the game directory"));
+    deploy_btn.set_tooltip_text(Some(
+        "Apply all enabled mods by linking their files into the game directory",
+    ));
     header.pack_end(&deploy_btn);
 
     // Undeploy button – removes all mod symlinks from the game directory
@@ -49,18 +50,46 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     content_container.set_vexpand(true);
 
     let game_rc = Rc::new(game.clone());
+    let search_query = Rc::new(RefCell::new(String::new()));
 
-    refresh_library_content(&content_container, &game_rc, Rc::clone(&config));
+    refresh_library_content_with_search(
+        &content_container,
+        &game_rc,
+        Rc::clone(&config),
+        &search_query.borrow(),
+    );
 
     toolbar_view.set_content(Some(&content_container));
 
-    wire_add_mod_button(&add_mod_btn, &game_rc, &content_container, Rc::clone(&config));
+    wire_add_mod_button(
+        &add_mod_btn,
+        &game_rc,
+        &content_container,
+        Rc::clone(&config),
+    );
+
+    {
+        let container_c = content_container.clone();
+        let game_c = Rc::clone(&game_rc);
+        let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_query);
+        search_entry.connect_search_changed(move |entry| {
+            *search_c.borrow_mut() = entry.text().to_string();
+            refresh_library_content_with_search(
+                &container_c,
+                &game_c,
+                Rc::clone(&config_c),
+                &search_c.borrow(),
+            );
+        });
+    }
 
     // Wire Deploy button: undeploy everything, then deploy all enabled mods
     {
         let game_c = Rc::clone(&game_rc);
         let container_c = content_container.clone();
         let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_query);
         deploy_btn.connect_clicked(move |btn| {
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
@@ -92,7 +121,12 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 format!("Deploy finished with {} error(s)", errors.len())
             };
             show_toast(btn.upcast_ref(), &msg);
-            refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
+            refresh_library_content_with_search(
+                &container_c,
+                &game_c,
+                Rc::clone(&config_c),
+                &search_c.borrow(),
+            );
         });
     }
 
@@ -101,6 +135,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let game_c = Rc::clone(&game_rc);
         let container_c = content_container.clone();
         let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_query);
         undeploy_btn.connect_clicked(move |btn| {
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
@@ -126,7 +161,12 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 format!("Undeploy finished with {} error(s)", errors.len())
             };
             show_toast(btn.upcast_ref(), &msg);
-            refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
+            refresh_library_content_with_search(
+                &container_c,
+                &game_c,
+                Rc::clone(&config_c),
+                &search_c.borrow(),
+            );
         });
     }
 
@@ -136,6 +176,15 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<RefCell<AppConfig>>) {
+    refresh_library_content_with_search(container, game, config, "");
+}
+
+fn refresh_library_content_with_search(
+    container: &gtk4::Box,
+    game: &Rc<Game>,
+    config: Rc<RefCell<AppConfig>>,
+    search_query: &str,
+) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
@@ -144,7 +193,24 @@ fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<Re
     db.scan_mods_dir(game);
     db.save(game);
 
-    if db.mods.is_empty() {
+    let visible_mods: Vec<_> = db
+        .mods
+        .iter()
+        .filter(|m| matches_query(&m.name, search_query))
+        .cloned()
+        .collect();
+
+    if visible_mods.is_empty() {
+        if !search_query.trim().is_empty() && !db.mods.is_empty() {
+            let status = adw::StatusPage::builder()
+                .title("No Matching Mods")
+                .description("No installed mods match your search.")
+                .icon_name("system-search-symbolic")
+                .build();
+            status.set_vexpand(true);
+            container.append(&status);
+            return;
+        }
         let status = adw::StatusPage::builder()
             .title("No Mods Installed")
             .description(&format!(
@@ -172,7 +238,7 @@ fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<Re
         list_box.add_css_class("boxed-list");
         list_box.set_selection_mode(gtk4::SelectionMode::None);
 
-        for mod_entry in &db.mods {
+        for mod_entry in &visible_mods {
             let row = build_mod_row(mod_entry, game, container, Rc::clone(&config));
             list_box.append(&row);
         }
@@ -232,7 +298,8 @@ fn wire_add_mod_button(
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "Unknown".to_string());
 
-                    let ext = path.extension()
+                    let ext = path
+                        .extension()
                         .and_then(|e| e.to_str())
                         .map(|s| s.to_lowercase())
                         .unwrap_or_default();
@@ -254,7 +321,9 @@ fn wire_add_mod_button(
 
                     // For FOMOD mods, launch the wizard
                     if let crate::core::installer::InstallStrategy::Fomod(_) = &strategy {
-                        if let Ok(fomod_config) = crate::core::installer::parse_fomod_from_zip(&path) {
+                        if let Ok(fomod_config) =
+                            crate::core::installer::parse_fomod_from_zip(&path)
+                        {
                             crate::ui::downloads::show_fomod_wizard_from_library(
                                 None,
                                 &path,
@@ -398,6 +467,14 @@ fn build_mod_row(
     row
 }
 
+fn matches_query(value: &str, query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    value.to_lowercase().contains(&trimmed.to_lowercase())
+}
+
 /// Show a brief in-app toast notification anchored to `widget`.
 fn show_toast(widget: &gtk4::Widget, message: &str) {
     // Walk up to the nearest AdwToastOverlay
@@ -413,4 +490,16 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
     }
     // Fallback: log to stderr
     log::info!("{message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_query;
+
+    #[test]
+    fn matches_query_is_case_insensitive() {
+        assert!(matches_query("Immersive Armors", "arm"));
+        assert!(matches_query("Immersive Armors", "  ARMORS  "));
+        assert!(!matches_query("Immersive Armors", "weapons"));
+    }
 }

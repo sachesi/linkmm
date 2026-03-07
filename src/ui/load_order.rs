@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4::gdk;
@@ -22,6 +23,12 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
         None => adw::WindowTitle::new("Load Order", ""),
     };
     header.set_title_widget(Some(&title_widget));
+
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Search plugins"));
+    search_entry.set_width_chars(24);
+    search_entry.set_sensitive(game.is_some());
+    header.pack_start(&search_entry);
 
     // Sort button – sorts non-vanilla plugins by type (ESM → ESL → ESP) then
     // alphabetically, matching the baseline LOOT sorting strategy.
@@ -51,11 +58,27 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 "Sort plugins by type: ESM → ESL → ESP, then alphabetically",
             ));
             let game_rc = Rc::new(g.clone());
+            let search_query = Rc::new(RefCell::new(String::new()));
+
+            {
+                let game_c = Rc::clone(&game_rc);
+                let container_c = content_container.clone();
+                let search_c = Rc::clone(&search_query);
+                search_entry.connect_search_changed(move |entry| {
+                    *search_c.borrow_mut() = entry.text().to_string();
+                    refresh_load_order_content_with_search(
+                        &container_c,
+                        &game_c,
+                        &search_c.borrow(),
+                    );
+                });
+            }
 
             // Connect sort button
             {
                 let game_c = Rc::clone(&game_rc);
                 let container_c = content_container.clone();
+                let search_c = Rc::clone(&search_query);
                 sort_btn.connect_clicked(move |_| {
                     let mut db = ModDatabase::load(&game_c);
                     if db.plugin_load_order.is_empty() {
@@ -66,11 +89,19 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                     if let Err(e) = db.write_plugins_txt(&game_c) {
                         log::warn!("Failed to write plugins.txt after sort: {e}");
                     }
-                    refresh_load_order_content(&container_c, &game_c);
+                    refresh_load_order_content_with_search(
+                        &container_c,
+                        &game_c,
+                        &search_c.borrow(),
+                    );
                 });
             }
 
-            refresh_load_order_content(&content_container, &game_rc);
+            refresh_load_order_content_with_search(
+                &content_container,
+                &game_rc,
+                &search_query.borrow(),
+            );
         }
     };
 
@@ -82,6 +113,14 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
 
 /// Re-populate `container` with the current plugin list for `game`.
 fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
+    refresh_load_order_content_with_search(container, game, "");
+}
+
+fn refresh_load_order_content_with_search(
+    container: &gtk4::Box,
+    game: &Rc<Game>,
+    search_query: &str,
+) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
@@ -107,13 +146,31 @@ fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
         return;
     }
 
-    let count = plugins.len();
-    let vanilla_count = plugins.iter().filter(|p| p.is_vanilla).count();
+    let filtered: Vec<PluginFile> = plugins
+        .into_iter()
+        .filter(|p| {
+            matches_query(&p.name, search_query) || matches_query(p.kind.label(), search_query)
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        let status = adw::StatusPage::builder()
+            .title("No Matching Plugins")
+            .description("No plugins match your search.")
+            .icon_name("system-search-symbolic")
+            .build();
+        status.set_vexpand(true);
+        container.append(&status);
+        return;
+    }
+
+    let count = filtered.len();
+    let vanilla_count = filtered.iter().filter(|p| p.is_vanilla).count();
     let list_box = gtk4::ListBox::new();
     list_box.add_css_class("boxed-list");
     list_box.set_selection_mode(gtk4::SelectionMode::None);
 
-    for (idx, plugin) in plugins.iter().enumerate() {
+    for (idx, plugin) in filtered.iter().enumerate() {
         let row = build_plugin_row(plugin, idx, count, vanilla_count, game, container);
         list_box.append(&row);
     }
@@ -423,6 +480,14 @@ fn adjusted_insert_pos(src_pos: usize, target_idx: usize, ordered: &[PluginFile]
     raw.max(first_non_vanilla).min(ordered.len())
 }
 
+fn matches_query(value: &str, query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    value.to_lowercase().contains(&trimmed.to_lowercase())
+}
+
 /// Show a modal dialog that lets the user type a load-order position number for
 /// `plugin_name`.  Vanilla masters (positions 1–`vanilla_count`) are protected;
 /// the valid input range is `vanilla_count + 1` to `total`.
@@ -490,4 +555,36 @@ fn show_move_to_position_dialog(
     });
 
     dialog.present(Some(parent));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adjusted_insert_pos, matches_query};
+    use crate::core::mods::{PluginFile, PluginKind};
+
+    #[test]
+    fn adjusted_insert_pos_never_enters_vanilla_region() {
+        let ordered = vec![
+            PluginFile {
+                name: "Skyrim.esm".to_string(),
+                kind: PluginKind::Master,
+                enabled: true,
+                is_vanilla: true,
+            },
+            PluginFile {
+                name: "A.esp".to_string(),
+                kind: PluginKind::Plugin,
+                enabled: true,
+                is_vanilla: false,
+            },
+        ];
+        assert_eq!(adjusted_insert_pos(1, 0, &ordered), 1);
+    }
+
+    #[test]
+    fn matches_query_is_case_insensitive() {
+        assert!(matches_query("MyPatch.esp", "patch"));
+        assert!(matches_query("MyPatch.esp", "  ESP  "));
+        assert!(!matches_query("MyPatch.esp", "armor"));
+    }
 }
