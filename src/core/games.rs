@@ -127,6 +127,9 @@ pub struct Game {
     pub name: String,
     pub kind: GameKind,
     pub root_path: PathBuf,
+    /// Always computed from `root_path` at load time; never persisted to JSON
+    /// so it stays in sync even when the user changes the game root path.
+    #[serde(skip)]
     pub data_path: PathBuf,
     /// When set, mods are stored under `<mods_base_dir>/mods/<game_id>/`
     /// instead of the default `~/.local/share/linkmm/mods/<game_id>/`.
