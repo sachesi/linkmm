@@ -448,6 +448,7 @@ fn do_install(
 type FomodSelections = Vec<Vec<Vec<usize>>>;
 const GROUP_PREVIEW_IMAGE_WIDTH: i32 = 300;
 const GROUP_PREVIEW_IMAGE_HEIGHT: i32 = 180;
+const GROUP_PREVIEW_NAME_WIDTH_CHARS: i32 = 34;
 
 fn collect_active_flags(
     fomod: &FomodConfig,
@@ -686,7 +687,7 @@ fn show_fomod_wizard(
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&adw::HeaderBar::new());
 
-    let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
     main_box.set_margin_start(24);
     main_box.set_margin_end(24);
     main_box.set_margin_top(12);
@@ -726,12 +727,12 @@ fn show_fomod_wizard(
     }
 
     let step_index = Rc::new(RefCell::new(0usize));
-    let step_content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let step_content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     step_content.set_vexpand(true);
 
     let nav_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     nav_box.set_halign(gtk4::Align::End);
-    nav_box.set_margin_top(8);
+    nav_box.set_margin_top(12);
     let back_btn = gtk4::Button::with_label("Back");
     let next_btn = gtk4::Button::with_label("Next");
     next_btn.add_css_class("suggested-action");
@@ -777,28 +778,47 @@ fn show_fomod_wizard(
             let title = gtk4::Label::new(Some(&step.name));
             title.add_css_class("title-2");
             title.set_halign(gtk4::Align::Start);
+            title.set_margin_bottom(4);
             sc.append(&title);
-            let step_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+            let step_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
             step_row.set_hexpand(true);
             step_row.set_vexpand(true);
             let scrolled = gtk4::ScrolledWindow::new();
             scrolled.set_vexpand(true);
             scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+            scrolled.add_css_class("card");
             let groups_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
             let preview_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-            preview_box.set_halign(gtk4::Align::Fill);
+            preview_box.add_css_class("card");
+            preview_box.set_halign(gtk4::Align::Start);
             preview_box.set_valign(gtk4::Align::Start);
             preview_box.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, -1);
+            preview_box.set_margin_top(1);
+            preview_box.set_margin_bottom(1);
+            preview_box.set_margin_start(1);
+            preview_box.set_margin_end(1);
             let preview_label = gtk4::Label::new(Some("Preview"));
             preview_label.add_css_class("dim-label");
             preview_label.add_css_class("caption");
             preview_label.set_halign(gtk4::Align::Start);
+            preview_label.set_margin_start(12);
+            preview_label.set_margin_top(12);
             let preview_name = gtk4::Label::new(Some(""));
             preview_name.set_wrap(true);
             preview_name.set_halign(gtk4::Align::Start);
+            preview_name.set_width_chars(GROUP_PREVIEW_NAME_WIDTH_CHARS);
+            preview_name.set_max_width_chars(GROUP_PREVIEW_NAME_WIDTH_CHARS);
+            preview_name.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            preview_name.set_margin_start(12);
+            preview_name.set_margin_end(12);
+            preview_name.set_margin_bottom(12);
             let preview_picture = gtk4::Picture::new();
             preview_picture.set_content_fit(gtk4::ContentFit::Contain);
             preview_picture.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
+            preview_picture.set_halign(gtk4::Align::Center);
+            preview_picture.set_margin_start(12);
+            preview_picture.set_margin_end(12);
+            preview_picture.set_margin_bottom(8);
             preview_box.append(&preview_label);
             preview_box.append(&preview_picture);
             preview_box.append(&preview_name);
@@ -813,6 +833,9 @@ fn show_fomod_wizard(
                     GroupType::SelectAny => "select any",
                 };
                 let frame = gtk4::Frame::new(Some(&format!("{} ({type_desc})", group.name)));
+                frame.add_css_class("card");
+                frame.set_margin_top(1);
+                frame.set_margin_bottom(1);
                 let lb = gtk4::ListBox::new();
                 lb.add_css_class("boxed-list");
                 lb.set_selection_mode(gtk4::SelectionMode::None);
