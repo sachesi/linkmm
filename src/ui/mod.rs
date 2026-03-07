@@ -28,8 +28,7 @@ pub fn build_ui(app: &libadwaita::Application) {
 
 const NAV_LIBRARY: i32 = 0;
 const NAV_LOAD_ORDER: i32 = 1;
-const NAV_NEXUSMODS: i32 = 2;
-const NAV_PREFERENCES: i32 = 3;
+const NAV_PREFERENCES: i32 = 2;
 
 // ── Main window ────────────────────────────────────────────────────────────
 
@@ -97,7 +96,7 @@ fn build_main_window(
     sidebar_box.append(&make_section_label("Navigation"));
 
     let nav_list = gtk4::ListBox::new();
-    nav_list.add_css_class("navigation-sidebar");
+    nav_list.add_css_class("boxed-list");
     nav_list.set_selection_mode(gtk4::SelectionMode::Single);
     nav_list.set_margin_start(12);
     nav_list.set_margin_end(12);
@@ -106,7 +105,6 @@ fn build_main_window(
     for (name, icon) in &[
         ("Library", "applications-games-symbolic"),
         ("Load Order", "format-justify-left-symbolic"),
-        ("NexusMods", "web-browser-symbolic"),
         ("Preferences", "preferences-system-symbolic"),
     ] {
         let row = adw::ActionRow::builder()
@@ -198,10 +196,6 @@ fn build_main_window(
     let load_order_widget = load_order::build_load_order_page(current_game.as_ref());
     content_stack.add_named(&load_order_widget, Some("load_order"));
 
-    // NexusMods stub
-    let nexus_widget = build_nexusmods_stub();
-    content_stack.add_named(&nexus_widget, Some("nexusmods"));
-
     let content_page = adw::NavigationPage::builder()
         .title("Library")
         .child(&content_stack)
@@ -231,10 +225,6 @@ fn build_main_window(
                 NAV_LOAD_ORDER => {
                     content_page_c.set_title("Load Order");
                     content_stack_c.set_visible_child_name("load_order");
-                }
-                NAV_NEXUSMODS => {
-                    content_page_c.set_title("NexusMods");
-                    content_stack_c.set_visible_child_name("nexusmods");
                 }
                 NAV_PREFERENCES => {
                     // Open settings as a dialog; revert selection to Library
@@ -360,23 +350,6 @@ fn build_no_game_page(title: &str, description: &str) -> gtk4::Widget {
         .title(title)
         .description(description)
         .icon_name("applications-games-symbolic")
-        .build();
-    status.set_vexpand(true);
-    toolbar_view.set_content(Some(&status));
-    toolbar_view.upcast()
-}
-
-fn build_nexusmods_stub() -> gtk4::Widget {
-    let toolbar_view = adw::ToolbarView::new();
-    let header = adw::HeaderBar::new();
-    let title = adw::WindowTitle::new("NexusMods", "");
-    header.set_title_widget(Some(&title));
-    toolbar_view.add_top_bar(&header);
-
-    let status = adw::StatusPage::builder()
-        .title("NexusMods Integration")
-        .description("Browse and download mods directly from NexusMods.\nThis feature is coming soon.")
-        .icon_name("web-browser-symbolic")
         .build();
     status.set_vexpand(true);
     toolbar_view.set_content(Some(&status));
