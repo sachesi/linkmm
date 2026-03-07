@@ -127,6 +127,10 @@ impl AppConfig {
     pub fn apply_mods_base_dirs(&mut self) {
         for game in &mut self.games {
             game.mods_base_dir = self.app_data_dir.clone();
+            // data_path is #[serde(skip)] so it is always recomputed here to
+            // stay in sync with root_path even after the user changes the game
+            // installation directory.
+            game.data_path = game.root_path.join(game.kind.default_data_subdir());
         }
     }
 
