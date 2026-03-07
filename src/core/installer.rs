@@ -134,7 +134,7 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
     if !archive_path.exists() {
         return Err(format!("Cannot open archive: {}", archive_path.display()));
     }
-    if !is_zip_archive(archive_path) {
+    if !has_zip_extension(archive_path) {
         return Ok(InstallStrategy::Data);
     }
 
@@ -748,7 +748,7 @@ pub fn install_mod_from_archive(
 
     match strategy {
         InstallStrategy::Data => {
-            if !is_zip_archive(archive_path) {
+            if !has_zip_extension(archive_path) {
                 install_data_archive_non_zip(archive_path, &mod_dir)?;
             } else {
             // Determine extraction root:
@@ -852,7 +852,7 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn is_zip_archive(path: &Path) -> bool {
+fn has_zip_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("zip"))
@@ -873,7 +873,11 @@ fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), S
         .arg(output_arg)
         .arg(archive_path)
         .output()
-        .map_err(|e| format!("Failed to start 7z extractor: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Failed to start 7z extractor ({e}). Install 7-Zip (the '7z' command) to extract .7z and .rar archives."
+            )
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -885,17 +889,7 @@ fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), S
 }
 
 fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(), String> {
-    let tmp_extract = std::env::temp_dir().join(format!(
-        "linkmm_extract_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&tmp_extract);
-    std::fs::create_dir_all(&tmp_extract)
-        .map_err(|e| format!("Failed to create temporary extraction directory: {e}"))?;
+    let tmp_extract = create_temp_extract_dir()?;
     extract_archive_with_7z(archive_path, &tmp_extract)?;
 
     let mut top_dirs = Vec::new();
@@ -928,8 +922,39 @@ fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(
         copy_dir_contents(&tmp_extract, &data_dir)?;
     }
 
-    let _ = std::fs::remove_dir_all(&tmp_extract);
+    if let Err(e) = std::fs::remove_dir_all(&tmp_extract) {
+        log::warn!(
+            "Failed to remove temporary extraction directory {}: {e}",
+            tmp_extract.display()
+        );
+    }
     Ok(())
+}
+
+fn create_temp_extract_dir() -> Result<std::path::PathBuf, String> {
+    let base = std::env::temp_dir();
+    for attempt in 0..100u32 {
+        let temp_extract_path = base.join(format!(
+            "linkmm_extract_{}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            attempt
+        ));
+        match std::fs::create_dir(&temp_extract_path) {
+            Ok(()) => return Ok(temp_extract_path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to create temporary extraction directory {}: {e}",
+                    temp_extract_path.display()
+                ));
+            }
+        }
+    }
+    Err("Failed to allocate a temporary extraction directory".to_string())
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {

@@ -649,7 +649,7 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
             }
             Ok(Err(e)) => {
                 if let Some(window) = app_c.active_window() {
-                    if e.contains("cancelled") {
+                    if e == download::DOWNLOAD_CANCELLED_ERROR {
                         log::info!("NXM download cancelled");
                         show_nxm_toast(&window, "Download cancelled");
                     } else {
