@@ -55,7 +55,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     wire_add_mod_button(&add_mod_btn, &game_rc, &content_container, Rc::clone(&config));
 
-    // Wire Deploy button: re-enable all currently-enabled mods
+    // Wire Deploy button: undeploy everything, then deploy all enabled mods
     {
         let game_c = Rc::clone(&game_rc);
         let container_c = content_container.clone();
@@ -63,16 +63,27 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         deploy_btn.connect_clicked(move |btn| {
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
+
+            // First, unlink all tracked mods so we start from a clean state
+            for m in &db.mods {
+                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+                    log::warn!("Undeploy warning for {}: {e}", m.name);
+                }
+            }
+
+            // Then deploy all enabled mods
+            let mut deployed_count = 0usize;
             for m in db.mods.iter().filter(|m| m.enabled) {
                 if let Err(e) = ModManager::enable_mod(&game_c, m) {
                     errors.push(format!("{}: {}", m.name, e));
+                } else {
+                    deployed_count += 1;
                 }
             }
-            // Write plugins.txt after deploy
             let _ = db.write_plugins_txt(&game_c);
 
             let msg = if errors.is_empty() {
-                format!("Deployed {} mod(s)", db.mods.iter().filter(|m| m.enabled).count())
+                format!("Deployed {deployed_count} mod(s)")
             } else {
                 for e in &errors {
                     log::error!("Deploy error: {e}");
@@ -165,7 +176,7 @@ fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<Re
         list_box.set_selection_mode(gtk4::SelectionMode::None);
 
         for mod_entry in &db.mods {
-            let row = build_mod_row(mod_entry, game, Rc::clone(&config));
+            let row = build_mod_row(mod_entry, game);
             list_box.append(&row);
         }
 
@@ -292,7 +303,6 @@ fn wire_add_mod_button(
 fn build_mod_row(
     mod_entry: &crate::core::mods::Mod,
     game: &Rc<Game>,
-    config: Rc<RefCell<AppConfig>>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title(&mod_entry.name)
@@ -312,36 +322,13 @@ fn build_mod_row(
 
     let mod_id = mod_entry.id.clone();
     let game_clone = Rc::clone(game);
-    let config_clone = Rc::clone(&config);
-    let reverting = Rc::new(RefCell::new(false));
 
     row.connect_active_notify(move |switch_row| {
-        if *reverting.borrow() {
-            return;
-        }
         let enabled = switch_row.is_active();
         let mut db = ModDatabase::load(&game_clone);
-
         if let Some(m) = db.mods.iter_mut().find(|m| m.id == mod_id) {
-            let result = if enabled {
-                ModManager::enable_mod(&game_clone, m)
-            } else {
-                ModManager::disable_mod(&game_clone, m)
-            };
-
-            match result {
-                Ok(()) => {
-                    m.enabled = enabled;
-                    db.save(&game_clone);
-                    config_clone.borrow().save();
-                }
-                Err(e) => {
-                    log::error!("Failed to toggle mod: {e}");
-                    *reverting.borrow_mut() = true;
-                    switch_row.set_active(!enabled);
-                    *reverting.borrow_mut() = false;
-                }
-            }
+            m.enabled = enabled;
+            db.save(&game_clone);
         }
     });
 

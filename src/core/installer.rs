@@ -130,6 +130,10 @@ fn top_level_component(path: &str) -> &str {
 /// - `SomeMod/Data/textures/sky.dds` → common prefix `SomeMod/` stripped →
 ///   remaining starts with `Data/` → returns `true`.
 /// - `textures/sky.dds` → no prefix → returns `false`.
+///
+/// The archive is opened twice because `find_common_prefix` consumes the
+/// mutable borrow of the first ZipArchive, the same pattern used by
+/// `extract_zip_to`.
 fn archive_has_data_folder(archive_path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(archive_path) else {
         return false;
@@ -155,7 +159,8 @@ fn archive_has_data_folder(archive_path: &Path) -> bool {
         } else {
             name
         };
-        let top = top_level_component(&rel.to_lowercase());
+        let rel_lower = rel.to_lowercase();
+        let top = top_level_component(&rel_lower);
         if top == "data" {
             return true;
         }
@@ -746,7 +751,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_strategy_root_for_data_folder() {
+    fn detect_strategy_data_for_archive_with_data_folder() {
+        // Archives that already contain a Data/ subfolder now also return Data,
+        // not Root – the distinction is handled during extraction.
         let tmp = tempdir();
         let archive = create_test_zip(&tmp, &[
             ("Data/", b""),
@@ -754,23 +761,106 @@ mod tests {
             ("Data/meshes/rock.nif", b"nif"),
         ]);
         let strategy = detect_strategy(&archive).unwrap();
-        assert!(matches!(strategy, InstallStrategy::Root));
+        assert!(matches!(strategy, InstallStrategy::Data));
     }
 
     #[test]
-    fn extract_zip_data_strategy_puts_files_at_root_of_mod_dir() {
+    fn archive_has_data_folder_flat_content() {
+        // Archive without Data/ subfolder – helper returns false.
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("textures/sky.dds", b"dds"),
+            ("plugin.esp", b"esp"),
+        ]);
+        assert!(!archive_has_data_folder(&archive));
+    }
+
+    #[test]
+    fn archive_has_data_folder_direct_data_prefix() {
+        // Archive where Data/ is the *only* top-level folder: find_common_prefix
+        // strips it, so after stripping the remaining entries no longer start
+        // with Data/ → helper returns false → content is extracted into Data/.
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("Data/", b""),
+            ("Data/textures/sky.dds", b"dds"),
+            ("Data/meshes/rock.nif", b"nif"),
+        ]);
+        assert!(!archive_has_data_folder(&archive));
+    }
+
+    #[test]
+    fn archive_has_data_folder_wrapped_data() {
+        // Archive with a wrapper folder containing Data/ – after stripping the
+        // wrapper the remaining path starts with Data/ → helper returns true.
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("MyMod/", b""),
+            ("MyMod/Data/", b""),
+            ("MyMod/Data/textures/sky.dds", b"dds"),
+        ]);
+        assert!(archive_has_data_folder(&archive));
+    }
+
+    #[test]
+    fn install_flat_archive_places_files_under_data_subdir() {
+        // Flat archive (textures/sky.dds) should land in dest/Data/textures/sky.dds
         let tmp = tempdir();
         let archive = create_test_zip(&tmp, &[
             ("textures/sky.dds", b"dds_data"),
             ("plugin.esp", b"esp_data"),
         ]);
-        let dest = tmp.join("extracted");
+        let dest = tmp.join("mod_dir");
         std::fs::create_dir_all(&dest).unwrap();
+        let data_dest = dest.join("Data");
+        std::fs::create_dir_all(&data_dest).unwrap();
+        extract_zip_to(&archive, &data_dest).unwrap();
+
+        assert!(dest.join("Data").join("textures").join("sky.dds").exists());
+        assert!(dest.join("Data").join("plugin.esp").exists());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("Data").join("plugin.esp")).unwrap(),
+            "esp_data"
+        );
+    }
+
+    #[test]
+    fn install_data_folder_archive_preserves_data_subdir() {
+        // Archive Data/textures/sky.dds: find_common_prefix strips Data/ so
+        // extraction to mod_dir/Data/ gives mod_dir/Data/textures/sky.dds.
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("Data/", b""),
+            ("Data/textures/sky.dds", b"dds_data"),
+        ]);
+        let dest = tmp.join("mod_dir");
+        std::fs::create_dir_all(&dest).unwrap();
+        // archive_has_data_folder returns false for this archive (Data/ stripped)
+        // so installer extracts to dest/Data/.
+        assert!(!archive_has_data_folder(&archive));
+        let data_dest = dest.join("Data");
+        std::fs::create_dir_all(&data_dest).unwrap();
+        extract_zip_to(&archive, &data_dest).unwrap();
+
+        assert!(dest.join("Data").join("textures").join("sky.dds").exists());
+    }
+
+    #[test]
+    fn install_wrapped_data_archive_preserves_data_subdir() {
+        // Archive MyMod/Data/textures/sky.dds: prefix MyMod/ stripped, remaining
+        // starts with Data/ → extract to mod_dir/ → mod_dir/Data/textures/sky.dds.
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("MyMod/", b""),
+            ("MyMod/Data/", b""),
+            ("MyMod/Data/textures/sky.dds", b"dds_data"),
+        ]);
+        let dest = tmp.join("mod_dir");
+        std::fs::create_dir_all(&dest).unwrap();
+        assert!(archive_has_data_folder(&archive));
         extract_zip_to(&archive, &dest).unwrap();
 
-        assert!(dest.join("textures").join("sky.dds").exists());
-        assert!(dest.join("plugin.esp").exists());
-        assert_eq!(std::fs::read_to_string(dest.join("plugin.esp")).unwrap(), "esp_data");
+        assert!(dest.join("Data").join("textures").join("sky.dds").exists());
     }
 
     #[test]
