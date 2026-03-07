@@ -827,8 +827,8 @@ fn show_fomod_wizard(
             let preview_picture = gtk4::Picture::new();
             preview_picture.set_content_fit(gtk4::ContentFit::Contain);
             preview_picture.set_can_shrink(true);
-            preview_picture.set_hexpand(true);
-            preview_picture.set_vexpand(true);
+            preview_picture.set_hexpand(false);
+            preview_picture.set_vexpand(false);
             preview_picture.set_halign(gtk4::Align::Center);
             let preview_picture_frame = gtk4::Frame::new(None);
             preview_picture_frame.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
