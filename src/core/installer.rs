@@ -893,6 +893,8 @@ fn install_fomod_files(
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
+    let archive_prefix = normalise_path(&find_common_prefix(&mut zip));
+    let archive_prefix_lower = archive_prefix.to_lowercase();
 
     // Build a map of lowercased entry names → indices for case-insensitive
     // matching.
@@ -926,12 +928,28 @@ fn install_fomod_files(
         let mut matching_indices = collect_matching_entries(&entry_map, &source_lower);
 
         if matching_indices.is_empty() {
+            if !archive_prefix_lower.is_empty() {
+                let wrapped_source_lower = format!("{archive_prefix_lower}/{source_lower}");
+                matching_indices = collect_matching_entries(&entry_map, &wrapped_source_lower);
+                if !matching_indices.is_empty() {
+                    matched_source = format!("{archive_prefix}/{source}");
+                }
+            }
+        }
+
+        if matching_indices.is_empty() {
             let stripped_source = strip_data_prefix(&source);
             let stripped_lower = stripped_source.to_lowercase();
             if !stripped_source.is_empty() && stripped_lower != source_lower {
                 matching_indices = collect_matching_entries(&entry_map, &stripped_lower);
                 if !matching_indices.is_empty() {
                     matched_source = stripped_source;
+                } else if !archive_prefix_lower.is_empty() {
+                    let wrapped_stripped_lower = format!("{archive_prefix_lower}/{stripped_lower}");
+                    matching_indices = collect_matching_entries(&entry_map, &wrapped_stripped_lower);
+                    if !matching_indices.is_empty() {
+                        matched_source = format!("{archive_prefix}/{stripped_source}");
+                    }
                 }
             } else if source_lower == "data" || source_lower == "data/" {
                 matching_indices = entry_map
@@ -952,6 +970,12 @@ fn install_fomod_files(
             matching_indices = collect_matching_entries(&entry_map, &prefixed);
             if !matching_indices.is_empty() {
                 matched_source = prefixed;
+            } else if !archive_prefix_lower.is_empty() {
+                let wrapped_prefixed = format!("{archive_prefix_lower}/{prefixed}");
+                matching_indices = collect_matching_entries(&entry_map, &wrapped_prefixed);
+                if !matching_indices.is_empty() {
+                    matched_source = format!("{archive_prefix}/data/{source}");
+                }
             }
         }
 
@@ -1412,6 +1436,49 @@ mod tests {
 
         assert!(dest.join("textures").join("armor.dds").exists());
         assert!(!dest.join("textures").join("empty").exists());
+    }
+
+    #[test]
+    fn install_fomod_files_matches_sources_in_wrapped_archives() {
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("Aela Replacer/", b""),
+                ("Aela Replacer/00 main/", b""),
+                ("Aela Replacer/00 main/AelaStandalone.esp", b"esp_data"),
+                (
+                    "Aela Replacer/00 main/textures/Actors/Character/Aela/Head/femalehead.dds",
+                    b"dds_data",
+                ),
+                ("Aela Replacer/fomod/", b""),
+                ("Aela Replacer/fomod/ModuleConfig.xml", b"<config/>"),
+            ],
+        );
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[FomodFile {
+                source: "00 main".to_string(),
+                destination: "Data".to_string(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+
+        assert!(dest.join("AelaStandalone.esp").exists());
+        assert!(
+            dest.join("textures")
+                .join("Actors")
+                .join("Character")
+                .join("Aela")
+                .join("Head")
+                .join("femalehead.dds")
+                .exists()
+        );
     }
 
     #[test]
