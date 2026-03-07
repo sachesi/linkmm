@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::path::Path;
+use std::process::Command;
 
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
@@ -130,6 +131,13 @@ pub struct FomodConfig {
 /// - Otherwise → `Data` (all content is placed under a `Data/` subdirectory
 ///   inside the mod folder and symlinked into `<game_root>/Data`).
 pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
+    if !archive_path.exists() {
+        return Err(format!("Cannot open archive: {}", archive_path.display()));
+    }
+    if !is_zip_archive(archive_path) {
+        return Ok(InstallStrategy::Data);
+    }
+
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip =
@@ -740,18 +748,22 @@ pub fn install_mod_from_archive(
 
     match strategy {
         InstallStrategy::Data => {
+            if !is_zip_archive(archive_path) {
+                install_data_archive_non_zip(archive_path, &mod_dir)?;
+            } else {
             // Determine extraction root:
             // • If the archive already carries a `Data/` subfolder after the
             //   common wrapper prefix is stripped, extract to `mod_dir/`
             //   directly – the `Data/` folder will land at `mod_dir/Data/`.
             // • Otherwise wrap the content inside `mod_dir/Data/` ourselves.
-            if archive_has_data_folder(archive_path) {
-                extract_zip_to(archive_path, &mod_dir)?;
-            } else {
-                let data_dir = mod_dir.join("Data");
-                std::fs::create_dir_all(&data_dir)
-                    .map_err(|e| format!("Failed to create Data directory: {e}"))?;
-                extract_zip_to(archive_path, &data_dir)?;
+                if archive_has_data_folder(archive_path) {
+                    extract_zip_to(archive_path, &mod_dir)?;
+                } else {
+                    let data_dir = mod_dir.join("Data");
+                    std::fs::create_dir_all(&data_dir)
+                        .map_err(|e| format!("Failed to create Data directory: {e}"))?;
+                    extract_zip_to(archive_path, &data_dir)?;
+                }
             }
         }
         InstallStrategy::Fomod(files) => {
@@ -837,6 +849,112 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn is_zip_archive(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false)
+}
+
+fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| {
+        format!(
+            "Failed to create extraction directory {}: {e}",
+            dest_dir.display()
+        )
+    })?;
+    let output_arg = format!("-o{}", dest_dir.display());
+    let output = Command::new("7z")
+        .arg("x")
+        .arg("-y")
+        .arg(output_arg)
+        .arg(archive_path)
+        .output()
+        .map_err(|e| format!("Failed to start 7z extractor: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "Failed to extract non-zip archive with 7z. stdout: {stdout}; stderr: {stderr}"
+        ));
+    }
+    Ok(())
+}
+
+fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(), String> {
+    let tmp_extract = std::env::temp_dir().join(format!(
+        "linkmm_extract_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_extract);
+    std::fs::create_dir_all(&tmp_extract)
+        .map_err(|e| format!("Failed to create temporary extraction directory: {e}"))?;
+    extract_archive_with_7z(archive_path, &tmp_extract)?;
+
+    let mut top_dirs = Vec::new();
+    let mut top_files = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&tmp_extract) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                top_dirs.push(path);
+            } else if path.is_file() {
+                top_files.push(path);
+            }
+        }
+    }
+
+    let data_source = if tmp_extract.join("Data").is_dir() {
+        Some(tmp_extract.clone())
+    } else if top_dirs.len() == 1 && top_files.is_empty() && top_dirs[0].join("Data").is_dir() {
+        Some(top_dirs[0].clone())
+    } else {
+        None
+    };
+
+    if let Some(source_root) = data_source {
+        copy_dir_contents(&source_root, mod_dir)?;
+    } else {
+        let data_dir = mod_dir.join("Data");
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| format!("Failed to create Data directory: {e}"))?;
+        copy_dir_contents(&tmp_extract, &data_dir)?;
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_extract);
+    Ok(())
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst)
+        .map_err(|e| format!("Failed to create destination {}: {e}", dst.display()))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("Failed to read {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_contents(&from, &to)?;
+        } else if from.is_file() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dir {}: {e}", parent.display()))?;
+            }
+            std::fs::copy(&from, &to).map_err(|e| {
+                format!(
+                    "Failed to copy extracted file {} -> {}: {e}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -1159,6 +1277,15 @@ mod tests {
                 ("Data/meshes/rock.nif", b"nif"),
             ],
         );
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(matches!(strategy, InstallStrategy::Data));
+    }
+
+    #[test]
+    fn detect_strategy_non_zip_defaults_to_data() {
+        let tmp = tempdir();
+        let archive = tmp.join("mod.7z");
+        std::fs::write(&archive, b"fake").unwrap();
         let strategy = detect_strategy(&archive).unwrap();
         assert!(matches!(strategy, InstallStrategy::Data));
     }
