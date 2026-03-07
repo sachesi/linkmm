@@ -274,7 +274,13 @@ pub fn parse_fomod_from_zip(archive_path: &Path) -> Result<FomodConfig, String> 
 fn find_fomod_config_in_dir(root: &Path) -> Option<std::path::PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).ok()?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                log::warn!("Failed to read extracted archive directory {}: {e}", dir.display());
+                continue;
+            }
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -284,14 +290,15 @@ fn find_fomod_config_in_dir(root: &Path) -> Option<std::path::PathBuf> {
             if !path.is_file() {
                 continue;
             }
-            let rel = path.strip_prefix(root).ok()?;
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
             let rel_lower = rel
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
                 .collect::<Vec<_>>()
                 .join("/");
-            if rel_lower == "fomod/moduleconfig.xml" || rel_lower.ends_with("/fomod/moduleconfig.xml")
-            {
+            if rel_lower.ends_with("fomod/moduleconfig.xml") {
                 return Some(path);
             }
         }
@@ -1357,29 +1364,48 @@ mod tests {
         }
         let archive_path = root.join(archive_name);
         let staging = root.join("staging");
-        std::fs::create_dir_all(staging.join("fomod")).ok()?;
-        std::fs::create_dir_all(staging.join("Data/textures")).ok()?;
-        std::fs::write(
+        if let Err(e) = std::fs::create_dir_all(staging.join("fomod")) {
+            eprintln!("create_test_7z: failed to create fomod dir: {e}");
+            return None;
+        }
+        if let Err(e) = std::fs::create_dir_all(staging.join("Data/textures")) {
+            eprintln!("create_test_7z: failed to create Data/textures dir: {e}");
+            return None;
+        }
+        if let Err(e) = std::fs::write(
             staging.join("fomod/ModuleConfig.xml"),
             r#"<config>
   <requiredInstallFiles>
     <file source="Data/textures/sky.dds" destination="Data/textures/sky.dds" />
   </requiredInstallFiles>
 </config>"#,
-        )
-        .ok()?;
-        std::fs::write(staging.join("Data/textures/sky.dds"), "dds").ok()?;
+        ) {
+            eprintln!("create_test_7z: failed to write ModuleConfig.xml: {e}");
+            return None;
+        }
+        if let Err(e) = std::fs::write(staging.join("Data/textures/sky.dds"), "dds") {
+            eprintln!("create_test_7z: failed to write test data file: {e}");
+            return None;
+        }
         let output = Command::new("7z")
             .current_dir(&staging)
             .arg("a")
             .arg("-y")
             .arg(&archive_path)
             .arg(".")
-            .output()
-            .ok()?;
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("create_test_7z: failed to launch 7z: {e}");
+                return None;
+            }
+        };
         if output.status.success() {
             Some(archive_path)
         } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("7z test archive creation failed: {stderr}");
             None
         }
     }
