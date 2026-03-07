@@ -1,181 +1,146 @@
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc;
 
 use gio;
-use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
 use crate::core::games::Game;
-use crate::core::nexus::{NexusClient, NexusModInfo};
+
+// ── Archive extensions we recognise as mod archives ──────────────────────────
+
+const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
 /// Build the Downloads page.
 ///
-/// Shows tabs for Trending mods and Latest Added mods (fetched from the Nexus
-/// API), plus a "Find by ID" panel for looking up a specific mod.
+/// Shows a list of archive files that the user has placed (or that a future
+/// downloader will place) in the configured downloads directory.  Provides
+/// actions to hide already-installed archives and to clean the cache.
 pub fn build_downloads_page(
-    game: Option<&Game>,
+    _game: Option<&Game>,
     config: Rc<RefCell<AppConfig>>,
 ) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
-    let title_widget = match game {
-        Some(g) => adw::WindowTitle::new("Downloads", &g.name),
-        None => adw::WindowTitle::new("Downloads", ""),
-    };
+    let title_widget = adw::WindowTitle::new("Downloads", "");
     header.set_title_widget(Some(&title_widget));
+
+    // "Hide Installed" toggle
+    let hide_btn = gtk4::ToggleButton::new();
+    hide_btn.set_icon_name("view-filter-symbolic");
+    hide_btn.set_tooltip_text(Some("Hide Installed"));
+    header.pack_end(&hide_btn);
+
+    // "Clean Cache" button
+    let clean_btn = gtk4::Button::new();
+    clean_btn.set_icon_name("user-trash-symbolic");
+    clean_btn.set_tooltip_text(Some("Clean Cache"));
+    header.pack_end(&clean_btn);
 
     toolbar_view.add_top_bar(&header);
 
-    let Some(game) = game else {
-        let status = adw::StatusPage::builder()
-            .title("No Game Selected")
-            .description("Select a game from the sidebar to browse mods.")
-            .icon_name("applications-games-symbolic")
-            .build();
-        status.set_vexpand(true);
-        toolbar_view.set_content(Some(&status));
-        return toolbar_view.upcast();
-    };
+    // Scrollable content container
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content.set_vexpand(true);
 
-    let api_key = config.borrow().nexus_api_key.clone();
-    let Some(api_key) = api_key else {
-        let status = adw::StatusPage::builder()
-            .title("API Key Required")
-            .description(
-                "Set your Nexus Mods API key in Preferences to browse and download mods.",
-            )
-            .icon_name("dialog-password-symbolic")
-            .build();
-        status.set_vexpand(true);
-        toolbar_view.set_content(Some(&status));
-        return toolbar_view.upcast();
-    };
+    let hide_installed = Rc::new(RefCell::new(false));
 
-    let game_domain = game.kind.nexus_game_id().to_string();
-    let game_rc = Rc::new(game.clone());
+    refresh_content(&content, &config, *hide_installed.borrow());
 
-    // ── Tab stack ─────────────────────────────────────────────────────────────
-    let tab_stack = gtk4::Stack::new();
-    tab_stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
-    tab_stack.set_vexpand(true);
+    toolbar_view.set_content(Some(&content));
 
-    let switcher = gtk4::StackSwitcher::new();
-    switcher.set_stack(Some(&tab_stack));
-    switcher.set_halign(gtk4::Align::Center);
+    // Wire "Hide Installed" toggle
+    {
+        let content_c = content.clone();
+        let config_c = Rc::clone(&config);
+        let hide_c = Rc::clone(&hide_installed);
+        hide_btn.connect_toggled(move |btn| {
+            *hide_c.borrow_mut() = btn.is_active();
+            refresh_content(&content_c, &config_c, *hide_c.borrow());
+        });
+    }
 
-    // Trending tab
-    let trending_box = build_mod_list_tab();
-    tab_stack.add_titled(&trending_box, Some("trending"), "Trending");
-
-    // Latest Added tab
-    let latest_box = build_mod_list_tab();
-    tab_stack.add_titled(&latest_box, Some("latest"), "Latest Added");
-
-    // Find by ID tab
-    let find_box = build_find_by_id_tab(&game_rc, &api_key, Rc::clone(&config));
-    tab_stack.add_titled(&find_box, Some("find"), "Find by ID");
-
-    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    outer.set_vexpand(true);
-
-    // Switcher bar
-    let switcher_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    switcher_box.set_margin_top(8);
-    switcher_box.set_margin_bottom(8);
-    switcher_box.append(&switcher);
-    outer.append(&switcher_box);
-
-    outer.append(&tab_stack);
-    toolbar_view.set_content(Some(&outer));
-
-    // Kick off initial data loads (network request → update list box on main thread)
-    load_mod_list(&trending_box, &game_domain, &api_key, NexusListKind::Trending);
-    load_mod_list(&latest_box, &game_domain, &api_key, NexusListKind::Latest);
+    // Wire "Clean Cache" button
+    {
+        let content_c = content.clone();
+        let config_c = Rc::clone(&config);
+        let hide_c = Rc::clone(&hide_installed);
+        clean_btn.connect_clicked(move |btn| {
+            show_clean_cache_dialog(btn, &config_c, &content_c, &hide_c);
+        });
+    }
 
     toolbar_view.upcast()
 }
 
-// ── Tab builders ──────────────────────────────────────────────────────────────
+// ── Content rendering ─────────────────────────────────────────────────────────
 
-/// Create a vertically-scrolling box that will be filled by `load_mod_list`.
-fn build_mod_list_tab() -> gtk4::Box {
-    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    outer.set_vexpand(true);
-
-    // Spinner shown while loading
-    let spinner = gtk4::Spinner::new();
-    spinner.set_spinning(true);
-    spinner.set_halign(gtk4::Align::Center);
-    spinner.set_valign(gtk4::Align::Center);
-    spinner.set_margin_top(48);
-    spinner.set_vexpand(true);
-    outer.append(&spinner);
-
-    outer
-}
-
-enum NexusListKind {
-    Trending,
-    Latest,
-}
-
-/// Spawn a background thread to fetch the mod list and populate `container`.
-fn load_mod_list(container: &gtk4::Box, game_domain: &str, api_key: &str, kind: NexusListKind) {
-    let (tx, rx) = mpsc::channel::<Result<Vec<NexusModInfo>, String>>();
-    let gd = game_domain.to_string();
-    let ak = api_key.to_string();
-
-    std::thread::spawn(move || {
-        let client = NexusClient::new(&ak);
-        let result = match kind {
-            NexusListKind::Trending => client.list_trending_mods(&gd),
-            NexusListKind::Latest => client.list_latest_added_mods(&gd),
-        };
-        let _ = tx.send(result);
-    });
-
-    // Poll from main thread
-    let container_c = container.clone();
-    let gd2 = game_domain.to_string();
-    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        match rx.try_recv() {
-            Ok(Ok(mods)) => {
-                populate_mod_list(&container_c, &mods, &gd2);
-                glib::ControlFlow::Break
-            }
-            Ok(Err(e)) => {
-                show_error_in_container(&container_c, &format!("Failed to fetch mods: {e}"));
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                show_error_in_container(&container_c, "Connection lost");
-                glib::ControlFlow::Break
-            }
-        }
-    });
-}
-
-/// Remove the spinner and fill `container` with mod cards.
-fn populate_mod_list(container: &gtk4::Box, mods: &[NexusModInfo], game_domain: &str) {
-    // Remove spinner
+fn refresh_content(container: &gtk4::Box, config: &Rc<RefCell<AppConfig>>, hide_installed: bool) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
 
-    if mods.is_empty() {
+    let downloads_dir = config.borrow().downloads_dir();
+
+    // Ensure the directory exists so the page is immediately useful
+    if !downloads_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&downloads_dir) {
+            log::warn!("Could not create downloads directory: {e}");
+        }
+    }
+
+    if !downloads_dir.exists() {
         let status = adw::StatusPage::builder()
-            .title("No Mods Found")
-            .description("No mods were returned by the Nexus API for this game.")
-            .icon_name("package-x-generic-symbolic")
+            .title("No Downloads Directory")
+            .description(
+                "Set your app data directory in Preferences so that downloads have a place to live.",
+            )
+            .icon_name("folder-download-symbolic")
             .build();
+        status.set_vexpand(true);
+        container.append(&status);
+        return;
+    }
+
+    let installed_archives: Vec<String> = config.borrow().installed_archives.clone();
+    let entries = scan_downloads(&downloads_dir);
+
+    let visible: Vec<&DownloadEntry> = if hide_installed {
+        entries
+            .iter()
+            .filter(|e| !installed_archives.contains(&e.name))
+            .collect()
+    } else {
+        entries.iter().collect()
+    };
+
+    if visible.is_empty() {
+        let description = if hide_installed && !entries.is_empty() {
+            "All downloaded mods have been installed.\nToggle \u{201c}Hide Installed\u{201d} to show them."
+        } else {
+            "Downloaded mod archives will appear here once you place them in the downloads folder."
+        };
+        let status = adw::StatusPage::builder()
+            .title("No Downloads")
+            .description(description)
+            .icon_name("folder-download-symbolic")
+            .build();
+
+        // "Open Folder" button so the user can drop files in easily
+        let open_btn = gtk4::Button::with_label("Open Downloads Folder");
+        open_btn.add_css_class("pill");
+        open_btn.set_halign(gtk4::Align::Center);
+        let dir_clone = downloads_dir.clone();
+        open_btn.connect_clicked(move |_| {
+            open_in_file_manager(&dir_clone);
+        });
+        status.set_child(Some(&open_btn));
         status.set_vexpand(true);
         container.append(&status);
         return;
@@ -185,8 +150,8 @@ fn populate_mod_list(container: &gtk4::Box, mods: &[NexusModInfo], game_domain: 
     list_box.add_css_class("boxed-list");
     list_box.set_selection_mode(gtk4::SelectionMode::None);
 
-    for mod_info in mods {
-        let row = build_mod_info_row(mod_info, game_domain);
+    for entry in &visible {
+        let row = build_entry_row(entry, &installed_archives, config, container, hide_installed);
         list_box.append(&row);
     }
 
@@ -206,165 +171,185 @@ fn populate_mod_list(container: &gtk4::Box, mods: &[NexusModInfo], game_domain: 
     container.append(&scrolled);
 }
 
-fn show_error_in_container(container: &gtk4::Box, message: &str) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
-    let status = adw::StatusPage::builder()
-        .title("Error")
-        .description(message)
-        .icon_name("dialog-error-symbolic")
-        .build();
-    status.set_vexpand(true);
-    container.append(&status);
-}
+// ── Row builder ───────────────────────────────────────────────────────────────
 
-// ── Mod info row ──────────────────────────────────────────────────────────────
+fn build_entry_row(
+    entry: &DownloadEntry,
+    installed_archives: &[String],
+    config: &Rc<RefCell<AppConfig>>,
+    container: &gtk4::Box,
+    hide_installed: bool,
+) -> adw::ActionRow {
+    let is_installed = installed_archives.contains(&entry.name);
 
-fn build_mod_info_row(mod_info: &NexusModInfo, game_domain: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(&mod_info.name)
-        .activatable(false)
+        .title(&entry.name)
+        .subtitle(&format_size(entry.size_bytes))
         .build();
 
-    // Subtitle: author + endorsements
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(author) = &mod_info.author {
-        parts.push(format!("by {author}"));
-    }
-    if mod_info.endorsement_count > 0 {
-        parts.push(format!("★ {}", mod_info.endorsement_count));
-    }
-    if let Some(summary) = &mod_info.summary {
-        // Collect at most 120 Unicode scalar values so we never split a multi-byte
-        // character.  This is safe because `chars()` yields full code-points.
-        let short: String = summary.chars().take(120).collect();
-        parts.push(short);
-    }
-    if !parts.is_empty() {
-        row.set_subtitle(&parts.join("  ·  "));
+    // "Installed" badge
+    if is_installed {
+        let badge = gtk4::Label::new(Some("Installed"));
+        badge.add_css_class("success");
+        badge.add_css_class("caption");
+        badge.set_valign(gtk4::Align::Center);
+        row.add_suffix(&badge);
     }
 
-    // "View on Nexus" button
-    let url = NexusClient::mod_page_url(game_domain, mod_info.mod_id);
-    let view_btn = gtk4::Button::new();
-    view_btn.set_icon_name("web-browser-symbolic");
-    view_btn.set_tooltip_text(Some("View on Nexus Mods"));
-    view_btn.set_valign(gtk4::Align::Center);
-    view_btn.add_css_class("flat");
+    // Delete / remove archive button
+    let delete_btn = gtk4::Button::new();
+    delete_btn.set_icon_name("user-trash-symbolic");
+    delete_btn.set_tooltip_text(Some("Remove archive"));
+    delete_btn.set_valign(gtk4::Align::Center);
+    delete_btn.add_css_class("flat");
+    delete_btn.add_css_class("destructive-action");
 
-    view_btn.connect_clicked(move |_| {
-        if let Err(e) = gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>) {
-            log::error!("Failed to open URL: {e}");
+    let path_c = entry.path.clone();
+    let name_c = entry.name.clone();
+    let config_c = Rc::clone(config);
+    let container_c = container.clone();
+    delete_btn.connect_clicked(move |_| {
+        if let Err(e) = std::fs::remove_file(&path_c) {
+            log::error!("Failed to remove archive \"{}\": {e}", name_c);
+        } else {
+            let mut cfg = config_c.borrow_mut();
+            cfg.installed_archives.retain(|a| a != &name_c);
+            cfg.save();
+            drop(cfg);
+            refresh_content(&container_c, &config_c, hide_installed);
         }
     });
 
-    row.add_suffix(&view_btn);
+    row.add_suffix(&delete_btn);
     row
 }
 
-// ── Find-by-ID tab ────────────────────────────────────────────────────────────
+// ── Clean cache dialog ────────────────────────────────────────────────────────
 
-fn build_find_by_id_tab(
-    game: &Rc<Game>,
-    api_key: &str,
-    _config: Rc<RefCell<AppConfig>>,
-) -> gtk4::Box {
-    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    outer.set_margin_start(24);
-    outer.set_margin_end(24);
-    outer.set_margin_top(24);
-    outer.set_margin_bottom(12);
+fn show_clean_cache_dialog(
+    anchor: &gtk4::Button,
+    config: &Rc<RefCell<AppConfig>>,
+    container: &gtk4::Box,
+    hide_installed: &Rc<RefCell<bool>>,
+) {
+    let dialog = adw::AlertDialog::new(
+        Some("Clean Download Cache?"),
+        Some(
+            "All downloaded archive files will be permanently deleted.\n\
+             Installed mods in your library will not be affected.",
+        ),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("clean", "Clean Cache");
+    dialog.set_response_appearance("clean", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
 
-    let header = gtk4::Label::new(Some("Look Up Mod by Nexus ID"));
-    header.add_css_class("title-3");
-    header.set_halign(gtk4::Align::Start);
-    outer.append(&header);
-
-    // Entry row
-    let entry_group = adw::PreferencesGroup::new();
-    let id_row = adw::EntryRow::builder()
-        .title("Nexus Mod ID")
-        .input_purpose(gtk4::InputPurpose::Digits)
-        .build();
-    entry_group.add(&id_row);
-    outer.append(&entry_group);
-
-    // Search button
-    let search_btn = gtk4::Button::with_label("Search");
-    search_btn.add_css_class("suggested-action");
-    search_btn.set_halign(gtk4::Align::Center);
-    outer.append(&search_btn);
-
-    // Result area
-    let result_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    result_box.set_vexpand(true);
-    outer.append(&result_box);
-
-    let game_domain = game.kind.nexus_game_id().to_string();
-    let ak = api_key.to_string();
-
-    search_btn.connect_clicked(move |_| {
-        let text = id_row.text().to_string();
-        let Ok(mod_id) = text.trim().parse::<u32>() else {
-            show_error_in_container(&result_box, "Please enter a valid numeric mod ID.");
-            return;
-        };
-
-        // Clear previous result and show spinner
-        while let Some(child) = result_box.first_child() {
-            result_box.remove(&child);
+    let config_c = Rc::clone(config);
+    let container_c = container.clone();
+    let hide_c = Rc::clone(hide_installed);
+    dialog.connect_response(None, move |_, response| {
+        if response == "clean" {
+            delete_all_archives(&config_c);
+            refresh_content(&container_c, &config_c, *hide_c.borrow());
         }
-        let spinner = gtk4::Spinner::new();
-        spinner.set_spinning(true);
-        spinner.set_halign(gtk4::Align::Center);
-        spinner.set_margin_top(24);
-        result_box.append(&spinner);
-
-        let (tx, rx) = mpsc::channel::<Result<NexusModInfo, String>>();
-        let gd = game_domain.clone();
-        let ak2 = ak.clone();
-        std::thread::spawn(move || {
-            let client = NexusClient::new(&ak2);
-            let result = client.get_mod(&gd, mod_id).map(|m| NexusModInfo {
-                mod_id: m.mod_id,
-                name: m.name,
-                summary: m.summary,
-                version: m.version,
-                author: m.author,
-                endorsement_count: 0,
-                picture_url: None,
-            });
-            let _ = tx.send(result);
-        });
-
-        let rb = result_box.clone();
-        let gd2 = game_domain.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            match rx.try_recv() {
-                Ok(Ok(mod_info)) => {
-                    while let Some(child) = rb.first_child() {
-                        rb.remove(&child);
-                    }
-                    let list_box = gtk4::ListBox::new();
-                    list_box.add_css_class("boxed-list");
-                    list_box.set_selection_mode(gtk4::SelectionMode::None);
-                    list_box.append(&build_mod_info_row(&mod_info, &gd2));
-                    rb.append(&list_box);
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(e)) => {
-                    show_error_in_container(&rb, &format!("Mod not found: {e}"));
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    show_error_in_container(&rb, "Connection lost");
-                    glib::ControlFlow::Break
-                }
-            }
-        });
     });
 
-    outer
+    // Walk up to find a parent Window
+    let parent = anchor
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
+    dialog.present(parent.as_ref());
+}
+
+fn delete_all_archives(config: &Rc<RefCell<AppConfig>>) {
+    let downloads_dir = config.borrow().downloads_dir();
+    if let Ok(entries) = std::fs::read_dir(&downloads_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            if ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    log::error!("Failed to delete {:?}: {e}", path);
+                }
+            }
+        }
+    }
+    // Clear the installed-archives tracking list as well
+    let mut cfg = config.borrow_mut();
+    cfg.installed_archives.clear();
+    cfg.save();
+}
+
+// ── Filesystem helpers ────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct DownloadEntry {
+    name: String,
+    path: PathBuf,
+    size_bytes: u64,
+}
+
+fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
+    let mut entries = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for item in read_dir.flatten() {
+            let path = item.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            if !ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            entries.push(DownloadEntry {
+                name,
+                path,
+                size_bytes,
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1_024;
+    const MB: u64 = 1_024 * KB;
+    const GB: u64 = 1_024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn open_in_file_manager(path: &Path) {
+    let file = gio::File::for_path(path);
+    let uri = file.uri();
+    if let Err(e) =
+        gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>)
+    {
+        log::error!("Failed to open folder in file manager: {e}");
+    }
 }

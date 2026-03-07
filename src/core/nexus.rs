@@ -2,6 +2,10 @@ use serde::Deserialize;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+// These types and methods are part of the Nexus API client which will be used
+// in future download functionality.  Suppress dead-code lints until then.
+#[allow(dead_code)]
+
 #[derive(Debug, Clone)]
 pub struct NexusUser {
     pub user_id: u64,
@@ -107,6 +111,7 @@ pub struct NexusClient {
     pub api_key: String,
 }
 
+#[allow(dead_code)]
 impl NexusClient {
     pub fn new(api_key: &str) -> Self {
         Self {
