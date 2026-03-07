@@ -111,7 +111,9 @@ fn refresh_content(
         container.remove(&child);
     }
 
-    let downloads_dir = config.borrow().downloads_dir();
+    let downloads_dir = config
+        .borrow()
+        .downloads_dir(game.as_ref().as_ref().map(|g| g.id.as_str()));
 
     if !downloads_dir.exists() {
         let _ = std::fs::create_dir_all(&downloads_dir);
@@ -444,8 +446,8 @@ fn do_install(
 
 /// Selected plugin indices by `[step_index][group_index][plugin_indices]`.
 type FomodSelections = Vec<Vec<Vec<usize>>>;
-const OPTION_IMAGE_WIDTH: i32 = 128;
-const OPTION_IMAGE_HEIGHT: i32 = 72;
+const GROUP_PREVIEW_IMAGE_WIDTH: i32 = 300;
+const GROUP_PREVIEW_IMAGE_HEIGHT: i32 = 180;
 
 fn collect_active_flags(
     fomod: &FomodConfig,
@@ -752,9 +754,12 @@ fn show_fomod_wizard(
                     GroupType::SelectAny => "select any",
                 };
                 let frame = gtk4::Frame::new(Some(&format!("{} ({type_desc})", group.name)));
+                let row_and_preview = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+                row_and_preview.set_hexpand(true);
                 let lb = gtk4::ListBox::new();
                 lb.add_css_class("boxed-list");
                 lb.set_selection_mode(gtk4::SelectionMode::None);
+                lb.set_hexpand(true);
                 let use_radio = matches!(
                     group.group_type,
                     GroupType::SelectExactlyOne | GroupType::SelectAtMostOne
@@ -764,6 +769,26 @@ fn show_fomod_wizard(
                 } else {
                     None
                 };
+                let preview_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+                preview_box.set_halign(gtk4::Align::Fill);
+                preview_box.set_valign(gtk4::Align::Start);
+                preview_box.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, -1);
+                let preview_label = gtk4::Label::new(Some("Preview"));
+                preview_label.add_css_class("dim-label");
+                preview_label.add_css_class("caption");
+                preview_label.set_halign(gtk4::Align::Start);
+                let preview_name = gtk4::Label::new(Some(""));
+                preview_name.set_wrap(true);
+                preview_name.set_halign(gtk4::Align::Start);
+                let preview_picture = gtk4::Picture::new();
+                preview_picture.set_content_fit(gtk4::ContentFit::Contain);
+                preview_picture
+                    .set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
+                preview_box.append(&preview_label);
+                preview_box.append(&preview_picture);
+                preview_box.append(&preview_name);
+                let mut has_group_preview = false;
+                let mut initial_preview: Option<(gtk4::gdk::Texture, String)> = None;
                 for (pi, plugin) in group.plugins.iter().enumerate() {
                     if !plugin_is_visible(plugin, &active_flags) {
                         continue;
@@ -777,9 +802,7 @@ fn show_fomod_wizard(
                     let check = gtk4::CheckButton::new();
                     if use_radio {
                         if let Some(ref rg) = radio_group {
-                            if pi > 0 {
-                                check.set_group(Some(rg));
-                            }
+                            check.set_group(Some(rg));
                         }
                     }
                     {
@@ -816,11 +839,31 @@ fn show_fomod_wizard(
                     if let Some(ref image_path) = plugin.image_path {
                         if let Some(texture) = load_fomod_option_image(&ap, image_path, &img_cache)
                         {
-                            let pic = gtk4::Picture::new();
-                            pic.set_paintable(Some(&texture));
-                            pic.set_content_fit(gtk4::ContentFit::Contain);
-                            pic.set_size_request(OPTION_IMAGE_WIDTH, OPTION_IMAGE_HEIGHT);
-                            row.add_suffix(&pic);
+                            has_group_preview = true;
+                            if check.is_active() || initial_preview.is_none() {
+                                initial_preview = Some((texture.clone(), plugin.name.clone()));
+                            }
+                            let hover_pic = preview_picture.clone();
+                            let hover_name = preview_name.clone();
+                            let hover_texture = texture.clone();
+                            let hover_plugin_name = plugin.name.clone();
+                            let row_motion = gtk4::EventControllerMotion::new();
+                            row_motion.connect_enter(move |_, _, _| {
+                                hover_pic.set_paintable(Some(&hover_texture));
+                                hover_name.set_label(&hover_plugin_name);
+                            });
+                            row.add_controller(row_motion);
+
+                            let radio_pic = preview_picture.clone();
+                            let radio_name = preview_name.clone();
+                            let radio_texture = texture.clone();
+                            let radio_plugin_name = plugin.name.clone();
+                            let check_motion = gtk4::EventControllerMotion::new();
+                            check_motion.connect_enter(move |_, _, _| {
+                                radio_pic.set_paintable(Some(&radio_texture));
+                                radio_name.set_label(&radio_plugin_name);
+                            });
+                            check.add_controller(check_motion);
                         }
                     }
                     let tl = match plugin.type_descriptor {
@@ -838,7 +881,15 @@ fn show_fomod_wizard(
                     }
                     lb.append(&row);
                 }
-                frame.set_child(Some(&lb));
+                row_and_preview.append(&lb);
+                if has_group_preview {
+                    if let Some((texture, plugin_name)) = initial_preview {
+                        preview_picture.set_paintable(Some(&texture));
+                        preview_name.set_label(&plugin_name);
+                    }
+                    row_and_preview.append(&preview_box);
+                }
+                frame.set_child(Some(&row_and_preview));
                 groups_box.append(&frame);
             }
             scrolled.set_child(Some(&groups_box));
@@ -954,7 +1005,7 @@ fn show_clean_cache_dialog(
     let gc = Rc::clone(game);
     dialog.connect_response(None, move |_, response| {
         if response == "clean" {
-            delete_all_archives(&cc);
+            delete_all_archives(&cc, &gc);
             refresh_content(&cont, &cc, *hc.borrow(), &gc);
         }
     });
@@ -964,8 +1015,10 @@ fn show_clean_cache_dialog(
     dialog.present(parent.as_ref());
 }
 
-fn delete_all_archives(config: &Rc<RefCell<AppConfig>>) {
-    let downloads_dir = config.borrow().downloads_dir();
+fn delete_all_archives(config: &Rc<RefCell<AppConfig>>, game: &Rc<Option<Game>>) {
+    let downloads_dir = config
+        .borrow()
+        .downloads_dir(game.as_ref().as_ref().map(|g| g.id.as_str()));
     if let Ok(entries) = std::fs::read_dir(&downloads_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1182,5 +1235,42 @@ mod tests {
         let sources: Vec<String> = files.into_iter().map(|f| f.source).collect();
         assert!(sources.contains(&"plus-variant.txt".to_string()));
         assert!(!sources.contains(&"minus-variant.txt".to_string()));
+    }
+
+    #[test]
+    fn sanitize_step_selection_respects_at_most_and_exactly_one_rules() {
+        let config = FomodConfig {
+            mod_name: Some("Test".to_string()),
+            required_files: Vec::new(),
+            steps: vec![InstallStep {
+                name: "Main".to_string(),
+                groups: vec![
+                    PluginGroup {
+                        name: "Exactly one".to_string(),
+                        group_type: GroupType::SelectExactlyOne,
+                        plugins: vec![
+                            test_plugin("A", "a.txt", Vec::new(), None),
+                            test_plugin("B", "b.txt", Vec::new(), None),
+                        ],
+                    },
+                    PluginGroup {
+                        name: "At most one".to_string(),
+                        group_type: GroupType::SelectAtMostOne,
+                        plugins: vec![
+                            test_plugin("C", "c.txt", Vec::new(), None),
+                            test_plugin("D", "d.txt", Vec::new(), None),
+                        ],
+                    },
+                ],
+            }],
+        };
+        let mut selections = vec![vec![vec![0, 1], vec![0, 1]]];
+        sanitize_step_selection(&config, &mut selections, 0);
+        assert_eq!(selections[0][0], vec![0]);
+        assert_eq!(selections[0][1], vec![0]);
+
+        let mut empty_at_most_one = vec![vec![vec![1], vec![]]];
+        sanitize_step_selection(&config, &mut empty_at_most_one, 0);
+        assert_eq!(empty_at_most_one[0][1], Vec::<usize>::new());
     }
 }
