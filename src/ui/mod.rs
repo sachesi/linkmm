@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc;
 
-use gio;
+use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -491,4 +492,149 @@ fn show_about_dialog(parent: &gtk4::Window) {
         .license_type(gtk4::License::Gpl30)
         .build();
     dialog.present(Some(parent));
+}
+
+// ── NXM protocol handler ──────────────────────────────────────────────────
+
+/// Handle an `nxm://` URL received from the browser.
+///
+/// Parses the URL, fetches the download link from the Nexus API, downloads the
+/// file to the configured downloads directory, and shows a toast on the active
+/// window.
+pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
+    use crate::core::download;
+    use crate::core::nexus::NexusClient;
+    use crate::core::nxm::NxmUrl;
+
+    let config = AppConfig::load_or_default();
+    let Some(api_key) = config.nexus_api_key.clone() else {
+        log::error!("Cannot handle NXM URL: no API key configured");
+        if let Some(window) = app.active_window() {
+            show_nxm_toast(&window, "Set your NexusMods API key in Preferences first.");
+        }
+        return;
+    };
+
+    let nxm = match NxmUrl::parse(url) {
+        Ok(n) => n,
+        Err(e) => {
+            log::error!("Failed to parse NXM URL: {e}");
+            if let Some(window) = app.active_window() {
+                show_nxm_toast(&window, &format!("Invalid NXM link: {e}"));
+            }
+            return;
+        }
+    };
+
+    let downloads_dir = config.downloads_dir();
+    if let Err(e) = std::fs::create_dir_all(&downloads_dir) {
+        log::error!("Failed to create downloads directory: {e}");
+        return;
+    }
+
+    log::info!(
+        "Handling NXM URL: game={}, mod={}, file={}",
+        nxm.game_domain,
+        nxm.mod_id,
+        nxm.file_id
+    );
+
+    if let Some(window) = app.active_window() {
+        show_nxm_toast(&window, &format!("Starting download for mod {}…", nxm.mod_id));
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<String, String>>();
+
+    std::thread::spawn(move || {
+        let result = (|| -> Result<String, String> {
+            let client = NexusClient::new(&api_key);
+
+            // Get file info to determine the file name
+            let files = client.get_mod_files(&nxm.game_domain, nxm.mod_id as u32)?;
+            let file_info = files.iter().find(|f| f.file_id == nxm.file_id);
+            let file_name = match file_info {
+                Some(f) => f.file_name.clone(),
+                None => format!("mod_{}_{}.zip", nxm.mod_id, nxm.file_id),
+            };
+
+            let dest_path = downloads_dir.join(&file_name);
+            if dest_path.exists() {
+                return Ok(format!("{file_name} (already downloaded)"));
+            }
+
+            // Get download link using NXM key/expires if available, otherwise
+            // fall back to the premium-only direct API
+            let links = match (&nxm.key, &nxm.expires) {
+                (Some(key), Some(expires)) => {
+                    client.get_download_links_nxm(
+                        &nxm.game_domain,
+                        nxm.mod_id as u32,
+                        nxm.file_id,
+                        key,
+                        expires,
+                    )?
+                }
+                _ => {
+                    client.get_download_links(
+                        &nxm.game_domain,
+                        nxm.mod_id as u32,
+                        nxm.file_id,
+                    )?
+                }
+            };
+
+            let (_cdn, url) = links
+                .first()
+                .ok_or_else(|| "No download links available".to_string())?;
+
+            download::download_file(url, &dest_path, |_downloaded, _total| {})?;
+
+            Ok(file_name)
+        })();
+        let _ = tx.send(result);
+    });
+
+    // Poll for completion and show toast
+    let app_c = app.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        match rx.try_recv() {
+            Ok(Ok(file_name)) => {
+                log::info!("NXM download complete: {file_name}");
+                if let Some(window) = app_c.active_window() {
+                    show_nxm_toast(&window, &format!("Downloaded: {file_name}"));
+                }
+                glib::ControlFlow::Break
+            }
+            Ok(Err(e)) => {
+                log::error!("NXM download failed: {e}");
+                if let Some(window) = app_c.active_window() {
+                    show_nxm_toast(&window, &format!("Download failed: {e}"));
+                }
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+}
+
+fn show_nxm_toast(window: &gtk4::Window, message: &str) {
+    // Try to find a ToastOverlay in the window hierarchy
+    if let Some(child) = window.child() {
+        walk_for_toast_overlay(&child, message);
+    }
+    log::info!("NXM: {message}");
+}
+
+fn walk_for_toast_overlay(widget: &gtk4::Widget, message: &str) {
+    if let Ok(overlay) = widget.clone().downcast::<adw::ToastOverlay>() {
+        let toast = adw::Toast::new(message);
+        toast.set_timeout(4);
+        overlay.add_toast(toast);
+        return;
+    }
+    // Try first child recursively
+    if let Some(child) = widget.first_child() {
+        walk_for_toast_overlay(&child, message);
+    }
 }

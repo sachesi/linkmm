@@ -580,14 +580,16 @@ fn install_fomod_files(
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
 
-    // Build a map of lowercased archive entry names → original names for
-    // case-insensitive matching.
-    let mut entry_names: Vec<String> = Vec::new();
+    // Build a map of lowercased entry names → indices for case-insensitive
+    // matching.
+    let mut entry_map: Vec<(String, String, usize)> = Vec::new(); // (lower, original, index)
     for i in 0..zip.len() {
         let Ok(entry) = zip.by_index(i) else {
             continue;
         };
-        entry_names.push(entry.name().to_string());
+        let name = entry.name().to_string();
+        let lower = name.to_lowercase();
+        entry_map.push((lower, name, i));
     }
 
     // Sort files by priority (higher priority wins for same destination)
@@ -597,27 +599,25 @@ fn install_fomod_files(
     for fomod_file in &sorted_files {
         let source = normalise_path(&fomod_file.source);
         let destination = normalise_path(&fomod_file.destination);
-
-        // Find matching entries in the archive (case-insensitive, could be a
-        // directory prefix)
         let source_lower = source.to_lowercase();
-        let matching: Vec<&str> = entry_names
+
+        // Find matching entry indices
+        let matching_indices: Vec<(String, usize)> = entry_map
             .iter()
-            .filter(|n| {
-                let nl = n.to_lowercase();
-                nl == source_lower
+            .filter(|(nl, _, _)| {
+                *nl == source_lower
                     || nl.starts_with(&format!("{source_lower}/"))
                     || nl.starts_with(&format!("{source_lower}\\"))
             })
-            .map(|s| s.as_str())
+            .map(|(_, orig, idx)| (orig.clone(), *idx))
             .collect();
 
-        for entry_name in matching {
+        for (entry_name, entry_idx) in matching_indices {
             let entry_lower = entry_name.to_lowercase();
             // Compute the relative portion after the source prefix
             let rel = if entry_lower == source_lower {
                 // Single file
-                Path::new(entry_name)
+                Path::new(&entry_name)
                     .file_name()
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_default()
@@ -631,8 +631,9 @@ fn install_fomod_files(
 
             let out_path = dest_dir.join(&destination).join(&rel);
 
+            // Use by_index to avoid long-lived borrow issues
             let mut entry = zip
-                .by_name(entry_name)
+                .by_index(entry_idx)
                 .map_err(|e| format!("Cannot read entry {entry_name}: {e}"))?;
 
             if entry.is_dir() {
@@ -660,12 +661,6 @@ fn install_fomod_files(
                 std::io::copy(&mut entry, &mut out_file)
                     .map_err(|e| format!("Failed to extract: {e}"))?;
             }
-
-            // Re-open the archive after by_name consumed it
-            let file2 = std::fs::File::open(archive_path)
-                .map_err(|e| format!("Cannot reopen archive: {e}"))?;
-            zip = zip::ZipArchive::new(file2)
-                .map_err(|e| format!("Cannot read zip archive: {e}"))?;
         }
     }
 

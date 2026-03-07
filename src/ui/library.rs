@@ -30,6 +30,12 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     deploy_btn.set_tooltip_text(Some("Apply all enabled mods by linking their files into the game directory"));
     header.pack_end(&deploy_btn);
 
+    // Undeploy button – removes all mod symlinks from the game directory
+    let undeploy_btn = gtk4::Button::with_label("Undeploy");
+    undeploy_btn.add_css_class("destructive-action");
+    undeploy_btn.set_tooltip_text(Some("Remove all mod symlinks from the game directory"));
+    header.pack_end(&undeploy_btn);
+
     // Add-mod button
     let add_mod_btn = gtk4::Button::new();
     add_mod_btn.set_icon_name("list-add-symbolic");
@@ -72,6 +78,44 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     log::error!("Deploy error: {e}");
                 }
                 format!("Deploy finished with {} error(s)", errors.len())
+            };
+            show_toast(btn.upcast_ref(), &msg);
+            refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
+        });
+    }
+
+    // Wire Undeploy button: remove all mod symlinks from the game directory
+    {
+        let game_c = Rc::clone(&game_rc);
+        let container_c = content_container.clone();
+        let config_c = Rc::clone(&config);
+        undeploy_btn.connect_clicked(move |btn| {
+            let db = ModDatabase::load(&game_c);
+            let mut errors: Vec<String> = Vec::new();
+            let mut count = 0;
+            for m in db.mods.iter().filter(|m| m.enabled) {
+                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+                    errors.push(format!("{}: {}", m.name, e));
+                } else {
+                    count += 1;
+                }
+            }
+
+            // Mark all mods as disabled in the database
+            let mut db = ModDatabase::load(&game_c);
+            for m in db.mods.iter_mut() {
+                m.enabled = false;
+            }
+            db.save(&game_c);
+            let _ = db.write_plugins_txt(&game_c);
+
+            let msg = if errors.is_empty() {
+                format!("Undeployed {count} mod(s)")
+            } else {
+                for e in &errors {
+                    log::error!("Undeploy error: {e}");
+                }
+                format!("Undeploy finished with {} error(s)", errors.len())
             };
             show_toast(btn.upcast_ref(), &msg);
             refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
