@@ -84,7 +84,7 @@ pub struct Game {
 impl Game {
     pub fn new(kind: GameKind, root_path: PathBuf) -> Self {
         let data_path = root_path.join(kind.default_data_subdir());
-        let id = format!("{}_{}", kind.id_str(), root_path.to_string_lossy().len());
+        let id = kind.id_str().to_string();
         let name = kind.display_name().to_string();
         Self {
             id,

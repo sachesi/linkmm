@@ -16,11 +16,11 @@ pub struct Mod {
 impl Mod {
     pub fn new(name: impl Into<String>, source_path: PathBuf) -> Self {
         let name = name.into();
-        let id = format!(
-            "{}_{}",
-            name.to_lowercase().replace(' ', "_"),
-            source_path.to_string_lossy().len()
-        );
+        let id = name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect::<String>();
         Self {
             id,
             name,
@@ -151,8 +151,17 @@ fn link_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::symlink;
-                if dest_path.exists() || dest_path.is_symlink() {
-                    // Skip if already linked or exists
+                if dest_path.is_symlink() {
+                    // Remove a broken symlink at the destination so we can re-create it
+                    if !dest_path.exists() {
+                        std::fs::remove_file(&dest_path)
+                            .map_err(|e| format!("Failed to remove broken symlink {:?}: {e}", dest_path))?;
+                    } else {
+                        // Valid symlink or file already exists — skip
+                        continue;
+                    }
+                } else if dest_path.exists() {
+                    // A real file exists — skip to avoid overwriting it
                     continue;
                 }
                 symlink(&src_path, &dest_path)
@@ -188,9 +197,14 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
         } else {
             #[cfg(unix)]
             {
+                // Only remove the symlink if it points to our source file
                 if dest_path.is_symlink() {
-                    std::fs::remove_file(&dest_path)
-                        .map_err(|e| format!("Failed to remove symlink {:?}: {e}", dest_path))?;
+                    if let Ok(target) = std::fs::read_link(&dest_path) {
+                        if target == src_path {
+                            std::fs::remove_file(&dest_path)
+                                .map_err(|e| format!("Failed to remove symlink {:?}: {e}", dest_path))?;
+                        }
+                    }
                 }
             }
         }
