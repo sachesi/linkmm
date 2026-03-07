@@ -1,6 +1,8 @@
 mod core {
     pub mod config;
+    pub mod download;
     pub mod games;
+    pub mod installer;
     pub mod mods;
     pub mod nexus;
     pub mod steam;
