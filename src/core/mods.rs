@@ -58,16 +58,22 @@ fn generate_mod_uuid() -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let nanos = ts.as_nanos();
+    let secs = ts.as_secs();
+    let nanos = ts.subsec_nanos();
     let pid = std::process::id();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
 
     // Format as 8-4-4-4-12 hex UUID-like string
-    let a = (nanos >> 96) as u32;
-    let b = ((nanos >> 80) & 0xFFFF) as u16;
-    let c = ((nanos >> 64) & 0xFFFF) as u16;
+    // a: seconds (lower 32 bits)
+    // b: subsec nanos (upper 16 bits)
+    // c: subsec nanos (lower 16 bits)
+    // d: pid XOR counter
+    // e: seconds (upper 32 bits) + pid + counter
+    let a = secs as u32;
+    let b = (nanos >> 16) as u16;
+    let c = nanos as u16;
     let d = (pid as u16) ^ (seq as u16);
-    let e = (nanos & 0xFFFF_FFFF_FFFF) as u64;
+    let e = (((secs >> 32) as u64) << 32) | ((pid as u64) << 16) | (seq as u64);
     format!("{a:08x}-{b:04x}-{c:04x}-{d:04x}-{e:012x}")
 }
 
@@ -375,7 +381,7 @@ impl ModManager {
         unlink_directory_contents(&mod_entry.source_path, target_dir)
     }
 
-    pub fn create_mod_directory(game: &Game, _mod_name: &str) -> Result<PathBuf, String> {
+    pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
         let uuid = generate_mod_uuid();
         let dir = game.mods_dir().join(&uuid);
         std::fs::create_dir_all(&dir)
