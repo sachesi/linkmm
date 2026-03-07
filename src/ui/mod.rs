@@ -528,6 +528,7 @@ fn show_about_dialog(parent: &gtk4::Window) {
 /// window.
 pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
     use crate::core::download;
+    use crate::core::download_state;
     use crate::core::nexus::NexusClient;
     use crate::core::nxm::NxmUrl;
 
@@ -622,7 +623,12 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
                 .first()
                 .ok_or_else(|| "No download links available".to_string())?;
 
-            download::download_file(url, &dest_path, |_downloaded, _total| {})?;
+            download_state::set_active(file_name.clone());
+            let download_result = download::download_file(url, &dest_path, |downloaded, total| {
+                download_state::update_progress(downloaded, total);
+            });
+            download_state::clear_active();
+            download_result?;
 
             Ok(file_name)
         })();
