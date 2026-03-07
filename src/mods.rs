@@ -90,9 +90,7 @@ impl ModDatabase {
                 if !path.is_dir() {
                     continue;
                 }
-                if path.file_name().map(|n| n == "mods.json").unwrap_or(false) {
-                    continue;
-                }
+                // Skip entries that are the database file (shouldn't happen since we check is_dir, but be safe)
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
