@@ -359,27 +359,39 @@ impl ModManager {
             std::fs::create_dir_all(target_dir)
                 .map_err(|e| format!("Failed to create target directory: {e}"))?;
         }
-        // Prefer the new `{mod_dir}/Data/` layout; fall back to the legacy
-        // flat layout so that mods installed before this change still work.
         let data_dir = mod_entry.source_path.join("Data");
-        let source = if data_dir.is_dir() {
-            data_dir
+        if data_dir.is_dir() {
+            // Link the contents of Data/ into the game Data directory.
+            link_directory_contents(&data_dir, target_dir)?;
+            // Also link any files/dirs at the mod root alongside Data/ (e.g. loose
+            // .esp files that the archive author placed outside the Data/ folder).
+            link_items_alongside_data(&mod_entry.source_path, target_dir)?;
         } else {
-            mod_entry.source_path.clone()
-        };
-        link_directory_contents(&source, target_dir)
+            // Legacy flat layout: link from mod root directly.
+            link_directory_contents(&mod_entry.source_path, target_dir)?;
+        }
+        Ok(())
     }
 
     pub fn disable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
         let target_dir = &game.data_path;
-        // Mirror the same source selection as enable_mod.
         let data_dir = mod_entry.source_path.join("Data");
-        let source = if data_dir.is_dir() {
-            data_dir
+        if data_dir.is_dir() {
+            // Unlink Data/ contents (current layout).
+            unlink_directory_contents(&data_dir, target_dir)?;
+            // Unlink items at mod root alongside Data/.
+            unlink_items_alongside_data(&mod_entry.source_path, target_dir)?;
+            // Migration: clean up the legacy nested Data/Data/ structure that was
+            // created when old deploy code used the entire mod directory as the link
+            // source against game_dir/Data, causing game_dir/Data/Data/ nesting.
+            let legacy_nested = target_dir.join("Data");
+            if legacy_nested.is_dir() {
+                unlink_directory_contents(&data_dir, &legacy_nested)?;
+            }
         } else {
-            mod_entry.source_path.clone()
-        };
-        unlink_directory_contents(&source, target_dir)
+            unlink_directory_contents(&mod_entry.source_path, target_dir)?;
+        }
+        Ok(())
     }
 
     pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
@@ -476,6 +488,105 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
             }
         }
     }
+
+    // Remove the directory if it is now empty.  This only succeeds when the
+    // directory is truly empty so it is safe to call on any directory – real
+    // game directories that still contain vanilla files will not be removed.
+    let _ = std::fs::remove_dir(dest);
+
+    Ok(())
+}
+
+/// Link all items (files and sub-directories) at `source_root` into `dest`,
+/// **skipping** the `Data/` subdirectory itself (its contents are linked
+/// separately by the caller via [`link_directory_contents`]).
+///
+/// This handles mod archives that place loose files (e.g. `.esp`) or extra
+/// asset directories alongside the `Data/` folder at the archive root.
+fn link_items_alongside_data(source_root: &Path, dest: &Path) -> Result<(), String> {
+    if !source_root.is_dir() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(source_root)
+        .map_err(|e| format!("Failed to read mod directory: {e}"))?;
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        // Skip the Data/ subdirectory – its contents are linked separately.
+        if file_name.to_string_lossy().eq_ignore_ascii_case("data") {
+            continue;
+        }
+        let src_path = entry.path();
+        let dest_path = dest.join(&file_name);
+
+        if src_path.is_dir() {
+            link_directory_contents(&src_path, &dest_path)?;
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                if dest_path.is_symlink() {
+                    if !dest_path.exists() {
+                        std::fs::remove_file(&dest_path).map_err(|e| {
+                            format!("Failed to remove broken symlink {:?}: {e}", dest_path)
+                        })?;
+                    } else {
+                        continue;
+                    }
+                } else if dest_path.exists() {
+                    continue;
+                }
+                symlink(&src_path, &dest_path).map_err(|e| {
+                    format!(
+                        "Failed to create symlink {:?} -> {:?}: {e}",
+                        dest_path, src_path
+                    )
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                return Err("Symlinks are only supported on Unix systems".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Unlink all items at `source_root` (skipping `Data/`) from `dest`.
+///
+/// Mirrors [`link_items_alongside_data`] for the undeploy direction.
+fn unlink_items_alongside_data(source_root: &Path, dest: &Path) -> Result<(), String> {
+    if !source_root.is_dir() || !dest.is_dir() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(source_root)
+        .map_err(|e| format!("Failed to read mod directory: {e}"))?;
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        if file_name.to_string_lossy().eq_ignore_ascii_case("data") {
+            continue;
+        }
+        let src_path = entry.path();
+        let dest_path = dest.join(&file_name);
+
+        if src_path.is_dir() {
+            unlink_directory_contents(&src_path, &dest_path)?;
+        } else {
+            #[cfg(unix)]
+            {
+                if dest_path.is_symlink() {
+                    if let Ok(target) = std::fs::read_link(&dest_path) {
+                        if target == src_path {
+                            std::fs::remove_file(&dest_path).map_err(|e| {
+                                format!("Failed to remove symlink {:?}: {e}", dest_path)
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -517,5 +628,196 @@ mod tests {
         assert_ne!(m1.id, m2.id);
         assert_eq!(m1.name, "Test Mod");
         assert_eq!(m2.name, "Test Mod");
+    }
+
+    // ── Deploy helpers ────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("linkmm_mods_test_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_directory_contents_creates_symlinks_for_files_and_dirs() {
+        let tmp = tempdir();
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        std::fs::create_dir_all(src.join("textures")).unwrap();
+        std::fs::write(src.join("textures").join("sky.dds"), b"dds").unwrap();
+        std::fs::write(src.join("plugin.esp"), b"esp").unwrap();
+
+        link_directory_contents(&src, &dst).unwrap();
+
+        assert!(dst.join("textures").is_dir());
+        assert!(dst.join("textures").join("sky.dds").is_symlink());
+        assert!(dst.join("plugin.esp").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlink_removes_symlinks_and_cleans_empty_dirs() {
+        let tmp = tempdir();
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        std::fs::create_dir_all(src.join("textures")).unwrap();
+        std::fs::write(src.join("textures").join("sky.dds"), b"dds").unwrap();
+
+        link_directory_contents(&src, &dst).unwrap();
+        assert!(dst.join("textures").join("sky.dds").is_symlink());
+
+        unlink_directory_contents(&src, &dst).unwrap();
+
+        // Symlink removed.
+        assert!(!dst.join("textures").join("sky.dds").exists());
+        // Empty sub-directory removed.
+        assert!(!dst.join("textures").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlink_preserves_dirs_that_contain_non_mod_files() {
+        let tmp = tempdir();
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        std::fs::create_dir_all(src.join("textures")).unwrap();
+        std::fs::write(src.join("textures").join("sky.dds"), b"dds").unwrap();
+        // Put a "vanilla" file in the destination textures dir.
+        std::fs::create_dir_all(dst.join("textures")).unwrap();
+        std::fs::write(dst.join("textures").join("vanilla.dds"), b"vanilla").unwrap();
+
+        link_directory_contents(&src, &dst).unwrap();
+        unlink_directory_contents(&src, &dst).unwrap();
+
+        // Mod symlink removed.
+        assert!(!dst.join("textures").join("sky.dds").exists());
+        // Real file untouched.
+        assert!(dst.join("textures").join("vanilla.dds").exists());
+        // Directory kept because it still has content.
+        assert!(dst.join("textures").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_items_alongside_data_links_root_files_but_not_data_dir() {
+        let tmp = tempdir();
+        let mod_root = tmp.join("mod");
+        let game_data = tmp.join("game_data");
+        std::fs::create_dir_all(mod_root.join("Data").join("textures")).unwrap();
+        std::fs::write(
+            mod_root.join("Data").join("textures").join("sky.dds"),
+            b"dds",
+        )
+        .unwrap();
+        std::fs::write(mod_root.join("SomeMod.esp"), b"esp").unwrap();
+        std::fs::create_dir_all(&game_data).unwrap();
+
+        link_items_alongside_data(&mod_root, &game_data).unwrap();
+
+        // Root-level .esp is linked.
+        assert!(game_data.join("SomeMod.esp").is_symlink());
+        // The Data/ directory itself is NOT linked (only its contents should be).
+        assert!(!game_data.join("Data").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_items_alongside_data_links_sibling_directories() {
+        let tmp = tempdir();
+        let mod_root = tmp.join("mod");
+        let game_data = tmp.join("game_data");
+        std::fs::create_dir_all(mod_root.join("Data")).unwrap();
+        std::fs::create_dir_all(mod_root.join("meshes").join("actors")).unwrap();
+        std::fs::write(
+            mod_root.join("meshes").join("actors").join("rock.nif"),
+            b"nif",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&game_data).unwrap();
+
+        link_items_alongside_data(&mod_root, &game_data).unwrap();
+
+        // meshes/ directory alongside Data/ is linked recursively.
+        assert!(game_data
+            .join("meshes")
+            .join("actors")
+            .join("rock.nif")
+            .is_symlink());
+        assert!(!game_data.join("Data").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlink_items_alongside_data_removes_root_symlinks() {
+        let tmp = tempdir();
+        let mod_root = tmp.join("mod");
+        let game_data = tmp.join("game_data");
+        std::fs::create_dir_all(mod_root.join("Data")).unwrap();
+        std::fs::write(mod_root.join("SomeMod.esp"), b"esp").unwrap();
+        std::fs::create_dir_all(&game_data).unwrap();
+
+        link_items_alongside_data(&mod_root, &game_data).unwrap();
+        assert!(game_data.join("SomeMod.esp").is_symlink());
+
+        unlink_items_alongside_data(&mod_root, &game_data).unwrap();
+        assert!(!game_data.join("SomeMod.esp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disable_cleans_up_legacy_nested_data_dir() {
+        // Reproduce the old-code bug: deploy was done with mod_dir as source
+        // against game_dir/Data, creating game_dir/Data/Data/ nesting.
+        let tmp = tempdir();
+        let mod_dir = tmp.join("mod");
+        let game_data = tmp.join("game_data");
+
+        std::fs::create_dir_all(mod_dir.join("Data").join("textures")).unwrap();
+        std::fs::write(
+            mod_dir.join("Data").join("textures").join("sky.dds"),
+            b"dds",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&game_data).unwrap();
+
+        // Simulate OLD deployment: link_directory_contents(mod_dir, game_data)
+        // → creates game_data/Data/textures/sky.dds (nested!)
+        link_directory_contents(&mod_dir, &game_data).unwrap();
+        assert!(
+            game_data
+                .join("Data")
+                .join("textures")
+                .join("sky.dds")
+                .is_symlink(),
+            "old-style deploy should create nested symlink"
+        );
+
+        // Run disable_mod logic: unlink current layout (nothing to do), then
+        // unlink legacy nested layout.
+        let data_dir = mod_dir.join("Data");
+        unlink_directory_contents(&data_dir, &game_data).unwrap();
+        let legacy_nested = game_data.join("Data");
+        if legacy_nested.is_dir() {
+            unlink_directory_contents(&data_dir, &legacy_nested).unwrap();
+        }
+
+        // Old nested symlinks gone.
+        assert!(
+            !game_data
+                .join("Data")
+                .join("textures")
+                .join("sky.dds")
+                .exists()
+        );
+        // Empty dirs cleaned up.
+        assert!(!game_data.join("Data").join("textures").exists());
+        assert!(!game_data.join("Data").exists());
     }
 }

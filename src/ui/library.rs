@@ -104,20 +104,16 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
             let mut count = 0;
-            for m in db.mods.iter().filter(|m| m.enabled) {
+            // Unlink ALL mods regardless of enabled state so the game directory
+            // is fully clean.  The enabled state is intentionally preserved so
+            // the user can re-deploy with the same selection later.
+            for m in &db.mods {
                 if let Err(e) = ModManager::disable_mod(&game_c, m) {
                     errors.push(format!("{}: {}", m.name, e));
                 } else {
                     count += 1;
                 }
             }
-
-            // Mark all mods as disabled in the database
-            let mut db = ModDatabase::load(&game_c);
-            for m in db.mods.iter_mut() {
-                m.enabled = false;
-            }
-            db.save(&game_c);
             let _ = db.write_plugins_txt(&game_c);
 
             let msg = if errors.is_empty() {
