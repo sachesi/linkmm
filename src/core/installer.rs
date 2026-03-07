@@ -430,11 +430,9 @@ pub fn install_mod_from_archive(
             extract_zip_to(archive_path, &mod_dir)?;
         }
         InstallStrategy::Data => {
-            // Create a Data/ sub-directory inside the mod and extract there
-            let data_sub = mod_dir.join("Data");
-            std::fs::create_dir_all(&data_sub)
-                .map_err(|e| format!("Failed to create Data subdir: {e}"))?;
-            extract_zip_to(archive_path, &data_sub)?;
+            // Extract directly into the mod directory – these files will be
+            // symlinked into the game's Data/ folder by ModManager::enable_mod.
+            extract_zip_to(archive_path, &mod_dir)?;
         }
         InstallStrategy::Fomod(files) => {
             install_fomod_files(archive_path, &mod_dir, files)?;
@@ -443,6 +441,9 @@ pub fn install_mod_from_archive(
 
     let mut mod_entry = Mod::new(mod_name, mod_dir);
     mod_entry.installed_from_nexus = true;
+    // Root-strategy mods contain a top-level Data/ folder and should be
+    // symlinked into the game root directory, not into Data/.
+    mod_entry.install_to_root = matches!(strategy, InstallStrategy::Root);
 
     // Register in the mod database
     let mut db = ModDatabase::load(game);
@@ -687,4 +688,112 @@ fn is_safe_relative_path(path: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    /// Create a simple zip archive in `dir` containing the given entries.
+    /// Each entry is (name, content).  Names ending with `/` are directories.
+    fn create_test_zip(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+        let archive_path = dir.join("test_mod.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip_writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for &(name, content) in entries {
+            if name.ends_with('/') {
+                zip_writer.add_directory(name, options).unwrap();
+            } else {
+                zip_writer.start_file(name, options).unwrap();
+                zip_writer.write_all(content).unwrap();
+            }
+        }
+        // finish() returns the inner File – drop it to flush
+        let inner = zip_writer.finish().unwrap();
+        drop(inner);
+        archive_path
+    }
+
+    #[test]
+    fn detect_strategy_data_for_loose_files() {
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("textures/sky.dds", b"dds"),
+            ("meshes/rock.nif", b"nif"),
+        ]);
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(matches!(strategy, InstallStrategy::Data));
+    }
+
+    #[test]
+    fn detect_strategy_root_for_data_folder() {
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("Data/", b""),
+            ("Data/textures/sky.dds", b"dds"),
+            ("Data/meshes/rock.nif", b"nif"),
+        ]);
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(matches!(strategy, InstallStrategy::Root));
+    }
+
+    #[test]
+    fn extract_zip_data_strategy_puts_files_at_root_of_mod_dir() {
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("textures/sky.dds", b"dds_data"),
+            ("plugin.esp", b"esp_data"),
+        ]);
+        let dest = tmp.join("extracted");
+        std::fs::create_dir_all(&dest).unwrap();
+        extract_zip_to(&archive, &dest).unwrap();
+
+        assert!(dest.join("textures").join("sky.dds").exists());
+        assert!(dest.join("plugin.esp").exists());
+        assert_eq!(std::fs::read_to_string(dest.join("plugin.esp")).unwrap(), "esp_data");
+    }
+
+    #[test]
+    fn extract_zip_strips_common_prefix() {
+        let tmp = tempdir();
+        let archive = create_test_zip(&tmp, &[
+            ("MyMod/", b""),
+            ("MyMod/textures/sky.dds", b"dds_data"),
+            ("MyMod/plugin.esp", b"esp_data"),
+        ]);
+        let dest = tmp.join("extracted");
+        std::fs::create_dir_all(&dest).unwrap();
+        extract_zip_to(&archive, &dest).unwrap();
+
+        // Common prefix "MyMod/" is stripped
+        assert!(dest.join("textures").join("sky.dds").exists());
+        assert!(dest.join("plugin.esp").exists());
+    }
+
+    #[test]
+    fn is_safe_relative_path_rejects_traversal() {
+        assert!(!is_safe_relative_path("../etc/passwd"));
+        assert!(!is_safe_relative_path("foo/../../bar"));
+        assert!(!is_safe_relative_path("/absolute/path"));
+        assert!(is_safe_relative_path("foo/bar/baz"));
+        assert!(is_safe_relative_path("textures/sky.dds"));
+        assert!(is_safe_relative_path("a/../a/b")); // depth never goes negative
+    }
+
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "linkmm_test_{}_{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }
