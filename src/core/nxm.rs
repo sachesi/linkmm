@@ -56,8 +56,21 @@ impl NxmUrl {
             for param in q.split('&') {
                 if let Some((k, v)) = param.split_once('=') {
                     match k {
-                        "key" => key = Some(v.to_string()),
-                        "expires" => expires = Some(v.to_string()),
+                        "key" => {
+                            // Validate key: alphanumeric, underscores, hyphens only
+                            if v.len() <= 128
+                                && v.chars()
+                                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                            {
+                                key = Some(v.to_string());
+                            }
+                        }
+                        "expires" => {
+                            // Validate expires: must be a valid integer timestamp
+                            if v.parse::<u64>().is_ok() {
+                                expires = Some(v.to_string());
+                            }
+                        }
                         _ => {} // ignore unknown params (user_id, etc.)
                     }
                 }

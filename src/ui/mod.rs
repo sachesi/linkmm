@@ -552,10 +552,19 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
             // Get file info to determine the file name
             let files = client.get_mod_files(&nxm.game_domain, nxm.mod_id as u32)?;
             let file_info = files.iter().find(|f| f.file_id == nxm.file_id);
-            let file_name = match file_info {
+            let raw_name = match file_info {
                 Some(f) => f.file_name.clone(),
                 None => format!("mod_{}_{}.zip", nxm.mod_id, nxm.file_id),
             };
+
+            // Sanitize filename: strip path components, reject traversal
+            let file_name = std::path::Path::new(&raw_name)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("mod_{}_{}.zip", nxm.mod_id, nxm.file_id));
+            if file_name.contains("..") || file_name.starts_with('.') {
+                return Err("Invalid filename from server".to_string());
+            }
 
             let dest_path = downloads_dir.join(&file_name);
             if dest_path.exists() {

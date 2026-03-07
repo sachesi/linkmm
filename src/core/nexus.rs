@@ -252,9 +252,16 @@ impl NexusClient {
         expires: &str,
     ) -> Result<Vec<(String, String)>, String> {
         let url = format!(
-            "https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}/files/{file_id}/download_link.json?key={key}&expires={expires}"
+            "https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}/files/{file_id}/download_link.json"
         );
-        let response = self.get(&url)?;
+        // Use ureq query parameters to avoid URL injection
+        let response = ureq::get(&url)
+            .set("apikey", &self.api_key)
+            .set("User-Agent", "Linkmm/0.1.0")
+            .query("key", key)
+            .query("expires", expires)
+            .call()
+            .map_err(|e| format!("Request failed: {e}"))?;
         let data: Vec<NexusDownloadLink> = response
             .into_json()
             .map_err(|e| format!("Failed to parse response: {e}"))?;

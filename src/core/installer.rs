@@ -491,22 +491,13 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
             continue;
         }
 
-        let out_path = dest_dir.join(&rel_name);
+        // Zip-slip protection: reject entries with path traversal components
+        if !is_safe_relative_path(&rel_name) {
+            log::warn!("Skipping zip entry with unsafe path: {rel_name}");
+            continue;
+        }
 
-        // Validate that the resolved path stays within dest_dir (zip-slip protection)
-        let canonical_dest = dest_dir
-            .canonicalize()
-            .unwrap_or_else(|_| dest_dir.to_path_buf());
-        // For the check, use the parent dirs that exist
-        if let Some(parent) = out_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(canonical_out) = out_path.canonicalize() {
-            if !canonical_out.starts_with(&canonical_dest) {
-                log::warn!("Skipping zip entry outside destination: {rel_name}");
-                continue;
-            }
-        }
+        let out_path = dest_dir.join(&rel_name);
 
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)
@@ -529,7 +520,7 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
 /// Detect whether all entries in the archive share a common top-level directory
 /// prefix.  If so, return it (with trailing `/`).
 fn find_common_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> String {
-    if zip.len() == 0 {
+    if zip.is_empty() {
         return String::new();
     }
 
@@ -629,6 +620,13 @@ fn install_fomod_files(
                 continue;
             }
 
+            // Zip-slip protection on the combined destination + rel path
+            let combined = format!("{}/{}", destination, rel);
+            if !is_safe_relative_path(&combined) {
+                log::warn!("Skipping fomod entry with unsafe path: {combined}");
+                continue;
+            }
+
             let out_path = dest_dir.join(&destination).join(&rel);
 
             // Use by_index to avoid long-lived borrow issues
@@ -643,17 +641,6 @@ fn install_fomod_files(
                 if let Some(parent) = out_path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Failed to create parent dir: {e}"))?;
-                }
-
-                // Zip-slip protection
-                let canonical_dest = dest_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| dest_dir.to_path_buf());
-                if let Ok(canonical_out) = out_path.canonicalize() {
-                    if !canonical_out.starts_with(&canonical_dest) {
-                        log::warn!("Skipping fomod entry outside destination: {}", out_path.display());
-                        continue;
-                    }
                 }
 
                 let mut out_file = std::fs::File::create(&out_path)
@@ -671,4 +658,33 @@ fn install_fomod_files(
 fn normalise_path(p: &str) -> String {
     let s = p.replace('\\', "/");
     s.strip_prefix('/').unwrap_or(&s).to_string()
+}
+
+/// Check that a relative path is safe (no traversal above the root).
+///
+/// Rejects paths containing `..` components that would escape the destination.
+fn is_safe_relative_path(path: &str) -> bool {
+    use std::path::Component;
+    let normalised = path.replace('\\', "/");
+    let p = Path::new(&normalised);
+    let mut depth: i32 = 0;
+    for component in p.components() {
+        match component {
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            Component::Normal(_) => {
+                depth += 1;
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                // Absolute paths are not safe relative paths
+                return false;
+            }
+            Component::CurDir => {}
+        }
+    }
+    true
 }
