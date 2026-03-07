@@ -764,11 +764,7 @@ fn show_fomod_wizard(
                     group.group_type,
                     GroupType::SelectExactlyOne | GroupType::SelectAtMostOne
                 );
-                let radio_group: Option<gtk4::CheckButton> = if use_radio {
-                    Some(gtk4::CheckButton::new())
-                } else {
-                    None
-                };
+                let mut first_radio_button: Option<gtk4::CheckButton> = None;
                 let preview_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
                 preview_box.set_halign(gtk4::Align::Fill);
                 preview_box.set_valign(gtk4::Align::Start);
@@ -801,8 +797,10 @@ fn show_fomod_wizard(
                     }
                     let check = gtk4::CheckButton::new();
                     if use_radio {
-                        if let Some(ref rg) = radio_group {
-                            check.set_group(Some(rg));
+                        if let Some(ref first) = first_radio_button {
+                            check.set_group(Some(first));
+                        } else {
+                            first_radio_button = Some(check.clone());
                         }
                     }
                     {
