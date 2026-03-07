@@ -677,11 +677,11 @@ fn install_fomod_files(
 
             // Zip-slip protection on the combined destination + rel path
             let combined = if destination.is_empty() {
-                rel.clone()
+                std::borrow::Cow::Borrowed(rel.as_str())
             } else {
-                format!("{destination}/{rel}")
+                std::borrow::Cow::Owned(format!("{destination}/{rel}"))
             };
-            if !is_safe_relative_path(&combined) {
+            if !is_safe_relative_path(combined.as_ref()) {
                 log::warn!("Skipping fomod entry with unsafe path: {combined}");
                 continue;
             }
