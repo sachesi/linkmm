@@ -309,30 +309,18 @@ fn show_strategy_picker(
     game: &Game,
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
-    detected: &InstallStrategy,
+    _detected: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
 ) {
-    let detected_label = match detected {
-        InstallStrategy::Root => "Root",
-        InstallStrategy::Data => "Data",
-        InstallStrategy::Fomod(_) => "FOMOD",
-    };
     let dialog = adw::AlertDialog::builder()
         .heading("Install Mod")
         .body(&format!(
-            "Choose how to install \"{archive_name}\".\n\n\
-             \u{2022} Root: Extracts to the game root folder\n\
-             \u{2022} Data: Extracts into the Data subfolder\n\n\
-             Detected strategy: {detected_label}"))
+            "Install \"{archive_name}\" into the game's Data folder?"))
         .build();
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("root", "Install to Root");
-    dialog.add_response("data", "Install to Data");
+    dialog.add_response("data", "Install");
     dialog.set_response_appearance("data", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some(match detected {
-        InstallStrategy::Root => "root",
-        _ => "data",
-    }));
+    dialog.set_default_response(Some("data"));
     dialog.set_close_response("cancel");
 
     let ap = archive_path.to_path_buf();
@@ -342,12 +330,9 @@ fn show_strategy_picker(
     let cont = container.clone();
     let grc = Rc::clone(game_rc);
     dialog.connect_response(None, move |_, response| {
-        let strategy = match response {
-            "root" => InstallStrategy::Root,
-            "data" => InstallStrategy::Data,
-            _ => return,
-        };
-        do_install(&ap, &an, &gc, &cc, &cont, &strategy, &grc);
+        if response == "data" {
+            do_install(&ap, &an, &gc, &cc, &cont, &InstallStrategy::Data, &grc);
+        }
     });
     dialog.present(parent);
 }
