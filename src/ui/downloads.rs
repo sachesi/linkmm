@@ -160,15 +160,15 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
             std::time::Duration::from_millis(DOWNLOAD_PROGRESS_POLL_INTERVAL_MS),
             move || {
                 let active = download_state::all_active();
-                let mut fingerprint = String::new();
+                let mut download_state_key = String::new();
                 for (id, entry) in &active {
-                    fingerprint.push_str(&format!(
+                    download_state_key.push_str(&format!(
                         "{id}:{}:{}:{}|",
                         entry.file_name, entry.downloaded, entry.total
                     ));
                 }
-                if *active_download_fingerprint_c.borrow() != fingerprint {
-                    *active_download_fingerprint_c.borrow_mut() = fingerprint;
+                if *active_download_fingerprint_c.borrow() != download_state_key {
+                    *active_download_fingerprint_c.borrow_mut() = download_state_key;
                     refresh_content_with_search(
                         &container_c,
                         &config_c,
@@ -317,7 +317,7 @@ fn build_active_download_row(download_id: u64, active: &download_state::ActiveDo
         progress.pulse();
         progress.set_text(Some(&format_size(active.downloaded)));
     }
-    row.add_prefix(&progress);
+    row.add_suffix(&progress);
 
     let cancel_btn = gtk4::Button::new();
     cancel_btn.set_icon_name("process-stop-symbolic");

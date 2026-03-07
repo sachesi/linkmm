@@ -1,6 +1,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+pub const DOWNLOAD_CANCELLED_ERROR: &str = "Download cancelled";
+
 /// Download a file from `url` to `dest_path`, reporting progress via `on_progress(downloaded, total)`.
 ///
 /// The file is first written to a `.part` temporary path and renamed on
@@ -53,7 +55,7 @@ pub fn download_file(
         if !on_progress(downloaded, total) {
             drop(out);
             let _ = std::fs::remove_file(&part_path);
-            return Err("Download cancelled".to_string());
+            return Err(DOWNLOAD_CANCELLED_ERROR.to_string());
         }
     }
 
