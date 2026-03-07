@@ -9,6 +9,7 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::mods::ModDatabase;
 
+pub mod downloads;
 pub mod library;
 pub mod load_order;
 pub mod mod_list;
@@ -28,7 +29,8 @@ pub fn build_ui(app: &libadwaita::Application) {
 
 const NAV_LIBRARY: i32 = 0;
 const NAV_LOAD_ORDER: i32 = 1;
-const NAV_PREFERENCES: i32 = 2;
+const NAV_DOWNLOADS: i32 = 2;
+const NAV_PREFERENCES: i32 = 3;
 
 // ── Main window ────────────────────────────────────────────────────────────
 
@@ -75,7 +77,6 @@ fn build_main_window(
     active_game_list.set_margin_start(12);
     active_game_list.set_margin_end(12);
     active_game_list.set_margin_bottom(12);
-    // The row itself handles activation; the ListBox doesn't need selection
     active_game_list.set_selection_mode(gtk4::SelectionMode::None);
 
     let active_game_row = adw::ActionRow::builder()
@@ -105,6 +106,7 @@ fn build_main_window(
     for (name, icon) in &[
         ("Library", "applications-games-symbolic"),
         ("Load Order", "format-justify-left-symbolic"),
+        ("Downloads", "folder-download-symbolic"),
         ("Preferences", "preferences-system-symbolic"),
     ] {
         let row = adw::ActionRow::builder()
@@ -148,7 +150,6 @@ fn build_main_window(
     stats_list.append(&conflicts_row);
     sidebar_box.append(&stats_list);
 
-    // Populate stats for the current game immediately
     refresh_stats(
         &config.borrow(),
         &installed_label,
@@ -171,15 +172,11 @@ fn build_main_window(
 
     // ── Content area ──────────────────────────────────────────────────────
 
-    // A Stack holds one page per navigation destination.
-    // Pages that require a game are initially placeholders and get replaced
-    // when a game is added / selected.
     let content_stack = gtk4::Stack::new();
     content_stack.set_transition_type(gtk4::StackTransitionType::None);
     content_stack.set_vexpand(true);
     content_stack.set_hexpand(true);
 
-    // Build initial pages (using current game if any)
     let current_game = {
         let cfg = config.borrow();
         cfg.current_game().cloned()
@@ -195,6 +192,11 @@ fn build_main_window(
     // Load Order
     let load_order_widget = load_order::build_load_order_page(current_game.as_ref());
     content_stack.add_named(&load_order_widget, Some("load_order"));
+
+    // Downloads
+    let downloads_widget =
+        downloads::build_downloads_page(current_game.as_ref(), Rc::clone(&config));
+    content_stack.add_named(&downloads_widget, Some("downloads"));
 
     let content_page = adw::NavigationPage::builder()
         .title("Library")
@@ -226,8 +228,11 @@ fn build_main_window(
                     content_page_c.set_title("Load Order");
                     content_stack_c.set_visible_child_name("load_order");
                 }
+                NAV_DOWNLOADS => {
+                    content_page_c.set_title("Downloads");
+                    content_stack_c.set_visible_child_name("downloads");
+                }
                 NAV_PREFERENCES => {
-                    // Open settings as a dialog; revert selection to Library
                     settings::show_settings_dialog(
                         window_c.upcast_ref::<gtk4::Window>(),
                         Rc::clone(&config_c),
@@ -239,7 +244,7 @@ fn build_main_window(
         });
     }
 
-    // ── on_setup_done callback (defined before signals that need it) ──────────
+    // ── on_setup_done callback ──────────────────────────────────────────────
     let active_game_row_r = active_game_row.clone();
     let installed_r = installed_label.clone();
     let enabled_r = enabled_label.clone();
@@ -280,6 +285,14 @@ fn build_main_window(
             content_stack_r.remove(&old);
         }
         content_stack_r.add_named(&new_load_order, Some("load_order"));
+
+        // Rebuild Downloads page
+        let new_downloads =
+            downloads::build_downloads_page(game_info.as_ref(), Rc::clone(&config_r));
+        if let Some(old) = content_stack_r.child_by_name("downloads") {
+            content_stack_r.remove(&old);
+        }
+        content_stack_r.add_named(&new_downloads, Some("downloads"));
 
         // Switch to Library
         content_page_r.set_title("Library");
@@ -435,7 +448,6 @@ fn show_game_picker(
 
     content_box.append(&game_list);
 
-    // "Add New Game" button
     let add_btn = gtk4::Button::with_label("Add New Game\u{2026}");
     add_btn.add_css_class("suggested-action");
     add_btn.set_halign(gtk4::Align::Center);
@@ -480,4 +492,3 @@ fn show_about_dialog(parent: &gtk4::Window) {
         .build();
     dialog.present(Some(parent));
 }
-
