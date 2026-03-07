@@ -449,6 +449,8 @@ type FomodSelections = Vec<Vec<Vec<usize>>>;
 const GROUP_PREVIEW_IMAGE_WIDTH: i32 = 300;
 const GROUP_PREVIEW_IMAGE_HEIGHT: i32 = 180;
 const GROUP_PREVIEW_NAME_WIDTH_CHARS: i32 = 34;
+const GROUP_PREVIEW_NAME_MAX_WIDTH_CHARS: i32 = 40;
+const FOMOD_CARD_EDGE_MARGIN: i32 = 1;
 
 fn collect_active_flags(
     fomod: &FomodConfig,
@@ -793,10 +795,10 @@ fn show_fomod_wizard(
             preview_box.set_halign(gtk4::Align::Start);
             preview_box.set_valign(gtk4::Align::Start);
             preview_box.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, -1);
-            preview_box.set_margin_top(1);
-            preview_box.set_margin_bottom(1);
-            preview_box.set_margin_start(1);
-            preview_box.set_margin_end(1);
+            preview_box.set_margin_top(FOMOD_CARD_EDGE_MARGIN);
+            preview_box.set_margin_bottom(FOMOD_CARD_EDGE_MARGIN);
+            preview_box.set_margin_start(FOMOD_CARD_EDGE_MARGIN);
+            preview_box.set_margin_end(FOMOD_CARD_EDGE_MARGIN);
             let preview_label = gtk4::Label::new(Some("Preview"));
             preview_label.add_css_class("dim-label");
             preview_label.add_css_class("caption");
@@ -807,7 +809,7 @@ fn show_fomod_wizard(
             preview_name.set_wrap(true);
             preview_name.set_halign(gtk4::Align::Start);
             preview_name.set_width_chars(GROUP_PREVIEW_NAME_WIDTH_CHARS);
-            preview_name.set_max_width_chars(GROUP_PREVIEW_NAME_WIDTH_CHARS);
+            preview_name.set_max_width_chars(GROUP_PREVIEW_NAME_MAX_WIDTH_CHARS);
             preview_name.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
             preview_name.set_margin_start(12);
             preview_name.set_margin_end(12);
@@ -834,8 +836,8 @@ fn show_fomod_wizard(
                 };
                 let frame = gtk4::Frame::new(Some(&format!("{} ({type_desc})", group.name)));
                 frame.add_css_class("card");
-                frame.set_margin_top(1);
-                frame.set_margin_bottom(1);
+                frame.set_margin_top(FOMOD_CARD_EDGE_MARGIN);
+                frame.set_margin_bottom(FOMOD_CARD_EDGE_MARGIN);
                 let lb = gtk4::ListBox::new();
                 lb.add_css_class("boxed-list");
                 lb.set_selection_mode(gtk4::SelectionMode::None);
