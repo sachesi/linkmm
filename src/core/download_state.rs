@@ -7,6 +7,7 @@ pub struct ActiveDownload {
     pub file_name: String,
     pub downloaded: u64,
     pub total: u64,
+    /// Set to `true` when the user requests cancelling this download.
     pub cancel_requested: bool,
 }
 
