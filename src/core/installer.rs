@@ -423,7 +423,7 @@ pub fn install_mod_from_archive(
     mod_name: &str,
     strategy: &InstallStrategy,
 ) -> Result<Mod, String> {
-    let mod_dir = ModManager::create_mod_directory(game, mod_name)?;
+    let mod_dir = ModManager::create_mod_directory(game)?;
 
     match strategy {
         InstallStrategy::Root => {
