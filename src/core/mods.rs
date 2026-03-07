@@ -47,6 +47,36 @@ pub struct PluginFile {
 
 // ── Mod struct ────────────────────────────────────────────────────────────────
 
+/// Generate a UUID-like unique identifier for mod folder names.
+///
+/// Uses nanosecond timestamp, process ID, and an atomic counter to ensure
+/// uniqueness even when multiple mods are created in rapid succession.
+fn generate_mod_uuid() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = ts.as_secs();
+    let nanos = ts.subsec_nanos();
+    let pid = std::process::id();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Format as 8-4-4-4-12 hex UUID-like string
+    // a: seconds (lower 32 bits)
+    // b: subsec nanos (upper 16 bits)
+    // c: subsec nanos (lower 16 bits)
+    // d: pid XOR counter
+    // e: seconds (upper 32 bits) + pid + counter
+    let a = secs as u32;
+    let b = (nanos >> 16) as u16;
+    let c = nanos as u16;
+    let d = (pid as u16) ^ (seq as u16);
+    let e = (((secs >> 32) as u64) << 32) | ((pid as u64) << 16) | (seq as u64);
+    format!("{a:08x}-{b:04x}-{c:04x}-{d:04x}-{e:012x}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
     pub id: String,
@@ -59,22 +89,17 @@ pub struct Mod {
     /// True when this mod was downloaded through the Downloads page via the Nexus API.
     #[serde(default)]
     pub installed_from_nexus: bool,
+    /// True when the mod should be linked into the game root directory instead
+    /// of the Data directory (e.g. mods containing a top-level `Data/` folder
+    /// or executables that sit next to the game binary).
+    #[serde(default)]
+    pub install_to_root: bool,
 }
 
 impl Mod {
     pub fn new(name: impl Into<String>, source_path: PathBuf) -> Self {
         let name = name.into();
-        let id = name
-            .to_lowercase()
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
+        let id = generate_mod_uuid();
         Self {
             id,
             name,
@@ -84,6 +109,7 @@ impl Mod {
             nexus_id: None,
             source_path,
             installed_from_nexus: false,
+            install_to_root: false,
         }
     }
 }
@@ -146,24 +172,8 @@ impl ModDatabase {
         if !mods_dir.is_dir() {
             return;
         }
-        if let Ok(entries) = std::fs::read_dir(&mods_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                // Skip entries that are the database file (shouldn't happen since we check is_dir, but be safe)
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let already_known = self.mods.iter().any(|m| m.source_path == path);
-                if !already_known && !name.is_empty() {
-                    let mod_entry = Mod::new(name, path);
-                    self.mods.push(mod_entry);
-                }
-            }
-        }
+        // Remove stale entries whose source directories no longer exist
+        self.mods.retain(|m| m.source_path.is_dir());
     }
 
     // ── Plugin / Load-Order helpers ──────────────────────────────────────────
@@ -350,21 +360,30 @@ pub struct ModManager;
 
 impl ModManager {
     pub fn enable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        let data_dir = &game.data_path;
-        if !data_dir.is_dir() {
-            std::fs::create_dir_all(data_dir)
-                .map_err(|e| format!("Failed to create data directory: {e}"))?;
+        let target_dir = if mod_entry.install_to_root {
+            &game.root_path
+        } else {
+            &game.data_path
+        };
+        if !target_dir.is_dir() {
+            std::fs::create_dir_all(target_dir)
+                .map_err(|e| format!("Failed to create target directory: {e}"))?;
         }
-        link_directory_contents(&mod_entry.source_path, data_dir)
+        link_directory_contents(&mod_entry.source_path, target_dir)
     }
 
     pub fn disable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        let data_dir = &game.data_path;
-        unlink_directory_contents(&mod_entry.source_path, data_dir)
+        let target_dir = if mod_entry.install_to_root {
+            &game.root_path
+        } else {
+            &game.data_path
+        };
+        unlink_directory_contents(&mod_entry.source_path, target_dir)
     }
 
-    pub fn create_mod_directory(game: &Game, mod_name: &str) -> Result<PathBuf, String> {
-        let dir = game.mods_dir().join(mod_name);
+    pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
+        let uuid = generate_mod_uuid();
+        let dir = game.mods_dir().join(&uuid);
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Failed to create mod directory: {e}"))?;
         Ok(dir)
@@ -457,4 +476,45 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_generation_is_unique() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let id = generate_mod_uuid();
+            assert!(!ids.contains(&id), "duplicate UUID: {id}");
+            ids.insert(id);
+        }
+    }
+
+    #[test]
+    fn uuid_format_looks_like_uuid() {
+        let id = generate_mod_uuid();
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 5, "UUID should have 5 dash-separated parts: {id}");
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "UUID should be hex: {id}"
+        );
+    }
+
+    #[test]
+    fn mod_new_generates_uuid_id() {
+        let m1 = Mod::new("Test Mod", PathBuf::from("/tmp/test1"));
+        let m2 = Mod::new("Test Mod", PathBuf::from("/tmp/test2"));
+        // Same name but different UUIDs
+        assert_ne!(m1.id, m2.id);
+        assert_eq!(m1.name, "Test Mod");
+        assert_eq!(m2.name, "Test Mod");
+    }
 }

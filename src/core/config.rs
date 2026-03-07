@@ -85,7 +85,10 @@ impl AppConfig {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
-                    Ok(config) => return config,
+                    Ok(mut config) => {
+                        config.apply_mods_base_dirs();
+                        return config;
+                    }
                     Err(e) => {
                         log::warn!("Failed to parse config: {e}, using defaults");
                     }
@@ -115,6 +118,15 @@ impl AppConfig {
             Err(e) => {
                 log::error!("Failed to serialize config: {e}");
             }
+        }
+    }
+
+    /// Set `mods_base_dir` on every game based on the user-chosen
+    /// `app_data_dir`.  Must be called after loading or after adding games /
+    /// changing `app_data_dir`.
+    pub fn apply_mods_base_dirs(&mut self) {
+        for game in &mut self.games {
+            game.mods_base_dir = self.app_data_dir.clone();
         }
     }
 

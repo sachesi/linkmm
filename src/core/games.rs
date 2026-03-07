@@ -128,6 +128,11 @@ pub struct Game {
     pub kind: GameKind,
     pub root_path: PathBuf,
     pub data_path: PathBuf,
+    /// When set, mods are stored under `<mods_base_dir>/mods/<game_id>/`
+    /// instead of the default `~/.local/share/linkmm/mods/<game_id>/`.
+    /// Populated from `AppConfig::app_data_dir` at load time.
+    #[serde(skip)]
+    pub mods_base_dir: Option<PathBuf>,
 }
 
 impl Game {
@@ -141,15 +146,24 @@ impl Game {
             kind,
             root_path,
             data_path,
+            mods_base_dir: None,
         }
     }
 
+    /// Return the directory where mod folders for this game are stored.
+    ///
+    /// When `mods_base_dir` is set (from the user-configured `app_data_dir`),
+    /// returns `<mods_base_dir>/mods/<game_id>/`.  Otherwise falls back to
+    /// `~/.local/share/linkmm/mods/<game_id>/`.
     pub fn mods_dir(&self) -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("linkmm")
-            .join("mods")
-            .join(&self.id)
+        match &self.mods_base_dir {
+            Some(base) => base.join("mods").join(&self.id),
+            None => dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("linkmm")
+                .join("mods")
+                .join(&self.id),
+        }
     }
 
     /// Try to locate the directory that contains `plugins.txt` for this game.

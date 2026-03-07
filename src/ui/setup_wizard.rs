@@ -639,6 +639,9 @@ fn finish_wizard(
             cfg.app_data_dir = Some(app_dir);
         }
 
+        // Resolve mods directories based on app_data_dir for all games
+        cfg.apply_mods_base_dirs();
+
         cfg.save();
     }
 
