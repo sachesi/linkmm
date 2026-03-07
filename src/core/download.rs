@@ -1,6 +1,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+pub const DOWNLOAD_CANCELLED_ERROR: &str = "Download cancelled";
+
 /// Download a file from `url` to `dest_path`, reporting progress via `on_progress(downloaded, total)`.
 ///
 /// The file is first written to a `.part` temporary path and renamed on
@@ -8,7 +10,7 @@ use std::path::{Path, PathBuf};
 pub fn download_file(
     url: &str,
     dest_path: &Path,
-    on_progress: impl Fn(u64, u64),
+    mut on_progress: impl FnMut(u64, u64) -> bool,
 ) -> Result<PathBuf, String> {
     let response = ureq::get(url)
         .set("User-Agent", "Linkmm/0.1.0")
@@ -50,7 +52,11 @@ pub fn download_file(
         std::io::Write::write_all(&mut out, &buf[..n])
             .map_err(|e| format!("Download write error: {e}"))?;
         downloaded += n as u64;
-        on_progress(downloaded, total);
+        if !on_progress(downloaded, total) {
+            drop(out);
+            let _ = std::fs::remove_file(&part_path);
+            return Err(DOWNLOAD_CANCELLED_ERROR.to_string());
+        }
     }
 
     drop(out);
