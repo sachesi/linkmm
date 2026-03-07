@@ -254,6 +254,23 @@ impl ModDatabase {
         result
     }
 
+    /// Sort non-vanilla plugins by type priority (ESM → ESL → ESP) then
+    /// alphabetically (case-insensitive) within each type.
+    ///
+    /// Vanilla masters are always kept first in their canonical game order and
+    /// are never reordered.  After sorting, `plugin_load_order` is updated and
+    /// the database can be saved / written to `plugins.txt` by the caller.
+    pub fn sort_plugins_by_type(&mut self, game: &Game) {
+        let mut plugins = self.get_ordered_plugins(game);
+        // Vanilla plugins are placed first by get_ordered_plugins; find where
+        // the non-vanilla section starts.
+        let vanilla_end = plugins.iter().take_while(|p| p.is_vanilla).count();
+        plugins[vanilla_end..].sort_by_cached_key(|p| {
+            (p.kind.sort_priority(), p.name.to_lowercase())
+        });
+        self.set_plugin_order(&plugins);
+    }
+
     /// Update `plugin_load_order` and `plugin_disabled` from the given ordered list.
     pub fn set_plugin_order(&mut self, plugins: &[PluginFile]) {
         self.plugin_load_order = plugins
