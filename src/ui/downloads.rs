@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -9,6 +9,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
+use crate::core::download_state;
 use crate::core::games::Game;
 use crate::core::installer::{
     DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
@@ -23,6 +24,7 @@ use crate::core::mods::ModDatabase;
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 /// Archive types that are currently installable by the app.
 const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip"];
+const DOWNLOAD_PROGRESS_POLL_INTERVAL_MS: u64 = 200;
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
@@ -54,46 +56,170 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
     refresh_btn.set_tooltip_text(Some("Refresh downloads list"));
     header.pack_start(&refresh_btn);
 
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Search downloads"));
+    search_entry.set_width_chars(24);
+    header.pack_start(&search_entry);
+
     toolbar_view.add_top_bar(&header);
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.set_vexpand(true);
 
+    let progress_revealer = gtk4::Revealer::new();
+    progress_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    progress_revealer.set_reveal_child(false);
+    progress_revealer.set_margin_start(12);
+    progress_revealer.set_margin_end(12);
+    progress_revealer.set_margin_top(12);
+
+    let progress_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    progress_box.add_css_class("card");
+    progress_box.set_margin_top(12);
+    progress_box.set_margin_bottom(12);
+    progress_box.set_margin_start(12);
+    progress_box.set_margin_end(12);
+
+    let progress_title = gtk4::Label::new(Some(""));
+    progress_title.set_xalign(0.0);
+    progress_title.add_css_class("heading");
+
+    let progress_bar = gtk4::ProgressBar::new();
+    progress_bar.set_show_text(true);
+    progress_bar.set_hexpand(true);
+
+    progress_box.append(&progress_title);
+    progress_box.append(&progress_bar);
+    progress_revealer.set_child(Some(&progress_box));
+
+    let list_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    list_container.set_vexpand(true);
+
+    content.append(&progress_revealer);
+    content.append(&list_container);
+
     let hide_installed = Rc::new(RefCell::new(false));
+    let search_query = Rc::new(RefCell::new(String::new()));
+    let was_downloading = Rc::new(Cell::new(false));
     let game_rc: Rc<Option<Game>> = Rc::new(game.cloned());
 
-    refresh_content(&content, &config, *hide_installed.borrow(), &game_rc);
+    refresh_content_with_search(
+        &list_container,
+        &config,
+        *hide_installed.borrow(),
+        &game_rc,
+        &search_query.borrow(),
+    );
     toolbar_view.set_content(Some(&content));
 
     {
-        let content_c = content.clone();
+        let container_c = list_container.clone();
         let config_c = Rc::clone(&config);
         let hide_c = Rc::clone(&hide_installed);
+        let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
         hide_btn.connect_toggled(move |btn| {
             *hide_c.borrow_mut() = btn.is_active();
-            refresh_content(&content_c, &config_c, *hide_c.borrow(), &game_c);
+            refresh_content_with_search(
+                &container_c,
+                &config_c,
+                *hide_c.borrow(),
+                &game_c,
+                &search_c.borrow(),
+            );
         });
     }
 
     {
-        let content_c = content.clone();
+        let container_c = list_container.clone();
         let config_c = Rc::clone(&config);
         let hide_c = Rc::clone(&hide_installed);
+        let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
         clean_btn.connect_clicked(move |btn| {
-            show_clean_cache_dialog(btn, &config_c, &content_c, &hide_c, &game_c);
+            show_clean_cache_dialog(btn, &config_c, &container_c, &hide_c, &search_c, &game_c);
         });
     }
 
     {
-        let content_c = content.clone();
+        let container_c = list_container.clone();
         let config_c = Rc::clone(&config);
         let hide_c = Rc::clone(&hide_installed);
+        let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
         refresh_btn.connect_clicked(move |_| {
-            refresh_content(&content_c, &config_c, *hide_c.borrow(), &game_c);
+            refresh_content_with_search(
+                &container_c,
+                &config_c,
+                *hide_c.borrow(),
+                &game_c,
+                &search_c.borrow(),
+            );
         });
+    }
+
+    {
+        let container_c = list_container.clone();
+        let config_c = Rc::clone(&config);
+        let hide_c = Rc::clone(&hide_installed);
+        let search_c = Rc::clone(&search_query);
+        let game_c = Rc::clone(&game_rc);
+        search_entry.connect_search_changed(move |entry| {
+            *search_c.borrow_mut() = entry.text().to_string();
+            refresh_content_with_search(
+                &container_c,
+                &config_c,
+                *hide_c.borrow(),
+                &game_c,
+                &search_c.borrow(),
+            );
+        });
+    }
+
+    {
+        let progress_revealer_c = progress_revealer.clone();
+        let progress_title_c = progress_title.clone();
+        let progress_bar_c = progress_bar.clone();
+        let container_c = list_container.clone();
+        let config_c = Rc::clone(&config);
+        let hide_c = Rc::clone(&hide_installed);
+        let search_c = Rc::clone(&search_query);
+        let game_c = Rc::clone(&game_rc);
+        let was_downloading_c = Rc::clone(&was_downloading);
+        gtk4::glib::timeout_add_local(
+            std::time::Duration::from_millis(DOWNLOAD_PROGRESS_POLL_INTERVAL_MS),
+            move || {
+                let active = download_state::current();
+                if let Some(progress) = active {
+                    progress_revealer_c.set_reveal_child(true);
+                    progress_title_c.set_label(&format!("Downloading {}", progress.file_name));
+                    if progress.total > 0 {
+                        let fraction =
+                            (progress.downloaded as f64 / progress.total as f64).clamp(0.0, 1.0);
+                        progress_bar_c.set_fraction(fraction);
+                        progress_bar_c.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+                    } else {
+                        progress_bar_c.pulse();
+                        progress_bar_c.set_text(Some(&format_size(progress.downloaded)));
+                    }
+                    was_downloading_c.set(true);
+                } else {
+                    progress_revealer_c.set_reveal_child(false);
+                    progress_bar_c.set_fraction(0.0);
+                    progress_bar_c.set_text(None::<&str>);
+                    if was_downloading_c.replace(false) {
+                        refresh_content_with_search(
+                            &container_c,
+                            &config_c,
+                            *hide_c.borrow(),
+                            &game_c,
+                            &search_c.borrow(),
+                        );
+                    }
+                }
+                gtk4::glib::ControlFlow::Continue
+            },
+        );
     }
 
     toolbar_view.upcast()
@@ -101,11 +227,12 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
 
 // ── Content rendering ─────────────────────────────────────────────────────────
 
-fn refresh_content(
+fn refresh_content_with_search(
     container: &gtk4::Box,
     config: &Rc<RefCell<AppConfig>>,
     hide_installed: bool,
     game: &Rc<Option<Game>>,
+    search_query: &str,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -141,17 +268,18 @@ fn refresh_content(
     };
     let entries = scan_downloads(&downloads_dir);
 
-    let visible: Vec<&DownloadEntry> = if hide_installed {
-        entries
-            .iter()
-            .filter(|e| !entry_is_installed(e, &installed_archives, &installed_mod_names))
-            .collect()
-    } else {
-        entries.iter().collect()
-    };
+    let visible: Vec<&DownloadEntry> = entries
+        .iter()
+        .filter(|e| {
+            (!hide_installed || !entry_is_installed(e, &installed_archives, &installed_mod_names))
+                && matches_query(&e.name, search_query)
+        })
+        .collect();
 
     if visible.is_empty() {
-        let description = if hide_installed && !entries.is_empty() {
+        let description = if !search_query.trim().is_empty() {
+            "No downloads match your search."
+        } else if hide_installed && !entries.is_empty() {
             "All downloaded mods have been installed.\nToggle \u{201c}Hide Installed\u{201d} to show them."
         } else {
             "Downloaded mod archives will appear here.\nClick \u{201c}Download with manager\u{201d} on nexusmods.com to start a download,\nor place archive files in the downloads folder manually."
@@ -185,6 +313,7 @@ fn refresh_content(
             config,
             container,
             hide_installed,
+            search_query,
             game,
         );
         list_box.append(&row);
@@ -214,6 +343,7 @@ fn build_entry_row(
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: bool,
+    search_query: &str,
     game: &Rc<Option<Game>>,
 ) -> adw::ActionRow {
     let is_installed = entry_is_installed(entry, installed_archives, installed_mod_names);
@@ -256,6 +386,7 @@ fn build_entry_row(
             let container_c = container.clone();
             let game_rc_c = Rc::clone(game);
             let hide_installed_c = hide_installed;
+            let search_query_c = search_query.to_string();
             install_btn.connect_clicked(move |btn| {
                 show_install_dialog(
                     btn,
@@ -265,6 +396,7 @@ fn build_entry_row(
                     &config_c,
                     &container_c,
                     hide_installed_c,
+                    &search_query_c,
                     &game_rc_c,
                 );
             });
@@ -284,6 +416,7 @@ fn build_entry_row(
     let config_c = Rc::clone(config);
     let container_c = container.clone();
     let game_c = Rc::clone(game);
+    let search_query_c = search_query.to_string();
     delete_btn.connect_clicked(move |_| {
         if let Err(e) = std::fs::remove_file(&path_c) {
             log::error!("Failed to remove archive \"{}\": {e}", name_c);
@@ -292,7 +425,13 @@ fn build_entry_row(
             cfg.installed_archives.retain(|a| a != &name_c);
             cfg.save();
             drop(cfg);
-            refresh_content(&container_c, &config_c, hide_installed, &game_c);
+            refresh_content_with_search(
+                &container_c,
+                &config_c,
+                hide_installed,
+                &game_c,
+                &search_query_c,
+            );
         }
     });
     row.add_suffix(&delete_btn);
@@ -309,6 +448,7 @@ fn show_install_dialog(
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: bool,
+    search_query: &str,
     game_rc: &Rc<Option<Game>>,
 ) {
     let strategy = match detect_strategy(archive_path) {
@@ -334,6 +474,7 @@ fn show_install_dialog(
                     config,
                     container,
                     hide_installed,
+                    search_query,
                     &fomod_config,
                     game_rc,
                 );
@@ -356,6 +497,7 @@ fn show_install_dialog(
         config,
         container,
         hide_installed,
+        search_query,
         &strategy,
         game_rc,
     );
@@ -369,6 +511,7 @@ fn show_strategy_picker(
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: bool,
+    search_query: &str,
     _detected: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
 ) {
@@ -390,6 +533,7 @@ fn show_strategy_picker(
     let cc = Rc::clone(config);
     let cont = container.clone();
     let hide = hide_installed;
+    let search = search_query.to_string();
     let grc = Rc::clone(game_rc);
     dialog.connect_response(None, move |_, response| {
         if response == "data" {
@@ -400,6 +544,7 @@ fn show_strategy_picker(
                 &cc,
                 &cont,
                 hide,
+                &search,
                 &InstallStrategy::Data,
                 &grc,
             );
@@ -415,6 +560,7 @@ fn do_install(
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: bool,
+    search_query: &str,
     strategy: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
 ) {
@@ -433,7 +579,7 @@ fn do_install(
             drop(cfg);
             log::info!("Installed mod \"{mod_name}\" from \"{archive_name}\"");
             show_toast(container.upcast_ref(), &format!("Installed: {mod_name}"));
-            refresh_content(container, config, hide_installed, game_rc);
+            refresh_content_with_search(container, config, hide_installed, game_rc, search_query);
         }
         Err(e) => {
             log::error!("Failed to install mod \"{mod_name}\": {e}");
@@ -517,7 +663,10 @@ fn dependencies_match(
     }
 }
 
-fn step_is_visible_with_flags(step: &InstallStep, active_flags: &HashMap<String, HashSet<String>>) -> bool {
+fn step_is_visible_with_flags(
+    step: &InstallStep,
+    active_flags: &HashMap<String, HashSet<String>>,
+) -> bool {
     let Some(visible) = &step.visible else {
         return true;
     };
@@ -655,6 +804,7 @@ fn show_fomod_wizard(
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: bool,
+    search_query: &str,
     fomod: &FomodConfig,
     game_rc: &Rc<Option<Game>>,
 ) {
@@ -672,6 +822,7 @@ fn show_fomod_wizard(
             config,
             container,
             hide_installed,
+            search_query,
             &strategy,
             game_rc,
         );
@@ -831,7 +982,8 @@ fn show_fomod_wizard(
             preview_picture.set_vexpand(false);
             preview_picture.set_halign(gtk4::Align::Center);
             let preview_picture_frame = gtk4::Frame::new(None);
-            preview_picture_frame.set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
+            preview_picture_frame
+                .set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
             preview_picture_frame.set_halign(gtk4::Align::Center);
             preview_picture_frame.set_margin_start(12);
             preview_picture_frame.set_margin_end(12);
@@ -1008,6 +1160,7 @@ fn show_fomod_wizard(
         let cont = container.clone();
         let dlg = dialog.clone();
         let hide = hide_installed;
+        let search = search_query.to_string();
         let grc = Rc::clone(game_rc);
         install_btn.connect_clicked(move |_| {
             let files = {
@@ -1021,6 +1174,7 @@ fn show_fomod_wizard(
                 &cc,
                 &cont,
                 hide,
+                &search,
                 &InstallStrategy::Fomod(files),
                 &grc,
             );
@@ -1053,6 +1207,7 @@ pub fn show_fomod_wizard_from_library(
         config,
         container,
         false,
+        "",
         fomod,
         game_rc,
     );
@@ -1065,6 +1220,7 @@ fn show_clean_cache_dialog(
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: &Rc<RefCell<bool>>,
+    search_query: &Rc<RefCell<String>>,
     game: &Rc<Option<Game>>,
 ) {
     let dialog = adw::AlertDialog::new(
@@ -1081,11 +1237,12 @@ fn show_clean_cache_dialog(
     let cc = Rc::clone(config);
     let cont = container.clone();
     let hc = Rc::clone(hide_installed);
+    let search_c = Rc::clone(search_query);
     let gc = Rc::clone(game);
     dialog.connect_response(None, move |_, response| {
         if response == "clean" {
             delete_all_archives(&cc, &gc);
-            refresh_content(&cont, &cc, *hc.borrow(), &gc);
+            refresh_content_with_search(&cont, &cc, *hc.borrow(), &gc, &search_c.borrow());
         }
     });
     let parent = anchor
@@ -1173,6 +1330,14 @@ fn entry_is_installed(
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     !mod_name.is_empty() && installed_mod_names.iter().any(|m| m == &mod_name)
+}
+
+fn matches_query(value: &str, query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    value.to_lowercase().contains(&trimmed.to_lowercase())
 }
 
 fn format_size(bytes: u64) -> String {
@@ -1396,7 +1561,12 @@ mod tests {
                     groups: vec![PluginGroup {
                         name: "Color".to_string(),
                         group_type: GroupType::SelectExactlyOne,
-                        plugins: vec![test_plugin("Black", "underwear-black.txt", Vec::new(), None)],
+                        plugins: vec![test_plugin(
+                            "Black",
+                            "underwear-black.txt",
+                            Vec::new(),
+                            None,
+                        )],
                     }],
                 },
             ],
@@ -1430,5 +1600,12 @@ mod tests {
         let visible_sources: Vec<String> = visible_files.into_iter().map(|f| f.source).collect();
         assert!(visible_sources.contains(&"underwear-black.txt".to_string()));
         assert!(visible_sources.contains(&"conditional-underwear.txt".to_string()));
+    }
+
+    #[test]
+    fn matches_query_is_case_insensitive_and_trim_aware() {
+        assert!(matches_query("MyCoolMod.zip", ""));
+        assert!(matches_query("MyCoolMod.zip", "  cool "));
+        assert!(!matches_query("MyCoolMod.zip", "armor"));
     }
 }
