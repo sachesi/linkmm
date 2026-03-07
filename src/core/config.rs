@@ -1,6 +1,6 @@
+use crate::core::games::Game;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use crate::games::Game;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -28,14 +28,12 @@ impl AppConfig {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(contents) => {
-                    match serde_json::from_str::<AppConfig>(&contents) {
-                        Ok(config) => return config,
-                        Err(e) => {
-                            log::warn!("Failed to parse config: {e}, using defaults");
-                        }
+                Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
+                    Ok(config) => return config,
+                    Err(e) => {
+                        log::warn!("Failed to parse config: {e}, using defaults");
                     }
-                }
+                },
                 Err(e) => {
                     log::warn!("Failed to read config file: {e}, using defaults");
                 }

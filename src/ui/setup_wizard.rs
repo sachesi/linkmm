@@ -1,20 +1,17 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use libadwaita as adw;
-use gtk4::prelude::*;
-use libadwaita::prelude::*;
 use gio;
 use glib;
+use gtk4::prelude::*;
+use libadwaita as adw;
+use libadwaita::prelude::*;
 
-use crate::config::AppConfig;
-use crate::games::{Game, GameKind};
-use crate::steam;
+use crate::core::config::AppConfig;
+use crate::core::games::{Game, GameKind};
+use crate::core::steam;
 
-pub fn show_setup_wizard(
-    parent: &adw::ApplicationWindow,
-    config: Rc<RefCell<AppConfig>>,
-) {
+pub fn show_setup_wizard(parent: &adw::ApplicationWindow, config: Rc<RefCell<AppConfig>>) {
     let dialog = adw::Window::builder()
         .title("Linkmm Setup")
         .modal(true)
@@ -45,8 +42,7 @@ pub fn show_setup_wizard(
     stack.add_named(&game_page, Some("select_game"));
 
     // --- Page 3: NexusMods API Key ---
-    let nexus_page =
-        build_nexus_page(&dialog, Rc::clone(&config), Rc::clone(&selected_game_clone));
+    let nexus_page = build_nexus_page(&dialog, Rc::clone(&config), Rc::clone(&selected_game_clone));
     stack.add_named(&nexus_page, Some("nexus_key"));
 
     toolbar_view.set_content(Some(&stack));
@@ -100,7 +96,10 @@ fn build_game_select_page(
     stack: &gtk4::Stack,
     detected_games: Vec<(GameKind, std::path::PathBuf)>,
     selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
-) -> (gtk4::Box, Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>) {
+) -> (
+    gtk4::Box,
+    Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
+) {
     let page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     page.set_vexpand(true);
     page.set_margin_start(24);
@@ -136,8 +135,7 @@ fn build_game_select_page(
         game_list.add_css_class("boxed-list");
         game_list.set_selection_mode(gtk4::SelectionMode::None);
 
-        let check_buttons: Rc<RefCell<Vec<gtk4::CheckButton>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let check_buttons: Rc<RefCell<Vec<gtk4::CheckButton>>> = Rc::new(RefCell::new(Vec::new()));
 
         for (kind, path) in &detected_games {
             let row = adw::ActionRow::builder()
@@ -250,9 +248,7 @@ fn show_add_game_dialog(
         .collect();
     let game_strings_ref: Vec<&str> = game_strings.iter().map(|s| s.as_str()).collect();
 
-    let kind_row = adw::ComboRow::builder()
-        .title("Game")
-        .build();
+    let kind_row = adw::ComboRow::builder().title("Game").build();
     let model = gtk4::StringList::new(&game_strings_ref);
     kind_row.set_model(Some(&model));
     kind_group.add(&kind_row);
@@ -261,9 +257,7 @@ fn show_add_game_dialog(
     // Root path
     let path_group = adw::PreferencesGroup::builder().title("Paths").build();
 
-    let root_path_row = adw::EntryRow::builder()
-        .title("Root Path")
-        .build();
+    let root_path_row = adw::EntryRow::builder().title("Root Path").build();
     let browse_root_btn = gtk4::Button::new();
     browse_root_btn.set_icon_name("folder-open-symbolic");
     browse_root_btn.set_valign(gtk4::Align::Center);
@@ -368,9 +362,7 @@ fn build_nexus_page(
 
     let prefs_group = adw::PreferencesGroup::new();
     // PasswordEntryRow (libadwaita 1.2+) includes a built-in visibility toggle
-    let api_key_row = adw::PasswordEntryRow::builder()
-        .title("API Key")
-        .build();
+    let api_key_row = adw::PasswordEntryRow::builder().title("API Key").build();
 
     prefs_group.add(&api_key_row);
     page.append(&prefs_group);
@@ -396,10 +388,11 @@ fn build_nexus_page(
             }
             status_label_clone.set_text("Validating\u{2026}");
 
-            let (tx, rx) = std::sync::mpsc::channel::<Result<crate::nexus::NexusUser, String>>();
+            let (tx, rx) =
+                std::sync::mpsc::channel::<Result<crate::core::nexus::NexusUser, String>>();
 
             std::thread::spawn(move || {
-                let client = crate::nexus::NexusClient::new(&key);
+                let client = crate::core::nexus::NexusClient::new(&key);
                 let _ = tx.send(client.validate());
             });
 

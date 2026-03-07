@@ -1,6 +1,6 @@
+use crate::core::games::Game;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use crate::games::Game;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
@@ -19,7 +19,13 @@ impl Mod {
         let id = name
             .to_lowercase()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>();
         Self {
             id,
@@ -44,14 +50,12 @@ impl ModDatabase {
         let path = game.mods_dir().join("mods.json");
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(contents) => {
-                    match serde_json::from_str::<ModDatabase>(&contents) {
-                        Ok(db) => return db,
-                        Err(e) => {
-                            log::warn!("Failed to parse mods database: {e}, using empty database");
-                        }
+                Ok(contents) => match serde_json::from_str::<ModDatabase>(&contents) {
+                    Ok(db) => return db,
+                    Err(e) => {
+                        log::warn!("Failed to parse mods database: {e}, using empty database");
                     }
-                }
+                },
                 Err(e) => {
                     log::warn!("Failed to read mods database: {e}");
                 }
@@ -137,8 +141,8 @@ fn link_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest)
         .map_err(|e| format!("Failed to create destination directory: {e}"))?;
 
-    let entries = std::fs::read_dir(source)
-        .map_err(|e| format!("Failed to read source directory: {e}"))?;
+    let entries =
+        std::fs::read_dir(source).map_err(|e| format!("Failed to read source directory: {e}"))?;
 
     for entry in entries.flatten() {
         let src_path = entry.path();
@@ -154,8 +158,9 @@ fn link_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
                 if dest_path.is_symlink() {
                     // Remove a broken symlink at the destination so we can re-create it
                     if !dest_path.exists() {
-                        std::fs::remove_file(&dest_path)
-                            .map_err(|e| format!("Failed to remove broken symlink {:?}: {e}", dest_path))?;
+                        std::fs::remove_file(&dest_path).map_err(|e| {
+                            format!("Failed to remove broken symlink {:?}: {e}", dest_path)
+                        })?;
                     } else {
                         // Valid symlink or file already exists — skip
                         continue;
@@ -164,8 +169,12 @@ fn link_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
                     // A real file exists — skip to avoid overwriting it
                     continue;
                 }
-                symlink(&src_path, &dest_path)
-                    .map_err(|e| format!("Failed to create symlink {:?} -> {:?}: {e}", dest_path, src_path))?;
+                symlink(&src_path, &dest_path).map_err(|e| {
+                    format!(
+                        "Failed to create symlink {:?} -> {:?}: {e}",
+                        dest_path, src_path
+                    )
+                })?;
             }
             #[cfg(not(unix))]
             {
@@ -184,8 +193,8 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let entries = std::fs::read_dir(source)
-        .map_err(|e| format!("Failed to read source directory: {e}"))?;
+    let entries =
+        std::fs::read_dir(source).map_err(|e| format!("Failed to read source directory: {e}"))?;
 
     for entry in entries.flatten() {
         let src_path = entry.path();
@@ -201,8 +210,9 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
                 if dest_path.is_symlink() {
                     if let Ok(target) = std::fs::read_link(&dest_path) {
                         if target == src_path {
-                            std::fs::remove_file(&dest_path)
-                                .map_err(|e| format!("Failed to remove symlink {:?}: {e}", dest_path))?;
+                            std::fs::remove_file(&dest_path).map_err(|e| {
+                                format!("Failed to remove symlink {:?}: {e}", dest_path)
+                            })?;
                         }
                     }
                 }

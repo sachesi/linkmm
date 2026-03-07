@@ -1,19 +1,16 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use libadwaita as adw;
-use gtk4::prelude::*;
-use libadwaita::prelude::*;
 use gio;
+use gtk4::prelude::*;
+use libadwaita as adw;
+use libadwaita::prelude::*;
 
-use crate::config::AppConfig;
-use crate::games::Game;
-use crate::mods::{ModDatabase, ModManager};
+use crate::core::config::AppConfig;
+use crate::core::games::Game;
+use crate::core::mods::{ModDatabase, ModManager};
 
-pub fn build_mod_list(
-    game: &Game,
-    config: Rc<RefCell<AppConfig>>,
-) -> gtk4::Widget {
+pub fn build_mod_list(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
@@ -42,9 +39,7 @@ pub fn build_mod_list(
     let config_clone = Rc::clone(&config);
     let container_clone = content_container.clone();
     add_mod_button.connect_clicked(move |btn| {
-        let parent = btn
-            .root()
-            .and_then(|r| r.downcast::<gtk4::Window>().ok());
+        let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
 
         let dialog = gtk4::FileDialog::new();
         dialog.set_title("Select Mod Folder");
@@ -61,7 +56,7 @@ pub fn build_mod_list(
                         .unwrap_or_else(|| "Unknown Mod".to_string());
 
                     let mut db = ModDatabase::load(&game_clone2);
-                    let new_mod = crate::mods::Mod::new(mod_name, path);
+                    let new_mod = crate::core::mods::Mod::new(mod_name, path);
                     db.mods.push(new_mod);
                     db.save(&game_clone2);
                     config_clone2.borrow().save();
@@ -124,7 +119,7 @@ fn refresh_mod_list(container: &gtk4::Box, game: &Rc<Game>, config: Rc<RefCell<A
 }
 
 fn build_mod_row(
-    mod_entry: &crate::mods::Mod,
+    mod_entry: &crate::core::mods::Mod,
     game: &Rc<Game>,
     config: Rc<RefCell<AppConfig>>,
 ) -> adw::SwitchRow {

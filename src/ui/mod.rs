@@ -1,13 +1,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use libadwaita as adw;
-use gtk4::prelude::*;
-use libadwaita::prelude::*;
 use gio;
+use gtk4::prelude::*;
+use libadwaita as adw;
+use libadwaita::prelude::*;
 
-use crate::config::AppConfig;
-use crate::games::Game;
+use crate::core::config::AppConfig;
+use crate::core::games::Game;
 
 pub mod mod_list;
 pub mod setup_wizard;
@@ -121,8 +121,7 @@ fn build_main_window(
                 let games = config_clone.borrow().games.clone();
                 if let Some(game) = games.get(idx) {
                     content_nav_page_clone.set_title(&game.name);
-                    let mod_widget =
-                        mod_list::build_mod_list(game, Rc::clone(&config_clone));
+                    let mod_widget = mod_list::build_mod_list(game, Rc::clone(&config_clone));
                     content_box_clone.append(&mod_widget);
                 }
             } else {

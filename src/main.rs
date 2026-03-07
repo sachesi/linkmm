@@ -1,9 +1,11 @@
-mod config;
-mod games;
-mod mods;
-mod nexus;
-mod steam;
-mod ui;
+mod core {
+    pub mod config;
+    pub mod games;
+    pub mod mods;
+    pub mod nexus;
+    pub mod steam;
+}
+pub mod ui;
 
 use gtk4::prelude::{ApplicationExt, ApplicationExtManual};
 
