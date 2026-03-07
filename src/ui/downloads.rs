@@ -200,13 +200,15 @@ fn build_entry_row(
         row.add_suffix(&badge);
     }
 
-    // Install button (only for zip archives when a game is selected)
+    // Install button (when a game is selected, for supported archives)
     if !is_installed {
         if let Some(ref g) = **game {
             let ext = entry.path.extension()
                 .and_then(|e| e.to_str())
                 .map(|s| s.to_lowercase())
                 .unwrap_or_default();
+            // Show install button for zip files (others are listed but can't be
+            // installed yet since extraction only supports zip)
             if ext == "zip" {
                 let install_btn = gtk4::Button::new();
                 install_btn.set_icon_name("emblem-system-symbolic");
@@ -225,6 +227,13 @@ fn build_entry_row(
                     show_install_dialog(btn, &path_c, &name_c, &game_c, &config_c, &container_c, &game_rc_c);
                 });
                 row.add_suffix(&install_btn);
+            } else {
+                // Non-zip archives: show a label indicating unsupported format
+                let unsup_label = gtk4::Label::new(Some("zip only"));
+                unsup_label.add_css_class("dim-label");
+                unsup_label.add_css_class("caption");
+                unsup_label.set_valign(gtk4::Align::Center);
+                row.add_suffix(&unsup_label);
             }
         }
     }
@@ -366,10 +375,12 @@ fn do_install(
             cfg.save();
             drop(cfg);
             log::info!("Installed mod \"{mod_name}\" from \"{archive_name}\"");
+            show_toast(container.upcast_ref(), &format!("Installed: {mod_name}"));
             refresh_content(container, config, false, game_rc);
         }
         Err(e) => {
             log::error!("Failed to install mod \"{mod_name}\": {e}");
+            show_toast(container.upcast_ref(), &format!("Install failed: {e}"));
         }
     }
 }
@@ -574,6 +585,20 @@ fn show_fomod_wizard(
     toolbar_view.set_content(Some(&main_box));
     dialog.set_content(Some(&toolbar_view));
     dialog.present();
+}
+
+/// Public entry point for the FOMOD wizard, callable from the Library page.
+pub fn show_fomod_wizard_from_library(
+    parent: Option<&gtk4::Window>,
+    archive_path: &Path,
+    archive_name: &str,
+    game: &Game,
+    config: &Rc<RefCell<AppConfig>>,
+    container: &gtk4::Box,
+    fomod: &crate::core::installer::FomodConfig,
+    game_rc: &Rc<Option<Game>>,
+) {
+    show_fomod_wizard(parent, archive_path, archive_name, game, config, container, fomod, game_rc);
 }
 
 // ── Clean cache dialog ────────────────────────────────────────────────────────
