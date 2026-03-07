@@ -14,7 +14,8 @@ use crate::core::games::Game;
 use crate::core::installer::{
     DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
     InstallStep, InstallStrategy, PluginDependencies, PluginType, detect_strategy,
-    install_mod_from_archive, parse_fomod_from_zip, read_archive_file_bytes,
+    install_mod_from_archive, install_mod_from_archive_with_nexus, parse_fomod_from_zip,
+    read_archive_file_bytes,
 };
 use crate::core::mods::ModDatabase;
 
@@ -568,7 +569,13 @@ fn do_install(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| archive_name.to_string());
 
-    match install_mod_from_archive(archive_path, game, &mod_name, strategy) {
+    let nexus_id = read_nxm_mod_id_for_archive(archive_path, game);
+    let install_result = if let Some(id) = nexus_id {
+        install_mod_from_archive_with_nexus(archive_path, game, &mod_name, strategy, Some(id))
+    } else {
+        install_mod_from_archive(archive_path, game, &mod_name, strategy)
+    };
+    match install_result {
         Ok(_) => {
             let mut cfg = config.borrow_mut();
             if !cfg.installed_archives.contains(&archive_name.to_string()) {
@@ -1354,6 +1361,24 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+fn nxm_metadata_path_for_archive(archive_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.nxm.json", archive_path.to_string_lossy()))
+}
+
+fn read_nxm_mod_id_for_archive(archive_path: &Path, game: &Game) -> Option<u32> {
+    let metadata_path = nxm_metadata_path_for_archive(archive_path);
+    let contents = std::fs::read_to_string(metadata_path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    let game_domain = value.get("game_domain")?.as_str()?;
+    if game_domain != game.kind.nexus_game_id() {
+        return None;
+    }
+    value
+        .get("mod_id")?
+        .as_u64()
+        .and_then(|id| u32::try_from(id).ok())
+}
+
 fn open_in_file_manager(path: &Path) {
     let file = gio::File::for_path(path);
     let uri = file.uri();
@@ -1377,6 +1402,7 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::games::{Game, GameKind};
     use crate::core::installer::{
         ConditionFlag, DependencyOperator, FlagDependency, FomodPlugin, InstallStep,
         PluginDependencies, PluginGroup,
@@ -1641,5 +1667,21 @@ mod tests {
         assert!(names.contains(&"mod-b.rar".to_string()));
         assert!(names.contains(&"mod-c.7z".to_string()));
         assert!(!names.contains(&"notes.txt".to_string()));
+    }
+
+    #[test]
+    fn read_nxm_mod_id_for_archive_reads_sidecar_for_matching_game() {
+        let tmp = tempdir();
+        let archive_path = tmp.join("SomeMod.zip");
+        std::fs::write(&archive_path, b"zip").unwrap();
+        let metadata_path = nxm_metadata_path_for_archive(&archive_path);
+        std::fs::write(
+            &metadata_path,
+            r#"{"game_domain":"skyrimspecialedition","mod_id":173949}"#,
+        )
+        .unwrap();
+
+        let game = Game::new(GameKind::SkyrimSE, tmp.join("game_root"));
+        assert_eq!(read_nxm_mod_id_for_archive(&archive_path, &game), Some(173949));
     }
 }

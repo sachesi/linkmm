@@ -744,6 +744,16 @@ pub fn install_mod_from_archive(
     mod_name: &str,
     strategy: &InstallStrategy,
 ) -> Result<Mod, String> {
+    install_mod_from_archive_with_nexus(archive_path, game, mod_name, strategy, None)
+}
+
+pub fn install_mod_from_archive_with_nexus(
+    archive_path: &Path,
+    game: &Game,
+    mod_name: &str,
+    strategy: &InstallStrategy,
+    nexus_id: Option<u32>,
+) -> Result<Mod, String> {
     let mod_dir = ModManager::create_mod_directory(game)?;
 
     match strategy {
@@ -777,7 +787,8 @@ pub fn install_mod_from_archive(
     }
 
     let mut mod_entry = Mod::new(mod_name, mod_dir);
-    mod_entry.installed_from_nexus = true;
+    mod_entry.installed_from_nexus = nexus_id.is_some();
+    mod_entry.nexus_id = nexus_id;
 
     // Register in the mod database
     let mut db = ModDatabase::load(game);
