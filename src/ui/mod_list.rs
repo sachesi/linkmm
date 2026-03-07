@@ -28,11 +28,66 @@ pub fn build_mod_list(
 
     toolbar_view.add_top_bar(&header);
 
+    // Container that holds the current list (or empty state) so it can be refreshed
+    let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content_container.set_vexpand(true);
+
+    let game_rc = Rc::new(game.clone());
+    refresh_mod_list(&content_container, &game_rc, Rc::clone(&config));
+
+    toolbar_view.set_content(Some(&content_container));
+
+    // Handle "Add Mod" button: open a folder picker, add the folder as a new mod, then refresh
+    let game_clone = Rc::clone(&game_rc);
+    let config_clone = Rc::clone(&config);
+    let container_clone = content_container.clone();
+    add_mod_button.connect_clicked(move |btn| {
+        let parent = btn
+            .root()
+            .and_then(|r| r.downcast::<gtk4::Window>().ok());
+
+        let dialog = gtk4::FileDialog::new();
+        dialog.set_title("Select Mod Folder");
+
+        let game_clone2 = Rc::clone(&game_clone);
+        let config_clone2 = Rc::clone(&config_clone);
+        let container_clone2 = container_clone.clone();
+        dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+            if let Ok(file) = result {
+                if let Some(path) = file.path() {
+                    let mod_name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Unknown Mod".to_string());
+
+                    let mut db = ModDatabase::load(&game_clone2);
+                    let new_mod = crate::mods::Mod::new(mod_name, path);
+                    db.mods.push(new_mod);
+                    db.save(&game_clone2);
+                    config_clone2.borrow().save();
+
+                    // Refresh the list to show the newly added mod
+                    refresh_mod_list(&container_clone2, &game_clone2, Rc::clone(&config_clone2));
+                }
+            }
+        });
+    });
+
+    toolbar_view.upcast()
+}
+
+/// Clear `container` and rebuild the mod list (or empty-state widget) from the current database.
+fn refresh_mod_list(container: &gtk4::Box, game: &Rc<Game>, config: Rc<RefCell<AppConfig>>) {
+    // Remove all existing children
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
     let mut db = ModDatabase::load(game);
     db.scan_mods_dir(game);
     db.save(game);
 
-    let content: gtk4::Widget = if db.mods.is_empty() {
+    let widget: gtk4::Widget = if db.mods.is_empty() {
         let status = adw::StatusPage::builder()
             .title("No Mods Installed")
             .description("Add a mod folder to get started.")
@@ -65,47 +120,12 @@ pub fn build_mod_list(
         scrolled.upcast()
     };
 
-    toolbar_view.set_content(Some(&content));
-
-    // Handle "Add Mod" button
-    let game_clone = game.clone();
-    let config_clone = Rc::clone(&config);
-    add_mod_button.connect_clicked(move |btn| {
-        let parent = btn
-            .root()
-            .and_then(|r| r.downcast::<gtk4::Window>().ok());
-
-        let dialog = gtk4::FileDialog::new();
-        dialog.set_title("Select Mod Folder");
-
-        let game_clone2 = game_clone.clone();
-        let config_clone2 = Rc::clone(&config_clone);
-        dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
-            if let Ok(file) = result {
-                if let Some(path) = file.path() {
-                    let mod_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Unknown Mod".to_string());
-
-                    let mut db = ModDatabase::load(&game_clone2);
-                    let new_mod = crate::mods::Mod::new(mod_name, path);
-                    db.mods.push(new_mod);
-                    db.save(&game_clone2);
-
-                    // Save config to persist any state
-                    config_clone2.borrow().save();
-                }
-            }
-        });
-    });
-
-    toolbar_view.upcast()
+    container.append(&widget);
 }
 
 fn build_mod_row(
     mod_entry: &crate::mods::Mod,
-    game: &Game,
+    game: &Rc<Game>,
     config: Rc<RefCell<AppConfig>>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
@@ -118,10 +138,15 @@ fn build_mod_row(
     }
 
     let mod_id = mod_entry.id.clone();
-    let game_clone = game.clone();
+    let game_clone = Rc::clone(game);
     let config_clone = Rc::clone(&config);
+    // Guard against re-entrant toggling when reverting the switch on error
+    let reverting = Rc::new(RefCell::new(false));
 
     row.connect_active_notify(move |switch_row: &adw::SwitchRow| {
+        if *reverting.borrow() {
+            return;
+        }
         let enabled = switch_row.is_active();
         let mut db = ModDatabase::load(&game_clone);
 
@@ -140,9 +165,10 @@ fn build_mod_row(
                 }
                 Err(e) => {
                     log::error!("Failed to toggle mod: {e}");
-                    // Revert the switch without triggering the signal again
-                    // We use a flag via the widget's name to avoid re-entrancy
+                    // Revert the switch without re-entering the handler
+                    *reverting.borrow_mut() = true;
                     switch_row.set_active(!enabled);
+                    *reverting.borrow_mut() = false;
                 }
             }
         }
