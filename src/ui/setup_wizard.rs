@@ -11,7 +11,12 @@ use crate::core::config::AppConfig;
 use crate::core::games::{Game, GameKind};
 use crate::core::steam;
 
-pub fn show_setup_wizard(parent: &adw::ApplicationWindow, config: Rc<RefCell<AppConfig>>) {
+pub fn show_setup_wizard<F: Fn() + 'static>(
+    parent: &adw::ApplicationWindow,
+    config: Rc<RefCell<AppConfig>>,
+    on_finish: F,
+) {
+    let on_finish_rc: Rc<dyn Fn()> = Rc::new(on_finish);
     let dialog = adw::Window::builder()
         .title("Linkmm Setup")
         .modal(true)
@@ -42,7 +47,12 @@ pub fn show_setup_wizard(parent: &adw::ApplicationWindow, config: Rc<RefCell<App
     stack.add_named(&game_page, Some("select_game"));
 
     // --- Page 3: NexusMods API Key ---
-    let nexus_page = build_nexus_page(&dialog, Rc::clone(&config), Rc::clone(&selected_game_clone));
+    let nexus_page = build_nexus_page(
+        &dialog,
+        Rc::clone(&config),
+        Rc::clone(&selected_game_clone),
+        Rc::clone(&on_finish_rc),
+    );
     stack.add_named(&nexus_page, Some("nexus_key"));
 
     toolbar_view.set_content(Some(&stack));
@@ -333,6 +343,7 @@ fn build_nexus_page(
     wizard_window: &adw::Window,
     config: Rc<RefCell<AppConfig>>,
     selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
+    on_finish: Rc<dyn Fn()>,
 ) -> gtk4::Box {
     let page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     page.set_vexpand(true);
@@ -443,12 +454,14 @@ fn build_nexus_page(
         let wizard_window_clone = wizard_window.clone();
         let config_clone = Rc::clone(&config);
         let selected_game_clone = Rc::clone(&selected_game);
+        let on_finish_clone = Rc::clone(&on_finish);
         skip_btn.connect_clicked(move |_| {
             finish_wizard(
                 &wizard_window_clone,
                 Rc::clone(&config_clone),
                 Rc::clone(&selected_game_clone),
                 None,
+                Rc::clone(&on_finish_clone),
             );
         });
     }
@@ -459,6 +472,7 @@ fn build_nexus_page(
         let config_clone = Rc::clone(&config);
         let selected_game_clone = Rc::clone(&selected_game);
         let api_key_row_clone = api_key_row.clone();
+        let on_finish_clone = Rc::clone(&on_finish);
         finish_btn.connect_clicked(move |_| {
             let key = api_key_row_clone.text().to_string();
             let api_key = if key.is_empty() { None } else { Some(key) };
@@ -467,6 +481,7 @@ fn build_nexus_page(
                 Rc::clone(&config_clone),
                 Rc::clone(&selected_game_clone),
                 api_key,
+                Rc::clone(&on_finish_clone),
             );
         });
     }
@@ -479,6 +494,7 @@ fn finish_wizard(
     config: Rc<RefCell<AppConfig>>,
     selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
     api_key: Option<String>,
+    on_finish: Rc<dyn Fn()>,
 ) {
     {
         let mut cfg = config.borrow_mut();
@@ -499,4 +515,5 @@ fn finish_wizard(
     }
 
     wizard_window.destroy();
+    on_finish();
 }
