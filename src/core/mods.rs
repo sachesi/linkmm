@@ -405,6 +405,34 @@ impl ModManager {
             .map_err(|e| format!("Failed to create mod directory: {e}"))?;
         Ok(dir)
     }
+
+    /// Fully uninstall a mod: remove its symlinks from the game directory,
+    /// delete its files from disk, and remove its entry from the database.
+    pub fn uninstall_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
+        // Undeploy first so no dangling symlinks remain in the game directory.
+        // Log but do not abort on undeploy failure – we still want to clean up
+        // the files and database record.
+        if let Err(e) = Self::disable_mod(game, mod_entry) {
+            log::warn!("Undeploy warning during uninstall of '{}': {e}", mod_entry.name);
+        }
+
+        // Delete the mod's managed directory from disk.
+        if mod_entry.source_path.exists() {
+            std::fs::remove_dir_all(&mod_entry.source_path).map_err(|e| {
+                format!(
+                    "Failed to delete mod files for '{}': {e}",
+                    mod_entry.name
+                )
+            })?;
+        }
+
+        // Remove the mod entry from the database.
+        let mut db = ModDatabase::load(game);
+        db.mods.retain(|m| m.id != mod_entry.id);
+        db.save(game);
+
+        Ok(())
+    }
 }
 
 fn link_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
@@ -493,11 +521,17 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
         }
     }
 
-    // Remove the directory if it is now empty.  `remove_dir` is a no-op on
-    // non-empty directories (it returns an error which we intentionally
-    // discard), so real game directories that still contain vanilla files or
-    // other mods' symlinks are never touched.
-    let _ = std::fs::remove_dir(dest);
+    // Remove the directory if it is now empty.  A "directory not empty" or
+    // "not found" result is fully expected (the dir has vanilla files, other
+    // mods' symlinks, or was already gone) and is silently ignored.  Any other
+    // OS error is logged at debug level to aid diagnosing unexpected failures.
+    if let Err(e) = std::fs::remove_dir(dest) {
+        if e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::debug!("Could not remove directory {}: {e}", dest.display());
+        }
+    }
 
     Ok(())
 }
@@ -822,5 +856,68 @@ mod tests {
         // Empty dirs cleaned up.
         assert!(!game_data.join("Data").join("textures").exists());
         assert!(!game_data.join("Data").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_mod_removes_source_directory_and_database_entry() {
+        use crate::core::games::{Game, GameKind};
+
+        let tmp = tempdir();
+
+        // Build a minimal Game pointing at a temp directory.
+        let game_root = tmp.join("game");
+        let mods_base = tmp.join("mods_base");
+        std::fs::create_dir_all(game_root.join("Data")).unwrap();
+        // mods_dir() returns mods_base/mods/test_game/
+        std::fs::create_dir_all(mods_base.join("mods").join("test_game")).unwrap();
+
+        let game = Game {
+            id: "test_game".to_string(),
+            name: "Test Game".to_string(),
+            kind: GameKind::SkyrimSE,
+            root_path: game_root.clone(),
+            data_path: game_root.join("Data"),
+            mods_base_dir: Some(mods_base.clone()),
+        };
+
+        // Create a mod directory with a Data/ subfolder and a file.
+        let mod_dir = game.mods_dir().join("test-mod-uuid");
+        std::fs::create_dir_all(mod_dir.join("Data").join("textures")).unwrap();
+        std::fs::write(
+            mod_dir.join("Data").join("textures").join("sky.dds"),
+            b"dds",
+        )
+        .unwrap();
+
+        // Register the mod in the database.
+        let mod_entry = crate::core::mods::Mod::new("TestMod", mod_dir.clone());
+        let mut db = ModDatabase::load(&game);
+        db.mods.push(mod_entry.clone());
+        db.save(&game);
+
+        // Deploy the mod manually so we can verify symlinks are cleaned up.
+        link_directory_contents(&mod_dir.join("Data"), &game.data_path).unwrap();
+        assert!(
+            game.data_path.join("textures").join("sky.dds").is_symlink(),
+            "symlink should exist before uninstall"
+        );
+
+        // Uninstall.
+        ModManager::uninstall_mod(&game, &mod_entry).unwrap();
+
+        // Symlinks cleaned up.
+        assert!(
+            !game.data_path.join("textures").join("sky.dds").exists(),
+            "symlink should be gone after uninstall"
+        );
+        // Mod directory deleted.
+        assert!(!mod_dir.exists(), "mod directory should be deleted");
+        // Database entry removed.
+        let db_after = ModDatabase::load(&game);
+        assert!(
+            db_after.mods.iter().all(|m| m.id != mod_entry.id),
+            "mod should be removed from database"
+        );
     }
 }
