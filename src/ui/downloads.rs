@@ -24,6 +24,7 @@ use crate::core::mods::ModDatabase;
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 /// Archive types that are currently installable by the app.
 const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip"];
+const DOWNLOAD_PROGRESS_POLL_INTERVAL_MS: u64 = 200;
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
@@ -185,37 +186,40 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
         let was_downloading_c = Rc::clone(&was_downloading);
-        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-            let active = download_state::current();
-            if let Some(progress) = active {
-                progress_revealer_c.set_reveal_child(true);
-                progress_title_c.set_label(&format!("Downloading {}", progress.file_name));
-                if progress.total > 0 {
-                    let fraction =
-                        (progress.downloaded as f64 / progress.total as f64).clamp(0.0, 1.0);
-                    progress_bar_c.set_fraction(fraction);
-                    progress_bar_c.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+        gtk4::glib::timeout_add_local(
+            std::time::Duration::from_millis(DOWNLOAD_PROGRESS_POLL_INTERVAL_MS),
+            move || {
+                let active = download_state::current();
+                if let Some(progress) = active {
+                    progress_revealer_c.set_reveal_child(true);
+                    progress_title_c.set_label(&format!("Downloading {}", progress.file_name));
+                    if progress.total > 0 {
+                        let fraction =
+                            (progress.downloaded as f64 / progress.total as f64).clamp(0.0, 1.0);
+                        progress_bar_c.set_fraction(fraction);
+                        progress_bar_c.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+                    } else {
+                        progress_bar_c.pulse();
+                        progress_bar_c.set_text(Some(&format_size(progress.downloaded)));
+                    }
+                    was_downloading_c.set(true);
                 } else {
-                    progress_bar_c.pulse();
-                    progress_bar_c.set_text(Some(&format_size(progress.downloaded)));
+                    progress_revealer_c.set_reveal_child(false);
+                    progress_bar_c.set_fraction(0.0);
+                    progress_bar_c.set_text(None::<&str>);
+                    if was_downloading_c.replace(false) {
+                        refresh_content_with_search(
+                            &container_c,
+                            &config_c,
+                            *hide_c.borrow(),
+                            &game_c,
+                            &search_c.borrow(),
+                        );
+                    }
                 }
-                was_downloading_c.set(true);
-            } else {
-                progress_revealer_c.set_reveal_child(false);
-                progress_bar_c.set_fraction(0.0);
-                progress_bar_c.set_text(None::<&str>);
-                if was_downloading_c.replace(false) {
-                    refresh_content_with_search(
-                        &container_c,
-                        &config_c,
-                        *hide_c.borrow(),
-                        &game_c,
-                        &search_c.borrow(),
-                    );
-                }
-            }
-            gtk4::glib::ControlFlow::Continue
-        });
+                gtk4::glib::ControlFlow::Continue
+            },
+        );
     }
 
     toolbar_view.upcast()
