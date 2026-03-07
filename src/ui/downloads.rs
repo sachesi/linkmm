@@ -236,6 +236,8 @@ fn build_mod_info_row(mod_info: &NexusModInfo, game_domain: &str) -> adw::Action
         parts.push(format!("★ {}", mod_info.endorsement_count));
     }
     if let Some(summary) = &mod_info.summary {
+        // Collect at most 120 Unicode scalar values so we never split a multi-byte
+        // character.  This is safe because `chars()` yields full code-points.
         let short: String = summary.chars().take(120).collect();
         parts.push(short);
     }
