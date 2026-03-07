@@ -243,15 +243,15 @@ fn build_mod_row(
 /// Show a brief in-app toast notification anchored to `widget`.
 fn show_toast(widget: &gtk4::Widget, message: &str) {
     // Walk up to the nearest AdwToastOverlay
-    let mut w: Option<gtk4::Widget> = Some(widget.clone());
-    while let Some(current) = w {
+    let mut ancestor: Option<gtk4::Widget> = Some(widget.clone());
+    while let Some(current) = ancestor {
         if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
             let toast = adw::Toast::new(message);
             toast.set_timeout(3);
             overlay.add_toast(toast);
             return;
         }
-        w = current.parent();
+        ancestor = current.parent();
     }
     // Fallback: log to stderr
     log::info!("{message}");

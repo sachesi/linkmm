@@ -23,6 +23,15 @@ impl PluginKind {
             PluginKind::Plugin => "ESP",
         }
     }
+
+    /// Lower value = loads earlier.  Used to sort non-vanilla plugins by type.
+    pub fn sort_priority(&self) -> u8 {
+        match self {
+            PluginKind::Master => 0,
+            PluginKind::Light => 1,
+            PluginKind::Plugin => 2,
+        }
+    }
 }
 
 /// A single plugin file found in the game's Data directory.
@@ -231,14 +240,12 @@ impl ModDatabase {
                 ordered.push(rest.remove(idx));
             }
         }
-        // Any plugin not yet in plugin_load_order: sort by type then name
+        // Any plugin not yet in plugin_load_order: sort by type priority then name
         rest.sort_by(|a, b| {
-            let weight = |p: &PluginFile| match p.kind {
-                PluginKind::Master => 0u8,
-                PluginKind::Light => 1,
-                PluginKind::Plugin => 2,
-            };
-            weight(a).cmp(&weight(b)).then_with(|| a.name.cmp(&b.name))
+            a.kind
+                .sort_priority()
+                .cmp(&b.kind.sort_priority())
+                .then_with(|| a.name.cmp(&b.name))
         });
         ordered.extend(rest);
 
@@ -302,7 +309,9 @@ impl ModDatabase {
         let mut order: Vec<String> = Vec::new();
         let mut disabled: Vec<String> = Vec::new();
         for line in contents.lines() {
-            let line = line.trim_end_matches('\r');
+            // `str::lines()` already strips `\n` and `\r\n`; trim remaining
+            // whitespace so we handle any exotic endings gracefully.
+            let line = line.trim();
             if line.starts_with('#') || line.is_empty() {
                 continue;
             }
