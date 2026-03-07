@@ -146,22 +146,11 @@ fn build_main_window(
     let enabled_row = adw::ActionRow::builder().title("Enabled").build();
     enabled_row.add_suffix(&enabled_label);
 
-    let conflicts_label = gtk4::Label::new(Some("0"));
-    conflicts_label.add_css_class("dim-label");
-    let conflicts_row = adw::ActionRow::builder().title("Conflicts").build();
-    conflicts_row.add_suffix(&conflicts_label);
-
     stats_list.append(&installed_row);
     stats_list.append(&enabled_row);
-    stats_list.append(&conflicts_row);
     sidebar_box.append(&stats_list);
 
-    refresh_stats(
-        &config.borrow(),
-        &installed_label,
-        &enabled_label,
-        &conflicts_label,
-    );
+    refresh_stats(&config.borrow(), &installed_label, &enabled_label);
 
     let sidebar_scroll = gtk4::ScrolledWindow::new();
     sidebar_scroll.set_vexpand(true);
@@ -295,7 +284,6 @@ fn build_main_window(
     let active_game_row_r = active_game_row.clone();
     let installed_r = installed_label.clone();
     let enabled_r = enabled_label.clone();
-    let conflicts_r = conflicts_label.clone();
     let content_stack_r = content_stack.clone();
     let content_page_r = content_page.clone();
     let config_r = Rc::clone(&config);
@@ -347,7 +335,7 @@ fn build_main_window(
         nav_list_r.select_row(nav_list_r.row_at_index(NAV_LIBRARY).as_ref());
 
         // Update stats
-        refresh_stats(&config_r.borrow(), &installed_r, &enabled_r, &conflicts_r);
+        refresh_stats(&config_r.borrow(), &installed_r, &enabled_r);
     });
 
     // ── Active-game row click → open wizard / game picker ─────────────────
@@ -415,7 +403,6 @@ fn refresh_stats(
     cfg: &AppConfig,
     installed: &gtk4::Label,
     enabled: &gtk4::Label,
-    conflicts: &gtk4::Label,
 ) {
     if let Some(game) = cfg.current_game() {
         let db = ModDatabase::load(game);
@@ -425,7 +412,6 @@ fn refresh_stats(
         installed.set_text("0");
         enabled.set_text("0");
     }
-    conflicts.set_text("0");
 }
 
 // ── Game picker dialog ─────────────────────────────────────────────────────
@@ -619,6 +605,11 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
 
             let dest_path = downloads_dir.join(&file_name);
             if dest_path.exists() {
+                if let Err(e) =
+                    write_nxm_download_metadata(&dest_path, &nxm.game_domain, nxm.mod_id as u32)
+                {
+                    log::warn!("Failed to update NXM metadata for {}: {e}", file_name);
+                }
                 return Ok(format!("{file_name} (already downloaded)"));
             }
 
@@ -646,6 +637,12 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
             });
             download_state::clear_active(download_id);
             download_result?;
+
+            if let Err(e) =
+                write_nxm_download_metadata(&dest_path, &nxm.game_domain, nxm.mod_id as u32)
+            {
+                log::warn!("Failed to write NXM metadata for {}: {e}", file_name);
+            }
 
             Ok(file_name)
         })();
@@ -700,4 +697,23 @@ fn walk_for_toast_overlay(widget: &gtk4::Widget, message: &str) {
     if let Some(child) = widget.first_child() {
         walk_for_toast_overlay(&child, message);
     }
+}
+
+fn nxm_metadata_path_for_archive(archive_path: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.nxm.json", archive_path.to_string_lossy()))
+}
+
+fn write_nxm_download_metadata(
+    archive_path: &std::path::Path,
+    game_domain: &str,
+    mod_id: u32,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "game_domain": game_domain,
+        "mod_id": mod_id
+    });
+    let path = nxm_metadata_path_for_archive(archive_path);
+    let body = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("Failed to serialize NXM metadata: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
