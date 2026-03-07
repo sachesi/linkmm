@@ -962,7 +962,7 @@ fn show_fomod_wizard(
                 }
             } else {
                 preview_picture.set_paintable(None::<&gtk4::gdk::Texture>);
-                preview_name.set_label("No preview available for this step");
+                preview_name.set_label("No preview available");
             }
             step_row.append(&preview_box);
             sc.append(&step_row);
