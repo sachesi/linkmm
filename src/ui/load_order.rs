@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -20,7 +22,10 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
 
     toolbar_view.add_top_bar(&header);
 
-    let content: gtk4::Widget = match game {
+    let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content_container.set_vexpand(true);
+
+    match game {
         None => {
             let status = adw::StatusPage::builder()
                 .title("No Game Selected")
@@ -28,16 +33,24 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 .icon_name("applications-games-symbolic")
                 .build();
             status.set_vexpand(true);
-            status.upcast()
+            content_container.append(&status);
         }
-        Some(g) => build_load_order_content(g),
+        Some(g) => {
+            let game_rc = Rc::new(g.clone());
+            refresh_load_order_content(&content_container, &game_rc);
+        }
     };
 
-    toolbar_view.set_content(Some(&content));
+    toolbar_view.set_content(Some(&content_container));
     toolbar_view.upcast()
 }
 
-fn build_load_order_content(game: &Game) -> gtk4::Widget {
+/// Re-populate `container` from the current mod database for `game`.
+fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
     let db = ModDatabase::load(game);
 
     if db.load_order.is_empty() && db.mods.is_empty() {
@@ -47,41 +60,90 @@ fn build_load_order_content(game: &Game) -> gtk4::Widget {
             .icon_name("format-justify-left-symbolic")
             .build();
         status.set_vexpand(true);
-        return status.upcast();
+        container.append(&status);
+        return;
     }
 
-    // Build an ordered list: use load_order if populated, otherwise use mod list order
-    let ordered: Vec<&crate::core::mods::Mod> = if db.load_order.is_empty() {
-        db.mods.iter().collect()
-    } else {
-        let mut result: Vec<&crate::core::mods::Mod> = db
-            .load_order
-            .iter()
-            .filter_map(|id| db.mods.iter().find(|m| &m.id == id))
-            .collect();
-        // Append any mods not in load_order
-        for m in &db.mods {
-            if !db.load_order.contains(&m.id) {
-                result.push(m);
-            }
-        }
-        result
-    };
+    let ordered_ids = compute_ordered_ids(&db);
+    let count = ordered_ids.len();
 
     let list_box = gtk4::ListBox::new();
     list_box.add_css_class("boxed-list");
     list_box.set_selection_mode(gtk4::SelectionMode::None);
 
-    for (idx, m) in ordered.iter().enumerate() {
+    for (idx, mod_id) in ordered_ids.iter().enumerate() {
+        let Some(mod_entry) = db.mods.iter().find(|m| &m.id == mod_id) else {
+            continue;
+        };
+
         let row = adw::ActionRow::builder()
-            .title(&m.name)
-            .subtitle(if m.enabled { "Enabled" } else { "Disabled" })
+            .title(&mod_entry.name)
+            .subtitle(if mod_entry.enabled { "Enabled" } else { "Disabled" })
             .build();
 
+        // Index prefix
         let index_label = gtk4::Label::new(Some(&format!("{}", idx + 1)));
         index_label.add_css_class("dim-label");
         index_label.add_css_class("numeric");
+        index_label.set_width_chars(3);
         row.add_prefix(&index_label);
+
+        // Move-up / move-down buttons
+        let up_btn = gtk4::Button::new();
+        up_btn.set_icon_name("go-up-symbolic");
+        up_btn.set_valign(gtk4::Align::Center);
+        up_btn.add_css_class("flat");
+        up_btn.set_tooltip_text(Some("Move up"));
+        up_btn.set_sensitive(idx > 0);
+
+        let down_btn = gtk4::Button::new();
+        down_btn.set_icon_name("go-down-symbolic");
+        down_btn.set_valign(gtk4::Align::Center);
+        down_btn.add_css_class("flat");
+        down_btn.set_tooltip_text(Some("Move down"));
+        down_btn.set_sensitive(idx + 1 < count);
+
+        row.add_suffix(&up_btn);
+        row.add_suffix(&down_btn);
+
+        // Connect up button — re-reads DB so position is always current
+        {
+            let game_c = Rc::clone(game);
+            let container_c = container.clone();
+            let mod_id_c = mod_id.clone();
+            up_btn.connect_clicked(move |_| {
+                let mut db = ModDatabase::load(&game_c);
+                let mut order = compute_ordered_ids(&db);
+                if let Some(pos) = order.iter().position(|id| id == &mod_id_c) {
+                    if pos > 0 {
+                        order.swap(pos, pos - 1);
+                        db.load_order = order;
+                        db.save(&game_c);
+                        refresh_load_order_content(&container_c, &game_c);
+                    }
+                }
+            });
+        }
+
+        // Connect down button — re-reads DB so position is always current
+        {
+            let game_c = Rc::clone(game);
+            let container_c = container.clone();
+            let mod_id_c = mod_id.clone();
+            down_btn.connect_clicked(move |_| {
+                let mut db = ModDatabase::load(&game_c);
+                let mut order = compute_ordered_ids(&db);
+                let len = order.len();
+                if let Some(pos) = order.iter().position(|id| id == &mod_id_c) {
+                    if pos + 1 < len {
+                        order.swap(pos, pos + 1);
+                        db.load_order = order;
+                        db.save(&game_c);
+                        refresh_load_order_content(&container_c, &game_c);
+                    }
+                }
+            });
+        }
 
         list_box.append(&row);
     }
@@ -99,5 +161,26 @@ fn build_load_order_content(game: &Game) -> gtk4::Widget {
     scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
     scrolled.set_child(Some(&clamp));
 
-    scrolled.upcast()
+    container.append(&scrolled);
+}
+
+/// Return mod IDs in load-order sequence.
+/// Uses `db.load_order` when populated; falls back to the natural mod list order.
+/// Any mods not referenced in `load_order` are appended at the end.
+fn compute_ordered_ids(db: &ModDatabase) -> Vec<String> {
+    if db.load_order.is_empty() {
+        return db.mods.iter().map(|m| m.id.clone()).collect();
+    }
+    let mut result: Vec<String> = db
+        .load_order
+        .iter()
+        .filter(|id| db.mods.iter().any(|m| &m.id == *id))
+        .cloned()
+        .collect();
+    for m in &db.mods {
+        if !result.contains(&m.id) {
+            result.push(m.id.clone());
+        }
+    }
+    result
 }

@@ -84,6 +84,7 @@ fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<Re
         let add_btn = gtk4::Button::with_label("Add Mod\u{2026}");
         add_btn.add_css_class("suggested-action");
         add_btn.add_css_class("pill");
+        add_btn.set_halign(gtk4::Align::Center);
 
         let game_clone = Rc::clone(game);
         let container_clone = container.clone();
