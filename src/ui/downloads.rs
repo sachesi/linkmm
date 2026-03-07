@@ -1298,7 +1298,7 @@ fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_lowercase())
                 .unwrap_or_default();
-            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+            if !ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
                 continue;
             }
             let name = path
@@ -1382,6 +1382,7 @@ mod tests {
         ConditionFlag, DependencyOperator, FlagDependency, FomodPlugin, InstallStep,
         PluginDependencies, PluginGroup,
     };
+    use std::path::PathBuf;
 
     fn test_plugin(
         name: &str,
@@ -1402,6 +1403,16 @@ mod tests {
             condition_flags,
             dependencies,
         }
+    }
+
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("linkmm_downloads_test_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -1607,5 +1618,22 @@ mod tests {
         assert!(matches_query("MyCoolMod.zip", ""));
         assert!(matches_query("MyCoolMod.zip", "  cool "));
         assert!(!matches_query("MyCoolMod.zip", "armor"));
+    }
+
+    #[test]
+    fn scan_downloads_includes_non_zip_archives() {
+        let tmp = tempdir();
+        std::fs::write(tmp.join("mod-a.zip"), b"zip").unwrap();
+        std::fs::write(tmp.join("mod-b.rar"), b"rar").unwrap();
+        std::fs::write(tmp.join("mod-c.7z"), b"7z").unwrap();
+        std::fs::write(tmp.join("notes.txt"), b"txt").unwrap();
+
+        let entries = scan_downloads(&tmp);
+        let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+
+        assert!(names.contains(&"mod-a.zip".to_string()));
+        assert!(names.contains(&"mod-b.rar".to_string()));
+        assert!(names.contains(&"mod-c.7z".to_string()));
+        assert!(!names.contains(&"notes.txt".to_string()));
     }
 }
