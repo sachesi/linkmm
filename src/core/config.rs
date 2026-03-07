@@ -9,6 +9,15 @@ pub struct AppConfig {
     pub current_game_id: Option<String>,
     pub nexus_api_key: Option<String>,
     pub games: Vec<Game>,
+    /// User-chosen directory that holds the `downloads/` sub-folder (and
+    /// optionally future extracted-mods storage).  When `None`, defaults to
+    /// `~/.local/share/linkmm`.
+    #[serde(default)]
+    pub app_data_dir: Option<PathBuf>,
+    /// File names of archives that have already been installed as mods.
+    /// Used by the Downloads page to show / hide installed archives.
+    #[serde(default)]
+    pub installed_archives: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -19,6 +28,8 @@ impl Default for AppConfig {
             current_game_id: None,
             nexus_api_key: None,
             games: Vec::new(),
+            app_data_dir: None,
+            installed_archives: Vec::new(),
         }
     }
 }
@@ -59,6 +70,20 @@ impl AppConfig {
             Err(e) => {
                 log::error!("Failed to serialize config: {e}");
             }
+        }
+    }
+
+    /// Returns the directory where downloaded archives are stored.
+    ///
+    /// When `app_data_dir` is configured this is `<app_data_dir>/downloads/`;
+    /// otherwise it falls back to `~/.local/share/linkmm/downloads/`.
+    pub fn downloads_dir(&self) -> PathBuf {
+        match &self.app_data_dir {
+            Some(dir) => dir.join("downloads"),
+            None => dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("linkmm")
+                .join("downloads"),
         }
     }
 
