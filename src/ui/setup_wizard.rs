@@ -45,7 +45,7 @@ pub fn show_setup_wizard(
     stack.add_named(&game_page, Some("select_game"));
 
     // --- Page 3: NexusMods API Key ---
-    let (nexus_page, _api_key_row) =
+    let nexus_page =
         build_nexus_page(&dialog, Rc::clone(&config), Rc::clone(&selected_game_clone));
     stack.add_named(&nexus_page, Some("nexus_key"));
 
@@ -339,7 +339,7 @@ fn build_nexus_page(
     wizard_window: &adw::Window,
     config: Rc<RefCell<AppConfig>>,
     selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
-) -> (gtk4::Box, adw::EntryRow) {
+) -> gtk4::Box {
     let page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     page.set_vexpand(true);
     page.set_margin_start(24);
@@ -367,15 +367,10 @@ fn build_nexus_page(
     page.append(&link_btn);
 
     let prefs_group = adw::PreferencesGroup::new();
-    let api_key_row = adw::EntryRow::builder()
+    // PasswordEntryRow (libadwaita 1.2+) includes a built-in visibility toggle
+    let api_key_row = adw::PasswordEntryRow::builder()
         .title("API Key")
         .build();
-
-    // Make it act like a password field
-    let visibility_btn = gtk4::ToggleButton::new();
-    visibility_btn.set_icon_name("view-reveal-symbolic");
-    visibility_btn.set_valign(gtk4::Align::Center);
-    api_key_row.add_suffix(&visibility_btn);
 
     prefs_group.add(&api_key_row);
     page.append(&prefs_group);
@@ -483,7 +478,7 @@ fn build_nexus_page(
         });
     }
 
-    (page, api_key_row)
+    page
 }
 
 fn finish_wizard(
