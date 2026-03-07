@@ -80,15 +80,16 @@ fn build_main_window(
     active_game_list.set_margin_bottom(12);
     active_game_list.set_selection_mode(gtk4::SelectionMode::None);
 
-    let active_game_row = adw::ActionRow::builder()
-        .activatable(true)
-        .build();
+    let active_game_row = adw::ActionRow::builder().activatable(true).build();
     let game_icon = gtk4::Image::from_icon_name("applications-games-symbolic");
     active_game_row.add_prefix(&game_icon);
 
     {
         let cfg = config.borrow();
-        update_active_game_row(&active_game_row, cfg.current_game().map(|g| g.name.as_str()));
+        update_active_game_row(
+            &active_game_row,
+            cfg.current_game().map(|g| g.name.as_str()),
+        );
     }
 
     active_game_list.append(&active_game_row);
@@ -186,7 +187,10 @@ fn build_main_window(
     // Library
     let library_widget: gtk4::Widget = match &current_game {
         Some(g) => library::build_library_page(g, Rc::clone(&config)),
-        None => build_no_game_page("No Game Selected", "Select or add a game to manage its mods."),
+        None => build_no_game_page(
+            "No Game Selected",
+            "Select or add a game to manage its mods.",
+        ),
     };
     content_stack.add_named(&library_widget, Some("library"));
 
@@ -327,12 +331,7 @@ fn build_main_window(
         nav_list_r.select_row(nav_list_r.row_at_index(NAV_LIBRARY).as_ref());
 
         // Update stats
-        refresh_stats(
-            &config_r.borrow(),
-            &installed_r,
-            &enabled_r,
-            &conflicts_r,
-        );
+        refresh_stats(&config_r.borrow(), &installed_r, &enabled_r, &conflicts_r);
     });
 
     // ── Active-game row click → open wizard / game picker ─────────────────
@@ -552,12 +551,6 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
         }
     };
 
-    let downloads_dir = config.downloads_dir();
-    if let Err(e) = std::fs::create_dir_all(&downloads_dir) {
-        log::error!("Failed to create downloads directory: {e}");
-        return;
-    }
-
     log::info!(
         "Handling NXM URL: game={}, mod={}, file={}",
         nxm.game_domain,
@@ -565,8 +558,23 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
         nxm.file_id
     );
 
+    let managed_game_id = config
+        .games
+        .iter()
+        .find(|g| g.kind.nexus_game_id() == nxm.game_domain)
+        .map(|g| g.id.as_str())
+        .or(config.current_game_id.as_deref());
+    let downloads_dir = config.downloads_dir(managed_game_id);
+    if let Err(e) = std::fs::create_dir_all(&downloads_dir) {
+        log::error!("Failed to create downloads directory: {e}");
+        return;
+    }
+
     if let Some(window) = app.active_window() {
-        show_nxm_toast(&window, &format!("Starting download for mod {}…", nxm.mod_id));
+        show_nxm_toast(
+            &window,
+            &format!("Starting download for mod {}…", nxm.mod_id),
+        );
     }
 
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
@@ -600,22 +608,14 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
             // Get download link using NXM key/expires if available, otherwise
             // fall back to the premium-only direct API
             let links = match (&nxm.key, &nxm.expires) {
-                (Some(key), Some(expires)) => {
-                    client.get_download_links_nxm(
-                        &nxm.game_domain,
-                        nxm.mod_id as u32,
-                        nxm.file_id,
-                        key,
-                        expires,
-                    )?
-                }
-                _ => {
-                    client.get_download_links(
-                        &nxm.game_domain,
-                        nxm.mod_id as u32,
-                        nxm.file_id,
-                    )?
-                }
+                (Some(key), Some(expires)) => client.get_download_links_nxm(
+                    &nxm.game_domain,
+                    nxm.mod_id as u32,
+                    nxm.file_id,
+                    key,
+                    expires,
+                )?,
+                _ => client.get_download_links(&nxm.game_domain, nxm.mod_id as u32, nxm.file_id)?,
             };
 
             let (_cdn, url) = links
