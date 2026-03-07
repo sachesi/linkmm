@@ -895,7 +895,8 @@ fn install_fomod_files(
 /// Normalise path separators: backslash → forward slash, strip leading slash.
 fn normalise_path(p: &str) -> String {
     let s = p.replace('\\', "/");
-    s.strip_prefix('/').unwrap_or(&s).to_string()
+    let s = s.strip_prefix('/').unwrap_or(&s);
+    s.trim_end_matches('/').to_string()
 }
 
 fn collect_matching_entries(
@@ -1202,6 +1203,35 @@ mod tests {
         .unwrap();
 
         assert!(dest.join("textures").join("sky.dds").exists());
+    }
+
+    #[test]
+    fn install_fomod_files_handles_source_with_trailing_slash() {
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("meshes/", b""),
+                ("meshes/armor.nif", b"nif_data"),
+                ("fomod/", b""),
+                ("fomod/ModuleConfig.xml", b"<config/>"),
+            ],
+        );
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[FomodFile {
+                source: "meshes/".to_string(),
+                destination: "Data/meshes".to_string(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+
+        assert!(dest.join("meshes").join("armor.nif").exists());
     }
 
     #[test]
