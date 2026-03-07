@@ -9,9 +9,8 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 /// How a mod archive should be installed.
 #[derive(Debug, Clone)]
 pub enum InstallStrategy {
-    /// Extract to a mod folder and symlink into the game root.
-    Root,
-    /// Extract to a mod folder and symlink into `<game_root>/Data`.
+    /// Extract to a mod folder under a `Data/` subdirectory and symlink into
+    /// `<game_root>/Data`.
     Data,
     /// FOMOD-guided installation.  The `Vec<FomodFile>` contains the resolved
     /// list of files to install based on user selections.
@@ -86,9 +85,8 @@ pub struct FomodConfig {
 ///
 /// - If a `fomod/ModuleConfig.xml` is found → `Fomod` (with empty file list;
 ///   the caller must run the wizard to populate it).
-/// - If the top-level entries already contain a `Data` folder (or known
-///   data-folder content such as `.esm`/`.esp`/`meshes`/`textures`) → `Root`.
-/// - Otherwise → `Data`.
+/// - Otherwise → `Data` (all content is placed under a `Data/` subdirectory
+///   inside the mod folder and symlinked into `<game_root>/Data`).
 pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
@@ -96,13 +94,6 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
 
     let mut has_fomod = false;
-    let mut has_data_folder = false;
-    let mut has_data_content = false;
-
-    let data_content_markers: &[&str] = &[
-        "meshes/", "textures/", "scripts/", "interface/", "sound/", "music/",
-        "seq/", "skse/",
-    ];
 
     for i in 0..zip.len() {
         let entry = zip
@@ -114,39 +105,12 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         {
             has_fomod = true;
         }
-
-        // Check for top-level "Data/" folder
-        let top = top_level_component(&name_lower);
-        if top == "data" {
-            has_data_folder = true;
-        }
-
-        // Check for data-folder content markers at top level
-        for marker in data_content_markers {
-            if name_lower.starts_with(marker) {
-                has_data_content = true;
-            }
-        }
-
-        // Check for plugin files at top level
-        if !name_lower.contains('/') || name_lower.matches('/').count() == 1 {
-            if name_lower.ends_with(".esm")
-                || name_lower.ends_with(".esp")
-                || name_lower.ends_with(".esl")
-            {
-                has_data_content = true;
-            }
-        }
     }
 
     if has_fomod {
         let config = parse_fomod_from_zip(archive_path)?;
         // Return Fomod with empty file list – the caller will run the wizard
         Ok(InstallStrategy::Fomod(config.required_files.clone()))
-    } else if has_data_folder {
-        Ok(InstallStrategy::Root)
-    } else if has_data_content {
-        Ok(InstallStrategy::Data)
     } else {
         Ok(InstallStrategy::Data)
     }
@@ -155,6 +119,48 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
 fn top_level_component(path: &str) -> &str {
     let stripped = path.strip_prefix('/').unwrap_or(path);
     stripped.split('/').next().unwrap_or("")
+}
+
+/// Return `true` when the archive already contains a `Data/` folder after the
+/// common wrapper prefix is stripped.
+///
+/// Examples:
+/// - `Data/textures/sky.dds` → common prefix `Data/` stripped → bare files →
+///   returns `false` (content needs to go into `Data/`).
+/// - `SomeMod/Data/textures/sky.dds` → common prefix `SomeMod/` stripped →
+///   remaining starts with `Data/` → returns `true`.
+/// - `textures/sky.dds` → no prefix → returns `false`.
+fn archive_has_data_folder(archive_path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(archive_path) else {
+        return false;
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    let prefix = find_common_prefix(&mut zip);
+
+    let Ok(file2) = std::fs::File::open(archive_path) else {
+        return false;
+    };
+    let Ok(mut zip2) = zip::ZipArchive::new(file2) else {
+        return false;
+    };
+    for i in 0..zip2.len() {
+        let Ok(entry) = zip2.by_index(i) else {
+            continue;
+        };
+        let name = entry.name();
+        let rel = if !prefix.is_empty() {
+            name.strip_prefix(&prefix).unwrap_or(name)
+        } else {
+            name
+        };
+        let top = top_level_component(&rel.to_lowercase());
+        if top == "data" {
+            return true;
+        }
+    }
+    false
 }
 
 // ── FOMOD XML parser ──────────────────────────────────────────────────────────
@@ -414,7 +420,8 @@ fn get_attr(
 
 /// Install a mod from a zip archive.
 ///
-/// 1. Extracts the archive into a mod directory under `<game_mods_dir>/<mod_name>/`.
+/// 1. Extracts the archive into `<mod_dir>/Data/` so that the managed directory
+///    always uses the `{uuid}/Data/…` structure.
 /// 2. Updates the mod database.
 /// 3. Returns the created `Mod` entry.
 pub fn install_mod_from_archive(
@@ -426,24 +433,33 @@ pub fn install_mod_from_archive(
     let mod_dir = ModManager::create_mod_directory(game)?;
 
     match strategy {
-        InstallStrategy::Root => {
-            extract_zip_to(archive_path, &mod_dir)?;
-        }
         InstallStrategy::Data => {
-            // Extract directly into the mod directory – these files will be
-            // symlinked into the game's Data/ folder by ModManager::enable_mod.
-            extract_zip_to(archive_path, &mod_dir)?;
+            // Determine extraction root:
+            // • If the archive already carries a `Data/` subfolder after the
+            //   common wrapper prefix is stripped, extract to `mod_dir/`
+            //   directly – the `Data/` folder will land at `mod_dir/Data/`.
+            // • Otherwise wrap the content inside `mod_dir/Data/` ourselves.
+            if archive_has_data_folder(archive_path) {
+                extract_zip_to(archive_path, &mod_dir)?;
+            } else {
+                let data_dir = mod_dir.join("Data");
+                std::fs::create_dir_all(&data_dir)
+                    .map_err(|e| format!("Failed to create Data directory: {e}"))?;
+                extract_zip_to(archive_path, &data_dir)?;
+            }
         }
         InstallStrategy::Fomod(files) => {
-            install_fomod_files(archive_path, &mod_dir, files)?;
+            // FOMOD destinations are relative to the game's Data folder, so
+            // extract directly into `mod_dir/Data/`.
+            let data_dir = mod_dir.join("Data");
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| format!("Failed to create Data directory: {e}"))?;
+            install_fomod_files(archive_path, &data_dir, files)?;
         }
     }
 
     let mut mod_entry = Mod::new(mod_name, mod_dir);
     mod_entry.installed_from_nexus = true;
-    // Root-strategy mods contain a top-level Data/ folder and should be
-    // symlinked into the game root directory, not into Data/.
-    mod_entry.install_to_root = matches!(strategy, InstallStrategy::Root);
 
     // Register in the mod database
     let mut db = ModDatabase::load(game);
