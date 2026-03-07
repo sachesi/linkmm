@@ -89,11 +89,6 @@ pub struct Mod {
     /// True when this mod was downloaded through the Downloads page via the Nexus API.
     #[serde(default)]
     pub installed_from_nexus: bool,
-    /// True when the mod should be linked into the game root directory instead
-    /// of the Data directory (e.g. mods containing a top-level `Data/` folder
-    /// or executables that sit next to the game binary).
-    #[serde(default)]
-    pub install_to_root: bool,
 }
 
 impl Mod {
@@ -109,7 +104,6 @@ impl Mod {
             nexus_id: None,
             source_path,
             installed_from_nexus: false,
-            install_to_root: false,
         }
     }
 }
@@ -360,25 +354,32 @@ pub struct ModManager;
 
 impl ModManager {
     pub fn enable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        let target_dir = if mod_entry.install_to_root {
-            &game.root_path
-        } else {
-            &game.data_path
-        };
+        let target_dir = &game.data_path;
         if !target_dir.is_dir() {
             std::fs::create_dir_all(target_dir)
                 .map_err(|e| format!("Failed to create target directory: {e}"))?;
         }
-        link_directory_contents(&mod_entry.source_path, target_dir)
+        // Prefer the new `{mod_dir}/Data/` layout; fall back to the legacy
+        // flat layout so that mods installed before this change still work.
+        let data_dir = mod_entry.source_path.join("Data");
+        let source = if data_dir.is_dir() {
+            data_dir
+        } else {
+            mod_entry.source_path.clone()
+        };
+        link_directory_contents(&source, target_dir)
     }
 
     pub fn disable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        let target_dir = if mod_entry.install_to_root {
-            &game.root_path
+        let target_dir = &game.data_path;
+        // Mirror the same source selection as enable_mod.
+        let data_dir = mod_entry.source_path.join("Data");
+        let source = if data_dir.is_dir() {
+            data_dir
         } else {
-            &game.data_path
+            mod_entry.source_path.clone()
         };
-        unlink_directory_contents(&mod_entry.source_path, target_dir)
+        unlink_directory_contents(&source, target_dir)
     }
 
     pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
