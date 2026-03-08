@@ -46,12 +46,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     ));
     header.pack_end(&deploy_btn);
 
-    // Undeploy button – removes all mod symlinks from the game directory
-    let undeploy_btn = gtk4::Button::with_label("Undeploy");
-    undeploy_btn.add_css_class("destructive-action");
-    undeploy_btn.set_tooltip_text(Some("Remove all mod symlinks from the game directory"));
-    header.pack_end(&undeploy_btn);
-
     toolbar_view.add_top_bar(&header);
 
     let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
@@ -137,7 +131,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let selected_c = Rc::clone(&selected_mod_id);
         let search_entry_c = search_entry.clone();
         let deploy_btn_c = deploy_btn.clone();
-        let undeploy_btn_c = undeploy_btn.clone();
         let status_label_c = status_label.clone();
         let status_progress_c = status_progress.clone();
         let status_revealer_c = status_revealer.clone();
@@ -145,7 +138,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             set_library_busy(
                 &search_entry_c,
                 &deploy_btn_c,
-                &undeploy_btn_c,
                 &container_c,
                 true,
             );
@@ -228,93 +220,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             set_library_busy(
                 &search_entry_c,
                 &deploy_btn_c,
-                &undeploy_btn_c,
-                &container_c,
-                false,
-            );
-            hide_status_popup_later(status_revealer_c.clone());
-            show_toast(btn.upcast_ref(), &msg);
-            refresh_library_content_with_search(
-                &container_c,
-                &game_c,
-                Rc::clone(&config_c),
-                &search_c.borrow(),
-                Rc::clone(&search_c),
-                Rc::clone(&selected_c),
-            );
-        });
-    }
-
-    // Wire Undeploy button: remove all mod symlinks from the game directory
-    {
-        let game_c = Rc::clone(&game_rc);
-        let container_c = list_container.clone();
-        let config_c = Rc::clone(&config);
-        let search_c = Rc::clone(&search_query);
-        let selected_c = Rc::clone(&selected_mod_id);
-        let search_entry_c = search_entry.clone();
-        let deploy_btn_c = deploy_btn.clone();
-        let undeploy_btn_c = undeploy_btn.clone();
-        let status_label_c = status_label.clone();
-        let status_progress_c = status_progress.clone();
-        let status_revealer_c = status_revealer.clone();
-        undeploy_btn.connect_clicked(move |btn| {
-            set_library_busy(
-                &search_entry_c,
-                &deploy_btn_c,
-                &undeploy_btn_c,
-                &container_c,
-                true,
-            );
-            status_revealer_c.set_reveal_child(true);
-            status_label_c.set_text("Starting undeploy…");
-            status_progress_c.set_fraction(0.0);
-            status_progress_c.set_text(Some("0%"));
-            flush_ui_events();
-            let db = ModDatabase::load(&game_c);
-            let mut errors: Vec<String> = Vec::new();
-            let mut count = 0;
-            let total = db.mods.len();
-            let total_steps = total + POST_LOOP_PROGRESS_STEPS;
-            // Unlink ALL mods regardless of enabled state so the game directory
-            // is fully clean.  The enabled state is intentionally preserved so
-            // the user can re-deploy with the same selection later.
-            for (idx, m) in db.mods.iter().enumerate() {
-                status_label_c.set_text(&format!("Undeploying mods ({}/{})…", idx + 1, total));
-                flush_ui_events();
-                if let Err(e) = ModManager::disable_mod_without_legacy_cleanup(&game_c, m) {
-                    errors.push(format!("{}: {}", m.name, e));
-                } else {
-                    count += 1;
-                }
-                let progress = (idx + 1) as f64 / total_steps.max(1) as f64;
-                status_progress_c.set_fraction(progress);
-                status_progress_c.set_text(Some(&format!("{:.0}%", progress * 100.0)));
-            }
-            ModManager::purge_legacy_nested_data_dir(&game_c);
-            let purge_progress = (total + 1) as f64 / total_steps.max(1) as f64;
-            status_progress_c.set_fraction(purge_progress);
-            status_progress_c.set_text(Some(&format!("{:.0}%", purge_progress * 100.0)));
-            let _ = db.write_plugins_txt(&game_c);
-            let write_progress = (total + POST_LOOP_PROGRESS_STEPS) as f64 / total_steps.max(1) as f64;
-            status_progress_c.set_fraction(write_progress);
-            status_progress_c.set_text(Some(&format!("{:.0}%", write_progress * 100.0)));
-
-            let msg = if errors.is_empty() {
-                format!("Undeployed {count} mod(s)")
-            } else {
-                for e in &errors {
-                    log::error!("Undeploy error: {e}");
-                }
-                format!("Undeploy finished with {} error(s)", errors.len())
-            };
-            status_label_c.set_text(&msg);
-            status_progress_c.set_fraction(1.0);
-            status_progress_c.set_text(Some("100%"));
-            set_library_busy(
-                &search_entry_c,
-                &deploy_btn_c,
-                &undeploy_btn_c,
                 &container_c,
                 false,
             );
@@ -426,14 +331,12 @@ fn refresh_library_content_with_search(
 fn set_library_busy(
     search_entry: &gtk4::SearchEntry,
     deploy_btn: &gtk4::Button,
-    undeploy_btn: &gtk4::Button,
     content_container: &gtk4::Box,
     busy: bool,
 ) {
     let sensitive = !busy;
     search_entry.set_sensitive(sensitive);
     deploy_btn.set_sensitive(sensitive);
-    undeploy_btn.set_sensitive(sensitive);
     content_container.set_sensitive(sensitive);
 }
 
@@ -779,6 +682,11 @@ fn build_mod_row(
         let source_path = mod_entry.source_path.clone();
         let nexus_id = mod_entry.nexus_id;
         let game_c = Rc::clone(game);
+        let container_rclick = container.clone();
+        let config_rclick = Rc::clone(&config);
+        let search_rclick = Rc::clone(&search_state);
+        let selected_rclick = Rc::clone(&selected_mod_id);
+        let mod_id_rclick = mod_entry.id.clone();
         let conflict_entries = conflict_state
             .map(|state| {
                 state
@@ -823,6 +731,27 @@ fn build_mod_row(
             show_conflicts_item.set_hexpand(true);
             show_conflicts_item.set_sensitive(!conflict_entries.is_empty());
             menu_box.append(&show_conflicts_item);
+
+            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            menu_box.append(&sep);
+
+            let move_item = gtk4::Button::with_label("Move to Position\u{2026}");
+            move_item.add_css_class("flat");
+            move_item.set_halign(gtk4::Align::Fill);
+            move_item.set_hexpand(true);
+            menu_box.append(&move_item);
+
+            let enable_all_item = gtk4::Button::with_label("Enable All");
+            enable_all_item.add_css_class("flat");
+            enable_all_item.set_halign(gtk4::Align::Fill);
+            enable_all_item.set_hexpand(true);
+            menu_box.append(&enable_all_item);
+
+            let disable_all_item = gtk4::Button::with_label("Disable All");
+            disable_all_item.add_css_class("flat");
+            disable_all_item.set_halign(gtk4::Align::Fill);
+            disable_all_item.set_hexpand(true);
+            menu_box.append(&disable_all_item);
 
             popover.set_child(Some(&menu_box));
 
@@ -882,6 +811,77 @@ fn build_mod_row(
                 dialog.present(parent.as_ref());
             });
 
+            let popover_move = popover.clone();
+            let row_move = row_c.clone();
+            let game_move = Rc::clone(&game_c);
+            let container_move = container_rclick.clone();
+            let config_move = Rc::clone(&config_rclick);
+            let search_move = Rc::clone(&search_rclick);
+            let selected_move = Rc::clone(&selected_rclick);
+            let mod_id_move = mod_id_rclick.clone();
+            move_item.connect_clicked(move |_| {
+                popover_move.popdown();
+                if let Some(root) = row_move.root() {
+                    if let Ok(window) = root.downcast::<gtk4::Window>() {
+                        show_move_to_position_dialog_for_mod(
+                            &window,
+                            mod_id_move.clone(),
+                            Rc::clone(&game_move),
+                            container_move.clone(),
+                            Rc::clone(&config_move),
+                            Rc::clone(&search_move),
+                            Rc::clone(&selected_move),
+                        );
+                    }
+                }
+            });
+
+            let popover_enable = popover.clone();
+            let game_enable = Rc::clone(&game_c);
+            let container_enable = container_rclick.clone();
+            let config_enable = Rc::clone(&config_rclick);
+            let search_enable = Rc::clone(&search_rclick);
+            let selected_enable = Rc::clone(&selected_rclick);
+            enable_all_item.connect_clicked(move |_| {
+                popover_enable.popdown();
+                let mut db = ModDatabase::load(&game_enable);
+                for m in db.mods.iter_mut() {
+                    m.enabled = true;
+                }
+                db.save(&game_enable);
+                refresh_library_content_with_search(
+                    &container_enable,
+                    &game_enable,
+                    Rc::clone(&config_enable),
+                    &search_enable.borrow(),
+                    Rc::clone(&search_enable),
+                    Rc::clone(&selected_enable),
+                );
+            });
+
+            let popover_disable = popover.clone();
+            let game_disable = Rc::clone(&game_c);
+            let container_disable = container_rclick.clone();
+            let config_disable = Rc::clone(&config_rclick);
+            let search_disable = Rc::clone(&search_rclick);
+            let selected_disable = Rc::clone(&selected_rclick);
+            disable_all_item.connect_clicked(move |_| {
+                popover_disable.popdown();
+                let mut db = ModDatabase::load(&game_disable);
+                for m in db.mods.iter_mut() {
+                    m.enabled = false;
+                }
+                db.save(&game_disable);
+                refresh_library_content_with_search(
+                    &container_disable,
+                    &game_disable,
+                    Rc::clone(&config_disable),
+                    &search_disable.borrow(),
+                    Rc::clone(&search_disable),
+                    Rc::clone(&selected_disable),
+                );
+            });
+
             popover.popup();
         });
     }
@@ -901,6 +901,76 @@ fn adjusted_insert_pos(src_pos: usize, target_idx: usize) -> usize {
     } else {
         target_idx
     }
+}
+
+/// Show a modal dialog that lets the user type a position number for a mod.
+/// The valid range is 1 to the total number of installed mods.
+fn show_move_to_position_dialog_for_mod(
+    parent: &gtk4::Window,
+    mod_id: String,
+    game: Rc<Game>,
+    container: gtk4::Box,
+    config: Rc<RefCell<AppConfig>>,
+    search_state: Rc<RefCell<String>>,
+    selected_mod_id: Rc<RefCell<Option<String>>>,
+) {
+    let db = ModDatabase::load(&game);
+    let total = db.mods.len();
+    if total == 0 {
+        return;
+    }
+    let Some(current_pos) = db.mods.iter().position(|m| m.id == mod_id) else {
+        return;
+    };
+    let mod_name = db.mods[current_pos].name.clone();
+
+    let body = format!(
+        "Enter the new position for \"{mod_name}\".\nValid range: 1–{total}.",
+    );
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Move to Position")
+        .body(&body)
+        .build();
+
+    let spin = gtk4::SpinButton::with_range(1.0, total as f64, 1.0);
+    spin.set_value((current_pos + 1) as f64);
+    spin.set_numeric(true);
+    dialog.set_extra_child(Some(&spin));
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("move", "Move");
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("move"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |_, response| {
+        if response != "move" {
+            return;
+        }
+        let target_pos_1indexed = spin.value() as usize;
+        let target_idx = target_pos_1indexed.saturating_sub(1);
+
+        let mut db = ModDatabase::load(&game);
+        if let Some(src_pos) = db.mods.iter().position(|m| m.id == mod_id) {
+            if target_idx < db.mods.len() {
+                let m = db.mods.remove(src_pos);
+                let insert_pos = adjusted_insert_pos(src_pos, target_idx);
+                db.mods.insert(insert_pos, m);
+                db.save(&game);
+                refresh_library_content_with_search(
+                    &container,
+                    &game,
+                    Rc::clone(&config),
+                    &search_state.borrow(),
+                    Rc::clone(&search_state),
+                    Rc::clone(&selected_mod_id),
+                );
+            }
+        }
+    });
+
+    dialog.present(Some(parent));
 }
 
 fn compute_conflict_states(
