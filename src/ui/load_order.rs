@@ -257,9 +257,9 @@ fn build_plugin_row(
             let enabled = btn.is_active();
             let mut db = ModDatabase::load(&game_c);
             if enabled {
-                db.plugin_disabled.retain(|n| n != &plugin_name);
-            } else if !db.plugin_disabled.contains(&plugin_name) {
-                db.plugin_disabled.push(plugin_name.clone());
+                db.plugin_disabled.remove(&plugin_name);
+            } else {
+                db.plugin_disabled.insert(plugin_name.clone());
             }
             db.save(&game_c);
             let _ = db.write_plugins_txt(&game_c);
@@ -484,8 +484,8 @@ fn build_plugin_row(
                 let mut db = ModDatabase::load(&game_disable);
                 let ordered = db.get_ordered_plugins(&game_disable);
                 for p in &ordered {
-                    if !p.is_vanilla && !db.plugin_disabled.contains(&p.name) {
-                        db.plugin_disabled.push(p.name.clone());
+                    if !p.is_vanilla {
+                        db.plugin_disabled.insert(p.name.clone());
                     }
                 }
                 db.save(&game_disable);
