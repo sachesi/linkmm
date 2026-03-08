@@ -169,12 +169,18 @@ fn build_main_window(
     // Initial population of the launch button based on the current game
     {
         let cfg = config.borrow();
+        let preferred = cfg
+            .current_game()
+            .and_then(|g| cfg.preferred_executables.get(&g.id))
+            .cloned();
         update_launch_ui(
             &launch_simple_btn,
             &launch_split_btn,
             cfg.current_game(),
+            preferred.as_deref(),
             &launch_default_exe,
             &launch_current_game,
+            &Rc::clone(&config),
         );
     }
 
@@ -254,13 +260,23 @@ fn build_main_window(
         let current_game_t = Rc::clone(&launch_current_game);
         let config_t = Rc::clone(&config);
         glib::timeout_add_local(std::time::Duration::from_secs(3), move || {
-            let cfg = config_t.borrow();
+            let (game_clone, preferred) = {
+                let cfg = config_t.borrow();
+                let g = cfg.current_game().cloned();
+                let p = g
+                    .as_ref()
+                    .and_then(|g| cfg.preferred_executables.get(&g.id))
+                    .cloned();
+                (g, p)
+            };
             update_launch_ui(
                 &simple_btn_t,
                 &split_btn_t,
-                cfg.current_game(),
+                game_clone.as_ref(),
+                preferred.as_deref(),
                 &default_exe_t,
                 &current_game_t,
+                &Rc::clone(&config_t),
             );
             glib::ControlFlow::Continue
         });
@@ -420,12 +436,21 @@ fn build_main_window(
         }
 
         // Refresh the launch button for the new game
+        let preferred = {
+            let cfg = config_r.borrow();
+            game_info
+                .as_ref()
+                .and_then(|g| cfg.preferred_executables.get(&g.id))
+                .cloned()
+        };
         update_launch_ui(
             &launch_simple_btn_r,
             &launch_split_btn_r,
             game_info.as_ref(),
+            preferred.as_deref(),
             &launch_default_exe_r,
             &launch_current_game_r,
+            &Rc::clone(&config_r),
         );
 
         // Rebuild Library page for the new game
@@ -549,12 +574,27 @@ fn refresh_stats(
 /// * Shows the plain `simple_btn` when exactly one executable exists.
 /// * Shows the `split_btn` (with a dropdown listing all executables) when
 ///   more than one executable is discovered in the game directory.
+///
+/// The active executable is chosen as follows:
+/// * If the **game just changed** (including the initial call), the value of
+///   `preferred_exe` — loaded from `AppConfig::preferred_executables` — is
+///   used if that executable is still present on disk.  Otherwise the first
+///   discovered executable is used.
+/// * If the **same game is being refreshed** (periodic scan to pick up newly
+///   deployed script-extender loaders), the current in-memory selection is
+///   preserved as long as it is still valid.
+///
+/// When the user selects an executable from the split-button dropdown the
+/// choice is immediately written to `config` and saved to disk so it
+/// survives an application restart.
 fn update_launch_ui(
     simple_btn: &gtk4::Button,
     split_btn: &adw::SplitButton,
     game: Option<&Game>,
+    preferred_exe: Option<&str>,
     default_exe: &Rc<RefCell<Option<String>>>,
     current_game: &Rc<RefCell<Option<Game>>>,
+    config: &Rc<RefCell<AppConfig>>,
 ) {
     // Always hide both first; we show the right one below.
     simple_btn.set_visible(false);
@@ -566,6 +606,11 @@ fn update_launch_ui(
         return;
     };
 
+    let game_changed = current_game
+        .borrow()
+        .as_ref()
+        .map(|cg| cg.id != g.id)
+        .unwrap_or(true);
     *current_game.borrow_mut() = Some(g.clone());
 
     let exes = g.discover_executables();
@@ -574,7 +619,24 @@ fn update_launch_ui(
         return;
     }
 
-    *default_exe.borrow_mut() = Some(exes[0].clone());
+    // Choose which exe to show as the active default:
+    // • game changed → use persisted preference (if still on disk) else first exe
+    // • same game    → preserve current in-memory selection if still valid
+    let preferred_or_first = |pref: Option<&str>| -> String {
+        pref.filter(|p| exes.iter().any(|e| e.as_str() == *p))
+            .map(str::to_string)
+            .unwrap_or_else(|| exes[0].clone())
+    };
+    let chosen: String = if game_changed {
+        preferred_or_first(preferred_exe)
+    } else {
+        let current = default_exe.borrow().clone();
+        current
+            .filter(|e| exes.iter().any(|x| x == e))
+            .unwrap_or_else(|| preferred_or_first(preferred_exe))
+    };
+
+    *default_exe.borrow_mut() = Some(chosen.clone());
 
     if exes.len() == 1 {
         simple_btn.set_label(&exes[0]);
@@ -596,15 +658,24 @@ fn update_launch_ui(
                 .build();
 
             let exe_c = exe.clone();
+            let game_id_c = g.id.clone();
             let game_c = g.clone();
             let default_exe_c = Rc::clone(default_exe);
             let split_btn_c = split_btn.clone();
             let popover_c = popover.clone();
+            let config_c = Rc::clone(config);
             row.connect_activated(move |_| {
-                // Update the default exe shown on the button and launch it.
+                // Update the default exe shown on the button.
                 *default_exe_c.borrow_mut() = Some(exe_c.clone());
                 split_btn_c.set_label(&exe_c);
                 popover_c.popdown();
+                // Persist the user's choice so it survives a restart.
+                {
+                    let mut cfg = config_c.borrow_mut();
+                    cfg.preferred_executables
+                        .insert(game_id_c.clone(), exe_c.clone());
+                    cfg.save();
+                }
                 do_launch_game(&game_c, &exe_c);
             });
 
@@ -613,7 +684,7 @@ fn update_launch_ui(
 
         popover.set_child(Some(&list));
         split_btn.set_popover(Some(&popover));
-        split_btn.set_label(&exes[0]);
+        split_btn.set_label(&chosen);
         split_btn.set_visible(true);
     }
 }
