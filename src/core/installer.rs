@@ -1040,12 +1040,12 @@ pub fn install_mod_from_archive_with_nexus_ticking(
             //   directly – the `Data/` folder will land at `mod_dir/Data/`.
             // • Otherwise wrap the content inside `mod_dir/Data/` ourselves.
                 if archive_has_data_folder(archive_path) {
-                    extract_zip_to(archive_path, &mod_dir)?;
+                    extract_zip_to(archive_path, &mod_dir, tick)?;
                 } else {
                     let data_dir = mod_dir.join("Data");
                     std::fs::create_dir_all(&data_dir)
                         .map_err(|e| format!("Failed to create Data directory: {e}"))?;
-                    extract_zip_to(archive_path, &data_dir)?;
+                    extract_zip_to(archive_path, &data_dir, tick)?;
                 }
             }
         }
@@ -1075,7 +1075,12 @@ pub fn install_mod_from_archive_with_nexus_ticking(
 
 /// Extract all files from a zip archive into `dest_dir`, preserving directory
 /// structure.
-fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
+///
+/// `tick` is called approximately every [`EXTRACTION_TICK_INTERVAL_MS`] while
+/// iterating over entries so that callers can pulse a progress bar or process
+/// UI events to keep the application responsive during extraction of large
+/// archives.  Pass `&|| {}` when no progress feedback is needed.
+fn extract_zip_to(archive_path: &Path, dest_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip =
@@ -1087,7 +1092,15 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
     // file handle for both the prefix scan and the extraction pass.
     let prefix = find_common_prefix(&zip);
 
+    let mut last_tick = std::time::Instant::now();
     for i in 0..zip.len() {
+        // Call tick periodically so the caller can keep the UI responsive.
+        let now = std::time::Instant::now();
+        if now.duration_since(last_tick).as_millis() as u64 >= EXTRACTION_TICK_INTERVAL_MS {
+            tick();
+            last_tick = now;
+        }
+
         let mut entry = zip
             .by_index(i)
             .map_err(|e| format!("Cannot read zip entry: {e}"))?;
@@ -2133,7 +2146,7 @@ Size = 9\n\
         std::fs::create_dir_all(&dest).unwrap();
         let data_dest = dest.join("Data");
         std::fs::create_dir_all(&data_dest).unwrap();
-        extract_zip_to(&archive, &data_dest).unwrap();
+        extract_zip_to(&archive, &data_dest, &|| {}).unwrap();
 
         assert!(dest.join("Data").join("textures").join("sky.dds").exists());
         assert!(dest.join("Data").join("plugin.esp").exists());
@@ -2159,7 +2172,7 @@ Size = 9\n\
         assert!(!archive_has_data_folder(&archive));
         let data_dest = dest.join("Data");
         std::fs::create_dir_all(&data_dest).unwrap();
-        extract_zip_to(&archive, &data_dest).unwrap();
+        extract_zip_to(&archive, &data_dest, &|| {}).unwrap();
 
         assert!(dest.join("Data").join("textures").join("sky.dds").exists());
     }
@@ -2180,7 +2193,7 @@ Size = 9\n\
         let dest = tmp.join("mod_dir");
         std::fs::create_dir_all(&dest).unwrap();
         assert!(archive_has_data_folder(&archive));
-        extract_zip_to(&archive, &dest).unwrap();
+        extract_zip_to(&archive, &dest, &|| {}).unwrap();
 
         assert!(dest.join("Data").join("textures").join("sky.dds").exists());
     }
@@ -2198,7 +2211,7 @@ Size = 9\n\
         );
         let dest = tmp.join("extracted");
         std::fs::create_dir_all(&dest).unwrap();
-        extract_zip_to(&archive, &dest).unwrap();
+        extract_zip_to(&archive, &dest, &|| {}).unwrap();
 
         // Common prefix "MyMod/" is stripped
         assert!(dest.join("textures").join("sky.dds").exists());

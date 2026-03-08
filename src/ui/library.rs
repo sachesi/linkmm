@@ -16,6 +16,11 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
 const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
 const POST_LOOP_PROGRESS_STEPS: usize = 2;
+/// Minimum interval (ms) between UI progress updates in the deploy loop.
+/// Throttling at one frame (~16 ms) prevents the GTK ProgressBar CSS
+/// transition from being restarted on every fast iteration and keeps the
+/// Revealer slide animation smooth.
+const PROGRESS_UPDATE_INTERVAL_MS: u64 = 16;
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
@@ -145,94 +150,135 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             status_label_c.set_text("Preparing deployment…");
             status_progress_c.set_fraction(0.0);
             status_progress_c.set_text(Some("0%"));
-            flush_ui_events();
 
-            let db = ModDatabase::load(&game_c);
-            let mut errors: Vec<String> = Vec::new();
-            let undeploy_total = db.mods.len();
-            // Progress covers both phases in a single bar: cleanup undeploy pass
-            // + enabled-mod deploy pass.
-            let deploy_total = db.mods.iter().filter(|m| m.enabled).count();
-            let total_steps = (undeploy_total + deploy_total + POST_LOOP_PROGRESS_STEPS).max(1);
-            let mut steps_done = 0usize;
+            // Defer the blocking deploy work to the next idle opportunity so
+            // the Revealer slide-down animation can start on this frame before
+            // the main thread is occupied.
+            let game_c = Rc::clone(&game_c);
+            let container_c = container_c.clone();
+            let config_c = Rc::clone(&config_c);
+            let search_c = Rc::clone(&search_c);
+            let selected_c = Rc::clone(&selected_c);
+            let search_entry_c = search_entry_c.clone();
+            let deploy_btn_c = deploy_btn_c.clone();
+            let status_label_c = status_label_c.clone();
+            let status_progress_c = status_progress_c.clone();
+            let status_revealer_c = status_revealer_c.clone();
+            let btn = btn.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                let db = ModDatabase::load(&game_c);
+                let mut errors: Vec<String> = Vec::new();
+                let undeploy_total = db.mods.len();
+                // Progress covers both phases in a single bar: cleanup undeploy pass
+                // + enabled-mod deploy pass.
+                let deploy_total = db.mods.iter().filter(|m| m.enabled).count();
+                let total_steps = (undeploy_total + deploy_total + POST_LOOP_PROGRESS_STEPS).max(1);
+                let mut steps_done = 0usize;
 
-            // First, unlink all tracked mods so we start from a clean state
-            for (idx, m) in db.mods.iter().enumerate() {
-                status_label_c.set_text(&format!(
-                    "Undeploying existing links ({}/{})…",
-                    idx + 1,
-                    undeploy_total
-                ));
-                flush_ui_events();
-                if let Err(e) = ModManager::disable_mod_without_legacy_cleanup(&game_c, m) {
-                    log::warn!("Undeploy warning for {}: {e}", m.name);
+                // Throttle UI updates so we don't restart the ProgressBar CSS
+                // transition on every fast iteration and let the Revealer
+                // animation advance smoothly at the display frame rate.
+                // Initialise to one interval in the past so the very first
+                // iteration always produces a visible UI update.
+                let mut last_ui_update = std::time::Instant::now()
+                    - std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS);
+
+                // First, unlink all tracked mods so we start from a clean state
+                for (idx, m) in db.mods.iter().enumerate() {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_ui_update).as_millis() as u64
+                        >= PROGRESS_UPDATE_INTERVAL_MS
+                    {
+                        status_label_c.set_text(&format!(
+                            "Undeploying existing links ({}/{})…",
+                            idx + 1,
+                            undeploy_total
+                        ));
+                        let frac = steps_done as f64 / total_steps as f64;
+                        status_progress_c.set_fraction(frac);
+                        status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
+                        flush_ui_events();
+                        last_ui_update = now;
+                    }
+                    if let Err(e) = ModManager::disable_mod_without_legacy_cleanup(&game_c, m) {
+                        log::warn!("Undeploy warning for {}: {e}", m.name);
+                    }
+                    steps_done += 1;
                 }
+                ModManager::purge_legacy_nested_data_dir(&game_c);
+                steps_done += 1;
+                {
+                    let frac = steps_done as f64 / total_steps as f64;
+                    status_progress_c.set_fraction(frac);
+                    status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
+                }
+
+                // Then deploy all enabled mods.
+                //
+                // The linker helpers skip creating a new link when a destination
+                // file already exists, so the first deployed mod "wins" each
+                // conflicting path. Because UI priority is defined as
+                // top (lowest priority) -> bottom (highest priority), we deploy in
+                // reverse visual order to ensure the bottom-most enabled mod wins
+                // conflicts.
+                let mut deployed_count = 0usize;
+                for (idx, m) in db.mods.iter().rev().filter(|m| m.enabled).enumerate() {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_ui_update).as_millis() as u64
+                        >= PROGRESS_UPDATE_INTERVAL_MS
+                    {
+                        status_label_c.set_text(&format!(
+                            "Deploying mods ({}/{})…",
+                            idx + 1,
+                            deploy_total
+                        ));
+                        let frac = steps_done as f64 / total_steps as f64;
+                        status_progress_c.set_fraction(frac);
+                        status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
+                        flush_ui_events();
+                        last_ui_update = now;
+                    }
+                    if let Err(e) = ModManager::enable_mod(&game_c, m) {
+                        errors.push(format!("{}: {}", m.name, e));
+                    } else {
+                        deployed_count += 1;
+                    }
+                    steps_done += 1;
+                }
+                let _ = db.write_plugins_txt(&game_c);
                 steps_done += 1;
                 let frac = steps_done as f64 / total_steps as f64;
                 status_progress_c.set_fraction(frac);
                 status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
-            }
-            ModManager::purge_legacy_nested_data_dir(&game_c);
-            steps_done += 1;
-            let frac = steps_done as f64 / total_steps as f64;
-            status_progress_c.set_fraction(frac);
-            status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
 
-            // Then deploy all enabled mods.
-            //
-            // The linker helpers skip creating a new link when a destination
-            // file already exists, so the first deployed mod "wins" each
-            // conflicting path. Because UI priority is defined as
-            // top (lowest priority) -> bottom (highest priority), we deploy in
-            // reverse visual order to ensure the bottom-most enabled mod wins
-            // conflicts.
-            let mut deployed_count = 0usize;
-            for (idx, m) in db.mods.iter().rev().filter(|m| m.enabled).enumerate() {
-                status_label_c.set_text(&format!("Deploying mods ({}/{})…", idx + 1, deploy_total));
-                flush_ui_events();
-                if let Err(e) = ModManager::enable_mod(&game_c, m) {
-                    errors.push(format!("{}: {}", m.name, e));
+                let msg = if errors.is_empty() {
+                    format!("Deployed {deployed_count} mod(s)")
                 } else {
-                    deployed_count += 1;
-                }
-                steps_done += 1;
-                let frac = steps_done as f64 / total_steps as f64;
-                status_progress_c.set_fraction(frac);
-                status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
-            }
-            let _ = db.write_plugins_txt(&game_c);
-            steps_done += 1;
-            let frac = steps_done as f64 / total_steps as f64;
-            status_progress_c.set_fraction(frac);
-            status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
-
-            let msg = if errors.is_empty() {
-                format!("Deployed {deployed_count} mod(s)")
-            } else {
-                for e in &errors {
-                    log::error!("Deploy error: {e}");
-                }
-                format!("Deploy finished with {} error(s)", errors.len())
-            };
-            status_label_c.set_text(&msg);
-            status_progress_c.set_fraction(1.0);
-            status_progress_c.set_text(Some("100%"));
-            set_library_busy(
-                &search_entry_c,
-                &deploy_btn_c,
-                &container_c,
-                false,
-            );
-            hide_status_popup_later(status_revealer_c.clone());
-            show_toast(btn.upcast_ref(), &msg);
-            refresh_library_content_with_search(
-                &container_c,
-                &game_c,
-                Rc::clone(&config_c),
-                &search_c.borrow(),
-                Rc::clone(&search_c),
-                Rc::clone(&selected_c),
-            );
+                    for e in &errors {
+                        log::error!("Deploy error: {e}");
+                    }
+                    format!("Deploy finished with {} error(s)", errors.len())
+                };
+                status_label_c.set_text(&msg);
+                status_progress_c.set_fraction(1.0);
+                status_progress_c.set_text(Some("100%"));
+                set_library_busy(
+                    &search_entry_c,
+                    &deploy_btn_c,
+                    &container_c,
+                    false,
+                );
+                hide_status_popup_later(status_revealer_c.clone());
+                show_toast(btn.upcast_ref(), &msg);
+                refresh_library_content_with_search(
+                    &container_c,
+                    &game_c,
+                    Rc::clone(&config_c),
+                    &search_c.borrow(),
+                    Rc::clone(&search_c),
+                    Rc::clone(&selected_c),
+                );
+            });
         });
     }
 
