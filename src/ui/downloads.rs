@@ -14,7 +14,7 @@ use crate::core::games::Game;
 use crate::core::installer::{
     DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
     InstallStep, InstallStrategy, PluginDependencies, PluginType, detect_strategy,
-    install_mod_from_archive, install_mod_from_archive_with_nexus, parse_fomod_from_archive,
+    install_mod_from_archive_with_nexus_ticking, parse_fomod_from_archive,
     read_archive_file_bytes,
 };
 use crate::core::mods::ModDatabase;
@@ -657,15 +657,35 @@ fn do_install(
         ctx.revealer.set_reveal_child(true);
         ctx.label.set_text(&format!("Installing \"{}\"…", mod_name));
         ctx.progress.set_fraction(0.0);
-        ctx.progress.set_text(Some("Unpacking…"));
+        ctx.progress.set_text(Some("Extracting archive…"));
         flush_ui_events();
     }
 
     let nexus_id = read_nxm_mod_id_for_archive(archive_path, game);
-    let install_result = if let Some(id) = nexus_id {
-        install_mod_from_archive_with_nexus(archive_path, game, &mod_name, strategy, Some(id))
-    } else {
-        install_mod_from_archive(archive_path, game, &mod_name, strategy)
+
+    // For non-zip archives (7z, rar, …) the underlying 7z process can take
+    // several seconds to extract a large archive.  Provide a tick callback so
+    // the progress bar pulses every ~50 ms and the UI stays responsive.
+    // The nexus_id check is factored out once here so the tick closure doesn't
+    // need to be duplicated across branches.
+    let install_result = {
+        let tick: Box<dyn Fn()> = if let Some(ctx) = status_ctx {
+            let progress = ctx.progress.clone();
+            Box::new(move || {
+                progress.pulse();
+                flush_ui_events();
+            })
+        } else {
+            Box::new(|| {})
+        };
+        install_mod_from_archive_with_nexus_ticking(
+            archive_path,
+            game,
+            &mod_name,
+            strategy,
+            nexus_id,
+            tick.as_ref(),
+        )
     };
     match install_result {
         Ok(_) => {
