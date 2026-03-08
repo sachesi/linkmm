@@ -244,6 +244,28 @@ fn build_main_window(
         });
     }
 
+    // Re-scan executables every 3 seconds so the launch button picks up newly
+    // deployed script-extender loaders (e.g. SKSE installed as a mod and
+    // then deployed to the game root via symlink).
+    {
+        let simple_btn_t = launch_simple_btn.clone();
+        let split_btn_t = launch_split_btn.clone();
+        let default_exe_t = Rc::clone(&launch_default_exe);
+        let current_game_t = Rc::clone(&launch_current_game);
+        let config_t = Rc::clone(&config);
+        glib::timeout_add_local(std::time::Duration::from_secs(3), move || {
+            let cfg = config_t.borrow();
+            update_launch_ui(
+                &simple_btn_t,
+                &split_btn_t,
+                cfg.current_game(),
+                &default_exe_t,
+                &current_game_t,
+            );
+            glib::ControlFlow::Continue
+        });
+    }
+
     let sidebar_scroll = gtk4::ScrolledWindow::new();
     sidebar_scroll.set_vexpand(true);
     sidebar_scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
