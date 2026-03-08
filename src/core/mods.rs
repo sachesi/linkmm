@@ -183,7 +183,7 @@ impl ModDatabase {
         if !data_dir.is_dir() {
             return plugins;
         }
-        let vanilla: HashSet<&str> = game.kind.vanilla_masters().into_iter().collect();
+        let vanilla: HashSet<&str> = game.kind.vanilla_masters().iter().copied().collect();
         if let Ok(entries) = std::fs::read_dir(data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -227,7 +227,7 @@ impl ModDatabase {
 
         // Partition into vanilla masters and the rest
         let vanilla_order = game.kind.vanilla_masters();
-        let (mut vanilla, mut rest): (Vec<_>, Vec<_>) =
+        let (mut vanilla, rest): (Vec<_>, Vec<_>) =
             plugins.into_iter().partition(|p| p.is_vanilla);
 
         // Sort vanilla masters in their canonical order
