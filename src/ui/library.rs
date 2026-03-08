@@ -50,6 +50,10 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     undeploy_btn.set_tooltip_text(Some("Remove all mod symlinks from the game directory"));
     header.pack_end(&undeploy_btn);
 
+    let status_label = gtk4::Label::new(None);
+    status_label.add_css_class("dim-label");
+    header.pack_start(&status_label);
+
     toolbar_view.add_top_bar(&header);
 
     let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -96,16 +100,38 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
         let selected_c = Rc::clone(&selected_mod_id);
+        let search_entry_c = search_entry.clone();
+        let deploy_btn_c = deploy_btn.clone();
+        let undeploy_btn_c = undeploy_btn.clone();
+        let status_label_c = status_label.clone();
         deploy_btn.connect_clicked(move |btn| {
+            set_library_busy(
+                &search_entry_c,
+                &deploy_btn_c,
+                &undeploy_btn_c,
+                &container_c,
+                true,
+            );
+            status_label_c.set_text("Preparing deployment…");
+            flush_ui_events();
+
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
+            let undeploy_total = db.mods.len();
 
             // First, unlink all tracked mods so we start from a clean state
-            for m in &db.mods {
-                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+            for (idx, m) in db.mods.iter().enumerate() {
+                status_label_c.set_text(&format!(
+                    "Undeploying existing links ({}/{})…",
+                    idx + 1,
+                    undeploy_total
+                ));
+                flush_ui_events();
+                if let Err(e) = ModManager::disable_mod_without_legacy_cleanup(&game_c, m) {
                     log::warn!("Undeploy warning for {}: {e}", m.name);
                 }
             }
+            ModManager::purge_legacy_nested_data(&game_c);
 
             // Then deploy all enabled mods.
             //
@@ -116,7 +142,11 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             // reverse visual order to ensure the bottom-most enabled mod wins
             // conflicts.
             let mut deployed_count = 0usize;
-            for m in db.mods.iter().rev().filter(|m| m.enabled) {
+            let enabled_mods: Vec<_> = db.mods.iter().rev().filter(|m| m.enabled).collect();
+            let deploy_total = enabled_mods.len();
+            for (idx, m) in enabled_mods.iter().enumerate() {
+                status_label_c.set_text(&format!("Deploying mods ({}/{})…", idx + 1, deploy_total));
+                flush_ui_events();
                 if let Err(e) = ModManager::enable_mod(&game_c, m) {
                     errors.push(format!("{}: {}", m.name, e));
                 } else {
@@ -133,6 +163,14 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 }
                 format!("Deploy finished with {} error(s)", errors.len())
             };
+            status_label_c.set_text(&msg);
+            set_library_busy(
+                &search_entry_c,
+                &deploy_btn_c,
+                &undeploy_btn_c,
+                &container_c,
+                false,
+            );
             show_toast(btn.upcast_ref(), &msg);
             refresh_library_content_with_search(
                 &container_c,
@@ -152,20 +190,37 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
         let selected_c = Rc::clone(&selected_mod_id);
+        let search_entry_c = search_entry.clone();
+        let deploy_btn_c = deploy_btn.clone();
+        let undeploy_btn_c = undeploy_btn.clone();
+        let status_label_c = status_label.clone();
         undeploy_btn.connect_clicked(move |btn| {
+            set_library_busy(
+                &search_entry_c,
+                &deploy_btn_c,
+                &undeploy_btn_c,
+                &container_c,
+                true,
+            );
+            status_label_c.set_text("Starting undeploy…");
+            flush_ui_events();
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
             let mut count = 0;
+            let total = db.mods.len();
             // Unlink ALL mods regardless of enabled state so the game directory
             // is fully clean.  The enabled state is intentionally preserved so
             // the user can re-deploy with the same selection later.
-            for m in &db.mods {
-                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+            for (idx, m) in db.mods.iter().enumerate() {
+                status_label_c.set_text(&format!("Undeploying mods ({}/{})…", idx + 1, total));
+                flush_ui_events();
+                if let Err(e) = ModManager::disable_mod_without_legacy_cleanup(&game_c, m) {
                     errors.push(format!("{}: {}", m.name, e));
                 } else {
                     count += 1;
                 }
             }
+            ModManager::purge_legacy_nested_data(&game_c);
             let _ = db.write_plugins_txt(&game_c);
 
             let msg = if errors.is_empty() {
@@ -176,6 +231,14 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 }
                 format!("Undeploy finished with {} error(s)", errors.len())
             };
+            status_label_c.set_text(&msg);
+            set_library_busy(
+                &search_entry_c,
+                &deploy_btn_c,
+                &undeploy_btn_c,
+                &container_c,
+                false,
+            );
             show_toast(btn.upcast_ref(), &msg);
             refresh_library_content_with_search(
                 &container_c,
@@ -276,6 +339,27 @@ fn refresh_library_content_with_search(
         scrolled.set_child(Some(&clamp));
 
         container.append(&scrolled);
+    }
+}
+
+fn set_library_busy(
+    search_entry: &gtk4::SearchEntry,
+    deploy_btn: &gtk4::Button,
+    undeploy_btn: &gtk4::Button,
+    content_container: &gtk4::Box,
+    busy: bool,
+) {
+    let sensitive = !busy;
+    search_entry.set_sensitive(sensitive);
+    deploy_btn.set_sensitive(sensitive);
+    undeploy_btn.set_sensitive(sensitive);
+    content_container.set_sensitive(sensitive);
+}
+
+fn flush_ui_events() {
+    let context = gtk4::glib::MainContext::default();
+    while context.pending() {
+        context.iteration(false);
     }
 }
 
