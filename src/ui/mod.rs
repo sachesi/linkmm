@@ -152,6 +152,18 @@ fn build_main_window(
 
     refresh_stats(&config.borrow(), &installed_label, &enabled_label);
 
+    // Refresh stats every 2 seconds so the counts stay current after mod
+    // installs, uninstalls, enables, and disables.
+    {
+        let installed_t = installed_label.clone();
+        let enabled_t = enabled_label.clone();
+        let config_t = Rc::clone(&config);
+        glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+            refresh_stats(&config_t.borrow(), &installed_t, &enabled_t);
+            glib::ControlFlow::Continue
+        });
+    }
+
     let sidebar_scroll = gtk4::ScrolledWindow::new();
     sidebar_scroll.set_vexpand(true);
     sidebar_scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
