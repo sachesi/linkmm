@@ -1041,11 +1041,13 @@ pub fn install_mod_from_archive_with_nexus_ticking(
             // • Otherwise wrap the content inside `mod_dir/Data/` ourselves.
                 if archive_has_data_folder(archive_path) {
                     extract_zip_to(archive_path, &mod_dir, tick)?;
+                    normalize_paths_to_lowercase(&mod_dir.join("Data"));
                 } else {
                     let data_dir = mod_dir.join("Data");
                     std::fs::create_dir_all(&data_dir)
                         .map_err(|e| format!("Failed to create Data directory: {e}"))?;
                     extract_zip_to(archive_path, &data_dir, tick)?;
+                    normalize_paths_to_lowercase(&data_dir);
                 }
             }
         }
@@ -1346,6 +1348,14 @@ fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path, tick: &dyn 
         copy_dir_contents(&tmp_extract, &data_dir)?;
     }
 
+    // Normalize folder and file names inside Data/ to lowercase so that mods
+    // with mixed-case directories (TEXTURES/, Meshes/, …) are stored
+    // consistently on case-sensitive (Linux) filesystems.
+    let data_dir = mod_dir.join("Data");
+    if data_dir.is_dir() {
+        normalize_paths_to_lowercase(&data_dir);
+    }
+
     if let Err(e) = std::fs::remove_dir_all(&tmp_extract) {
         log::warn!(
             "Failed to remove temporary extraction directory {}: {e}",
@@ -1405,6 +1415,88 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Recursively rename every file and directory inside `dir` to use lowercase
+/// names.  The directory `dir` itself is never renamed.
+///
+/// When both an uppercase and a lowercase variant of a name already exist in
+/// the same directory (e.g. `TEXTURES/` and `textures/`), the two directories
+/// are merged: contents of the uppercase one are moved into the lowercase one
+/// and the now-empty uppercase directory is removed.  For files the lowercase
+/// version takes precedence and the uppercase duplicate is discarded.
+///
+/// Any rename or merge failure is logged as a warning but does not abort the
+/// operation so that as many entries as possible are normalised.
+fn normalize_paths_to_lowercase(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) => {
+            log::warn!("normalize_paths_to_lowercase: cannot read {}: {err}", dir.display());
+            return;
+        }
+    };
+
+    // Collect all entries first to avoid iterator invalidation during renames.
+    let items: Vec<_> = entries.flatten().collect();
+
+    for entry in items {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let lower = name_str.to_lowercase();
+
+        if name_str.as_ref() == lower.as_str() {
+            // Already lowercase – recurse into directories.
+            if path.is_dir() {
+                normalize_paths_to_lowercase(&path);
+            }
+            continue;
+        }
+
+        let new_path = dir.join(&lower);
+
+        if new_path.exists() {
+            // A lowercase-named item already exists at the destination.
+            if path.is_dir() && new_path.is_dir() {
+                // Merge: move all children of the uppercase dir into the
+                // lowercase dir, then remove the (now empty) uppercase dir.
+                if let Ok(children) = std::fs::read_dir(&path) {
+                    for child in children.flatten() {
+                        let child_dst = new_path.join(child.file_name());
+                        if let Err(e) = std::fs::rename(child.path(), &child_dst) {
+                            log::warn!(
+                                "normalize_paths_to_lowercase: failed to merge {} -> {}: {e}",
+                                child.path().display(),
+                                child_dst.display()
+                            );
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir(&path);
+                normalize_paths_to_lowercase(&new_path);
+            }
+            // For files, the lowercase version already exists – discard the
+            // uppercase duplicate.
+        } else {
+            // Safe to rename: lowercase version does not yet exist.
+            if let Err(e) = std::fs::rename(&path, &new_path) {
+                log::warn!(
+                    "normalize_paths_to_lowercase: failed to rename {} -> {}: {e}",
+                    path.display(),
+                    new_path.display()
+                );
+                // Still recurse into the original path if it is a directory.
+                if path.is_dir() {
+                    normalize_paths_to_lowercase(&path);
+                }
+                continue;
+            }
+            if new_path.is_dir() {
+                normalize_paths_to_lowercase(&new_path);
+            }
+        }
+    }
 }
 
 /// Detect whether all entries in the archive share a common top-level directory
@@ -2633,5 +2725,79 @@ Size = 9\n\
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── normalize_paths_to_lowercase ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_paths_to_lowercase_renames_uppercase_dirs() {
+        let tmp = tempdir();
+        std::fs::create_dir_all(tmp.join("TEXTURES")).unwrap();
+        std::fs::write(tmp.join("TEXTURES/sky.dds"), b"dds").unwrap();
+
+        normalize_paths_to_lowercase(&tmp);
+
+        assert!(tmp.join("textures").is_dir(), "directory should be lowercased");
+        assert!(tmp.join("textures/sky.dds").exists(), "file inside renamed dir should exist");
+        assert!(!tmp.join("TEXTURES").exists(), "original uppercase dir should be gone");
+    }
+
+    #[test]
+    fn normalize_paths_to_lowercase_merges_duplicate_dirs() {
+        // Archive might produce both TEXTURES/ and textures/ – they should be merged.
+        let tmp = tempdir();
+        std::fs::create_dir_all(tmp.join("TEXTURES")).unwrap();
+        std::fs::write(tmp.join("TEXTURES/sky.dds"), b"upper").unwrap();
+        std::fs::create_dir_all(tmp.join("textures")).unwrap();
+        std::fs::write(tmp.join("textures/ground.dds"), b"lower").unwrap();
+
+        normalize_paths_to_lowercase(&tmp);
+
+        // Both files should end up in textures/.
+        assert!(tmp.join("textures/sky.dds").exists(), "sky.dds from TEXTURES should be merged");
+        assert!(tmp.join("textures/ground.dds").exists(), "ground.dds from textures should remain");
+        assert!(!tmp.join("TEXTURES").exists(), "uppercase variant should be removed");
+    }
+
+    #[test]
+    fn normalize_paths_to_lowercase_recurses_into_subdirs() {
+        let tmp = tempdir();
+        std::fs::create_dir_all(tmp.join("meshes/ARMOR")).unwrap();
+        std::fs::write(tmp.join("meshes/ARMOR/helm.nif"), b"nif").unwrap();
+
+        normalize_paths_to_lowercase(&tmp);
+
+        assert!(tmp.join("meshes/armor/helm.nif").exists());
+        assert!(!tmp.join("meshes/ARMOR").exists());
+    }
+
+    #[test]
+    fn install_flat_archive_normalizes_uppercase_folder_names() {
+        // Archive with TEXTURES/ and meshes/ at top level (no single wrapper prefix
+        // so find_common_prefix returns "") → TEXTURES/ should be renamed textures/.
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("TEXTURES/", b""),
+                ("TEXTURES/sky.dds", b"dds_data"),
+                ("meshes/helm.nif", b"nif_data"),
+            ],
+        );
+        let dest = tmp.join("mod_dir");
+        std::fs::create_dir_all(&dest).unwrap();
+        let data_dest = dest.join("Data");
+        std::fs::create_dir_all(&data_dest).unwrap();
+        extract_zip_to(&archive, &data_dest, &|| {}).unwrap();
+        normalize_paths_to_lowercase(&data_dest);
+
+        assert!(
+            data_dest.join("textures").join("sky.dds").exists(),
+            "uppercase TEXTURES should be normalised to textures"
+        );
+        assert!(
+            !data_dest.join("TEXTURES").exists(),
+            "uppercase TEXTURES dir should be gone after normalisation"
+        );
     }
 }
