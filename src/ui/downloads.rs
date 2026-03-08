@@ -24,7 +24,7 @@ use crate::core::mods::ModDatabase;
 /// All archive file types the Downloads page can clean from cache.
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 /// Archive types that are currently installable by the app.
-const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z"];
+const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 const DOWNLOAD_PROGRESS_POLL_INTERVAL_MS: u64 = 200;
 
 // ── Public entry-point ────────────────────────────────────────────────────────
@@ -372,11 +372,9 @@ fn build_entry_row(
             if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
                 return row;
             }
-            let install_btn = gtk4::Button::new();
-            install_btn.set_icon_name("emblem-system-symbolic");
+            let install_btn = gtk4::Button::with_label("Install");
             install_btn.set_tooltip_text(Some("Install mod"));
             install_btn.set_valign(gtk4::Align::Center);
-            install_btn.add_css_class("flat");
             install_btn.add_css_class("suggested-action");
 
             let path_c = entry.path.clone();
@@ -1646,10 +1644,14 @@ mod tests {
     }
 
     #[test]
-    fn installable_archive_extensions_include_rar_and_7z() {
+    fn installable_archive_extensions_match_supported_archive_types() {
         assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"zip"));
         assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"rar"));
         assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"7z"));
+        assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"tar"));
+        assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"gz"));
+        assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"bz2"));
+        assert!(INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&"xz"));
     }
 
     #[test]
