@@ -1,5 +1,6 @@
 use crate::core::games::Game;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ── Plugin types ─────────────────────────────────────────────────────────────
@@ -120,7 +121,7 @@ pub struct ModDatabase {
     pub plugin_load_order: Vec<String>,
     /// Plugin file names that the user has explicitly *disabled* in the Load Order.
     #[serde(default)]
-    pub plugin_disabled: Vec<String>,
+    pub plugin_disabled: HashSet<String>,
 }
 
 impl ModDatabase {
@@ -182,7 +183,7 @@ impl ModDatabase {
         if !data_dir.is_dir() {
             return plugins;
         }
-        let vanilla = game.kind.vanilla_masters();
+        let vanilla: HashSet<&str> = game.kind.vanilla_masters().into_iter().collect();
         if let Ok(entries) = std::fs::read_dir(data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -203,7 +204,7 @@ impl ModDatabase {
                 } else {
                     continue;
                 };
-                let is_vanilla = vanilla.contains(&name.as_str());
+                let is_vanilla = vanilla.contains(name.as_str());
                 let enabled = !self.plugin_disabled.contains(&name);
                 plugins.push(PluginFile {
                     name,
@@ -238,20 +239,34 @@ impl ModDatabase {
         });
 
         // Apply saved order to non-vanilla plugins
-        let mut ordered: Vec<PluginFile> = Vec::new();
-        for name in &self.plugin_load_order {
-            if let Some(idx) = rest.iter().position(|p| &p.name == name) {
-                ordered.push(rest.remove(idx));
+        let load_order_indices: HashMap<&str, usize> = self
+            .plugin_load_order
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| (name.as_str(), idx))
+            .collect();
+        let mut ordered_with_idx: Vec<(usize, PluginFile)> = Vec::new();
+        let mut unordered: Vec<PluginFile> = Vec::new();
+        for plugin in rest {
+            if let Some(idx) = load_order_indices.get(plugin.name.as_str()) {
+                ordered_with_idx.push((*idx, plugin));
+            } else {
+                unordered.push(plugin);
             }
         }
+        ordered_with_idx.sort_by_key(|(idx, _)| *idx);
+        let mut ordered: Vec<PluginFile> = ordered_with_idx
+            .into_iter()
+            .map(|(_, plugin)| plugin)
+            .collect();
         // Any plugin not yet in plugin_load_order: sort by type priority then name
-        rest.sort_by(|a, b| {
+        unordered.sort_by(|a, b| {
             a.kind
                 .sort_priority()
                 .cmp(&b.kind.sort_priority())
                 .then_with(|| a.name.cmp(&b.name))
         });
-        ordered.extend(rest);
+        ordered.extend(unordered);
 
         let mut result = vanilla;
         result.extend(ordered);
@@ -345,7 +360,9 @@ impl ModDatabase {
         }
         if !order.is_empty() {
             self.plugin_load_order = order;
-            self.plugin_disabled = disabled;
+            // `plugins.txt` should not contain duplicates; collect into a set so
+            // malformed files cannot create redundant disabled entries.
+            self.plugin_disabled = disabled.into_iter().collect();
         }
     }
 }
@@ -1086,6 +1103,61 @@ mod tests {
 
         // Real file survives.
         assert!(dir.join("sub").join("real.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_ordered_plugins_respects_saved_order_and_sorts_untracked() {
+        use crate::core::games::{Game, GameKind};
+
+        let tmp = tempdir();
+        let game_root = tmp.join("game");
+        let data_dir = game_root.join("Data");
+        let mods_base = tmp.join("mods_base");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(mods_base.join("mods").join("test_game")).unwrap();
+        for file in ["a.esm", "b.esl", "c.esp", "z.esp"] {
+            std::fs::write(data_dir.join(file), b"plugin").unwrap();
+        }
+
+        let game = Game {
+            id: "test_game".to_string(),
+            name: "Test Game".to_string(),
+            kind: GameKind::SkyrimSE,
+            root_path: game_root.clone(),
+            data_path: data_dir,
+            mods_base_dir: Some(mods_base),
+        };
+        let db = ModDatabase {
+            plugin_load_order: vec!["z.esp".to_string(), "a.esm".to_string()],
+            plugin_disabled: ["z.esp".to_string()].into_iter().collect(),
+            ..ModDatabase::default()
+        };
+
+        let ordered = db.get_ordered_plugins(&game);
+        let names: Vec<&str> = ordered.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["z.esp", "a.esm", "b.esl", "c.esp"]);
+        assert!(!ordered[0].enabled);
+        assert!(ordered[1].enabled);
+    }
+
+    #[test]
+    fn plugin_disabled_deserialize_deduplicates_entries() {
+        let json = r#"{
+            "mods": [],
+            "load_order": [],
+            "plugin_load_order": [],
+            "plugin_disabled": ["A.esp", "A.esp", "B.esm"]
+        }"#;
+
+        let db: ModDatabase = serde_json::from_str(json).unwrap();
+        assert_eq!(db.plugin_disabled.len(), 2);
+        assert!(db.plugin_disabled.contains("A.esp"));
+        assert!(db.plugin_disabled.contains("B.esm"));
+
+        let encoded = serde_json::to_string(&db).unwrap();
+        assert_eq!(encoded.matches("A.esp").count(), 1);
+        assert_eq!(encoded.matches("B.esm").count(), 1);
     }
 
     #[cfg(unix)]
