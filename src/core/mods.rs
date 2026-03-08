@@ -379,11 +379,18 @@ impl ModManager {
         Self::disable_mod_internal(game, mod_entry, true)
     }
 
+    /// Disable a mod without running the legacy nested Data/Data cleanup.
+    ///
+    /// Use this in batch undeploy paths, then call `purge_legacy_nested_data_dir`
+    /// once after all mods are processed to avoid repeated full-directory scans.
     pub fn disable_mod_without_legacy_cleanup(game: &Game, mod_entry: &Mod) -> Result<(), String> {
         Self::disable_mod_internal(game, mod_entry, false)
     }
 
-    pub fn purge_legacy_nested_data(game: &Game) {
+    /// Clean up legacy symlinks from game Data/Data left by older deployment logic.
+    ///
+    /// Batch deploy/undeploy flows should call this once after unlinking mods.
+    pub fn purge_legacy_nested_data_dir(game: &Game) {
         let legacy_nested = game.data_path.join("Data");
         if legacy_nested.is_dir() {
             purge_symlinks(&legacy_nested);
@@ -393,7 +400,7 @@ impl ModManager {
     fn disable_mod_internal(
         game: &Game,
         mod_entry: &Mod,
-        purge_legacy_nested_data_dir: bool,
+        run_legacy_cleanup: bool,
     ) -> Result<(), String> {
         let target_dir = &game.data_path;
         let data_dir = mod_entry.source_path.join("Data");
@@ -408,8 +415,8 @@ impl ModManager {
             // Migration: aggressively clean up the legacy nested Data/Data/
             // structure by removing ALL symlinks from it (not just ones belonging
             // to this mod), then removing any empty directories left behind.
-            if purge_legacy_nested_data_dir {
-                Self::purge_legacy_nested_data(game);
+            if run_legacy_cleanup {
+                Self::purge_legacy_nested_data_dir(game);
             }
         } else {
             unlink_directory_contents(&mod_entry.source_path, target_dir)?;
