@@ -320,11 +320,16 @@ fn find_fomod_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String, 
 }
 
 /// Load a file from an archive by path, using case-insensitive matching and
-/// common FOMOD-relative fallbacks.
+/// common FOMOD-relative fallbacks.  Supports both zip archives and non-zip
+/// archives (7z, rar, etc. — extracted via the `7z` command).
 pub fn read_archive_file_bytes(
     archive_path: &Path,
     relative_path: &str,
 ) -> Result<Vec<u8>, String> {
+    if !has_zip_extension(archive_path) {
+        return read_archive_file_bytes_non_zip(archive_path, relative_path);
+    }
+
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip =
@@ -363,6 +368,150 @@ pub fn read_archive_file_bytes(
     }
 
     Err(format!("Archive file not found: {relative_path}"))
+}
+
+/// Read a file from a non-zip archive (7z, rar, etc.) by extracting to a
+/// temporary directory and then searching for the target using the same
+/// case-insensitive / `fomod/`-relative matching logic as the zip variant.
+fn read_archive_file_bytes_non_zip(
+    archive_path: &Path,
+    relative_path: &str,
+) -> Result<Vec<u8>, String> {
+    let tmp = create_temp_extract_dir()?;
+    let result = (|| {
+        extract_archive_with_7z(archive_path, &tmp)?;
+
+        let target = normalise_path(relative_path);
+        let target_lower = target.to_lowercase();
+        if target_lower.is_empty() {
+            return Err("Empty archive path".to_string());
+        }
+        let fomod_target = format!("{FOMOD_DIR_PREFIX}{target_lower}");
+
+        let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
+        collect_fs_files(&tmp, &tmp, &mut files);
+
+        for (rel_lower, full_path) in &files {
+            let matches = *rel_lower == target_lower
+                || rel_lower.ends_with(&format!("/{target_lower}"))
+                || *rel_lower == fomod_target
+                || rel_lower.ends_with(&format!("/{fomod_target}"));
+            if matches {
+                return std::fs::read(full_path)
+                    .map_err(|e| format!("Failed to read {}: {e}", full_path.display()));
+            }
+        }
+
+        Err(format!("Archive file not found: {relative_path}"))
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Recursively collect all regular files under `dir`, returning tuples of
+/// `(lowercase_relative_path, full_path)` relative to `root`.
+fn collect_fs_files(
+    root: &Path,
+    dir: &Path,
+    result: &mut Vec<(String, std::path::PathBuf)>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_fs_files(root, &path, result);
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel_str = normalise_path(&rel.to_string_lossy());
+                result.push((rel_str.to_lowercase(), path));
+            }
+        }
+    }
+}
+
+/// Recursively collect all entries (files and directories) under `dir`,
+/// returning tuples of `(lowercase_relative_path, original_relative_path)`
+/// relative to `root`.
+fn collect_fs_entries(
+    root: &Path,
+    dir: &Path,
+    result: &mut Vec<(String, String)>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel_str = normalise_path(&rel.to_string_lossy());
+        if rel_str.is_empty() {
+            continue;
+        }
+        result.push((rel_str.to_lowercase(), rel_str));
+        if path.is_dir() {
+            collect_fs_entries(root, &path, result);
+        }
+    }
+}
+
+/// Determine the common top-level prefix shared by all entries in a filesystem
+/// entry map (mirrors [`find_common_prefix`] for zip archives).
+///
+/// Returns `(original_case_prefix, lowercase_prefix)`, both including a
+/// trailing `/`, or two empty strings when no common prefix is found.
+fn find_fs_common_prefix(entry_map: &[(String, String)]) -> (String, String) {
+    if entry_map.len() <= 1 {
+        return (String::new(), String::new());
+    }
+    let mut first_lower: Option<String> = None;
+    let mut first_orig: Option<String> = None;
+    let mut all_same = true;
+    for (lower, orig) in entry_map {
+        let tl = lower.split('/').next().unwrap_or("");
+        let to = orig.split('/').next().unwrap_or("");
+        if tl.is_empty() {
+            continue;
+        }
+        match &first_lower {
+            None => {
+                first_lower = Some(tl.to_string());
+                first_orig = Some(to.to_string());
+            }
+            Some(ft) if ft.as_str() != tl => {
+                all_same = false;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if all_same {
+        if let (Some(tl), Some(to)) = (first_lower, first_orig) {
+            return (format!("{to}/"), format!("{tl}/"));
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// Filter `entry_map` to entries whose lowercase relative path equals
+/// `source_lower` or starts with `source_lower/`, returning the original
+/// relative paths.
+fn collect_matching_fs_entries(
+    entry_map: &[(String, String)],
+    source_lower: &str,
+) -> Vec<String> {
+    entry_map
+        .iter()
+        .filter(|(nl, _)| {
+            *nl == source_lower
+                || nl.starts_with(&format!("{source_lower}/"))
+                || nl.starts_with(&format!("{source_lower}\\"))
+        })
+        .map(|(_, orig)| orig.clone())
+        .collect()
 }
 
 fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
@@ -1099,7 +1248,12 @@ fn find_common_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> String {
     String::new()
 }
 
-/// Install FOMOD-selected files from a zip archive.
+/// Install FOMOD-selected files from an archive.
+///
+/// Supports both zip archives and non-zip archives (7z, rar, etc.).  For
+/// non-zip archives the archive is first fully extracted to a temporary
+/// directory; the per-file selection logic is then applied to the extracted
+/// tree before the temp directory is removed.
 ///
 /// For each `FomodFile`, extract the `source` path from the archive and place it
 /// at `dest_dir / destination`.
@@ -1108,6 +1262,9 @@ fn install_fomod_files(
     dest_dir: &Path,
     files: &[FomodFile],
 ) -> Result<(), String> {
+    if !has_zip_extension(archive_path) {
+        return install_fomod_files_non_zip(archive_path, dest_dir, files);
+    }
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip =
@@ -1255,7 +1412,161 @@ fn install_fomod_files(
     Ok(())
 }
 
-/// Normalise path separators: backslash → forward slash, strip leading slash.
+/// Extract a non-zip archive to a temporary directory, run the FOMOD file
+/// selection logic on the extracted tree, then remove the temp directory.
+fn install_fomod_files_non_zip(
+    archive_path: &Path,
+    dest_dir: &Path,
+    files: &[FomodFile],
+) -> Result<(), String> {
+    let tmp = create_temp_extract_dir()?;
+    extract_archive_with_7z(archive_path, &tmp)?;
+    let result = install_fomod_files_from_dir(&tmp, dest_dir, files);
+    if let Err(e) = std::fs::remove_dir_all(&tmp) {
+        log::warn!(
+            "Failed to remove temporary extraction directory {}: {e}",
+            tmp.display()
+        );
+    }
+    result
+}
+
+/// Install FOMOD-selected files from an already-extracted directory tree.
+///
+/// Mirrors the matching and extraction logic of [`install_fomod_files`] but
+/// operates on real filesystem paths instead of a zip archive.
+fn install_fomod_files_from_dir(
+    extracted_dir: &Path,
+    dest_dir: &Path,
+    files: &[FomodFile],
+) -> Result<(), String> {
+    // Build a map of (lowercase_rel, original_rel) for all entries in the tree.
+    let mut entry_map: Vec<(String, String)> = Vec::new();
+    collect_fs_entries(extracted_dir, extracted_dir, &mut entry_map);
+
+    let (archive_prefix, archive_prefix_lower) = find_fs_common_prefix(&entry_map);
+
+    let mut sorted_files = files.to_vec();
+    sorted_files.sort_by(|a, b| a.priority.cmp(&b.priority));
+
+    for fomod_file in &sorted_files {
+        let source = normalise_path(&fomod_file.source);
+        let destination = strip_data_prefix(&normalise_path(&fomod_file.destination));
+        let source_lower = source.to_lowercase();
+
+        let mut matched_source = source.clone();
+        let mut matching_rels = collect_matching_fs_entries(&entry_map, &source_lower);
+
+        if matching_rels.is_empty() && !archive_prefix_lower.is_empty() {
+            let wrapped = format!("{archive_prefix_lower}{source_lower}");
+            matching_rels = collect_matching_fs_entries(&entry_map, &wrapped);
+            if !matching_rels.is_empty() {
+                matched_source = format!("{archive_prefix}{source}");
+            }
+        }
+
+        if matching_rels.is_empty() {
+            let stripped = strip_data_prefix(&source);
+            let stripped_lower = stripped.to_lowercase();
+            if !stripped.is_empty() && stripped_lower != source_lower {
+                matching_rels = collect_matching_fs_entries(&entry_map, &stripped_lower);
+                if !matching_rels.is_empty() {
+                    matched_source = stripped;
+                } else if !archive_prefix_lower.is_empty() {
+                    let wrapped_stripped = format!("{archive_prefix_lower}{stripped_lower}");
+                    matching_rels = collect_matching_fs_entries(&entry_map, &wrapped_stripped);
+                    if !matching_rels.is_empty() {
+                        matched_source = format!("{archive_prefix}{stripped}");
+                    }
+                }
+            } else if source_lower == "data" || source_lower == "data/" {
+                matching_rels = entry_map
+                    .iter()
+                    .filter(|(nl, _)| {
+                        !(nl == "fomod"
+                            || nl.starts_with("fomod/")
+                            || nl.contains("/fomod/"))
+                    })
+                    .map(|(_, orig)| orig.clone())
+                    .collect();
+                if !matching_rels.is_empty() {
+                    matched_source = String::new();
+                }
+            }
+        }
+
+        if matching_rels.is_empty() && !source_lower.is_empty() {
+            let prefixed = format!("data/{source_lower}");
+            matching_rels = collect_matching_fs_entries(&entry_map, &prefixed);
+            if !matching_rels.is_empty() {
+                matched_source = prefixed;
+            } else if !archive_prefix_lower.is_empty() {
+                let wrapped_prefixed = format!("{archive_prefix_lower}data/{source_lower}");
+                matching_rels = collect_matching_fs_entries(&entry_map, &wrapped_prefixed);
+                if !matching_rels.is_empty() {
+                    matched_source = format!("{archive_prefix}data/{source}");
+                }
+            }
+        }
+
+        let matched_source_lower = matched_source.to_lowercase();
+
+        for orig_rel in matching_rels {
+            let full_path = extracted_dir.join(&orig_rel);
+
+            // Skip directory entries – only copy actual files.
+            if full_path.is_dir() {
+                continue;
+            }
+
+            let entry_lower = orig_rel.to_lowercase();
+            let rel = if entry_lower == matched_source_lower {
+                // Single-file match: use the file name only.
+                Path::new(&orig_rel)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            } else {
+                orig_rel[matched_source.len()..]
+                    .trim_start_matches('/')
+                    .to_string()
+            };
+
+            if rel.is_empty() {
+                continue;
+            }
+
+            // Zip-slip protection on the combined destination + rel path.
+            let combined = if destination.is_empty() {
+                std::borrow::Cow::Borrowed(rel.as_str())
+            } else {
+                std::borrow::Cow::Owned(format!("{destination}/{rel}"))
+            };
+            if !is_safe_relative_path(combined.as_ref()) {
+                log::warn!("Skipping fomod entry with unsafe path: {combined}");
+                continue;
+            }
+
+            let out_path = dest_dir.join(&destination).join(&rel);
+
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dir: {e}"))?;
+            }
+
+            std::fs::copy(&full_path, &out_path).map_err(|e| {
+                format!(
+                    "Failed to copy {} → {}: {e}",
+                    full_path.display(),
+                    out_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 fn normalise_path(p: &str) -> String {
     let s = p.replace('\\', "/");
     let s = s.strip_prefix('/').unwrap_or(&s);
@@ -1407,6 +1718,58 @@ mod tests {
             let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!("7z test archive creation failed: {stderr}");
             None
+        }
+    }
+
+    /// Create a 7z archive containing a FOMOD image for testing.
+    ///
+    /// Layout:
+    /// ```
+    /// fomod/images/preview.png  (content: "pngdata")
+    /// Data/textures/sky.dds
+    /// ```
+    fn create_test_7z_with_image(root: &Path, archive_name: &str) -> Option<PathBuf> {
+        if !has_7z() {
+            return None;
+        }
+        let archive_path = root.join(archive_name);
+        let staging = root.join("staging_img");
+        if let Err(e) = std::fs::create_dir_all(staging.join("fomod/images")) {
+            eprintln!("create_test_7z_with_image: {e}");
+            return None;
+        }
+        if let Err(e) = std::fs::create_dir_all(staging.join("Data/textures")) {
+            eprintln!("create_test_7z_with_image: {e}");
+            return None;
+        }
+        if let Err(e) = std::fs::write(staging.join("fomod/images/preview.png"), b"pngdata") {
+            eprintln!("create_test_7z_with_image: {e}");
+            return None;
+        }
+        if let Err(e) = std::fs::write(staging.join("Data/textures/sky.dds"), b"dds") {
+            eprintln!("create_test_7z_with_image: {e}");
+            return None;
+        }
+        let output = Command::new("7z")
+            .current_dir(&staging)
+            .arg("a")
+            .arg("-y")
+            .arg(&archive_path)
+            .arg(".")
+            .output();
+        match output {
+            Ok(o) if o.status.success() => Some(archive_path),
+            Ok(o) => {
+                eprintln!(
+                    "7z image archive creation failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("create_test_7z_with_image: failed to launch 7z: {e}");
+                None
+            }
         }
     }
 
@@ -1918,6 +2281,85 @@ mod tests {
         );
         let bytes = read_archive_file_bytes(&archive, "images/preview.png").unwrap();
         assert_eq!(bytes, b"pngdata");
+    }
+
+    #[test]
+    fn read_archive_file_bytes_non_zip_finds_image() {
+        let tmp = tempdir();
+        let Some(archive) = create_test_7z_with_image(&tmp, "mod_img.7z") else {
+            return; // 7z not available
+        };
+        let bytes = read_archive_file_bytes(&archive, "images/preview.png").unwrap();
+        assert_eq!(bytes, b"pngdata");
+    }
+
+    #[test]
+    fn install_fomod_files_non_zip_installs_selected_files() {
+        let tmp = tempdir();
+        let Some(archive) = create_test_7z(&tmp, "mod_fomod.7z") else {
+            return; // 7z not available
+        };
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // The test 7z has Data/textures/sky.dds; ask for that via a FOMOD
+        // file entry with source="textures" destination="Data/textures".
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[FomodFile {
+                source: "textures".to_string(),
+                destination: "Data/textures".to_string(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+
+        assert!(dest.join("textures").join("sky.dds").exists());
+        assert_eq!(
+            std::fs::read(dest.join("textures").join("sky.dds")).unwrap(),
+            b"dds",
+        );
+    }
+
+    #[test]
+    fn install_fomod_files_from_dir_same_result_as_zip() {
+        // Verify that install_fomod_files_from_dir produces the same layout as
+        // the zip-based code by comparing results for identical content.
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("fomod/", b""),
+                ("fomod/ModuleConfig.xml", b"<config/>"),
+                ("textures/sky.dds", b"dds_data"),
+            ],
+        );
+        let dest_zip = tmp.join("dest_zip");
+        std::fs::create_dir_all(&dest_zip).unwrap();
+        let files = vec![FomodFile {
+            source: "textures".to_string(),
+            destination: "Data/textures".to_string(),
+            priority: 0,
+        }];
+        install_fomod_files(&archive, &dest_zip, &files).unwrap();
+
+        // Now do the same with the dir-based function using a matching tree.
+        let extracted = tmp.join("extracted");
+        std::fs::create_dir_all(extracted.join("fomod")).unwrap();
+        std::fs::write(extracted.join("fomod/ModuleConfig.xml"), b"<config/>").unwrap();
+        std::fs::create_dir_all(extracted.join("textures")).unwrap();
+        std::fs::write(extracted.join("textures/sky.dds"), b"dds_data").unwrap();
+
+        let dest_dir = tmp.join("dest_dir");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        install_fomod_files_from_dir(&extracted, &dest_dir, &files).unwrap();
+
+        assert!(dest_dir.join("textures").join("sky.dds").exists());
+        assert_eq!(
+            std::fs::read(dest_zip.join("textures").join("sky.dds")).unwrap(),
+            std::fs::read(dest_dir.join("textures").join("sky.dds")).unwrap(),
+        );
     }
 
     fn tempdir() -> PathBuf {
