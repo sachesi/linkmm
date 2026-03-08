@@ -658,7 +658,9 @@ fn do_install(
         ctx.label.set_text(&format!("Installing \"{}\"…", mod_name));
         ctx.progress.set_fraction(0.0);
         ctx.progress.set_text(Some("Extracting archive…"));
-        flush_ui_events();
+        // Dispatch one event to let the Revealer animation frame start before
+        // the blocking extraction work begins.
+        gtk4::glib::MainContext::default().iteration(false);
     }
 
     let nexus_id = read_nxm_mod_id_for_archive(archive_path, game);
@@ -673,7 +675,10 @@ fn do_install(
             let progress = ctx.progress.clone();
             Box::new(move || {
                 progress.pulse();
-                flush_ui_events();
+                // Process one pending event so the animation frame clock can
+                // advance without draining the entire event queue at once,
+                // which would cause the progress animation to stutter.
+                gtk4::glib::MainContext::default().iteration(false);
             })
         } else {
             Box::new(|| {})
@@ -1556,15 +1561,6 @@ fn set_downloads_busy(ctx: &InstallStatusCtx, busy: bool) {
     ctx.clean_btn.set_sensitive(sensitive);
     ctx.refresh_btn.set_sensitive(sensitive);
     ctx.list_container.set_sensitive(sensitive);
-}
-
-/// Process pending GTK events so that status-label and progress updates are
-/// shown immediately during a long synchronous operation.
-fn flush_ui_events() {
-    let ctx = gtk4::glib::MainContext::default();
-    while ctx.pending() {
-        ctx.iteration(false);
-    }
 }
 
 /// Schedule the status popup to slide back up after a short delay.
