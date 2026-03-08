@@ -173,3 +173,125 @@ pub fn detect_games() -> Vec<(GameKind, PathBuf)> {
     }
     found
 }
+
+// ── Launch helpers ─────────────────────────────────────────────────────────
+
+/// Return the root Steam installation directory, or `None` when Steam cannot
+/// be found on this machine.
+pub fn find_steam_root() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let candidates = [
+        home.join(".steam").join("steam"),
+        home.join(".local").join("share").join("Steam"),
+        home.join("snap")
+            .join("steam")
+            .join("common")
+            .join(".steam")
+            .join("steam"),
+        home.join(".var")
+            .join("app")
+            .join("com.valvesoftware.Steam")
+            .join(".steam")
+            .join("steam"),
+    ];
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+/// Return the Proton compatdata directory for `app_id`, searching all known
+/// Steam library locations.
+pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let roots: &[&str] = &[
+        ".steam/steam/steamapps/compatdata",
+        ".local/share/Steam/steamapps/compatdata",
+        "snap/steam/common/.steam/steam/steamapps/compatdata",
+        ".var/app/com.valvesoftware.Steam/.steam/steam/steamapps/compatdata",
+    ];
+    for root in roots {
+        let path = home.join(root).join(app_id.to_string());
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Return the `proton` run-script from any Proton installation found in the
+/// Steam libraries.  Prefers "Proton Experimental" over numbered releases
+/// (it sorts last lexicographically), and among numbered releases picks the
+/// highest folder name.  Note: "Proton 10.0" sorts before "Proton 9.0" with
+/// plain string comparison; this edge-case is accepted given that Proton
+/// Experimental is typically the most current choice anyway.
+pub fn find_proton_run() -> Option<PathBuf> {
+    let libraries = find_steam_libraries();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for lib in &libraries {
+        let common = lib.path.join("common");
+        if let Ok(entries) = std::fs::read_dir(&common) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("Proton") && entry.path().is_dir() {
+                    let proton_script = entry.path().join("proton");
+                    if proton_script.is_file() {
+                        candidates.push(proton_script);
+                    }
+                }
+            }
+        }
+    }
+    // Sort to prefer higher version numbers (lexicographic order works for
+    // "Proton 9.0", "Proton Experimental", etc.)
+    candidates.sort();
+    candidates.into_iter().last()
+}
+
+/// Launch a game executable via Proton.
+///
+/// Every executable — the primary game binary as well as launchers and
+/// script-extender loaders (SKSE, F4SE, NVSE, …) — is run through Proton so
+/// that the correct Wine prefix and Steam runtime are always used.
+///
+/// Required environment variables set automatically:
+/// * `STEAM_COMPAT_DATA_PATH` — path to the game's per-app Wine prefix
+///   (the `compatdata/<app_id>` directory managed by Steam).
+/// * `STEAM_COMPAT_CLIENT_INSTALL_PATH` — Steam installation root, used by
+///   Proton to locate its own runtime libraries and scripts.
+///
+/// Returns `Ok(())` if the process was successfully spawned, or an error
+/// message string on failure.
+pub fn launch_game_executable(
+    game: &crate::core::games::Game,
+    exe_name: &str,
+) -> Result<(), String> {
+    let exe_path = game.root_path.join(exe_name);
+    if !exe_path.is_file() {
+        return Err(format!("Executable not found: {}", exe_path.display()));
+    }
+
+    let app_id = game
+        .kind
+        .steam_app_id()
+        .ok_or_else(|| "Game has no Steam App ID".to_string())?;
+
+    let proton = find_proton_run()
+        .ok_or_else(|| "No Proton installation found in Steam libraries".to_string())?;
+
+    let steam_root = find_steam_root()
+        .ok_or_else(|| "Steam installation not found".to_string())?;
+
+    let compatdata = find_compatdata_path(app_id)
+        .ok_or_else(|| format!("Steam compatdata not found for app {app_id}"))?;
+
+    std::process::Command::new(&proton)
+        .arg("run")
+        .arg(&exe_path)
+        // STEAM_COMPAT_DATA_PATH points Proton to the game's Wine prefix
+        // (the per-app compatdata directory created by Steam).
+        // STEAM_COMPAT_CLIENT_INSTALL_PATH tells Proton where the Steam
+        // installation root is so it can locate its own runtime files.
+        .env("STEAM_COMPAT_DATA_PATH", &compatdata)
+        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &steam_root)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to launch {exe_name} via Proton: {e}"))
+}
