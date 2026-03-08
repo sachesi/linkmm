@@ -14,6 +14,8 @@ use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
+const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
+const POST_LOOP_PROGRESS_STEPS: usize = 2;
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
@@ -52,15 +54,52 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     toolbar_view.add_top_bar(&header);
 
-    let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     content_container.set_vexpand(true);
+    content_container.set_margin_start(12);
+    content_container.set_margin_end(12);
+    content_container.set_margin_top(8);
+    content_container.set_margin_bottom(8);
+
+    let status_revealer = gtk4::Revealer::new();
+    status_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    status_revealer.set_reveal_child(false);
+
+    let status_card = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    status_card.add_css_class("card");
+    status_card.set_margin_bottom(4);
+    status_card.set_margin_top(4);
+    status_card.set_margin_start(4);
+    status_card.set_margin_end(4);
+
+    let status_label = gtk4::Label::new(None);
+    status_label.set_xalign(0.0);
+    status_label.add_css_class("dim-label");
+    status_label.set_margin_top(8);
+    status_label.set_margin_start(8);
+    status_label.set_margin_end(8);
+
+    let status_progress = gtk4::ProgressBar::new();
+    status_progress.set_show_text(true);
+    status_progress.set_margin_start(8);
+    status_progress.set_margin_end(8);
+    status_progress.set_margin_bottom(8);
+
+    status_card.append(&status_label);
+    status_card.append(&status_progress);
+    status_revealer.set_child(Some(&status_card));
+    content_container.append(&status_revealer);
+
+    let list_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    list_container.set_vexpand(true);
+    content_container.append(&list_container);
 
     let game_rc = Rc::new(game.clone());
     let search_query = Rc::new(RefCell::new(String::new()));
     let selected_mod_id = Rc::new(RefCell::new(None::<String>));
 
     refresh_library_content_with_search(
-        &content_container,
+        &list_container,
         &game_rc,
         Rc::clone(&config),
         &search_query.borrow(),
@@ -71,7 +110,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     toolbar_view.set_content(Some(&content_container));
 
     {
-        let container_c = content_container.clone();
+        let container_c = list_container.clone();
         let game_c = Rc::clone(&game_rc);
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
@@ -92,20 +131,60 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     // Wire Deploy button: undeploy everything, then deploy all enabled mods
     {
         let game_c = Rc::clone(&game_rc);
-        let container_c = content_container.clone();
+        let container_c = list_container.clone();
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
         let selected_c = Rc::clone(&selected_mod_id);
+        let search_entry_c = search_entry.clone();
+        let deploy_btn_c = deploy_btn.clone();
+        let undeploy_btn_c = undeploy_btn.clone();
+        let status_label_c = status_label.clone();
+        let status_progress_c = status_progress.clone();
+        let status_revealer_c = status_revealer.clone();
         deploy_btn.connect_clicked(move |btn| {
+            set_library_busy(
+                &search_entry_c,
+                &deploy_btn_c,
+                &undeploy_btn_c,
+                &container_c,
+                true,
+            );
+            status_revealer_c.set_reveal_child(true);
+            status_label_c.set_text("Preparing deployment…");
+            status_progress_c.set_fraction(0.0);
+            status_progress_c.set_text(Some("0%"));
+            flush_ui_events();
+
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
+            let undeploy_total = db.mods.len();
+            // Progress covers both phases in a single bar: cleanup undeploy pass
+            // + enabled-mod deploy pass.
+            let deploy_total = db.mods.iter().filter(|m| m.enabled).count();
+            let total_steps = (undeploy_total + deploy_total + POST_LOOP_PROGRESS_STEPS).max(1);
+            let mut steps_done = 0usize;
 
             // First, unlink all tracked mods so we start from a clean state
-            for m in &db.mods {
-                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+            for (idx, m) in db.mods.iter().enumerate() {
+                status_label_c.set_text(&format!(
+                    "Undeploying existing links ({}/{})…",
+                    idx + 1,
+                    undeploy_total
+                ));
+                flush_ui_events();
+                if let Err(e) = ModManager::disable_mod_without_legacy_cleanup(&game_c, m) {
                     log::warn!("Undeploy warning for {}: {e}", m.name);
                 }
+                steps_done += 1;
+                let frac = steps_done as f64 / total_steps as f64;
+                status_progress_c.set_fraction(frac);
+                status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
             }
+            ModManager::purge_legacy_nested_data_dir(&game_c);
+            steps_done += 1;
+            let frac = steps_done as f64 / total_steps as f64;
+            status_progress_c.set_fraction(frac);
+            status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
 
             // Then deploy all enabled mods.
             //
@@ -116,14 +195,24 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             // reverse visual order to ensure the bottom-most enabled mod wins
             // conflicts.
             let mut deployed_count = 0usize;
-            for m in db.mods.iter().rev().filter(|m| m.enabled) {
+            for (idx, m) in db.mods.iter().rev().filter(|m| m.enabled).enumerate() {
+                status_label_c.set_text(&format!("Deploying mods ({}/{})…", idx + 1, deploy_total));
+                flush_ui_events();
                 if let Err(e) = ModManager::enable_mod(&game_c, m) {
                     errors.push(format!("{}: {}", m.name, e));
                 } else {
                     deployed_count += 1;
                 }
+                steps_done += 1;
+                let frac = steps_done as f64 / total_steps as f64;
+                status_progress_c.set_fraction(frac);
+                status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
             }
             let _ = db.write_plugins_txt(&game_c);
+            steps_done += 1;
+            let frac = steps_done as f64 / total_steps as f64;
+            status_progress_c.set_fraction(frac);
+            status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
 
             let msg = if errors.is_empty() {
                 format!("Deployed {deployed_count} mod(s)")
@@ -133,6 +222,17 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 }
                 format!("Deploy finished with {} error(s)", errors.len())
             };
+            status_label_c.set_text(&msg);
+            status_progress_c.set_fraction(1.0);
+            status_progress_c.set_text(Some("100%"));
+            set_library_busy(
+                &search_entry_c,
+                &deploy_btn_c,
+                &undeploy_btn_c,
+                &container_c,
+                false,
+            );
+            hide_status_popup_later(status_revealer_c.clone());
             show_toast(btn.upcast_ref(), &msg);
             refresh_library_content_with_search(
                 &container_c,
@@ -148,25 +248,57 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     // Wire Undeploy button: remove all mod symlinks from the game directory
     {
         let game_c = Rc::clone(&game_rc);
-        let container_c = content_container.clone();
+        let container_c = list_container.clone();
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
         let selected_c = Rc::clone(&selected_mod_id);
+        let search_entry_c = search_entry.clone();
+        let deploy_btn_c = deploy_btn.clone();
+        let undeploy_btn_c = undeploy_btn.clone();
+        let status_label_c = status_label.clone();
+        let status_progress_c = status_progress.clone();
+        let status_revealer_c = status_revealer.clone();
         undeploy_btn.connect_clicked(move |btn| {
+            set_library_busy(
+                &search_entry_c,
+                &deploy_btn_c,
+                &undeploy_btn_c,
+                &container_c,
+                true,
+            );
+            status_revealer_c.set_reveal_child(true);
+            status_label_c.set_text("Starting undeploy…");
+            status_progress_c.set_fraction(0.0);
+            status_progress_c.set_text(Some("0%"));
+            flush_ui_events();
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
             let mut count = 0;
+            let total = db.mods.len();
+            let total_steps = total + POST_LOOP_PROGRESS_STEPS;
             // Unlink ALL mods regardless of enabled state so the game directory
             // is fully clean.  The enabled state is intentionally preserved so
             // the user can re-deploy with the same selection later.
-            for m in &db.mods {
-                if let Err(e) = ModManager::disable_mod(&game_c, m) {
+            for (idx, m) in db.mods.iter().enumerate() {
+                status_label_c.set_text(&format!("Undeploying mods ({}/{})…", idx + 1, total));
+                flush_ui_events();
+                if let Err(e) = ModManager::disable_mod_without_legacy_cleanup(&game_c, m) {
                     errors.push(format!("{}: {}", m.name, e));
                 } else {
                     count += 1;
                 }
+                let progress = (idx + 1) as f64 / total_steps.max(1) as f64;
+                status_progress_c.set_fraction(progress);
+                status_progress_c.set_text(Some(&format!("{:.0}%", progress * 100.0)));
             }
+            ModManager::purge_legacy_nested_data_dir(&game_c);
+            let purge_progress = (total + 1) as f64 / total_steps.max(1) as f64;
+            status_progress_c.set_fraction(purge_progress);
+            status_progress_c.set_text(Some(&format!("{:.0}%", purge_progress * 100.0)));
             let _ = db.write_plugins_txt(&game_c);
+            let write_progress = (total + POST_LOOP_PROGRESS_STEPS) as f64 / total_steps.max(1) as f64;
+            status_progress_c.set_fraction(write_progress);
+            status_progress_c.set_text(Some(&format!("{:.0}%", write_progress * 100.0)));
 
             let msg = if errors.is_empty() {
                 format!("Undeployed {count} mod(s)")
@@ -176,6 +308,17 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 }
                 format!("Undeploy finished with {} error(s)", errors.len())
             };
+            status_label_c.set_text(&msg);
+            status_progress_c.set_fraction(1.0);
+            status_progress_c.set_text(Some("100%"));
+            set_library_busy(
+                &search_entry_c,
+                &deploy_btn_c,
+                &undeploy_btn_c,
+                &container_c,
+                false,
+            );
+            hide_status_popup_later(status_revealer_c.clone());
             show_toast(btn.upcast_ref(), &msg);
             refresh_library_content_with_search(
                 &container_c,
@@ -277,6 +420,38 @@ fn refresh_library_content_with_search(
 
         container.append(&scrolled);
     }
+}
+
+/// Toggle interactivity for Library controls during long deploy operations.
+fn set_library_busy(
+    search_entry: &gtk4::SearchEntry,
+    deploy_btn: &gtk4::Button,
+    undeploy_btn: &gtk4::Button,
+    content_container: &gtk4::Box,
+    busy: bool,
+) {
+    let sensitive = !busy;
+    search_entry.set_sensitive(sensitive);
+    deploy_btn.set_sensitive(sensitive);
+    undeploy_btn.set_sensitive(sensitive);
+    content_container.set_sensitive(sensitive);
+}
+
+/// Process pending GTK events so status text updates are shown during long loops.
+fn flush_ui_events() {
+    let context = gtk4::glib::MainContext::default();
+    while context.pending() {
+        context.iteration(false);
+    }
+}
+
+fn hide_status_popup_later(status_revealer: gtk4::Revealer) {
+    gtk4::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(STATUS_POPUP_HIDE_DELAY_MS),
+        move || {
+            status_revealer.set_reveal_child(false);
+        },
+    );
 }
 
 fn build_mod_row(
