@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{BufWriter, Read};
 use std::path::Path;
 use std::process::Command;
 
@@ -183,10 +183,6 @@ fn top_level_component(path: &str) -> &str {
 /// - `SomeMod/Data/textures/sky.dds` → common prefix `SomeMod/` stripped →
 ///   remaining starts with `Data/` → returns `true`.
 /// - `textures/sky.dds` → no prefix → returns `false`.
-///
-/// The archive is opened twice because `find_common_prefix` consumes the
-/// mutable borrow of the first ZipArchive, the same pattern used by
-/// `extract_zip_to`.
 fn archive_has_data_folder(archive_path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(archive_path) else {
         return false;
@@ -194,16 +190,12 @@ fn archive_has_data_folder(archive_path: &Path) -> bool {
     let Ok(mut zip) = zip::ZipArchive::new(file) else {
         return false;
     };
-    let prefix = find_common_prefix(&mut zip);
+    // find_common_prefix now uses file_names() (&self), so we can reuse the
+    // same ZipArchive instance for the entry scan below.
+    let prefix = find_common_prefix(&zip);
 
-    let Ok(file2) = std::fs::File::open(archive_path) else {
-        return false;
-    };
-    let Ok(mut zip2) = zip::ZipArchive::new(file2) else {
-        return false;
-    };
-    for i in 0..zip2.len() {
-        let Ok(entry) = zip2.by_index(i) else {
+    for i in 0..zip.len() {
+        let Ok(entry) = zip.by_index(i) else {
             continue;
         };
         let name = entry.name();
@@ -1023,16 +1015,13 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
 
     // Find common prefix to strip (e.g. when archive has a single top-level
-    // folder wrapping everything)
-    let prefix = find_common_prefix(&mut zip);
+    // folder wrapping everything).  Uses file_names() which reads only the
+    // central-directory metadata – no decompression – so we can keep a single
+    // file handle for both the prefix scan and the extraction pass.
+    let prefix = find_common_prefix(&zip);
 
-    let file2 =
-        std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
-    let mut zip2 =
-        zip::ZipArchive::new(file2).map_err(|e| format!("Cannot read zip archive: {e}"))?;
-
-    for i in 0..zip2.len() {
-        let mut entry = zip2
+    for i in 0..zip.len() {
+        let mut entry = zip
             .by_index(i)
             .map_err(|e| format!("Cannot read zip entry: {e}"))?;
 
@@ -1067,9 +1056,10 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create parent dir: {e}"))?;
             }
-            let mut out_file = std::fs::File::create(&out_path)
+            let out_file = std::fs::File::create(&out_path)
                 .map_err(|e| format!("Failed to create file {}: {e}", out_path.display()))?;
-            std::io::copy(&mut entry, &mut out_file)
+            let mut buffered = BufWriter::with_capacity(256 * 1024, out_file);
+            std::io::copy(&mut entry, &mut buffered)
                 .map_err(|e| format!("Failed to extract {}: {e}", rel_name))?;
         }
     }
@@ -1210,7 +1200,11 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// Detect whether all entries in the archive share a common top-level directory
 /// prefix.  If so, return it (with trailing `/`).
-fn find_common_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> String {
+///
+/// Uses `ZipArchive::file_names()` which only reads the central directory
+/// metadata (no decompression), so this is fast and does not require a
+/// mutable borrow.
+fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String {
     if zip.is_empty() {
         return String::new();
     }
@@ -1218,11 +1212,7 @@ fn find_common_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> String {
     let mut first_top: Option<String> = None;
     let mut all_same = true;
 
-    for i in 0..zip.len() {
-        let Ok(entry) = zip.by_index(i) else {
-            continue;
-        };
-        let name = entry.name();
+    for name in zip.file_names() {
         let top = name.split('/').next().unwrap_or("");
         if top.is_empty() {
             continue;
@@ -1269,7 +1259,7 @@ fn install_fomod_files(
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
-    let archive_prefix = normalise_path(&find_common_prefix(&mut zip));
+    let archive_prefix = normalise_path(&find_common_prefix(&zip));
     let archive_prefix_lower = archive_prefix.to_lowercase();
 
     // Build a map of lowercased entry names → indices for case-insensitive
@@ -1403,9 +1393,10 @@ fn install_fomod_files(
                     .map_err(|e| format!("Failed to create parent dir: {e}"))?;
             }
 
-            let mut out_file =
+            let out_file =
                 std::fs::File::create(&out_path).map_err(|e| format!("Failed to create file: {e}"))?;
-            std::io::copy(&mut entry, &mut out_file).map_err(|e| format!("Failed to extract: {e}"))?;
+            let mut buffered = BufWriter::with_capacity(256 * 1024, out_file);
+            std::io::copy(&mut entry, &mut buffered).map_err(|e| format!("Failed to extract: {e}"))?;
         }
     }
 
