@@ -14,7 +14,7 @@ use crate::core::games::Game;
 use crate::core::installer::{
     DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
     InstallStep, InstallStrategy, PluginDependencies, PluginType, detect_strategy,
-    install_mod_from_archive, install_mod_from_archive_with_nexus, parse_fomod_from_archive,
+    install_mod_from_archive_with_nexus_ticking, parse_fomod_from_archive,
     read_archive_file_bytes,
 };
 use crate::core::mods::ModDatabase;
@@ -26,6 +26,25 @@ const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "x
 /// Archive types that are currently installable by the app.
 const INSTALLABLE_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 const DOWNLOAD_PROGRESS_POLL_INTERVAL_MS: u64 = 200;
+const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
+
+// ── Install status context ────────────────────────────────────────────────────
+
+/// Widgets shared across the install flow for showing a progress popup and
+/// graying out the downloads UI while an install is in progress.
+#[derive(Clone)]
+struct InstallStatusCtx {
+    revealer: gtk4::Revealer,
+    label: gtk4::Label,
+    progress: gtk4::ProgressBar,
+    // header bar controls to disable during install
+    search_entry: gtk4::SearchEntry,
+    hide_btn: gtk4::ToggleButton,
+    clean_btn: gtk4::Button,
+    refresh_btn: gtk4::Button,
+    // main list (grayed while busy)
+    list_container: gtk4::Box,
+}
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
@@ -67,10 +86,52 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.set_vexpand(true);
 
+    // ── Install progress popup ────────────────────────────────────────────────
+    let status_revealer = gtk4::Revealer::new();
+    status_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    status_revealer.set_reveal_child(false);
+
+    let status_card = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    status_card.add_css_class("card");
+    status_card.set_margin_bottom(4);
+    status_card.set_margin_top(4);
+    status_card.set_margin_start(4);
+    status_card.set_margin_end(4);
+
+    let status_label = gtk4::Label::new(None);
+    status_label.set_xalign(0.0);
+    status_label.add_css_class("dim-label");
+    status_label.set_margin_top(8);
+    status_label.set_margin_start(8);
+    status_label.set_margin_end(8);
+
+    let status_progress = gtk4::ProgressBar::new();
+    status_progress.set_show_text(true);
+    status_progress.set_margin_start(8);
+    status_progress.set_margin_end(8);
+    status_progress.set_margin_bottom(8);
+
+    status_card.append(&status_label);
+    status_card.append(&status_progress);
+    status_revealer.set_child(Some(&status_card));
+    content.append(&status_revealer);
+    // ─────────────────────────────────────────────────────────────────────────
+
     let list_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     list_container.set_vexpand(true);
 
     content.append(&list_container);
+
+    let status_ctx = InstallStatusCtx {
+        revealer: status_revealer,
+        label: status_label,
+        progress: status_progress,
+        search_entry: search_entry.clone(),
+        hide_btn: hide_btn.clone(),
+        clean_btn: clean_btn.clone(),
+        refresh_btn: refresh_btn.clone(),
+        list_container: list_container.clone(),
+    };
 
     let hide_installed = Rc::new(RefCell::new(false));
     let search_query = Rc::new(RefCell::new(String::new()));
@@ -83,6 +144,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         *hide_installed.borrow(),
         &game_rc,
         &search_query.borrow(),
+        &status_ctx,
     );
     toolbar_view.set_content(Some(&content));
 
@@ -92,6 +154,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         let hide_c = Rc::clone(&hide_installed);
         let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
+        let ctx_c = status_ctx.clone();
         hide_btn.connect_toggled(move |btn| {
             *hide_c.borrow_mut() = btn.is_active();
             refresh_content_with_search(
@@ -100,6 +163,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
                 *hide_c.borrow(),
                 &game_c,
                 &search_c.borrow(),
+                &ctx_c,
             );
         });
     }
@@ -110,8 +174,9 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         let hide_c = Rc::clone(&hide_installed);
         let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
+        let ctx_c = status_ctx.clone();
         clean_btn.connect_clicked(move |btn| {
-            show_clean_cache_dialog(btn, &config_c, &container_c, &hide_c, &search_c, &game_c);
+            show_clean_cache_dialog(btn, &config_c, &container_c, &hide_c, &search_c, &game_c, &ctx_c);
         });
     }
 
@@ -121,6 +186,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         let hide_c = Rc::clone(&hide_installed);
         let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
+        let ctx_c = status_ctx.clone();
         refresh_btn.connect_clicked(move |_| {
             refresh_content_with_search(
                 &container_c,
@@ -128,6 +194,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
                 *hide_c.borrow(),
                 &game_c,
                 &search_c.borrow(),
+                &ctx_c,
             );
         });
     }
@@ -138,6 +205,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         let hide_c = Rc::clone(&hide_installed);
         let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
+        let ctx_c = status_ctx.clone();
         search_entry.connect_search_changed(move |entry| {
             *search_c.borrow_mut() = entry.text().to_string();
             refresh_content_with_search(
@@ -146,6 +214,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
                 *hide_c.borrow(),
                 &game_c,
                 &search_c.borrow(),
+                &ctx_c,
             );
         });
     }
@@ -157,6 +226,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
         let active_download_fingerprint_c = Rc::clone(&active_download_fingerprint);
+        let ctx_c = status_ctx.clone();
         gtk4::glib::timeout_add_local(
             std::time::Duration::from_millis(DOWNLOAD_PROGRESS_POLL_INTERVAL_MS),
             move || {
@@ -176,6 +246,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
                         *hide_c.borrow(),
                         &game_c,
                         &search_c.borrow(),
+                        &ctx_c,
                     );
                 }
                 gtk4::glib::ControlFlow::Continue
@@ -194,6 +265,7 @@ fn refresh_content_with_search(
     hide_installed: bool,
     game: &Rc<Option<Game>>,
     search_query: &str,
+    status_ctx: &InstallStatusCtx,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -281,6 +353,7 @@ fn refresh_content_with_search(
             hide_installed,
             search_query,
             game,
+            status_ctx,
         );
         list_box.append(&row);
     }
@@ -345,6 +418,7 @@ fn build_entry_row(
     hide_installed: bool,
     search_query: &str,
     game: &Rc<Option<Game>>,
+    status_ctx: &InstallStatusCtx,
 ) -> adw::ActionRow {
     let is_installed = entry_is_installed(entry, installed_archives, installed_mod_names);
     let row = adw::ActionRow::builder()
@@ -385,6 +459,7 @@ fn build_entry_row(
             let game_rc_c = Rc::clone(game);
             let hide_installed_c = hide_installed;
             let search_query_c = search_query.to_string();
+            let ctx_c = status_ctx.clone();
             install_btn.connect_clicked(move |btn| {
                 show_install_dialog(
                     btn,
@@ -396,6 +471,7 @@ fn build_entry_row(
                     hide_installed_c,
                     &search_query_c,
                     &game_rc_c,
+                    &ctx_c,
                 );
             });
             row.add_suffix(&install_btn);
@@ -415,6 +491,7 @@ fn build_entry_row(
     let container_c = container.clone();
     let game_c = Rc::clone(game);
     let search_query_c = search_query.to_string();
+    let ctx_c = status_ctx.clone();
     delete_btn.connect_clicked(move |_| {
         if let Err(e) = std::fs::remove_file(&path_c) {
             log::error!("Failed to remove archive \"{}\": {e}", name_c);
@@ -429,6 +506,7 @@ fn build_entry_row(
                 hide_installed,
                 &game_c,
                 &search_query_c,
+                &ctx_c,
             );
         }
     });
@@ -448,6 +526,7 @@ fn show_install_dialog(
     hide_installed: bool,
     search_query: &str,
     game_rc: &Rc<Option<Game>>,
+    status_ctx: &InstallStatusCtx,
 ) {
     let strategy = match detect_strategy(archive_path) {
         Ok(s) => s,
@@ -475,6 +554,7 @@ fn show_install_dialog(
                     search_query,
                     &fomod_config,
                     game_rc,
+                    Some(status_ctx),
                 );
                 return;
             }
@@ -498,6 +578,7 @@ fn show_install_dialog(
         search_query,
         &strategy,
         game_rc,
+        status_ctx,
     );
 }
 
@@ -512,6 +593,7 @@ fn show_strategy_picker(
     search_query: &str,
     _detected: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
+    status_ctx: &InstallStatusCtx,
 ) {
     let dialog = adw::AlertDialog::builder()
         .heading("Install Mod")
@@ -533,6 +615,7 @@ fn show_strategy_picker(
     let hide = hide_installed;
     let search = search_query.to_string();
     let grc = Rc::clone(game_rc);
+    let ctx = status_ctx.clone();
     dialog.connect_response(None, move |_, response| {
         if response == "data" {
             do_install(
@@ -545,6 +628,7 @@ fn show_strategy_picker(
                 &search,
                 &InstallStrategy::Data,
                 &grc,
+                Some(&ctx),
             );
         }
     });
@@ -561,17 +645,47 @@ fn do_install(
     search_query: &str,
     strategy: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
+    status_ctx: Option<&InstallStatusCtx>,
 ) {
     let mod_name = Path::new(archive_name)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| archive_name.to_string());
 
+    if let Some(ctx) = status_ctx {
+        set_downloads_busy(ctx, true);
+        ctx.revealer.set_reveal_child(true);
+        ctx.label.set_text(&format!("Installing \"{}\"…", mod_name));
+        ctx.progress.set_fraction(0.0);
+        ctx.progress.set_text(Some("Extracting archive…"));
+        flush_ui_events();
+    }
+
     let nexus_id = read_nxm_mod_id_for_archive(archive_path, game);
-    let install_result = if let Some(id) = nexus_id {
-        install_mod_from_archive_with_nexus(archive_path, game, &mod_name, strategy, Some(id))
-    } else {
-        install_mod_from_archive(archive_path, game, &mod_name, strategy)
+
+    // For non-zip archives (7z, rar, …) the underlying 7z process can take
+    // several seconds to extract a large archive.  Provide a tick callback so
+    // the progress bar pulses every ~50 ms and the UI stays responsive.
+    // The nexus_id check is factored out once here so the tick closure doesn't
+    // need to be duplicated across branches.
+    let install_result = {
+        let tick: Box<dyn Fn()> = if let Some(ctx) = status_ctx {
+            let progress = ctx.progress.clone();
+            Box::new(move || {
+                progress.pulse();
+                flush_ui_events();
+            })
+        } else {
+            Box::new(|| {})
+        };
+        install_mod_from_archive_with_nexus_ticking(
+            archive_path,
+            game,
+            &mod_name,
+            strategy,
+            nexus_id,
+            tick.as_ref(),
+        )
     };
     match install_result {
         Ok(_) => {
@@ -582,12 +696,39 @@ fn do_install(
             cfg.save();
             drop(cfg);
             log::info!("Installed mod \"{mod_name}\" from \"{archive_name}\"");
-            show_toast(container.upcast_ref(), &format!("Installed: {mod_name}"));
-            refresh_content_with_search(container, config, hide_installed, game_rc, search_query);
+            let msg = format!("Installed: {mod_name}");
+            if let Some(ctx) = status_ctx {
+                ctx.label.set_text(&msg);
+                ctx.progress.set_fraction(1.0);
+                ctx.progress.set_text(Some("100%"));
+                set_downloads_busy(ctx, false);
+                hide_status_popup_later(ctx.revealer.clone());
+                show_toast(ctx.list_container.upcast_ref(), &msg);
+                refresh_content_with_search(
+                    &ctx.list_container,
+                    config,
+                    hide_installed,
+                    game_rc,
+                    search_query,
+                    ctx,
+                );
+            } else {
+                show_toast(container.upcast_ref(), &msg);
+            }
         }
         Err(e) => {
             log::error!("Failed to install mod \"{mod_name}\": {e}");
-            show_toast(container.upcast_ref(), &format!("Install failed: {e}"));
+            let msg = format!("Install failed: {e}");
+            if let Some(ctx) = status_ctx {
+                ctx.label.set_text(&msg);
+                ctx.progress.set_fraction(0.0);
+                ctx.progress.set_text(Some("Error"));
+                set_downloads_busy(ctx, false);
+                hide_status_popup_later(ctx.revealer.clone());
+                show_toast(ctx.list_container.upcast_ref(), &msg);
+            } else {
+                show_toast(container.upcast_ref(), &msg);
+            }
         }
     }
 }
@@ -811,6 +952,7 @@ fn show_fomod_wizard(
     search_query: &str,
     fomod: &FomodConfig,
     game_rc: &Rc<Option<Game>>,
+    status_ctx: Option<&InstallStatusCtx>,
 ) {
     let mod_display_name = fomod
         .mod_name
@@ -829,6 +971,7 @@ fn show_fomod_wizard(
             search_query,
             &strategy,
             game_rc,
+            status_ctx,
         );
         return;
     }
@@ -1166,11 +1309,15 @@ fn show_fomod_wizard(
         let hide = hide_installed;
         let search = search_query.to_string();
         let grc = Rc::clone(game_rc);
+        let ctx = status_ctx.cloned();
         install_btn.connect_clicked(move |_| {
             let files = {
                 let sel = sel_c.borrow();
                 resolve_fomod_files(&fc, &sel)
             };
+            // Close the wizard first so the Downloads page is visible when
+            // the install progress popup appears.
+            dlg.destroy();
             do_install(
                 &ap,
                 &an,
@@ -1181,8 +1328,8 @@ fn show_fomod_wizard(
                 &search,
                 &InstallStrategy::Fomod(files),
                 &grc,
+                ctx.as_ref(),
             );
-            dlg.destroy();
         });
     }
     main_box.append(&step_content);
@@ -1214,6 +1361,7 @@ pub fn show_fomod_wizard_from_library(
         "",
         fomod,
         game_rc,
+        None,
     );
 }
 
@@ -1226,6 +1374,7 @@ fn show_clean_cache_dialog(
     hide_installed: &Rc<RefCell<bool>>,
     search_query: &Rc<RefCell<String>>,
     game: &Rc<Option<Game>>,
+    status_ctx: &InstallStatusCtx,
 ) {
     let dialog = adw::AlertDialog::new(
         Some("Clean Download Cache?"),
@@ -1243,10 +1392,11 @@ fn show_clean_cache_dialog(
     let hc = Rc::clone(hide_installed);
     let search_c = Rc::clone(search_query);
     let gc = Rc::clone(game);
+    let ctx_c = status_ctx.clone();
     dialog.connect_response(None, move |_, response| {
         if response == "clean" {
             delete_all_archives(&cc, &gc);
-            refresh_content_with_search(&cont, &cc, *hc.borrow(), &gc, &search_c.borrow());
+            refresh_content_with_search(&cont, &cc, *hc.borrow(), &gc, &search_c.borrow(), &ctx_c);
         }
     });
     let parent = anchor
@@ -1395,6 +1545,36 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
         ancestor = current.parent();
     }
     log::info!("{message}");
+}
+
+/// Disable all interactive Downloads controls while an install is in progress,
+/// visually indicating to the user that the UI is locked.
+fn set_downloads_busy(ctx: &InstallStatusCtx, busy: bool) {
+    let sensitive = !busy;
+    ctx.search_entry.set_sensitive(sensitive);
+    ctx.hide_btn.set_sensitive(sensitive);
+    ctx.clean_btn.set_sensitive(sensitive);
+    ctx.refresh_btn.set_sensitive(sensitive);
+    ctx.list_container.set_sensitive(sensitive);
+}
+
+/// Process pending GTK events so that status-label and progress updates are
+/// shown immediately during a long synchronous operation.
+fn flush_ui_events() {
+    let ctx = gtk4::glib::MainContext::default();
+    while ctx.pending() {
+        ctx.iteration(false);
+    }
+}
+
+/// Schedule the status popup to slide back up after a short delay.
+fn hide_status_popup_later(revealer: gtk4::Revealer) {
+    gtk4::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(STATUS_POPUP_HIDE_DELAY_MS),
+        move || {
+            revealer.set_reveal_child(false);
+        },
+    );
 }
 
 #[cfg(test)]

@@ -1,9 +1,21 @@
-use std::io::Read;
+use std::io::{BufWriter, Read};
 use std::path::Path;
 use std::process::Command;
 
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Write-buffer capacity used when extracting individual archive entries.  A
+/// 256 KB buffer reduces the number of `write` syscalls for archives that
+/// contain many small files.
+const EXTRACT_BUFFER_SIZE: usize = 256 * 1024;
+
+/// How often the 7z extraction polling loop calls the progress `tick` callback.
+/// At 50 ms the progress bar pulses at ~20 Hz, which looks smooth enough
+/// without busy-polling too aggressively.
+const EXTRACTION_TICK_INTERVAL_MS: u64 = 50;
 
 // ── Install strategy ──────────────────────────────────────────────────────────
 
@@ -135,9 +147,23 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         return Err(format!("Cannot open archive: {}", archive_path.display()));
     }
     if !has_zip_extension(archive_path) {
-        return match parse_fomod_from_archive(archive_path) {
-            Ok(config) => Ok(InstallStrategy::Fomod(config.required_files.clone())),
-            Err(_) => Ok(InstallStrategy::Data),
+        // Use fast header listing (no extraction) to detect FOMOD presence.
+        // If listing fails (e.g. 7z not installed or corrupt archive), fall
+        // back gracefully to Data strategy.
+        let entries = list_archive_entries_with_7z(archive_path).unwrap_or_default();
+        let has_fomod = entries.iter().any(|p| {
+            let lower = p.to_lowercase().replace('\\', "/");
+            lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
+        });
+        return if has_fomod {
+            // Parse the config to get required_files; only extracts the small
+            // XML rather than the whole archive.
+            match parse_fomod_from_archive(archive_path) {
+                Ok(config) => Ok(InstallStrategy::Fomod(config.required_files.clone())),
+                Err(_) => Ok(InstallStrategy::Data),
+            }
+        } else {
+            Ok(InstallStrategy::Data)
         };
     }
 
@@ -183,10 +209,6 @@ fn top_level_component(path: &str) -> &str {
 /// - `SomeMod/Data/textures/sky.dds` → common prefix `SomeMod/` stripped →
 ///   remaining starts with `Data/` → returns `true`.
 /// - `textures/sky.dds` → no prefix → returns `false`.
-///
-/// The archive is opened twice because `find_common_prefix` consumes the
-/// mutable borrow of the first ZipArchive, the same pattern used by
-/// `extract_zip_to`.
 fn archive_has_data_folder(archive_path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(archive_path) else {
         return false;
@@ -194,16 +216,12 @@ fn archive_has_data_folder(archive_path: &Path) -> bool {
     let Ok(mut zip) = zip::ZipArchive::new(file) else {
         return false;
     };
-    let prefix = find_common_prefix(&mut zip);
+    // find_common_prefix now uses file_names() (&self), so we can reuse the
+    // same ZipArchive instance for the entry scan below.
+    let prefix = find_common_prefix(&zip);
 
-    let Ok(file2) = std::fs::File::open(archive_path) else {
-        return false;
-    };
-    let Ok(mut zip2) = zip::ZipArchive::new(file2) else {
-        return false;
-    };
-    for i in 0..zip2.len() {
-        let Ok(entry) = zip2.by_index(i) else {
+    for i in 0..zip.len() {
+        let Ok(entry) = zip.by_index(i) else {
             continue;
         };
         let name = entry.name();
@@ -229,12 +247,23 @@ pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, Stri
         return parse_fomod_from_zip(archive_path);
     }
 
-    let tmp_extract = create_temp_extract_dir()?;
-    extract_archive_with_7z(archive_path, &tmp_extract)?;
+    // For non-zip archives: list entries to find the FOMOD XML path, then
+    // extract only that single file.  This is much faster than a full
+    // extraction for large archives.
+    let entries = list_archive_entries_with_7z(archive_path)?;
+    let fomod_entry = entries
+        .iter()
+        .find(|p| {
+            let lower = p.to_lowercase().replace('\\', "/");
+            lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
+        })
+        .ok_or_else(|| "No fomod/ModuleConfig.xml found in archive".to_string())?;
 
+    let tmp_extract = create_temp_extract_dir()?;
     let result = (|| {
+        extract_single_file_with_7z(archive_path, fomod_entry, &tmp_extract)?;
         let config_path = find_fomod_config_in_dir(&tmp_extract)
-            .ok_or_else(|| "No fomod/ModuleConfig.xml found in archive".to_string())?;
+            .ok_or_else(|| "fomod/ModuleConfig.xml not found after extraction".to_string())?;
         let xml_bytes = std::fs::read(&config_path)
             .map_err(|e| format!("Failed to read fomod config {}: {e}", config_path.display()))?;
         parse_fomod_xml(&xml_bytes)
@@ -370,39 +399,49 @@ pub fn read_archive_file_bytes(
     Err(format!("Archive file not found: {relative_path}"))
 }
 
-/// Read a file from a non-zip archive (7z, rar, etc.) by extracting to a
-/// temporary directory and then searching for the target using the same
+/// Read a file from a non-zip archive (7z, rar, etc.) using the same
 /// case-insensitive / `fomod/`-relative matching logic as the zip variant.
+///
+/// Instead of fully extracting the archive, this function first lists the
+/// archive's contents to find the exact stored path, then extracts only that
+/// single file.  This is orders of magnitude faster for large archives.
 fn read_archive_file_bytes_non_zip(
     archive_path: &Path,
     relative_path: &str,
 ) -> Result<Vec<u8>, String> {
+    // Build the list of archive entries (fast: reads only headers, no extraction).
+    let entries = list_archive_entries_with_7z(archive_path)?;
+
+    let target = normalise_path(relative_path);
+    let target_lower = target.to_lowercase();
+    if target_lower.is_empty() {
+        return Err("Empty archive path".to_string());
+    }
+    let fomod_target = format!("{FOMOD_DIR_PREFIX}{target_lower}");
+
+    // Find the matching entry using the same fallback aliases as the zip path.
+    let matching_entry = entries.iter().find(|p| {
+        let norm = normalise_path(p);
+        let lower = norm.to_lowercase();
+        lower == target_lower
+            || lower.ends_with(&format!("/{target_lower}"))
+            || lower == fomod_target
+            || lower.ends_with(&format!("/{fomod_target}"))
+    });
+
+    let Some(entry_path) = matching_entry else {
+        return Err(format!("Archive file not found: {relative_path}"));
+    };
+
+    // Extract only that single file.
     let tmp = create_temp_extract_dir()?;
     let result = (|| {
-        extract_archive_with_7z(archive_path, &tmp)?;
-
-        let target = normalise_path(relative_path);
-        let target_lower = target.to_lowercase();
-        if target_lower.is_empty() {
-            return Err("Empty archive path".to_string());
-        }
-        let fomod_target = format!("{FOMOD_DIR_PREFIX}{target_lower}");
-
-        let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
-        collect_fs_files(&tmp, &tmp, &mut files);
-
-        for (rel_lower, full_path) in &files {
-            let matches = *rel_lower == target_lower
-                || rel_lower.ends_with(&format!("/{target_lower}"))
-                || *rel_lower == fomod_target
-                || rel_lower.ends_with(&format!("/{fomod_target}"));
-            if matches {
-                return std::fs::read(full_path)
-                    .map_err(|e| format!("Failed to read {}: {e}", full_path.display()));
-            }
-        }
-
-        Err(format!("Archive file not found: {relative_path}"))
+        extract_single_file_with_7z(archive_path, entry_path, &tmp)?;
+        // The file was extracted preserving directory structure.  Locate it.
+        let normalised = normalise_path(entry_path);
+        let extracted_path = tmp.join(Path::new(&normalised));
+        std::fs::read(&extracted_path)
+            .map_err(|e| format!("Failed to read extracted file {}: {e}", extracted_path.display()))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     result
@@ -958,7 +997,7 @@ pub fn install_mod_from_archive(
     mod_name: &str,
     strategy: &InstallStrategy,
 ) -> Result<Mod, String> {
-    install_mod_from_archive_with_nexus(archive_path, game, mod_name, strategy, None)
+    install_mod_from_archive_with_nexus_ticking(archive_path, game, mod_name, strategy, None, &|| {})
 }
 
 pub fn install_mod_from_archive_with_nexus(
@@ -968,12 +1007,32 @@ pub fn install_mod_from_archive_with_nexus(
     strategy: &InstallStrategy,
     nexus_id: Option<u32>,
 ) -> Result<Mod, String> {
+    install_mod_from_archive_with_nexus_ticking(archive_path, game, mod_name, strategy, nexus_id, &|| {})
+}
+
+/// Like [`install_mod_from_archive_with_nexus`] but calls `tick()` periodically
+/// during the extraction phase for non-zip archives (7z, rar, …).
+///
+/// The `tick` function is invoked on the calling thread roughly every 50 ms
+/// while waiting for 7-Zip to finish extracting the archive.  A typical
+/// implementation pulses a GTK `ProgressBar` and flushes pending UI events so
+/// the application stays visually responsive during the extraction.
+///
+/// Pass `&|| {}` (a no-op) when no progress feedback is needed.
+pub fn install_mod_from_archive_with_nexus_ticking(
+    archive_path: &Path,
+    game: &Game,
+    mod_name: &str,
+    strategy: &InstallStrategy,
+    nexus_id: Option<u32>,
+    tick: &dyn Fn(),
+) -> Result<Mod, String> {
     let mod_dir = ModManager::create_mod_directory(game)?;
 
     match strategy {
         InstallStrategy::Data => {
             if !has_zip_extension(archive_path) {
-                install_data_archive_non_zip(archive_path, &mod_dir)?;
+                install_data_archive_non_zip(archive_path, &mod_dir, tick)?;
             } else {
             // Determine extraction root:
             // • If the archive already carries a `Data/` subfolder after the
@@ -996,7 +1055,7 @@ pub fn install_mod_from_archive_with_nexus(
             let data_dir = mod_dir.join("Data");
             std::fs::create_dir_all(&data_dir)
                 .map_err(|e| format!("Failed to create Data directory: {e}"))?;
-            install_fomod_files(archive_path, &data_dir, files)?;
+            install_fomod_files(archive_path, &data_dir, files, tick)?;
         }
     }
 
@@ -1023,16 +1082,13 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
 
     // Find common prefix to strip (e.g. when archive has a single top-level
-    // folder wrapping everything)
-    let prefix = find_common_prefix(&mut zip);
+    // folder wrapping everything).  Uses file_names() which reads only the
+    // central-directory metadata – no decompression – so we can keep a single
+    // file handle for both the prefix scan and the extraction pass.
+    let prefix = find_common_prefix(&zip);
 
-    let file2 =
-        std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
-    let mut zip2 =
-        zip::ZipArchive::new(file2).map_err(|e| format!("Cannot read zip archive: {e}"))?;
-
-    for i in 0..zip2.len() {
-        let mut entry = zip2
+    for i in 0..zip.len() {
+        let mut entry = zip
             .by_index(i)
             .map_err(|e| format!("Cannot read zip entry: {e}"))?;
 
@@ -1067,9 +1123,10 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create parent dir: {e}"))?;
             }
-            let mut out_file = std::fs::File::create(&out_path)
+            let out_file = std::fs::File::create(&out_path)
                 .map_err(|e| format!("Failed to create file {}: {e}", out_path.display()))?;
-            std::io::copy(&mut entry, &mut out_file)
+            let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
+            std::io::copy(&mut entry, &mut buffered)
                 .map_err(|e| format!("Failed to extract {}: {e}", rel_name))?;
         }
     }
@@ -1084,7 +1141,134 @@ fn has_zip_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
+/// Full-archive extraction using 7-Zip.
+///
+/// `tick` is called approximately every 50 ms while waiting for the 7z
+/// process to finish.  This lets the caller pulse a progress bar or process
+/// UI events so the application stays responsive during a long extraction.
+/// Pass `&|| {}` when no progress feedback is needed.
+fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| {
+        format!(
+            "Failed to create extraction directory {}: {e}",
+            dest_dir.display()
+        )
+    })?;
+    let output_arg = format!("-o{}", dest_dir.display());
+
+    // Spawn 7z and poll it so that `tick` can be called while we wait.
+    // Using spawn() + try_wait() instead of output() keeps the calling
+    // thread free to process UI events between polls.
+    let mut child = Command::new("7z")
+        .arg("x")
+        .arg("-y")
+        .arg(&output_arg)
+        .arg(archive_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "Failed to start 7z extractor ({e}). Install 7-Zip (the '7z' command) to extract .7z and .rar archives."
+            )
+        })?;
+
+    loop {
+        match child.try_wait().map_err(|e| format!("Failed to check 7z process status: {e}"))? {
+            Some(status) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    // Read whatever stderr the process produced for the error
+                    // message.  The process has already exited so this won't
+                    // block.
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .map(|mut r| {
+                            let mut s = String::new();
+                            std::io::Read::read_to_string(&mut r, &mut s).ok();
+                            s
+                        })
+                        .unwrap_or_default();
+                    Err(format!(
+                        "Failed to extract non-zip archive with 7z. stderr: {stderr}"
+                    ))
+                };
+            }
+            None => {
+                // Process still running — call tick so the UI can update.
+                tick();
+                std::thread::sleep(std::time::Duration::from_millis(EXTRACTION_TICK_INTERVAL_MS));
+            }
+        }
+    }
+}
+
+/// List all file/directory paths stored inside a non-zip archive by running
+/// `7z l -slt` (technical listing, no extraction).
+///
+/// This is fast for large archives because no data is decompressed — 7z only
+/// reads the archive headers.  The returned paths are exactly as stored inside
+/// the archive (case and separator are preserved).
+fn list_archive_entries_with_7z(archive_path: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("7z")
+        .args(["l", "-slt"])
+        .arg(archive_path)
+        .output()
+        .map_err(|e| {
+            format!(
+                "Failed to start 7z lister ({e}). Install 7-Zip (the '7z' command) to handle .7z and .rar archives."
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("7z list failed for {}: {stderr}", archive_path.display()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_7z_slt_paths(&stdout))
+}
+
+/// Parse `Path = …` lines from the output of `7z l -slt`.
+///
+/// The output contains two kinds of sections:
+/// - An archive-info block starting with `--` (contains the archive's own path
+///   and global metadata).
+/// - Per-entry blocks, each preceded by a `----------` (10-dash) separator.
+///
+/// We only collect paths from per-entry blocks, skipping the archive-info
+/// block, so the archive's own filesystem path is never included.
+fn parse_7z_slt_paths(output: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_file_section = false;
+    for line in output.lines() {
+        if line.starts_with("----------") {
+            in_file_section = true;
+            continue;
+        }
+        if in_file_section {
+            if let Some(path) = line.strip_prefix("Path = ") {
+                let p = path.trim().to_string();
+                if !p.is_empty() {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Extract a single file from a non-zip archive to `dest_dir`, preserving
+/// the directory structure from the archive root.
+///
+/// `file_path_in_archive` must be the exact path as stored in the archive (use
+/// [`list_archive_entries_with_7z`] to discover it).  The file will be placed
+/// at `dest_dir / file_path_in_archive`.
+fn extract_single_file_with_7z(
+    archive_path: &Path,
+    file_path_in_archive: &str,
+    dest_dir: &Path,
+) -> Result<(), String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| {
         format!(
             "Failed to create extraction directory {}: {e}",
@@ -1097,6 +1281,8 @@ fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), S
         .arg("-y")
         .arg(output_arg)
         .arg(archive_path)
+        .arg("--")
+        .arg(file_path_in_archive)
         .output()
         .map_err(|e| {
             format!(
@@ -1107,15 +1293,15 @@ fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), S
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(format!(
-            "Failed to extract non-zip archive with 7z. stdout: {stdout}; stderr: {stderr}"
+            "Failed to extract '{file_path_in_archive}' from archive. stdout: {stdout}; stderr: {stderr}"
         ));
     }
     Ok(())
 }
 
-fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(), String> {
+fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
     let tmp_extract = create_temp_extract_dir()?;
-    extract_archive_with_7z(archive_path, &tmp_extract)?;
+    extract_archive_with_7z(archive_path, &tmp_extract, tick)?;
 
     let mut top_dirs = Vec::new();
     let mut top_files = Vec::new();
@@ -1210,7 +1396,11 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// Detect whether all entries in the archive share a common top-level directory
 /// prefix.  If so, return it (with trailing `/`).
-fn find_common_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> String {
+///
+/// Uses `ZipArchive::file_names()` which only reads the central directory
+/// metadata (no decompression), so this is fast and does not require a
+/// mutable borrow.
+fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String {
     if zip.is_empty() {
         return String::new();
     }
@@ -1218,11 +1408,7 @@ fn find_common_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> String {
     let mut first_top: Option<String> = None;
     let mut all_same = true;
 
-    for i in 0..zip.len() {
-        let Ok(entry) = zip.by_index(i) else {
-            continue;
-        };
-        let name = entry.name();
+    for name in zip.file_names() {
         let top = name.split('/').next().unwrap_or("");
         if top.is_empty() {
             continue;
@@ -1257,19 +1443,23 @@ fn find_common_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> String {
 ///
 /// For each `FomodFile`, extract the `source` path from the archive and place it
 /// at `dest_dir / destination`.
+///
+/// `tick` is called periodically during the non-zip extraction phase so the
+/// caller can pulse a progress indicator.  Pass `&|| {}` when not needed.
 fn install_fomod_files(
     archive_path: &Path,
     dest_dir: &Path,
     files: &[FomodFile],
+    tick: &dyn Fn(),
 ) -> Result<(), String> {
     if !has_zip_extension(archive_path) {
-        return install_fomod_files_non_zip(archive_path, dest_dir, files);
+        return install_fomod_files_non_zip(archive_path, dest_dir, files, tick);
     }
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
-    let archive_prefix = normalise_path(&find_common_prefix(&mut zip));
+    let archive_prefix = normalise_path(&find_common_prefix(&zip));
     let archive_prefix_lower = archive_prefix.to_lowercase();
 
     // Build a map of lowercased entry names → indices for case-insensitive
@@ -1403,9 +1593,10 @@ fn install_fomod_files(
                     .map_err(|e| format!("Failed to create parent dir: {e}"))?;
             }
 
-            let mut out_file =
+            let out_file =
                 std::fs::File::create(&out_path).map_err(|e| format!("Failed to create file: {e}"))?;
-            std::io::copy(&mut entry, &mut out_file).map_err(|e| format!("Failed to extract: {e}"))?;
+            let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
+            std::io::copy(&mut entry, &mut buffered).map_err(|e| format!("Failed to extract: {e}"))?;
         }
     }
 
@@ -1418,9 +1609,10 @@ fn install_fomod_files_non_zip(
     archive_path: &Path,
     dest_dir: &Path,
     files: &[FomodFile],
+    tick: &dyn Fn(),
 ) -> Result<(), String> {
     let tmp = create_temp_extract_dir()?;
-    extract_archive_with_7z(archive_path, &tmp)?;
+    extract_archive_with_7z(archive_path, &tmp, tick)?;
     let result = install_fomod_files_from_dir(&tmp, dest_dir, files);
     if let Err(e) = std::fs::remove_dir_all(&tmp) {
         log::warn!(
@@ -1642,6 +1834,58 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+
+    // ── parse_7z_slt_paths ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_7z_slt_paths_skips_archive_info_block() {
+        // Simulated `7z l -slt` output: first section is archive metadata
+        // (starting with `--`), then per-entry sections after `----------`.
+        let output = "\
+7-Zip 23.01 (x64) : Copyright (c) 1999-2023 Igor Pavlov : 2023-06-20\n\
+\n\
+Listing archive: /path/to/mod.7z\n\
+\n\
+--\n\
+Path = /path/to/mod.7z\n\
+Type = 7z\n\
+Physical Size = 1234\n\
+\n\
+----------\n\
+Path = fomod\n\
+Size = 0\n\
+\n\
+Path = fomod/ModuleConfig.xml\n\
+Size = 256\n\
+\n\
+Path = Data/textures/sky.dds\n\
+Size = 9\n\
+";
+        let paths = parse_7z_slt_paths(output);
+        // Should include per-file entries but NOT the archive path line
+        assert_eq!(
+            paths,
+            vec!["fomod", "fomod/ModuleConfig.xml", "Data/textures/sky.dds"]
+        );
+        assert!(!paths.iter().any(|p| p.contains("/path/to/")));
+    }
+
+    #[test]
+    fn list_archive_entries_with_7z_returns_paths() {
+        if !has_7z() {
+            return;
+        }
+        let tmp = tempdir();
+        let Some(archive) = create_test_7z(&tmp, "list_test.7z") else {
+            return;
+        };
+        let entries = list_archive_entries_with_7z(&archive).unwrap();
+        let lower: Vec<String> = entries.iter().map(|p| p.to_lowercase().replace('\\', "/")).collect();
+        assert!(lower.iter().any(|p| p.ends_with("fomod/moduleconfig.xml")),
+            "expected fomod/moduleconfig.xml in listing, got: {lower:?}");
+        assert!(lower.iter().any(|p| p.ends_with("data/textures/sky.dds")),
+            "expected Data/textures/sky.dds in listing, got: {lower:?}");
+    }
 
     /// Create a simple zip archive in `dir` containing the given entries.
     /// Each entry is (name, content).  Names ending with `/` are directories.
@@ -2010,6 +2254,7 @@ mod tests {
                 destination: "Data/textures".to_string(),
                 priority: 0,
             }],
+            &|| {},
         )
         .unwrap();
 
@@ -2039,6 +2284,7 @@ mod tests {
                 destination: "Data/meshes".to_string(),
                 priority: 0,
             }],
+            &|| {},
         )
         .unwrap();
 
@@ -2067,6 +2313,7 @@ mod tests {
                 destination: "Data".to_string(),
                 priority: 0,
             }],
+            &|| {},
         )
         .unwrap();
 
@@ -2098,6 +2345,7 @@ mod tests {
                 destination: "Data/textures".to_string(),
                 priority: 0,
             }],
+            &|| {},
         )
         .unwrap();
 
@@ -2133,6 +2381,7 @@ mod tests {
                 destination: "Data".to_string(),
                 priority: 0,
             }],
+            &|| {},
         )
         .unwrap();
 
@@ -2312,6 +2561,7 @@ mod tests {
                 destination: "Data/textures".to_string(),
                 priority: 0,
             }],
+            &|| {},
         )
         .unwrap();
 
@@ -2342,7 +2592,7 @@ mod tests {
             destination: "Data/textures".to_string(),
             priority: 0,
         }];
-        install_fomod_files(&archive, &dest_zip, &files).unwrap();
+        install_fomod_files(&archive, &dest_zip, &files, &|| {}).unwrap();
 
         // Now do the same with the dir-based function using a matching tree.
         let extracted = tmp.join("extracted");
