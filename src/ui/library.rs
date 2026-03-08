@@ -14,6 +14,8 @@ use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
+const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
+const POST_LOOP_PROGRESS_STEPS: usize = 2;
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
@@ -156,8 +158,10 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
             let undeploy_total = db.mods.len();
+            // Progress covers both phases in a single bar: cleanup undeploy pass
+            // + enabled-mod deploy pass.
             let deploy_total = db.mods.iter().filter(|m| m.enabled).count();
-            let total_steps = (undeploy_total + deploy_total).max(1);
+            let total_steps = (undeploy_total + deploy_total + POST_LOOP_PROGRESS_STEPS).max(1);
             let mut steps_done = 0usize;
 
             // First, unlink all tracked mods so we start from a clean state
@@ -177,6 +181,10 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
             }
             ModManager::purge_legacy_nested_data_dir(&game_c);
+            steps_done += 1;
+            let frac = steps_done as f64 / total_steps as f64;
+            status_progress_c.set_fraction(frac);
+            status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
 
             // Then deploy all enabled mods.
             //
@@ -201,6 +209,10 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
             }
             let _ = db.write_plugins_txt(&game_c);
+            steps_done += 1;
+            let frac = steps_done as f64 / total_steps as f64;
+            status_progress_c.set_fraction(frac);
+            status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
 
             let msg = if errors.is_empty() {
                 format!("Deployed {deployed_count} mod(s)")
@@ -220,7 +232,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &container_c,
                 false,
             );
-            status_revealer_c.set_reveal_child(false);
+            hide_status_popup_later(status_revealer_c.clone());
             show_toast(btn.upcast_ref(), &msg);
             refresh_library_content_with_search(
                 &container_c,
@@ -263,6 +275,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let mut errors: Vec<String> = Vec::new();
             let mut count = 0;
             let total = db.mods.len();
+            let total_steps = total + POST_LOOP_PROGRESS_STEPS;
             // Unlink ALL mods regardless of enabled state so the game directory
             // is fully clean.  The enabled state is intentionally preserved so
             // the user can re-deploy with the same selection later.
@@ -274,12 +287,18 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 } else {
                     count += 1;
                 }
-                let progress = (idx + 1) as f64 / total.max(1) as f64;
+                let progress = (idx + 1) as f64 / total_steps.max(1) as f64;
                 status_progress_c.set_fraction(progress);
                 status_progress_c.set_text(Some(&format!("{:.0}%", progress * 100.0)));
             }
             ModManager::purge_legacy_nested_data_dir(&game_c);
+            let purge_progress = (total + 1) as f64 / total_steps.max(1) as f64;
+            status_progress_c.set_fraction(purge_progress);
+            status_progress_c.set_text(Some(&format!("{:.0}%", purge_progress * 100.0)));
             let _ = db.write_plugins_txt(&game_c);
+            let write_progress = (total + POST_LOOP_PROGRESS_STEPS) as f64 / total_steps.max(1) as f64;
+            status_progress_c.set_fraction(write_progress);
+            status_progress_c.set_text(Some(&format!("{:.0}%", write_progress * 100.0)));
 
             let msg = if errors.is_empty() {
                 format!("Undeployed {count} mod(s)")
@@ -299,7 +318,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &container_c,
                 false,
             );
-            status_revealer_c.set_reveal_child(false);
+            hide_status_popup_later(status_revealer_c.clone());
             show_toast(btn.upcast_ref(), &msg);
             refresh_library_content_with_search(
                 &container_c,
@@ -424,6 +443,15 @@ fn flush_ui_events() {
     while context.pending() {
         context.iteration(false);
     }
+}
+
+fn hide_status_popup_later(status_revealer: gtk4::Revealer) {
+    gtk4::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(STATUS_POPUP_HIDE_DELAY_MS),
+        move || {
+            status_revealer.set_reveal_child(false);
+        },
+    );
 }
 
 fn build_mod_row(
