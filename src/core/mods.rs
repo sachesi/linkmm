@@ -376,6 +376,25 @@ impl ModManager {
     }
 
     pub fn disable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
+        Self::disable_mod_internal(game, mod_entry, true)
+    }
+
+    pub fn disable_mod_without_legacy_cleanup(game: &Game, mod_entry: &Mod) -> Result<(), String> {
+        Self::disable_mod_internal(game, mod_entry, false)
+    }
+
+    pub fn purge_legacy_nested_data(game: &Game) {
+        let legacy_nested = game.data_path.join("Data");
+        if legacy_nested.is_dir() {
+            purge_symlinks(&legacy_nested);
+        }
+    }
+
+    fn disable_mod_internal(
+        game: &Game,
+        mod_entry: &Mod,
+        purge_legacy_nested_data_dir: bool,
+    ) -> Result<(), String> {
         let target_dir = &game.data_path;
         let data_dir = mod_entry.source_path.join("Data");
         if data_dir.is_dir() {
@@ -389,9 +408,8 @@ impl ModManager {
             // Migration: aggressively clean up the legacy nested Data/Data/
             // structure by removing ALL symlinks from it (not just ones belonging
             // to this mod), then removing any empty directories left behind.
-            let legacy_nested = target_dir.join("Data");
-            if legacy_nested.is_dir() {
-                purge_symlinks(&legacy_nested);
+            if purge_legacy_nested_data_dir {
+                Self::purge_legacy_nested_data(game);
             }
         } else {
             unlink_directory_contents(&mod_entry.source_path, target_dir)?;
