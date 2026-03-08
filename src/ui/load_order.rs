@@ -484,7 +484,7 @@ fn build_plugin_row(
                 let mut db = ModDatabase::load(&game_disable);
                 let ordered = db.get_ordered_plugins(&game_disable);
                 for p in &ordered {
-                    if !p.is_vanilla {
+                    if !p.is_vanilla && !db.plugin_disabled.contains(&p.name) {
                         db.plugin_disabled.insert(p.name.clone());
                     }
                 }

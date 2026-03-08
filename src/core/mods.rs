@@ -360,6 +360,8 @@ impl ModDatabase {
         }
         if !order.is_empty() {
             self.plugin_load_order = order;
+            // `plugins.txt` should not contain duplicates; collect into a set so
+            // malformed files cannot create redundant disabled entries.
             self.plugin_disabled = disabled.into_iter().collect();
         }
     }
@@ -1152,6 +1154,10 @@ mod tests {
         assert_eq!(db.plugin_disabled.len(), 2);
         assert!(db.plugin_disabled.contains("A.esp"));
         assert!(db.plugin_disabled.contains("B.esm"));
+
+        let encoded = serde_json::to_string(&db).unwrap();
+        assert_eq!(encoded.matches("A.esp").count(), 1);
+        assert_eq!(encoded.matches("B.esm").count(), 1);
     }
 
     #[cfg(unix)]
