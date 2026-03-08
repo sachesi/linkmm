@@ -659,24 +659,24 @@ fn update_launch_ui(
 
             let exe_c = exe.clone();
             let game_id_c = g.id.clone();
-            let game_c = g.clone();
             let default_exe_c = Rc::clone(default_exe);
             let split_btn_c = split_btn.clone();
             let popover_c = popover.clone();
             let config_c = Rc::clone(config);
             row.connect_activated(move |_| {
-                // Update the default exe shown on the button.
+                // Update the label and in-memory default exe.
                 *default_exe_c.borrow_mut() = Some(exe_c.clone());
                 split_btn_c.set_label(&exe_c);
                 popover_c.popdown();
                 // Persist the user's choice so it survives a restart.
+                // The game is NOT launched here — the user presses the main
+                // split button to start the game with the chosen executable.
                 {
                     let mut cfg = config_c.borrow_mut();
                     cfg.preferred_executables
                         .insert(game_id_c.clone(), exe_c.clone());
                     cfg.save();
                 }
-                do_launch_game(&game_c, &exe_c);
             });
 
             list.append(&row);
