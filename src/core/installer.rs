@@ -5,6 +5,13 @@ use std::process::Command;
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Write-buffer capacity used when extracting individual archive entries.  A
+/// 256 KB buffer reduces the number of `write` syscalls for archives that
+/// contain many small files.
+const EXTRACT_BUFFER_SIZE: usize = 256 * 1024;
+
 // ── Install strategy ──────────────────────────────────────────────────────────
 
 /// How a mod archive should be installed.
@@ -1058,7 +1065,7 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
             }
             let out_file = std::fs::File::create(&out_path)
                 .map_err(|e| format!("Failed to create file {}: {e}", out_path.display()))?;
-            let mut buffered = BufWriter::with_capacity(256 * 1024, out_file);
+            let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
             std::io::copy(&mut entry, &mut buffered)
                 .map_err(|e| format!("Failed to extract {}: {e}", rel_name))?;
         }
@@ -1395,7 +1402,7 @@ fn install_fomod_files(
 
             let out_file =
                 std::fs::File::create(&out_path).map_err(|e| format!("Failed to create file: {e}"))?;
-            let mut buffered = BufWriter::with_capacity(256 * 1024, out_file);
+            let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
             std::io::copy(&mut entry, &mut buffered).map_err(|e| format!("Failed to extract: {e}"))?;
         }
     }
