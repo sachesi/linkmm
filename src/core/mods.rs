@@ -183,7 +183,7 @@ impl ModDatabase {
         if !data_dir.is_dir() {
             return plugins;
         }
-        let vanilla: HashSet<&str> = game.kind.vanilla_masters().into_iter().collect();
+        let vanilla: HashSet<&str> = game.kind.vanilla_masters().iter().copied().collect();
         if let Ok(entries) = std::fs::read_dir(data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
