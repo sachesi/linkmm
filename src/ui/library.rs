@@ -1,22 +1,34 @@
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
 use gio;
+use gtk4::gdk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
 use crate::core::games::Game;
-use crate::core::mods::{ModDatabase, ModManager};
+use crate::core::mods::{Mod, ModDatabase, ModManager};
+
+const TOAST_TIMEOUT_SECONDS: u32 = 3;
+
+#[derive(Debug, Clone, Default)]
+struct ConflictState {
+    overwrites: bool,
+    overwritten: bool,
+    files: BTreeSet<String>,
+    conflict_mods_by_file: BTreeMap<String, BTreeSet<String>>,
+}
 
 /// Build the full Library page for `game`.
 pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
-    let title_widget = adw::WindowTitle::new("Library", &game.name);
+    let title_widget = adw::WindowTitle::new("Library", "");
     header.set_title_widget(Some(&title_widget));
 
     let search_entry = gtk4::SearchEntry::new();
@@ -38,12 +50,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     undeploy_btn.set_tooltip_text(Some("Remove all mod symlinks from the game directory"));
     header.pack_end(&undeploy_btn);
 
-    // Add-mod button
-    let add_mod_btn = gtk4::Button::new();
-    add_mod_btn.set_icon_name("list-add-symbolic");
-    add_mod_btn.set_tooltip_text(Some("Add Mod"));
-    header.pack_end(&add_mod_btn);
-
     toolbar_view.add_top_bar(&header);
 
     let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -51,28 +57,25 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     let game_rc = Rc::new(game.clone());
     let search_query = Rc::new(RefCell::new(String::new()));
+    let selected_mod_id = Rc::new(RefCell::new(None::<String>));
 
     refresh_library_content_with_search(
         &content_container,
         &game_rc,
         Rc::clone(&config),
         &search_query.borrow(),
+        Rc::clone(&search_query),
+        Rc::clone(&selected_mod_id),
     );
 
     toolbar_view.set_content(Some(&content_container));
-
-    wire_add_mod_button(
-        &add_mod_btn,
-        &game_rc,
-        &content_container,
-        Rc::clone(&config),
-    );
 
     {
         let container_c = content_container.clone();
         let game_c = Rc::clone(&game_rc);
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
+        let selected_c = Rc::clone(&selected_mod_id);
         search_entry.connect_search_changed(move |entry| {
             *search_c.borrow_mut() = entry.text().to_string();
             refresh_library_content_with_search(
@@ -80,6 +83,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &game_c,
                 Rc::clone(&config_c),
                 &search_c.borrow(),
+                Rc::clone(&search_c),
+                Rc::clone(&selected_c),
             );
         });
     }
@@ -90,6 +95,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let container_c = content_container.clone();
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
+        let selected_c = Rc::clone(&selected_mod_id);
         deploy_btn.connect_clicked(move |btn| {
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
@@ -101,9 +107,16 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 }
             }
 
-            // Then deploy all enabled mods
+            // Then deploy all enabled mods.
+            //
+            // The linker helpers skip creating a new link when a destination
+            // file already exists, so the first deployed mod "wins" each
+            // conflicting path. Because UI priority is defined as
+            // top (lowest priority) -> bottom (highest priority), we deploy in
+            // reverse visual order to ensure the bottom-most enabled mod wins
+            // conflicts.
             let mut deployed_count = 0usize;
-            for m in db.mods.iter().filter(|m| m.enabled) {
+            for m in db.mods.iter().rev().filter(|m| m.enabled) {
                 if let Err(e) = ModManager::enable_mod(&game_c, m) {
                     errors.push(format!("{}: {}", m.name, e));
                 } else {
@@ -126,6 +139,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &game_c,
                 Rc::clone(&config_c),
                 &search_c.borrow(),
+                Rc::clone(&search_c),
+                Rc::clone(&selected_c),
             );
         });
     }
@@ -136,6 +151,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let container_c = content_container.clone();
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
+        let selected_c = Rc::clone(&selected_mod_id);
         undeploy_btn.connect_clicked(move |btn| {
             let db = ModDatabase::load(&game_c);
             let mut errors: Vec<String> = Vec::new();
@@ -166,6 +182,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &game_c,
                 Rc::clone(&config_c),
                 &search_c.borrow(),
+                Rc::clone(&search_c),
+                Rc::clone(&selected_c),
             );
         });
     }
@@ -175,15 +193,13 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-fn refresh_library_content(container: &gtk4::Box, game: &Rc<Game>, config: Rc<RefCell<AppConfig>>) {
-    refresh_library_content_with_search(container, game, config, "");
-}
-
 fn refresh_library_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
     config: Rc<RefCell<AppConfig>>,
     search_query: &str,
+    search_state: Rc<RefCell<String>>,
+    selected_mod_id: Rc<RefCell<Option<String>>>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -192,6 +208,12 @@ fn refresh_library_content_with_search(
     let mut db = ModDatabase::load(game);
     db.scan_mods_dir(game);
     db.save(game);
+
+    if let Some(selected) = selected_mod_id.borrow().as_ref() {
+        if !db.mods.iter().any(|m| &m.id == selected) {
+            *selected_mod_id.borrow_mut() = None;
+        }
+    }
 
     let visible_mods: Vec<_> = db
         .mods
@@ -213,33 +235,30 @@ fn refresh_library_content_with_search(
         }
         let status = adw::StatusPage::builder()
             .title("No Mods Installed")
-            .description(&format!(
-                "Install mods for {} from the Downloads page or by clicking the \u{201c}+\u{201d} button to select a mod archive.",
-                game.name
-            ))
             .icon_name("package-x-generic-symbolic")
             .build();
         status.set_vexpand(true);
-
-        let add_btn = gtk4::Button::with_label("Add Mod\u{2026}");
-        add_btn.add_css_class("suggested-action");
-        add_btn.add_css_class("pill");
-        add_btn.set_halign(gtk4::Align::Center);
-
-        let game_clone = Rc::clone(game);
-        let container_clone = container.clone();
-        let config_clone = Rc::clone(&config);
-        wire_add_mod_button(&add_btn, &game_clone, &container_clone, config_clone);
-
-        status.set_child(Some(&add_btn));
         container.append(&status);
     } else {
+        let selected = selected_mod_id.borrow().clone();
+        let conflict_states = compute_conflict_states(&db.mods, selected.as_deref());
+
         let list_box = gtk4::ListBox::new();
         list_box.add_css_class("boxed-list");
         list_box.set_selection_mode(gtk4::SelectionMode::None);
 
-        for mod_entry in &visible_mods {
-            let row = build_mod_row(mod_entry, game, container, Rc::clone(&config));
+        for (idx, mod_entry) in visible_mods.iter().enumerate() {
+            let row = build_mod_row(
+                mod_entry,
+                idx,
+                visible_mods.len(),
+                game,
+                container,
+                Rc::clone(&config),
+                Rc::clone(&search_state),
+                Rc::clone(&selected_mod_id),
+                conflict_states.get(&mod_entry.id),
+            );
             list_box.append(&row);
         }
 
@@ -260,119 +279,16 @@ fn refresh_library_content_with_search(
     }
 }
 
-fn wire_add_mod_button(
-    btn: &gtk4::Button,
-    game: &Rc<Game>,
-    container: &gtk4::Box,
-    config: Rc<RefCell<AppConfig>>,
-) {
-    let game_clone = Rc::clone(game);
-    let container_clone = container.clone();
-    let config_clone = Rc::clone(&config);
-
-    btn.connect_clicked(move |b| {
-        let parent = b.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-        let dialog = gtk4::FileDialog::new();
-        dialog.set_title("Select Mod Archive");
-
-        // Allow supported mod archive formats
-        let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("Mod archives (*.zip, *.7z, *.rar)"));
-        filter.add_pattern("*.zip");
-        filter.add_pattern("*.7z");
-        filter.add_pattern("*.rar");
-        let filters = gio::ListStore::new::<gtk4::FileFilter>();
-        filters.append(&filter);
-        dialog.set_filters(Some(&filters));
-
-        let game2 = Rc::clone(&game_clone);
-        let container2 = container_clone.clone();
-        let config2 = Rc::clone(&config_clone);
-        dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
-            if let Ok(file) = result {
-                if let Some(path) = file.path() {
-                    if !path.is_file() {
-                        return;
-                    }
-
-                    let archive_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Unknown".to_string());
-
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(|s| s.to_lowercase())
-                        .unwrap_or_default();
-
-                    if !["zip", "7z", "rar"].contains(&ext.as_str()) {
-                        log::error!("Only .zip, .7z, and .rar archives are supported for installation");
-                        return;
-                    }
-
-                    let strategy = match crate::core::installer::detect_strategy(&path) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            log::error!("Failed to detect install strategy: {e}");
-                            return;
-                        }
-                    };
-
-                    let game_rc: Rc<Option<Game>> = Rc::new(Some((*game2).clone()));
-
-                    // For FOMOD mods, launch the wizard
-                    if let crate::core::installer::InstallStrategy::Fomod(_) = &strategy {
-                        if let Ok(fomod_config) =
-                            crate::core::installer::parse_fomod_from_zip(&path)
-                        {
-                            crate::ui::downloads::show_fomod_wizard_from_library(
-                                None,
-                                &path,
-                                &archive_name,
-                                &game2,
-                                &config2,
-                                &container2,
-                                &fomod_config,
-                                &game_rc,
-                            );
-                            return;
-                        }
-                    }
-
-                    // Non-FOMOD: use detected strategy directly
-                    let mod_name = std::path::Path::new(&archive_name)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| archive_name.clone());
-
-                    match crate::core::installer::install_mod_from_archive(
-                        &path, &game2, &mod_name, &strategy,
-                    ) {
-                        Ok(_) => {
-                            let mut cfg = config2.borrow_mut();
-                            if !cfg.installed_archives.contains(&archive_name) {
-                                cfg.installed_archives.push(archive_name.clone());
-                            }
-                            cfg.save();
-                            drop(cfg);
-                            refresh_library_content(&container2, &game2, Rc::clone(&config2));
-                        }
-                        Err(e) => {
-                            log::error!("Failed to install mod: {e}");
-                        }
-                    }
-                }
-            }
-        });
-    });
-}
-
 fn build_mod_row(
-    mod_entry: &crate::core::mods::Mod,
+    mod_entry: &Mod,
+    idx: usize,
+    total: usize,
     game: &Rc<Game>,
     container: &gtk4::Box,
     config: Rc<RefCell<AppConfig>>,
+    search_state: Rc<RefCell<String>>,
+    selected_mod_id: Rc<RefCell<Option<String>>>,
+    conflict_state: Option<&ConflictState>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title(&mod_entry.name)
@@ -390,6 +306,28 @@ fn build_mod_row(
         row.set_subtitle(&subtitle);
     }
 
+    // Drag handle + index prefix
+    let drag_handle = gtk4::Image::from_icon_name("list-drag-handle-symbolic");
+    drag_handle.add_css_class("dim-label");
+    drag_handle.set_tooltip_text(Some("Drag to reorder"));
+    row.add_prefix(&drag_handle);
+
+    let index_label = gtk4::Label::new(Some(&format!("{}", idx + 1)));
+    index_label.add_css_class("dim-label");
+    index_label.add_css_class("numeric");
+    index_label.set_width_chars(3);
+    row.add_prefix(&index_label);
+
+    if let Some(state) = conflict_state {
+        if state.overwritten {
+            row.add_css_class("error");
+        } else if state.overwrites {
+            row.add_css_class("success");
+        } else if !state.files.is_empty() {
+            row.add_css_class("accent");
+        }
+    }
+
     let mod_id = mod_entry.id.clone();
     let game_clone = Rc::clone(game);
 
@@ -401,6 +339,134 @@ fn build_mod_row(
             db.save(&game_clone);
         }
     });
+
+    // Move up / down
+    let up_btn = gtk4::Button::new();
+    up_btn.set_icon_name("go-up-symbolic");
+    up_btn.set_valign(gtk4::Align::Center);
+    up_btn.add_css_class("flat");
+    up_btn.set_tooltip_text(Some("Move up"));
+    up_btn.set_sensitive(idx > 0);
+
+    let down_btn = gtk4::Button::new();
+    down_btn.set_icon_name("go-down-symbolic");
+    down_btn.set_valign(gtk4::Align::Center);
+    down_btn.add_css_class("flat");
+    down_btn.set_tooltip_text(Some("Move down"));
+    down_btn.set_sensitive(idx + 1 < total);
+
+    row.add_suffix(&up_btn);
+    row.add_suffix(&down_btn);
+
+    {
+        let game_c = Rc::clone(game);
+        let container_c = container.clone();
+        let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_state);
+        let selected_c = Rc::clone(&selected_mod_id);
+        let mod_id_c = mod_entry.id.clone();
+        up_btn.connect_clicked(move |_| {
+            let mut db = ModDatabase::load(&game_c);
+            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c) {
+                if pos > 0 {
+                    db.mods.swap(pos, pos - 1);
+                    db.save(&game_c);
+                    refresh_library_content_with_search(
+                        &container_c,
+                        &game_c,
+                        Rc::clone(&config_c),
+                        &search_c.borrow(),
+                        Rc::clone(&search_c),
+                        Rc::clone(&selected_c),
+                    );
+                }
+            }
+        });
+    }
+
+    {
+        let game_c = Rc::clone(game);
+        let container_c = container.clone();
+        let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_state);
+        let selected_c = Rc::clone(&selected_mod_id);
+        let mod_id_c = mod_entry.id.clone();
+        down_btn.connect_clicked(move |_| {
+            let mut db = ModDatabase::load(&game_c);
+            let len = db.mods.len();
+            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c) {
+                if pos + 1 < len {
+                    db.mods.swap(pos, pos + 1);
+                    db.save(&game_c);
+                    refresh_library_content_with_search(
+                        &container_c,
+                        &game_c,
+                        Rc::clone(&config_c),
+                        &search_c.borrow(),
+                        Rc::clone(&search_c),
+                        Rc::clone(&selected_c),
+                    );
+                }
+            }
+        });
+    }
+
+    // Drag-and-drop reorder
+    let drag_source = gtk4::DragSource::new();
+    drag_source.set_actions(gdk::DragAction::MOVE);
+    {
+        let mod_id_drag = mod_entry.id.clone();
+        drag_source.connect_prepare(move |_, _, _| {
+            let value = mod_id_drag.to_value();
+            Some(gdk::ContentProvider::for_value(&value))
+        });
+    }
+    {
+        let row_c = row.clone();
+        drag_source.connect_drag_begin(move |src, _| {
+            let paintable = gtk4::WidgetPaintable::new(Some(&row_c));
+            src.set_icon(Some(&paintable), 0, 0);
+        });
+    }
+    row.add_controller(drag_source);
+
+    let drop_target = gtk4::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+    {
+        let game_drop = Rc::clone(game);
+        let container_drop = container.clone();
+        let config_drop = Rc::clone(&config);
+        let search_drop = Rc::clone(&search_state);
+        let selected_drop = Rc::clone(&selected_mod_id);
+        let target_id = mod_entry.id.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            let Ok(source_id) = value.get::<String>() else {
+                return false;
+            };
+            if source_id == target_id {
+                return false;
+            }
+            let mut db = ModDatabase::load(&game_drop);
+            if let (Some(src_pos), Some(tgt_pos)) = (
+                db.mods.iter().position(|m| m.id == source_id),
+                db.mods.iter().position(|m| m.id == target_id),
+            ) {
+                let moved = db.mods.remove(src_pos);
+                let insert_pos = adjusted_insert_pos(src_pos, tgt_pos);
+                db.mods.insert(insert_pos, moved);
+                db.save(&game_drop);
+                refresh_library_content_with_search(
+                    &container_drop,
+                    &game_drop,
+                    Rc::clone(&config_drop),
+                    &search_drop.borrow(),
+                    Rc::clone(&search_drop),
+                    Rc::clone(&selected_drop),
+                );
+            }
+            true
+        });
+    }
+    row.add_controller(drop_target);
 
     // ── Uninstall button ─────────────────────────────────────────────────────
     let delete_btn = gtk4::Button::new();
@@ -415,6 +481,8 @@ fn build_mod_row(
     let game_del = Rc::clone(game);
     let container_del = container.clone();
     let config_del = Rc::clone(&config);
+    let search_del = Rc::clone(&search_state);
+    let selected_del = Rc::clone(&selected_mod_id);
 
     delete_btn.connect_clicked(move |btn| {
         let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
@@ -422,7 +490,7 @@ fn build_mod_row(
         let dialog = adw::AlertDialog::builder()
             .heading("Remove Mod?")
             .body(format!(
-                "\u{201c}{}\u{201d} will be permanently removed from disk.",
+                "“{}” will be permanently removed from disk.",
                 mod_name_del
             ))
             .build();
@@ -437,6 +505,8 @@ fn build_mod_row(
         let game_c = Rc::clone(&game_del);
         let container_c = container_del.clone();
         let config_c = Rc::clone(&config_del);
+        let search_c = Rc::clone(&search_del);
+        let selected_c = Rc::clone(&selected_del);
         dialog.connect_response(None, move |_, response| {
             if response != "remove" {
                 return;
@@ -460,13 +530,400 @@ fn build_mod_row(
                     cfg.save();
                 }
             }
-            refresh_library_content(&container_c, &game_c, Rc::clone(&config_c));
+            if selected_c
+                .borrow()
+                .as_ref()
+                .map(|id| id == &mod_id_c)
+                .unwrap_or(false)
+            {
+                *selected_c.borrow_mut() = None;
+            }
+            refresh_library_content_with_search(
+                &container_c,
+                &game_c,
+                Rc::clone(&config_c),
+                &search_c.borrow(),
+                Rc::clone(&search_c),
+                Rc::clone(&selected_c),
+            );
         });
 
         dialog.present(parent.as_ref());
     });
 
+    // Left click selects a mod for conflict highlighting
+    let left_click = gtk4::GestureClick::new();
+    left_click.set_button(1);
+    {
+        let game_sel = Rc::clone(game);
+        let container_sel = container.clone();
+        let config_sel = Rc::clone(&config);
+        let search_sel = Rc::clone(&search_state);
+        let selected_sel = Rc::clone(&selected_mod_id);
+        let mod_id_sel = mod_entry.id.clone();
+        // Use `released` (not `pressed`) so built-in SwitchRow controls process
+        // the click first; refreshing immediately on press can swallow toggle
+        // interactions and make row controls feel broken.
+        left_click.connect_released(move |_, _, _, _| {
+            {
+                let mut selected = selected_sel.borrow_mut();
+                if selected.as_ref() == Some(&mod_id_sel) {
+                    // Clicking the same row again clears selection and returns
+                    // conflict highlighting to the global blue mode.
+                    *selected = None;
+                } else {
+                    *selected = Some(mod_id_sel.clone());
+                }
+            }
+            // Defer refresh so switch/button default handlers run first; this
+            // keeps row toggles and other left-click controls responsive.
+            let container_idle = container_sel.clone();
+            let game_idle = Rc::clone(&game_sel);
+            let config_idle = Rc::clone(&config_sel);
+            let search_idle = Rc::clone(&search_sel);
+            let selected_idle = Rc::clone(&selected_sel);
+            gtk4::glib::idle_add_local_once(move || {
+                refresh_library_content_with_search(
+                    &container_idle,
+                    &game_idle,
+                    Rc::clone(&config_idle),
+                    &search_idle.borrow(),
+                    Rc::clone(&search_idle),
+                    Rc::clone(&selected_idle),
+                );
+            });
+        });
+    }
+    row.add_controller(left_click);
+
+    // ── Right-click context menu ──────────────────────────────────────────────
+    let right_click = gtk4::GestureClick::new();
+    right_click.set_button(3);
+    {
+        let row_c = row.clone();
+        let source_path = mod_entry.source_path.clone();
+        let nexus_id = mod_entry.nexus_id;
+        let game_c = Rc::clone(game);
+        let conflict_entries = conflict_state
+            .map(|state| {
+                state
+                    .conflict_mods_by_file
+                    .iter()
+                    .map(|(file, mods)| (file.clone(), mods.iter().cloned().collect::<Vec<_>>()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        right_click.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+
+            let popover = gtk4::Popover::new();
+            popover.set_parent(&row_c);
+            let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            popover.set_pointing_to(Some(&rect));
+            popover.set_has_arrow(false);
+
+            let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            menu_box.set_margin_top(4);
+            menu_box.set_margin_bottom(4);
+            menu_box.set_margin_start(4);
+            menu_box.set_margin_end(4);
+
+            let open_dir_item = gtk4::Button::with_label("Open Mod Directory");
+            open_dir_item.add_css_class("flat");
+            open_dir_item.set_halign(gtk4::Align::Fill);
+            open_dir_item.set_hexpand(true);
+            menu_box.append(&open_dir_item);
+
+            let open_nexus_item = gtk4::Button::with_label("Visit on Nexus Mods");
+            open_nexus_item.add_css_class("flat");
+            open_nexus_item.set_halign(gtk4::Align::Fill);
+            open_nexus_item.set_hexpand(true);
+            open_nexus_item.set_sensitive(nexus_id.is_some());
+            menu_box.append(&open_nexus_item);
+
+            let show_conflicts_item = gtk4::Button::with_label("Show Conflicting Files");
+            show_conflicts_item.add_css_class("flat");
+            show_conflicts_item.set_halign(gtk4::Align::Fill);
+            show_conflicts_item.set_hexpand(true);
+            show_conflicts_item.set_sensitive(!conflict_entries.is_empty());
+            menu_box.append(&show_conflicts_item);
+
+            popover.set_child(Some(&menu_box));
+
+            let popover_dir = popover.clone();
+            let source_dir = source_path.clone();
+            open_dir_item.connect_clicked(move |_| {
+                popover_dir.popdown();
+                open_in_file_manager(&source_dir);
+            });
+
+            let popover_nexus = popover.clone();
+            let game_nexus = Rc::clone(&game_c);
+            open_nexus_item.connect_clicked(move |_| {
+                popover_nexus.popdown();
+                if let Some(id) = nexus_id {
+                    let uri = format!(
+                        "https://www.nexusmods.com/{}/mods/{}",
+                        game_nexus.kind.nexus_game_id(),
+                        id
+                    );
+                    let _ =
+                        gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                }
+            });
+
+            let popover_conflicts = popover.clone();
+            let row_for_dialog = row_c.clone();
+            let conflict_entries_for_menu = conflict_entries.clone();
+            show_conflicts_item.connect_clicked(move |_| {
+                popover_conflicts.popdown();
+                if conflict_entries_for_menu.is_empty() {
+                    return;
+                }
+
+                let body = conflict_entries_for_menu
+                    .iter()
+                    .map(|(file, mods)| {
+                        if mods.is_empty() {
+                            format!("• {file}")
+                        } else {
+                            format!("• {file}\n  conflicts with: {}", mods.join(", "))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Conflicting Files")
+                    .body(&body)
+                    .build();
+                dialog.add_response("ok", "OK");
+                dialog.set_default_response(Some("ok"));
+                dialog.set_close_response("ok");
+                let parent = row_for_dialog
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                dialog.present(parent.as_ref());
+            });
+
+            popover.popup();
+        });
+    }
+    row.add_controller(right_click);
+
     row
+}
+
+/// Compute target insertion index after removing an item from `src_pos`.
+///
+/// If `src_pos < target_idx`, removing the source shifts subsequent indices
+/// down by one, so the insertion position must be decremented to preserve the
+/// intended visual drop target.
+fn adjusted_insert_pos(src_pos: usize, target_idx: usize) -> usize {
+    if src_pos < target_idx {
+        target_idx.saturating_sub(1)
+    } else {
+        target_idx
+    }
+}
+
+fn compute_conflict_states(
+    mods: &[Mod],
+    selected_id: Option<&str>,
+) -> HashMap<String, ConflictState> {
+    let global_states = compute_global_conflict_states(mods);
+
+    if let Some(selected_id) = selected_id {
+        let Some(selected_idx) = mods.iter().position(|m| m.id == selected_id) else {
+            return global_states;
+        };
+
+        let selected_files = collect_mod_target_files(&mods[selected_idx]);
+        if selected_files.is_empty() {
+            return global_states;
+        }
+
+        let mut states: HashMap<String, ConflictState> = HashMap::new();
+        for (idx, m) in mods.iter().enumerate() {
+            if idx == selected_idx {
+                continue;
+            }
+            let files = collect_mod_target_files(m);
+            if files.is_empty() {
+                continue;
+            }
+
+            let shared: BTreeSet<String> = selected_files.intersection(&files).cloned().collect();
+            if shared.is_empty() {
+                continue;
+            }
+
+            // With selection active: preserve green/red directionality by order.
+            if idx > selected_idx {
+                states.entry(m.id.clone()).or_default().overwrites = true;
+                states
+                    .entry(selected_id.to_string())
+                    .or_default()
+                    .overwritten = true;
+            } else {
+                states.entry(m.id.clone()).or_default().overwritten = true;
+                states
+                    .entry(selected_id.to_string())
+                    .or_default()
+                    .overwrites = true;
+            }
+
+            states
+                .entry(m.id.clone())
+                .or_default()
+                .files
+                .extend(shared.iter().cloned());
+            {
+                let entry = states.entry(m.id.clone()).or_default();
+                for file in &shared {
+                    entry
+                        .conflict_mods_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(mods[selected_idx].name.clone());
+                }
+            }
+            states
+                .entry(selected_id.to_string())
+                .or_default()
+                .files
+                .extend(shared.iter().cloned());
+            {
+                let entry = states.entry(selected_id.to_string()).or_default();
+                for file in &shared {
+                    entry
+                        .conflict_mods_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(m.name.clone());
+                }
+            }
+        }
+        // If selected mod has no conflicts, keep the global blue conflict mode.
+        if states.is_empty() {
+            global_states
+        } else {
+            states
+        }
+    } else {
+        global_states
+    }
+}
+
+fn compute_global_conflict_states(mods: &[Mod]) -> HashMap<String, ConflictState> {
+    let mut states: HashMap<String, ConflictState> = HashMap::new();
+    let all_files: Vec<BTreeSet<String>> = mods.iter().map(collect_mod_target_files).collect();
+
+    for i in 0..mods.len() {
+        if all_files[i].is_empty() {
+            continue;
+        }
+        for j in (i + 1)..mods.len() {
+            if all_files[j].is_empty() {
+                continue;
+            }
+            let shared: BTreeSet<String> = all_files[i].intersection(&all_files[j]).cloned().collect();
+            if shared.is_empty() {
+                continue;
+            }
+
+            states
+                .entry(mods[i].id.clone())
+                .or_default()
+                .files
+                .extend(shared.iter().cloned());
+            {
+                let entry = states.entry(mods[i].id.clone()).or_default();
+                for file in &shared {
+                    entry
+                        .conflict_mods_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(mods[j].name.clone());
+                }
+            }
+            states
+                .entry(mods[j].id.clone())
+                .or_default()
+                .files
+                .extend(shared.iter().cloned());
+            {
+                let entry = states.entry(mods[j].id.clone()).or_default();
+                for file in &shared {
+                    entry
+                        .conflict_mods_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(mods[i].name.clone());
+                }
+            }
+        }
+    }
+
+    states
+}
+
+fn collect_mod_target_files(mod_entry: &Mod) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    let root = &mod_entry.source_path;
+    let data_dir = root.join("Data");
+
+    if data_dir.is_dir() {
+        collect_files_recursive(&data_dir, &data_dir, "data", &mut files);
+
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.file_name().map(|n| n == "Data").unwrap_or(false) {
+                    continue;
+                }
+                if path.is_dir() {
+                    collect_files_recursive(&path, root, "root", &mut files);
+                } else if path.is_file() {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        files.insert(normalize_relative_path("root", rel));
+                    }
+                }
+            }
+        }
+    } else {
+        collect_files_recursive(root, root, "data", &mut files);
+    }
+
+    files
+}
+
+fn collect_files_recursive(base: &Path, root: &Path, prefix: &str, files: &mut BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(&path, root, prefix, files);
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                files.insert(normalize_relative_path(prefix, rel));
+            }
+        }
+    }
+}
+
+fn normalize_relative_path(prefix: &str, rel: &Path) -> String {
+    let rel = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_lowercase();
+    format!("{prefix}/{rel}")
 }
 
 fn matches_query(value: &str, query: &str) -> bool {
@@ -477,6 +934,12 @@ fn matches_query(value: &str, query: &str) -> bool {
     value.to_lowercase().contains(&trimmed.to_lowercase())
 }
 
+fn open_in_file_manager(path: &Path) {
+    let file = gio::File::for_path(path);
+    let uri = file.uri();
+    let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+}
+
 /// Show a brief in-app toast notification anchored to `widget`.
 fn show_toast(widget: &gtk4::Widget, message: &str) {
     // Walk up to the nearest AdwToastOverlay
@@ -484,7 +947,7 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
     while let Some(current) = ancestor {
         if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
             let toast = adw::Toast::new(message);
-            toast.set_timeout(3);
+            toast.set_timeout(TOAST_TIMEOUT_SECONDS);
             overlay.add_toast(toast);
             return;
         }
@@ -496,12 +959,200 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::matches_query;
+    use super::{adjusted_insert_pos, compute_conflict_states, matches_query};
+    use crate::core::mods::Mod;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sample_mod(id: &str, name: &str, path: &str) -> Mod {
+        Mod {
+            id: id.to_string(),
+            name: name.to_string(),
+            version: None,
+            enabled: false,
+            priority: 0,
+            nexus_id: None,
+            source_path: PathBuf::from(path),
+            installed_from_nexus: false,
+        }
+    }
 
     #[test]
     fn matches_query_is_case_insensitive() {
         assert!(matches_query("Immersive Armors", "arm"));
         assert!(matches_query("Immersive Armors", "  ARMORS  "));
         assert!(!matches_query("Immersive Armors", "weapons"));
+    }
+
+    #[test]
+    fn adjusted_insert_pos_accounts_for_source_removal() {
+        assert_eq!(adjusted_insert_pos(0, 2), 1);
+        assert_eq!(adjusted_insert_pos(3, 1), 1);
+    }
+
+    #[test]
+    fn compute_conflict_states_returns_empty_without_selection() {
+        let mods = vec![sample_mod("a", "A", "/tmp/a")];
+        let states = compute_conflict_states(&mods, None);
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn compute_conflict_states_detects_shared_files_between_mods() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("linkmm-conflict-test-{unique}"));
+        let mod_a = root.join("a");
+        let mod_b = root.join("b");
+        let mod_c = root.join("c");
+
+        std::fs::create_dir_all(mod_a.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_b.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_c.join("Data/textures")).unwrap();
+        std::fs::write(mod_a.join("Data/textures/sky.dds"), "a").unwrap();
+        std::fs::write(mod_b.join("Data/textures/sky.dds"), "b").unwrap();
+        std::fs::write(mod_c.join("Data/textures/cloud.dds"), "c").unwrap();
+
+        let mods = vec![
+            sample_mod("a", "A", &mod_a.to_string_lossy()),
+            sample_mod("b", "B", &mod_b.to_string_lossy()),
+            sample_mod("c", "C", &mod_c.to_string_lossy()),
+        ];
+
+        let states = compute_conflict_states(&mods, Some("a"));
+        let selected = states.get("a").unwrap();
+        let conflicting = states.get("b").unwrap();
+        assert!(selected.files.contains("data/textures/sky.dds"));
+        assert!(conflicting.files.contains("data/textures/sky.dds"));
+        assert!(
+            selected
+                .conflict_mods_by_file
+                .get("data/textures/sky.dds")
+                .unwrap()
+                .contains("B")
+        );
+        assert!(
+            conflicting
+                .conflict_mods_by_file
+                .get("data/textures/sky.dds")
+                .unwrap()
+                .contains("A")
+        );
+        assert!(!states.contains_key("c"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compute_conflict_states_marks_all_conflicting_mods_when_nothing_selected() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("linkmm-conflict-none-test-{unique}"));
+        let mod_a = root.join("a");
+        let mod_b = root.join("b");
+
+        std::fs::create_dir_all(mod_a.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_b.join("Data/textures")).unwrap();
+        std::fs::write(mod_a.join("Data/textures/sky.dds"), "a").unwrap();
+        std::fs::write(mod_b.join("Data/textures/sky.dds"), "b").unwrap();
+
+        let mods = vec![
+            sample_mod("a", "A", &mod_a.to_string_lossy()),
+            sample_mod("b", "B", &mod_b.to_string_lossy()),
+        ];
+
+        let states = compute_conflict_states(&mods, None);
+        let a = states.get("a").unwrap();
+        let b = states.get("b").unwrap();
+        assert!(a.files.contains("data/textures/sky.dds"));
+        assert!(b.files.contains("data/textures/sky.dds"));
+        assert!(
+            a.conflict_mods_by_file
+                .get("data/textures/sky.dds")
+                .unwrap()
+                .contains("B")
+        );
+        assert!(
+            b.conflict_mods_by_file
+                .get("data/textures/sky.dds")
+                .unwrap()
+                .contains("A")
+        );
+        assert!(!a.overwrites && !a.overwritten);
+        assert!(!b.overwrites && !b.overwritten);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compute_conflict_states_classifies_overwrite_direction_with_selection() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("linkmm-conflict-dir-test-{unique}"));
+        let mod_a = root.join("a");
+        let mod_b = root.join("b");
+
+        std::fs::create_dir_all(mod_a.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_b.join("Data/textures")).unwrap();
+        std::fs::write(mod_a.join("Data/textures/sky.dds"), "a").unwrap();
+        std::fs::write(mod_b.join("Data/textures/sky.dds"), "b").unwrap();
+
+        let mods = vec![
+            sample_mod("a", "A", &mod_a.to_string_lossy()),
+            sample_mod("b", "B", &mod_b.to_string_lossy()),
+        ];
+
+        let states = compute_conflict_states(&mods, Some("a"));
+        let selected = states.get("a").unwrap();
+        let other = states.get("b").unwrap();
+        assert!(selected.overwritten);
+        assert!(!selected.overwrites);
+        assert!(other.overwrites);
+        assert!(!other.overwritten);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compute_conflict_states_keeps_global_blue_conflicts_when_selected_mod_has_none() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("linkmm-conflict-fallback-test-{unique}"));
+        let mod_a = root.join("a");
+        let mod_b = root.join("b");
+        let mod_c = root.join("c");
+
+        std::fs::create_dir_all(mod_a.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_b.join("Data/textures")).unwrap();
+        std::fs::create_dir_all(mod_c.join("Data/meshes")).unwrap();
+        std::fs::write(mod_a.join("Data/textures/sky.dds"), "a").unwrap();
+        std::fs::write(mod_b.join("Data/textures/sky.dds"), "b").unwrap();
+        std::fs::write(mod_c.join("Data/meshes/rock.nif"), "c").unwrap();
+
+        let mods = vec![
+            sample_mod("a", "A", &mod_a.to_string_lossy()),
+            sample_mod("b", "B", &mod_b.to_string_lossy()),
+            sample_mod("c", "C", &mod_c.to_string_lossy()),
+        ];
+
+        // Select C (no conflicts) -> A/B must still remain in blue-mode data.
+        let states = compute_conflict_states(&mods, Some("c"));
+        let a = states.get("a").unwrap();
+        let b = states.get("b").unwrap();
+        assert!(a.files.contains("data/textures/sky.dds"));
+        assert!(b.files.contains("data/textures/sky.dds"));
+        assert!(!a.overwrites && !a.overwritten);
+        assert!(!b.overwrites && !b.overwritten);
+        assert!(!states.contains_key("c"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

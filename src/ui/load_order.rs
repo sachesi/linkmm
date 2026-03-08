@@ -18,10 +18,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
-    let title_widget = match game {
-        Some(g) => adw::WindowTitle::new("Load Order", &g.name),
-        None => adw::WindowTitle::new("Load Order", ""),
-    };
+    let title_widget = adw::WindowTitle::new("Load Order", "");
     header.set_title_widget(Some(&title_widget));
 
     let search_entry = gtk4::SearchEntry::new();
