@@ -424,6 +424,21 @@ fn build_plugin_row(
             move_item.set_hexpand(true);
             menu_box.append(&move_item);
 
+            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            menu_box.append(&sep);
+
+            let enable_all_item = gtk4::Button::with_label("Enable All");
+            enable_all_item.add_css_class("flat");
+            enable_all_item.set_halign(gtk4::Align::Fill);
+            enable_all_item.set_hexpand(true);
+            menu_box.append(&enable_all_item);
+
+            let disable_all_item = gtk4::Button::with_label("Disable All");
+            disable_all_item.add_css_class("flat");
+            disable_all_item.set_halign(gtk4::Align::Fill);
+            disable_all_item.set_hexpand(true);
+            menu_box.append(&disable_all_item);
+
             popover.set_child(Some(&menu_box));
 
             let popover_c = popover.clone();
@@ -447,6 +462,35 @@ fn build_plugin_row(
                         );
                     }
                 }
+            });
+
+            let popover_enable = popover.clone();
+            let game_enable = Rc::clone(&game_rclick);
+            let container_enable = container_rclick.clone();
+            enable_all_item.connect_clicked(move |_| {
+                popover_enable.popdown();
+                let mut db = ModDatabase::load(&game_enable);
+                db.plugin_disabled.clear();
+                db.save(&game_enable);
+                let _ = db.write_plugins_txt(&game_enable);
+                refresh_load_order_content(&container_enable, &game_enable);
+            });
+
+            let popover_disable = popover.clone();
+            let game_disable = Rc::clone(&game_rclick);
+            let container_disable = container_rclick.clone();
+            disable_all_item.connect_clicked(move |_| {
+                popover_disable.popdown();
+                let mut db = ModDatabase::load(&game_disable);
+                let ordered = db.get_ordered_plugins(&game_disable);
+                for p in &ordered {
+                    if !p.is_vanilla && !db.plugin_disabled.contains(&p.name) {
+                        db.plugin_disabled.push(p.name.clone());
+                    }
+                }
+                db.save(&game_disable);
+                let _ = db.write_plugins_txt(&game_disable);
+                refresh_load_order_content(&container_disable, &game_disable);
             });
 
             popover.popup();
