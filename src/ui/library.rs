@@ -131,7 +131,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     log::warn!("Undeploy warning for {}: {e}", m.name);
                 }
             }
-            ModManager::purge_legacy_nested_data(&game_c);
+            ModManager::purge_legacy_nested_data_dir(&game_c);
 
             // Then deploy all enabled mods.
             //
@@ -142,9 +142,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             // reverse visual order to ensure the bottom-most enabled mod wins
             // conflicts.
             let mut deployed_count = 0usize;
-            let enabled_mods: Vec<_> = db.mods.iter().rev().filter(|m| m.enabled).collect();
-            let deploy_total = enabled_mods.len();
-            for (idx, m) in enabled_mods.iter().enumerate() {
+            let deploy_total = db.mods.iter().filter(|m| m.enabled).count();
+            for (idx, m) in db.mods.iter().rev().filter(|m| m.enabled).enumerate() {
                 status_label_c.set_text(&format!("Deploying mods ({}/{})…", idx + 1, deploy_total));
                 flush_ui_events();
                 if let Err(e) = ModManager::enable_mod(&game_c, m) {
@@ -220,7 +219,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     count += 1;
                 }
             }
-            ModManager::purge_legacy_nested_data(&game_c);
+            ModManager::purge_legacy_nested_data_dir(&game_c);
             let _ = db.write_plugins_txt(&game_c);
 
             let msg = if errors.is_empty() {
@@ -342,6 +341,7 @@ fn refresh_library_content_with_search(
     }
 }
 
+/// Toggle interactivity for Library controls during long deploy operations.
 fn set_library_busy(
     search_entry: &gtk4::SearchEntry,
     deploy_btn: &gtk4::Button,
@@ -356,6 +356,7 @@ fn set_library_busy(
     content_container.set_sensitive(sensitive);
 }
 
+/// Process pending GTK events so status text updates are shown during long loops.
 fn flush_ui_events() {
     let context = gtk4::glib::MainContext::default();
     while context.pending() {
