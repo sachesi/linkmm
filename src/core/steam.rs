@@ -197,22 +197,37 @@ pub fn find_steam_root() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_dir())
 }
 
-/// Return the Proton compatdata directory for `app_id`, searching all known
-/// Steam library locations.
+/// Return the Proton compatdata directory for `app_id`.
+///
+/// Searches the Steam library that contains the game's `appmanifest_<app_id>.acf`
+/// first (which is where Steam always stores the matching `compatdata` entry),
+/// then falls back to all other known Steam libraries.  This replaces the old
+/// approach of checking a static list of hardcoded home-relative paths, which
+/// failed whenever games were installed in a non-default Steam library.
 pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let roots: &[&str] = &[
-        ".steam/steam/steamapps/compatdata",
-        ".local/share/Steam/steamapps/compatdata",
-        "snap/steam/common/.steam/steam/steamapps/compatdata",
-        ".var/app/com.valvesoftware.Steam/.steam/steam/steamapps/compatdata",
-    ];
-    for root in roots {
-        let path = home.join(root).join(app_id.to_string());
+    let libraries = find_steam_libraries();
+
+    // Prefer the library that actually contains the game's appmanifest — Steam
+    // always creates the compatdata entry next to the appmanifest.
+    for lib in &libraries {
+        let manifest = lib.path.join(format!("appmanifest_{app_id}.acf"));
+        if manifest.exists() {
+            let path = lib.path.join("compatdata").join(app_id.to_string());
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+
+    // Fallback: check all libraries (handles e.g. compatdata created before the
+    // game was moved to a different library).
+    for lib in &libraries {
+        let path = lib.path.join("compatdata").join(app_id.to_string());
         if path.is_dir() {
             return Some(path);
         }
     }
+
     None
 }
 
@@ -222,6 +237,10 @@ pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
 /// highest folder name.  Note: "Proton 10.0" sorts before "Proton 9.0" with
 /// plain string comparison; this edge-case is accepted given that Proton
 /// Experimental is typically the most current choice anyway.
+///
+/// This is a generic fallback.  Prefer [`find_proton_for_app`] when you know
+/// which app you are launching so that Steam's per-app Proton selection is
+/// honoured.
 pub fn find_proton_run() -> Option<PathBuf> {
     let libraries = find_steam_libraries();
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -245,6 +264,207 @@ pub fn find_proton_run() -> Option<PathBuf> {
     candidates.into_iter().last()
 }
 
+// ── Steam config.vdf helpers ──────────────────────────────────────────────
+
+/// Parse a VDF line that is a bare section-header key with no associated
+/// value, e.g. `"CompatToolMapping"`.  Returns `None` for lines that have
+/// a value (handled by [`parse_vdf_key_value`]) or are not quoted strings.
+fn parse_vdf_section_name(line: &str) -> Option<String> {
+    let line = line.trim();
+    if !line.starts_with('"') {
+        return None;
+    }
+    let rest = &line[1..];
+    let key_end = rest.find('"')?;
+    let key = rest[..key_end].to_string();
+    // Ensure nothing follows the closing quote (otherwise it is a key-value pair)
+    if rest[key_end + 1..].trim().is_empty() {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// Return the path to Steam's main `config/config.vdf`, trying all known
+/// Steam installation roots.
+fn find_config_vdf() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let candidates = [
+        home.join(".steam").join("steam").join("config").join("config.vdf"),
+        home.join(".local")
+            .join("share")
+            .join("Steam")
+            .join("config")
+            .join("config.vdf"),
+        home.join("snap")
+            .join("steam")
+            .join("common")
+            .join(".steam")
+            .join("steam")
+            .join("config")
+            .join("config.vdf"),
+        home.join(".var")
+            .join("app")
+            .join("com.valvesoftware.Steam")
+            .join(".steam")
+            .join("steam")
+            .join("config")
+            .join("config.vdf"),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Parse `config.vdf` text and return the `CompatToolMapping > <app_id> > name`
+/// value for `app_id`, if present.
+///
+/// The returned string is the tool identifier Steam stored, which may be a
+/// short name (`proton_experimental`, `proton_9`) or a full directory name
+/// (`Proton 9.0-3`).  Returns `None` when no mapping exists for the app.
+pub fn parse_compat_tool_from_config_vdf(contents: &str, app_id: u32) -> Option<String> {
+    let app_id_str = app_id.to_string();
+    let mut depth: i32 = 0;
+
+    #[derive(PartialEq)]
+    enum State {
+        LookingForCompatMapping,
+        InCompatMapping,
+        InApp,
+    }
+
+    let mut state = State::LookingForCompatMapping;
+    let mut compat_depth: i32 = -1;
+    let mut app_depth: i32 = -1;
+    let mut pending_key: Option<String> = None;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+
+        if trimmed == "{" {
+            depth += 1;
+            match &state {
+                State::LookingForCompatMapping => {
+                    if pending_key
+                        .as_deref()
+                        .map(|k| k.eq_ignore_ascii_case("compattoolmapping"))
+                        .unwrap_or(false)
+                    {
+                        state = State::InCompatMapping;
+                        compat_depth = depth;
+                    }
+                }
+                State::InCompatMapping => {
+                    if pending_key.as_deref() == Some(app_id_str.as_str()) {
+                        state = State::InApp;
+                        app_depth = depth;
+                    }
+                }
+                State::InApp => {}
+            }
+            pending_key = None;
+        } else if trimmed == "}" {
+            match &state {
+                State::InApp if depth == app_depth => {
+                    state = State::InCompatMapping;
+                    app_depth = -1;
+                }
+                State::InCompatMapping if depth == compat_depth => {
+                    state = State::LookingForCompatMapping;
+                    compat_depth = -1;
+                }
+                _ => {}
+            }
+            depth -= 1;
+            pending_key = None;
+        } else if let Some((key, value)) = parse_vdf_key_value(trimmed) {
+            if state == State::InApp && key.eq_ignore_ascii_case("name") && !value.is_empty() {
+                return Some(value);
+            }
+            pending_key = None;
+        } else if let Some(section_name) = parse_vdf_section_name(trimmed) {
+            pending_key = Some(section_name);
+        } else {
+            pending_key = None;
+        }
+    }
+
+    None
+}
+
+/// Convert a Proton tool identifier read from `config.vdf` into a directory
+/// name prefix used to locate the Proton installation folder.
+///
+/// Examples:
+/// * `"proton_experimental"` → `"Proton Experimental"`
+/// * `"proton_9"`            → `"Proton 9"`
+/// * `"Proton 9.0-3"`        → `"Proton 9.0-3"` (already a full name)
+fn tool_name_to_dir_prefix(tool_name: &str) -> String {
+    if tool_name.contains(' ') {
+        // Already looks like a full directory name (e.g. "Proton 9.0-3").
+        tool_name.to_string()
+    } else {
+        // Convert underscore-separated identifier to title-cased, space-
+        // separated prefix, e.g. "proton_experimental" → "Proton Experimental".
+        tool_name
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => first.to_uppercase().to_string() + chars.as_str(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Return the `proton` run-script for the Proton version that Steam has
+/// configured for `app_id`.
+///
+/// Reads `~/.steam/steam/config/config.vdf` to determine which Proton tool
+/// Steam assigned to the game, then locates that tool in the Steam libraries.
+/// Falls back to [`find_proton_run`] (highest available version) when:
+/// * `config.vdf` cannot be read or contains no mapping for `app_id`, or
+/// * the configured Proton version is not installed.
+pub fn find_proton_for_app(app_id: u32) -> Option<PathBuf> {
+    let libraries = find_steam_libraries();
+
+    if let Some(tool_name) = find_config_vdf()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|contents| parse_compat_tool_from_config_vdf(&contents, app_id))
+    {
+        if !tool_name.is_empty() {
+            let dir_prefix = tool_name_to_dir_prefix(&tool_name);
+            let mut candidates: Vec<PathBuf> = Vec::new();
+
+            for lib in &libraries {
+                let common = lib.path.join("common");
+                if let Ok(entries) = std::fs::read_dir(&common) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        // Accept an exact match or a directory whose name starts
+                        // with the prefix (handles versioned suffixes like "-3").
+                        if name == dir_prefix || name.starts_with(&(dir_prefix.clone() + " ")) {
+                            let proton_script = entry.path().join("proton");
+                            if proton_script.is_file() {
+                                candidates.push(proton_script);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !candidates.is_empty() {
+                candidates.sort();
+                return candidates.into_iter().last();
+            }
+        }
+    }
+
+    // Fallback: use the highest available Proton version.
+    find_proton_run()
+}
+
 /// Launch a game executable.
 ///
 /// * The **primary** game binary (first entry in
@@ -261,10 +481,15 @@ pub fn find_proton_run() -> Option<PathBuf> {
 ///   Wine environment.
 ///
 /// Required environment variables for Proton launches (set automatically):
-/// * `STEAM_COMPAT_DATA_PATH` — path to the game's per-app Wine prefix
-///   (the `compatdata/<app_id>` directory managed by Steam).
+/// * `STEAM_COMPAT_DATA_PATH` — the game's per-app Wine prefix as configured
+///   by Steam (`compatdata/<app_id>` in the Steam library that holds the
+///   game).
 /// * `STEAM_COMPAT_CLIENT_INSTALL_PATH` — Steam installation root, used by
 ///   Proton to locate its own runtime libraries and scripts.
+///
+/// The Proton binary used is the one Steam has configured for this specific
+/// game (read from `config/config.vdf`), falling back to the highest
+/// available Proton version when no per-app mapping exists.
 ///
 /// Returns `Ok(())` if the process was successfully spawned, or an error
 /// message string on failure.
@@ -304,7 +529,9 @@ pub fn launch_game_executable(
         // Run the selected executable (e.g. SKSE, F4SE) via Proton directly.
         // steam://run/<app_id> would always launch the game's default exe and
         // would ignore the user's choice, so Proton is the correct path here.
-        let proton = find_proton_run()
+        // Use the Proton version that Steam has configured for this specific
+        // game (read from config.vdf), falling back to the highest available.
+        let proton = find_proton_for_app(app_id)
             .ok_or_else(|| "No Proton installation found in Steam libraries".to_string())?;
 
         let steam_root = find_steam_root()
