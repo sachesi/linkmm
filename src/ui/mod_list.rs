@@ -101,7 +101,7 @@ fn refresh_mod_list(container: &gtk4::Box, game: &Rc<Game>, config: Rc<RefCell<A
         }
 
         let clamp = adw::Clamp::new();
-        clamp.set_maximum_size(800);
+        clamp.set_maximum_size(900);
         clamp.set_child(Some(&list_box));
         clamp.set_margin_top(12);
         clamp.set_margin_bottom(12);
