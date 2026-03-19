@@ -211,32 +211,30 @@ impl Game {
 
     /// Try to locate the directory that contains `plugins.txt` for this game.
     ///
-    /// Checks Steam/Proton compatdata paths common on Linux.  Returns `None`
-    /// when no matching directory is found.
+    /// Uses [`crate::core::steam::find_compatdata_path`] to locate the correct
+    /// Proton prefix for this game — that is, the `compatdata/<app_id>` entry
+    /// in the Steam library that actually holds the game — and then navigates
+    /// to the equivalent of `%LOCALAPPDATA%/<game_folder>` inside it.
+    ///
+    /// Returns `None` when no matching directory is found.
     pub fn plugins_txt_dir(&self) -> Option<PathBuf> {
         let app_id = self.kind.steam_app_id()?;
-        let home = dirs::home_dir()?;
         let sub = self.kind.local_app_data_folder();
 
-        // Common Proton / Steam-on-Linux compatdata roots
-        let roots: &[&str] = &[
-            ".steam/steam/steamapps/compatdata",
-            ".local/share/Steam/steamapps/compatdata",
-            "snap/steam/common/.steam/steam/steamapps/compatdata",
-            ".var/app/com.valvesoftware.Steam/.steam/steam/steamapps/compatdata",
-        ];
-
-        for root in roots {
-            let path = home
-                .join(root)
-                .join(app_id.to_string())
-                .join("pfx/drive_c/users/steamuser/AppData/Local")
-                .join(sub);
-            if path.is_dir() {
-                return Some(path);
-            }
+        let compatdata = crate::core::steam::find_compatdata_path(app_id)?;
+        let path = compatdata
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("AppData")
+            .join("Local")
+            .join(sub);
+        if path.is_dir() {
+            Some(path)
+        } else {
+            None
         }
-        None
     }
 
     /// Return the expected path of `plugins.txt`, even if it does not yet exist.
