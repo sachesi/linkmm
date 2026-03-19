@@ -44,6 +44,9 @@ struct InstallStatusCtx {
     refresh_btn: gtk4::Button,
     // main list (grayed while busy)
     list_container: gtk4::Box,
+    /// `true` while a mod archive is being extracted/installed so the download
+    /// progress poll timer does not trigger a disruptive list rebuild.
+    is_installing: Rc<RefCell<bool>>,
 }
 
 // ── Public entry-point ────────────────────────────────────────────────────────
@@ -131,6 +134,7 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         clean_btn: clean_btn.clone(),
         refresh_btn: refresh_btn.clone(),
         list_container: list_container.clone(),
+        is_installing: Rc::new(RefCell::new(false)),
     };
 
     let hide_installed = Rc::new(RefCell::new(false));
@@ -230,6 +234,11 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         gtk4::glib::timeout_add_local(
             std::time::Duration::from_millis(DOWNLOAD_PROGRESS_POLL_INTERVAL_MS),
             move || {
+                // Skip list rebuilds while a mod is being installed to avoid
+                // disrupting the extraction in progress.
+                if *ctx_c.is_installing.borrow() {
+                    return gtk4::glib::ControlFlow::Continue;
+                }
                 let active = download_state::all_active();
                 let mut download_state_key = String::new();
                 for (id, entry) in &active {
@@ -1555,6 +1564,7 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 /// Disable all interactive Downloads controls while an install is in progress,
 /// visually indicating to the user that the UI is locked.
 fn set_downloads_busy(ctx: &InstallStatusCtx, busy: bool) {
+    *ctx.is_installing.borrow_mut() = busy;
     let sensitive = !busy;
     ctx.search_entry.set_sensitive(sensitive);
     ctx.hide_btn.set_sensitive(sensitive);
