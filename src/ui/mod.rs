@@ -8,7 +8,6 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
-use crate::core::games::Game;
 use crate::core::mods::ModDatabase;
 
 pub mod downloads;
@@ -100,89 +99,36 @@ fn build_main_window(
     active_game_list.append(&active_game_row);
     sidebar_box.append(&active_game_list);
 
-    // ── Launch Game button ────────────────────────────────────────────────
-    //
-    // Shows a plain Button when exactly one executable is discovered in the
-    // game directory, or an adw::SplitButton (with a dropdown listing all
-    // discovered executables) when more than one exist.  Both are placed
-    // inside a shared container box; the inactive widget is hidden so the
-    // layout stays stable.
+    // ── Play Game button ──────────────────────────────────────────────────
 
-    let launch_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    launch_box.set_margin_start(12);
-    launch_box.set_margin_end(12);
-    launch_box.set_margin_bottom(8);
-    launch_box.set_hexpand(true);
-
-    // Plain button (used when there is exactly one known executable)
-    let launch_simple_btn = gtk4::Button::builder()
-        .label("Launch Game")
+    let play_btn = gtk4::Button::builder()
+        .label("Play")
         .hexpand(true)
-        .visible(false)
         .build();
-    launch_simple_btn.add_css_class("suggested-action");
+    play_btn.add_css_class("suggested-action");
+    play_btn.set_margin_start(12);
+    play_btn.set_margin_end(12);
+    play_btn.set_margin_bottom(8);
 
-    // Split button (used when multiple executables are discovered)
-    let launch_split_btn = adw::SplitButton::builder()
-        .label("Launch Game")
-        .hexpand(true)
-        .visible(false)
-        .build();
-    launch_split_btn.add_css_class("suggested-action");
-
-    launch_box.append(&launch_simple_btn);
-    launch_box.append(&launch_split_btn);
-    sidebar_box.append(&launch_box);
-
-    // Shared state: which executable and game are launched when the main
-    // button is pressed.  Updated whenever the active game changes so the
-    // single-shot click handlers (connected once) always see the latest values.
-    let launch_default_exe: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let launch_current_game: Rc<RefCell<Option<Game>>> = Rc::new(RefCell::new(None));
-
-    // Wire up the plain-button click
-    {
-        let game_rc = Rc::clone(&launch_current_game);
-        let exe_rc = Rc::clone(&launch_default_exe);
-        launch_simple_btn.connect_clicked(move |_| {
-            let game = game_rc.borrow();
-            let exe = exe_rc.borrow();
-            if let (Some(g), Some(e)) = (game.as_ref(), exe.as_ref()) {
-                do_launch_game(g, e);
-            }
-        });
-    }
-
-    // Wire up the split-button main-click
-    {
-        let game_rc = Rc::clone(&launch_current_game);
-        let exe_rc = Rc::clone(&launch_default_exe);
-        launch_split_btn.connect_clicked(move |_| {
-            let game = game_rc.borrow();
-            let exe = exe_rc.borrow();
-            if let (Some(g), Some(e)) = (game.as_ref(), exe.as_ref()) {
-                do_launch_game(g, e);
-            }
-        });
-    }
-
-    // Initial population of the launch button based on the current game
+    // Show the button only when a game with a known Steam App ID is active.
     {
         let cfg = config.borrow();
-        let preferred = cfg
-            .current_game()
-            .and_then(|g| cfg.preferred_executables.get(&g.id))
-            .cloned();
-        update_launch_ui(
-            &launch_simple_btn,
-            &launch_split_btn,
-            cfg.current_game(),
-            preferred.as_deref(),
-            &launch_default_exe,
-            &launch_current_game,
-            &Rc::clone(&config),
-        );
+        play_btn.set_visible(cfg.current_game().and_then(|g| g.kind.steam_app_id()).is_some());
     }
+
+    {
+        let config_c = Rc::clone(&config);
+        play_btn.connect_clicked(move |_| {
+            let game = config_c.borrow().current_game().cloned();
+            if let Some(g) = game {
+                if let Err(e) = crate::core::steam::launch_game(&g) {
+                    log::warn!("Could not launch {}: {e}", g.name);
+                }
+            }
+        });
+    }
+
+    sidebar_box.append(&play_btn);
 
 
     // ── Navigation section ────────────────────────────────────────────────
@@ -246,38 +192,6 @@ fn build_main_window(
         let config_t = Rc::clone(&config);
         glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
             refresh_stats(&config_t.borrow(), &installed_t, &enabled_t);
-            glib::ControlFlow::Continue
-        });
-    }
-
-    // Re-scan executables every 3 seconds so the launch button picks up newly
-    // deployed script-extender loaders (e.g. SKSE installed as a mod and
-    // then deployed to the game root via symlink).
-    {
-        let simple_btn_t = launch_simple_btn.clone();
-        let split_btn_t = launch_split_btn.clone();
-        let default_exe_t = Rc::clone(&launch_default_exe);
-        let current_game_t = Rc::clone(&launch_current_game);
-        let config_t = Rc::clone(&config);
-        glib::timeout_add_local(std::time::Duration::from_secs(3), move || {
-            let (game_clone, preferred) = {
-                let cfg = config_t.borrow();
-                let g = cfg.current_game().cloned();
-                let p = g
-                    .as_ref()
-                    .and_then(|g| cfg.preferred_executables.get(&g.id))
-                    .cloned();
-                (g, p)
-            };
-            update_launch_ui(
-                &simple_btn_t,
-                &split_btn_t,
-                game_clone.as_ref(),
-                preferred.as_deref(),
-                &default_exe_t,
-                &current_game_t,
-                &Rc::clone(&config_t),
-            );
             glib::ControlFlow::Continue
         });
     }
@@ -418,10 +332,7 @@ fn build_main_window(
     let content_page_r = content_page.clone();
     let config_r = Rc::clone(&config);
     let nav_list_r = nav_list.clone();
-    let launch_simple_btn_r = launch_simple_btn.clone();
-    let launch_split_btn_r = launch_split_btn.clone();
-    let launch_default_exe_r = Rc::clone(&launch_default_exe);
-    let launch_current_game_r = Rc::clone(&launch_current_game);
+    let play_btn_r = play_btn.clone();
 
     let on_setup_done_rc: Rc<dyn Fn()> = Rc::new(move || {
         let game_info = {
@@ -435,22 +346,12 @@ fn build_main_window(
             update_active_game_row(&active_game_row_r, None);
         }
 
-        // Refresh the launch button for the new game
-        let preferred = {
-            let cfg = config_r.borrow();
+        // Show Play button only when the active game has a Steam App ID.
+        play_btn_r.set_visible(
             game_info
                 .as_ref()
-                .and_then(|g| cfg.preferred_executables.get(&g.id))
-                .cloned()
-        };
-        update_launch_ui(
-            &launch_simple_btn_r,
-            &launch_split_btn_r,
-            game_info.as_ref(),
-            preferred.as_deref(),
-            &launch_default_exe_r,
-            &launch_current_game_r,
-            &Rc::clone(&config_r),
+                .and_then(|g| g.kind.steam_app_id())
+                .is_some(),
         );
 
         // Rebuild Library page for the new game
@@ -563,136 +464,6 @@ fn refresh_stats(
     } else {
         installed.set_text("0");
         enabled.set_text("0");
-    }
-}
-
-// ── Launch-button helpers ──────────────────────────────────────────────────
-
-/// Update the sidebar launch button(s) to reflect the currently active game.
-///
-/// * Hides both buttons when `game` is `None` or no executables are found.
-/// * Shows the plain `simple_btn` when exactly one executable exists.
-/// * Shows the `split_btn` (with a dropdown listing all executables) when
-///   more than one executable is discovered in the game directory.
-///
-/// The active executable is chosen as follows:
-/// * If the **game just changed** (including the initial call), the value of
-///   `preferred_exe` — loaded from `AppConfig::preferred_executables` — is
-///   used if that executable is still present on disk.  Otherwise the first
-///   discovered executable is used.
-/// * If the **same game is being refreshed** (periodic scan to pick up newly
-///   deployed script-extender loaders), the current in-memory selection is
-///   preserved as long as it is still valid.
-///
-/// When the user selects an executable from the split-button dropdown the
-/// choice is immediately written to `config` and saved to disk so it
-/// survives an application restart.
-fn update_launch_ui(
-    simple_btn: &gtk4::Button,
-    split_btn: &adw::SplitButton,
-    game: Option<&Game>,
-    preferred_exe: Option<&str>,
-    default_exe: &Rc<RefCell<Option<String>>>,
-    current_game: &Rc<RefCell<Option<Game>>>,
-    config: &Rc<RefCell<AppConfig>>,
-) {
-    // Always hide both first; we show the right one below.
-    simple_btn.set_visible(false);
-    split_btn.set_visible(false);
-
-    let Some(g) = game else {
-        *default_exe.borrow_mut() = None;
-        *current_game.borrow_mut() = None;
-        return;
-    };
-
-    let game_changed = current_game
-        .borrow()
-        .as_ref()
-        .map(|cg| cg.id != g.id)
-        .unwrap_or(true);
-    *current_game.borrow_mut() = Some(g.clone());
-
-    let exes = g.discover_executables();
-    if exes.is_empty() {
-        *default_exe.borrow_mut() = None;
-        return;
-    }
-
-    // Choose which exe to show as the active default:
-    // • game changed → use persisted preference (if still on disk) else first exe
-    // • same game    → preserve current in-memory selection if still valid
-    let preferred_or_first = |pref: Option<&str>| -> String {
-        pref.filter(|p| exes.iter().any(|e| e.as_str() == *p))
-            .map(str::to_string)
-            .unwrap_or_else(|| exes[0].clone())
-    };
-    let chosen: String = if game_changed {
-        preferred_or_first(preferred_exe)
-    } else {
-        let current = default_exe.borrow().clone();
-        current
-            .filter(|e| exes.iter().any(|x| x == e))
-            .unwrap_or_else(|| preferred_or_first(preferred_exe))
-    };
-
-    *default_exe.borrow_mut() = Some(chosen.clone());
-
-    if exes.len() == 1 {
-        simple_btn.set_label(&exes[0]);
-        simple_btn.set_visible(true);
-    } else {
-        // Multiple executables: build a popover listing all of them.
-        let popover = gtk4::Popover::new();
-        let list = gtk4::ListBox::new();
-        list.add_css_class("boxed-list");
-        list.set_margin_start(4);
-        list.set_margin_end(4);
-        list.set_margin_top(4);
-        list.set_margin_bottom(4);
-
-        for exe in &exes {
-            let row = adw::ActionRow::builder()
-                .title(exe.as_str())
-                .activatable(true)
-                .build();
-
-            let exe_c = exe.clone();
-            let game_id_c = g.id.clone();
-            let default_exe_c = Rc::clone(default_exe);
-            let split_btn_c = split_btn.clone();
-            let popover_c = popover.clone();
-            let config_c = Rc::clone(config);
-            row.connect_activated(move |_| {
-                // Update the label and in-memory default exe.
-                *default_exe_c.borrow_mut() = Some(exe_c.clone());
-                split_btn_c.set_label(&exe_c);
-                popover_c.popdown();
-                // Persist the user's choice so it survives a restart.
-                // The game is NOT launched here — the user presses the main
-                // split button to start the game with the chosen executable.
-                {
-                    let mut cfg = config_c.borrow_mut();
-                    cfg.preferred_executables
-                        .insert(game_id_c.clone(), exe_c.clone());
-                    cfg.save();
-                }
-            });
-
-            list.append(&row);
-        }
-
-        popover.set_child(Some(&list));
-        split_btn.set_popover(Some(&popover));
-        split_btn.set_label(&chosen);
-        split_btn.set_visible(true);
-    }
-}
-
-/// Attempt to launch `exe_name` for `game`, logging a warning on failure.
-fn do_launch_game(game: &Game, exe_name: &str) {
-    if let Err(e) = crate::core::steam::launch_game_executable(game, exe_name) {
-        log::warn!("Could not launch {} for {}: {e}", exe_name, game.name);
     }
 }
 
