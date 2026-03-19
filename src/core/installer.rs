@@ -17,6 +17,20 @@ const EXTRACT_BUFFER_SIZE: usize = 256 * 1024;
 /// without busy-polling too aggressively.
 const EXTRACTION_TICK_INTERVAL_MS: u64 = 50;
 
+/// Well-known subdirectory names that are expected directly inside a game's
+/// `Data/` folder.  Used by the scoring heuristic to identify which directory
+/// in an archive corresponds to the game data root.
+const KNOWN_DATA_SUBDIRS: &[&str] = &[
+    "meshes", "textures", "scripts", "sound", "music", "shaders",
+    "lodsettings", "seq", "interface", "skse", "f4se", "nvse", "obse",
+    "fose", "mwse", "xnvse", "strings", "video", "facegen", "grass",
+    "shadersfx", "terrain", "dialogueviews", "vis", "lightingtemplate",
+    "distantlod", "lod", "trees", "fxmaster", "sky",
+];
+
+/// Plugin file extensions that strongly indicate a game data root.
+const KNOWN_PLUGIN_EXTS: &[&str] = &["esp", "esm", "esl"];
+
 // ── Install strategy ──────────────────────────────────────────────────────────
 
 /// How a mod archive should be installed.
@@ -131,6 +145,274 @@ pub struct FomodConfig {
     pub required_files: Vec<FomodFile>,
     pub steps: Vec<InstallStep>,
     pub conditional_file_installs: Vec<ConditionalFileInstall>,
+}
+
+// ── Install root detection heuristics ────────────────────────────────────────
+
+/// Score a path prefix as a candidate game Data-root directory.
+///
+/// Higher scores indicate a better match.  Scoring weights:
+/// * **+20** if the directory itself is named `data` (case-insensitive)
+/// * **+10** for each direct-child directory that matches a known game
+///   data subdirectory (meshes, textures, scripts, …)
+/// * **+15** for each direct-child file with a plugin extension
+///   (.esp / .esm / .esl)
+///
+/// Only the first occurrence of each direct-child name is counted so that
+/// duplicate paths do not inflate the score.
+fn score_as_data_root(prefix: &str, paths: &[&str]) -> i32 {
+    let mut score = 0i32;
+
+    // +20 if the directory is itself named "data".
+    let prefix_norm = prefix.to_lowercase().replace('\\', "/");
+    let dir_name = prefix_norm.trim_end_matches('/').split('/').next_back().unwrap_or("");
+    if dir_name == "data" {
+        score += 20;
+    }
+
+    // Build the lowercase search prefix with a trailing "/" for child matching.
+    let search_prefix: String = if prefix_norm.trim_end_matches('/').is_empty() {
+        String::new()
+    } else {
+        format!("{}/", prefix_norm.trim_end_matches('/'))
+    };
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for path in paths {
+        let path_norm = path.to_lowercase().replace('\\', "/");
+        let path_norm = path_norm.trim_start_matches('/');
+
+        // Strip the candidate prefix.
+        let rel = if !search_prefix.is_empty() {
+            match path_norm.strip_prefix(&search_prefix) {
+                Some(r) => r,
+                None => continue,
+            }
+        } else {
+            path_norm
+        };
+
+        let rel = rel.trim_start_matches('/');
+        if rel.is_empty() {
+            continue;
+        }
+
+        // Get the first path component (immediate child of the candidate dir).
+        let first = rel.split('/').next().unwrap_or("").trim_end_matches('\\');
+        if first.is_empty() || seen.contains(first) {
+            continue;
+        }
+        seen.insert(first.to_string());
+
+        // Known game data subdirectory.
+        if KNOWN_DATA_SUBDIRS.contains(&first) {
+            score += 10;
+        }
+
+        // Plugin file extension.
+        if first.contains('.') {
+            let ext = first.rsplit('.').next().unwrap_or("");
+            if KNOWN_PLUGIN_EXTS.contains(&ext) {
+                score += 15;
+            }
+        }
+    }
+
+    score
+}
+
+/// Scan all paths in an archive and return the prefix (with trailing `/`) that
+/// best corresponds to the game's `Data/` directory.
+///
+/// The return value is the prefix to **strip** from archive entry names before
+/// placing extracted files into `mod_dir/Data/`.  An empty string means the
+/// archive root is already the data root (content goes directly into
+/// `mod_dir/Data/`).
+///
+/// # Algorithm
+/// Every ancestor directory of every path is scored with [`score_as_data_root`].
+/// The directory with the highest score becomes the install root.  Ties are
+/// broken in favour of the shallowest (shortest) directory to avoid over-
+/// stripping.  If all scores are zero the empty string (archive root) is
+/// returned and the caller should apply a secondary heuristic.
+pub fn find_data_root_in_paths(paths: &[&str]) -> String {
+    // Collect all unique ancestor directories (candidates).  The archive root
+    // ("")  is always included.  Limit depth to 6 levels to avoid O(n²) work
+    // on pathological archives with very deep nesting.
+    const MAX_DEPTH: usize = 6;
+
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    dirs.insert(String::new());
+
+    for path in paths {
+        let p = path.replace('\\', "/");
+        let p = p.trim_start_matches('/');
+        let mut current = String::new();
+        let mut depth = 0usize;
+        for component in p.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            depth += 1;
+            if depth > MAX_DEPTH {
+                break;
+            }
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(component);
+            dirs.insert(current.clone());
+        }
+    }
+
+    let mut best_dir = String::new();
+    let mut best_score = -1i32;
+
+    for dir in &dirs {
+        let score = score_as_data_root(dir, paths);
+        // Prefer a higher score; on a tie keep the shallower (shorter) path.
+        if score > best_score || (score == best_score && dir.len() < best_dir.len()) {
+            best_score = score;
+            best_dir = dir.clone();
+        }
+    }
+
+    if best_dir.is_empty() {
+        String::new()
+    } else {
+        format!("{best_dir}/")
+    }
+}
+
+/// Compute the common single-level top-directory prefix shared by all entries
+/// in a path list.
+///
+/// Returns a string with a trailing `/` if all entries share the same
+/// top-level folder, or an empty string otherwise.  This is the path-slice
+/// equivalent of [`find_common_prefix`].
+fn find_common_prefix_from_paths(paths: &[&str]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+
+    let mut first_top: Option<String> = None;
+    let mut all_same = true;
+
+    for path in paths {
+        let p = path.replace('\\', "/");
+        let top = p.trim_start_matches('/').split('/').next().unwrap_or("");
+        if top.is_empty() {
+            continue;
+        }
+        match &first_top {
+            None => first_top = Some(top.to_string()),
+            Some(ft) if ft.as_str() != top => {
+                all_same = false;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if all_same {
+        if let Some(ft) = first_top {
+            if paths.len() > 1 {
+                return format!("{ft}/");
+            }
+        }
+    }
+    String::new()
+}
+
+/// Return `true` if the paths (already stripped of any outer wrapper prefix)
+/// look like game-**root**-level content rather than game-Data content.
+///
+/// Indicators checked:
+/// * Known root-level directory names: `enbseries`, `reshade-shaders`,
+///   `reshade`
+/// * DLL / ASI files at the top level
+///
+/// This function intentionally has a low false-positive rate: it only triggers
+/// on clear root-level markers so that ambiguous archives default to the safer
+/// Data/ install path.
+fn looks_like_root_level_mod(paths: &[&str]) -> bool {
+    const ROOT_DIRS: &[&str] = &["enbseries", "reshade-shaders", "reshade"];
+    const ROOT_EXTS: &[&str] = &["dll", "asi"];
+
+    for path in paths {
+        let p = path.to_lowercase().replace('\\', "/");
+        let first = p.trim_start_matches('/').split('/').next().unwrap_or("");
+        if first.is_empty() {
+            continue;
+        }
+        if ROOT_DIRS.contains(&first) {
+            return true;
+        }
+        if first.contains('.') {
+            let ext = first.rsplit('.').next().unwrap_or("");
+            if ROOT_EXTS.contains(&ext) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Return `true` if the archive follows BAIN (Wrye Bash) package conventions.
+///
+/// BAIN archives have **two or more** top-level directories whose names start
+/// with exactly two ASCII digits followed by a space or underscore
+/// (`"00 Core/"`, `"01 Optional/"`, `"02_Patches/"`, …).
+pub fn is_bain_archive(paths: &[&str]) -> bool {
+    let mut top_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in paths {
+        let p = path.replace('\\', "/");
+        let p = p.trim_start_matches('/').to_string();
+        if let Some(first) = p.split('/').next() {
+            if !first.is_empty() {
+                top_dirs.insert(first.to_lowercase());
+            }
+        }
+    }
+
+    if top_dirs.len() < 2 {
+        return false;
+    }
+
+    // Every top-level entry must match the BAIN "NN " or "NN_" pattern.
+    top_dirs.iter().all(|d| {
+        d.len() >= 3
+            && d.chars().take(2).all(|c| c.is_ascii_digit())
+            && matches!(d.chars().nth(2), Some(' ') | Some('_'))
+    })
+}
+
+/// Return the sorted list of BAIN package directory names from a path list.
+///
+/// The names are returned in ascending order so that higher-numbered packages
+/// are installed last and naturally override earlier ones.
+fn collect_bain_top_dirs(paths: &[&str]) -> Vec<String> {
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in paths {
+        let p = path.replace('\\', "/");
+        let p_lower = p.trim_start_matches('/').to_lowercase();
+        if let Some(first) = p_lower.split('/').next() {
+            if !first.is_empty()
+                && first.len() >= 3
+                && first.chars().take(2).all(|c| c.is_ascii_digit())
+                && matches!(first.chars().nth(2), Some(' ') | Some('_'))
+            {
+                // Use the original case for the directory name so that the
+                // file system path matches the archive entry.
+                let orig_p = p.trim_start_matches('/');
+                if let Some(orig_first) = orig_p.split('/').next() {
+                    dirs.insert(orig_first.to_string());
+                }
+            }
+        }
+    }
+    dirs.into_iter().collect()
 }
 
 // ── Strategy detection ────────────────────────────────────────────────────────
@@ -1034,21 +1316,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
             if !has_zip_extension(archive_path) {
                 install_data_archive_non_zip(archive_path, &mod_dir, tick)?;
             } else {
-            // Determine extraction root:
-            // • If the archive already carries a `Data/` subfolder after the
-            //   common wrapper prefix is stripped, extract to `mod_dir/`
-            //   directly – the `Data/` folder will land at `mod_dir/Data/`.
-            // • Otherwise wrap the content inside `mod_dir/Data/` ourselves.
-                if archive_has_data_folder(archive_path) {
-                    extract_zip_to(archive_path, &mod_dir, tick)?;
-                    normalize_paths_to_lowercase(&mod_dir.join("Data"));
-                } else {
-                    let data_dir = mod_dir.join("Data");
-                    std::fs::create_dir_all(&data_dir)
-                        .map_err(|e| format!("Failed to create Data directory: {e}"))?;
-                    extract_zip_to(archive_path, &data_dir, tick)?;
-                    normalize_paths_to_lowercase(&data_dir);
-                }
+                install_zip_data_mod(archive_path, &mod_dir, tick)?;
             }
         }
         InstallStrategy::Fomod(files) => {
@@ -1075,24 +1343,27 @@ pub fn install_mod_from_archive_with_nexus_ticking(
     Ok(mod_entry)
 }
 
-/// Extract all files from a zip archive into `dest_dir`, preserving directory
-/// structure.
+/// Extract all files from a zip archive into `dest_dir`, stripping
+/// `strip_prefix` from every entry name before writing.
+///
+/// `strip_prefix` should be the prefix (including trailing `/`) determined by
+/// [`find_data_root_in_paths`] or an equivalent detection call.  Pass `""` to
+/// extract entries without any prefix stripping.
 ///
 /// `tick` is called approximately every [`EXTRACTION_TICK_INTERVAL_MS`] while
 /// iterating over entries so that callers can pulse a progress bar or process
 /// UI events to keep the application responsive during extraction of large
 /// archives.  Pass `&|| {}` when no progress feedback is needed.
-fn extract_zip_to(archive_path: &Path, dest_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
+fn extract_zip_to(
+    archive_path: &Path,
+    dest_dir: &Path,
+    strip_prefix: &str,
+    tick: &dyn Fn(),
+) -> Result<(), String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
-
-    // Find common prefix to strip (e.g. when archive has a single top-level
-    // folder wrapping everything).  Uses file_names() which reads only the
-    // central-directory metadata – no decompression – so we can keep a single
-    // file handle for both the prefix scan and the extraction pass.
-    let prefix = find_common_prefix(&zip);
 
     let mut last_tick = std::time::Instant::now();
     for i in 0..zip.len() {
@@ -1108,12 +1379,23 @@ fn extract_zip_to(archive_path: &Path, dest_dir: &Path, tick: &dyn Fn()) -> Resu
             .map_err(|e| format!("Cannot read zip entry: {e}"))?;
 
         let raw_name = entry.name().to_string();
-        // Strip common prefix
-        let rel_name = if !prefix.is_empty() {
-            raw_name
-                .strip_prefix(&prefix)
-                .unwrap_or(&raw_name)
-                .to_string()
+        // Strip the caller-supplied prefix.
+        let rel_name = if !strip_prefix.is_empty() {
+            match raw_name.strip_prefix(strip_prefix) {
+                Some(r) => r.to_string(),
+                None => {
+                    // Try a case-insensitive strip for archives where casing
+                    // of the prefix may differ from the detected prefix.
+                    let raw_lower = raw_name.to_lowercase();
+                    let prefix_lower = strip_prefix.to_lowercase();
+                    if let Some(r) = raw_lower.strip_prefix(&prefix_lower) {
+                        raw_name[raw_name.len() - r.len()..].to_string()
+                    } else {
+                        // Entry is outside the selected data root – skip it.
+                        continue;
+                    }
+                }
+            }
         } else {
             raw_name
         };
@@ -1314,44 +1596,178 @@ fn extract_single_file_with_7z(
     Ok(())
 }
 
+/// Install a zip-format Data mod into `mod_dir`.
+///
+/// Uses the scoring heuristic ([`find_data_root_in_paths`]) to detect the
+/// archive's data root, then handles three cases:
+///
+/// 1. **BAIN packages** – all numbered top-level directories are extracted and
+///    merged into `mod_dir/Data/` in ascending order.
+/// 2. **Root-level mod** (e.g. ENB, ReShade) – content is extracted into
+///    `mod_dir/` alongside an empty `mod_dir/Data/`; the deployment layer
+///    ([`link_items_alongside_data`]) will link these files to the game root.
+/// 3. **Normal data mod** – content is extracted with the detected prefix
+///    stripped directly into `mod_dir/Data/`.
+fn install_zip_data_mod(archive_path: &Path, mod_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
+    // Collect all file names from the central directory (no decompression).
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
+    let zip =
+        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
+    let all_paths: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+    drop(zip); // release the file handle before extraction
+    let path_refs: Vec<&str> = all_paths.iter().map(|s| s.as_str()).collect();
+
+    let data_dir = mod_dir.join("Data");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create Data directory: {e}"))?;
+
+    if is_bain_archive(&path_refs) {
+        // BAIN: install all numbered packages, merged in ascending order so
+        // that higher-numbered packages override lower-numbered ones.
+        for bain_dir in collect_bain_top_dirs(&path_refs) {
+            let bain_prefix = format!("{bain_dir}/");
+            extract_zip_to(archive_path, &data_dir, &bain_prefix, tick)?;
+        }
+        normalize_paths_to_lowercase(&data_dir);
+        return Ok(());
+    }
+
+    let data_root = find_data_root_in_paths(&path_refs);
+    let root_trimmed = data_root.trim_end_matches('/');
+    let best_score = score_as_data_root(root_trimmed, &path_refs);
+
+    if best_score > 0 {
+        // Scoring found a clear data root: extract into mod_dir/Data/ with
+        // the detected prefix stripped.
+        extract_zip_to(archive_path, &data_dir, &data_root, tick)?;
+        normalize_paths_to_lowercase(&data_dir);
+        return Ok(());
+    }
+
+    // No data-like content found via scoring.  Fall back to the simple
+    // common-prefix approach and check for root-level markers.
+    let simple_prefix = find_common_prefix_from_paths(&path_refs);
+    let stripped: Vec<String> = path_refs
+        .iter()
+        .filter_map(|p| {
+            let p_lower = p.to_lowercase().replace('\\', "/");
+            let p_lower = p_lower.trim_start_matches('/').to_string();
+            if simple_prefix.is_empty() {
+                Some(p_lower)
+            } else {
+                p_lower
+                    .strip_prefix(&simple_prefix.to_lowercase())
+                    .map(|s| s.to_string())
+            }
+        })
+        .collect();
+    let stripped_refs: Vec<&str> = stripped.iter().map(|s| s.as_str()).collect();
+
+    if looks_like_root_level_mod(&stripped_refs) {
+        // Root-level mod (ENB, ReShade, …): extract to mod_dir/ so that the
+        // deploy layer can link these files to the game root directory.
+        // mod_dir/Data/ is already created above so enable_mod will take the
+        // "has Data dir" branch and call link_items_alongside_data.
+        extract_zip_to(archive_path, mod_dir, &simple_prefix, tick)?;
+    } else {
+        // Ambiguous – just extract everything to mod_dir/Data/.
+        extract_zip_to(archive_path, &data_dir, &simple_prefix, tick)?;
+        normalize_paths_to_lowercase(&data_dir);
+    }
+
+    Ok(())
+}
+
 fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
+    // Pre-list archive entries to determine the install strategy before
+    // performing the (potentially large) extraction.
+    let entries = list_archive_entries_with_7z(archive_path).unwrap_or_default();
+    let path_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+
     let tmp_extract = create_temp_extract_dir()?;
     extract_archive_with_7z(archive_path, &tmp_extract, tick)?;
 
-    let mut top_dirs = Vec::new();
-    let mut top_files = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&tmp_extract) {
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                top_dirs.push(path);
-            } else if path.is_file() {
-                top_files.push(path);
+    let data_dir = mod_dir.join("Data");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create Data directory: {e}"))?;
+
+    let install_result = (|| -> Result<(), String> {
+        if is_bain_archive(&path_refs) {
+            // BAIN: merge all numbered packages in ascending order.
+            for bain_dir in collect_bain_top_dirs(&path_refs) {
+                let src = tmp_extract.join(&bain_dir);
+                if src.is_dir() {
+                    copy_dir_contents(&src, &data_dir)?;
+                }
             }
+            return Ok(());
         }
-    }
 
-    let data_source = if tmp_extract.join("Data").is_dir() {
-        Some(tmp_extract.clone())
-    } else if top_dirs.len() == 1 && top_files.is_empty() && top_dirs[0].join("Data").is_dir() {
-        Some(top_dirs[0].clone())
-    } else {
-        None
-    };
+        let data_root = find_data_root_in_paths(&path_refs);
+        let root_trimmed = data_root.trim_end_matches('/');
+        let best_score = score_as_data_root(root_trimmed, &path_refs);
 
-    if let Some(source_root) = data_source {
-        copy_dir_contents(&source_root, mod_dir)?;
-    } else {
-        let data_dir = mod_dir.join("Data");
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|e| format!("Failed to create Data directory: {e}"))?;
-        copy_dir_contents(&tmp_extract, &data_dir)?;
-    }
+        if best_score > 0 {
+            // Scoring found the data root: copy from the extracted subtree.
+            let src = if root_trimmed.is_empty() {
+                tmp_extract.clone()
+            } else {
+                // Join path components individually to handle '/' separators.
+                let mut p = tmp_extract.clone();
+                for component in root_trimmed.split('/') {
+                    if !component.is_empty() {
+                        p = p.join(component);
+                    }
+                }
+                p
+            };
+            copy_dir_contents(&src, &data_dir)?;
+            return Ok(());
+        }
 
-    // Normalize folder and file names inside Data/ to lowercase so that mods
+        // Fallback: use simple common prefix, check for root-level markers.
+        let simple_prefix = find_common_prefix_from_paths(&path_refs);
+        let stripped: Vec<String> = path_refs
+            .iter()
+            .filter_map(|p| {
+                let p_lower = p.to_lowercase().replace('\\', "/");
+                let p_lower = p_lower.trim_start_matches('/').to_string();
+                if simple_prefix.is_empty() {
+                    Some(p_lower)
+                } else {
+                    p_lower
+                        .strip_prefix(&simple_prefix.to_lowercase())
+                        .map(|s| s.to_string())
+                }
+            })
+            .collect();
+        let stripped_refs: Vec<&str> = stripped.iter().map(|s| s.as_str()).collect();
+
+        let src_root = if simple_prefix.is_empty() {
+            tmp_extract.clone()
+        } else {
+            let prefix_trimmed = simple_prefix.trim_end_matches('/');
+            let mut p = tmp_extract.clone();
+            for component in prefix_trimmed.split('/') {
+                if !component.is_empty() {
+                    p = p.join(component);
+                }
+            }
+            p
+        };
+
+        if looks_like_root_level_mod(&stripped_refs) {
+            copy_dir_contents(&src_root, mod_dir)?;
+        } else {
+            copy_dir_contents(&src_root, &data_dir)?;
+        }
+        Ok(())
+    })();
+
+    // Normalize folder / file names inside Data/ to lowercase so that mods
     // with mixed-case directories (TEXTURES/, Meshes/, …) are stored
     // consistently on case-sensitive (Linux) filesystems.
-    let data_dir = mod_dir.join("Data");
     if data_dir.is_dir() {
         normalize_paths_to_lowercase(&data_dir);
     }
@@ -1362,7 +1778,8 @@ fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path, tick: &dyn 
             tmp_extract.display()
         );
     }
-    Ok(())
+
+    install_result
 }
 
 fn create_temp_extract_dir() -> Result<std::path::PathBuf, String> {
