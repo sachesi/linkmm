@@ -231,44 +231,11 @@ pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
     None
 }
 
-/// Return the `proton` run-script from any Proton installation found in the
-/// Steam libraries.  Prefers "Proton Experimental" over numbered releases
-/// (it sorts last lexicographically), and among numbered releases picks the
-/// highest folder name.  Note: "Proton 10.0" sorts before "Proton 9.0" with
-/// plain string comparison; this edge-case is accepted given that Proton
-/// Experimental is typically the most current choice anyway.
-///
-/// This is a generic fallback.  Prefer [`find_proton_for_app`] when you know
-/// which app you are launching so that Steam's per-app Proton selection is
-/// honoured.
-pub fn find_proton_run() -> Option<PathBuf> {
-    let libraries = find_steam_libraries();
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    for lib in &libraries {
-        let common = lib.path.join("common");
-        if let Ok(entries) = std::fs::read_dir(&common) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("Proton") && entry.path().is_dir() {
-                    let proton_script = entry.path().join("proton");
-                    if proton_script.is_file() {
-                        candidates.push(proton_script);
-                    }
-                }
-            }
-        }
-    }
-    // Sort to prefer higher version numbers (lexicographic order works for
-    // "Proton 9.0", "Proton Experimental", etc.)
-    candidates.sort();
-    candidates.into_iter().last()
-}
-
-// ── Steam config.vdf helpers ──────────────────────────────────────────────
+// ── localconfig.vdf helpers ───────────────────────────────────────────────
 
 /// Parse a VDF line that is a bare section-header key with no associated
-/// value, e.g. `"CompatToolMapping"`.  Returns `None` for lines that have
-/// a value (handled by [`parse_vdf_key_value`]) or are not quoted strings.
+/// value, e.g. `"apps"`.  Returns `None` for lines that carry a value
+/// (handled by [`parse_vdf_key_value`]) or are not quoted strings.
 fn parse_vdf_section_name(line: &str) -> Option<String> {
     let line = line.trim();
     if !line.starts_with('"') {
@@ -277,7 +244,7 @@ fn parse_vdf_section_name(line: &str) -> Option<String> {
     let rest = &line[1..];
     let key_end = rest.find('"')?;
     let key = rest[..key_end].to_string();
-    // Ensure nothing follows the closing quote (otherwise it is a key-value pair)
+    // A bare section key has nothing after the closing quote.
     if rest[key_end + 1..].trim().is_empty() {
         Some(key)
     } else {
@@ -285,214 +252,283 @@ fn parse_vdf_section_name(line: &str) -> Option<String> {
     }
 }
 
-/// Return the path to Steam's main `config/config.vdf`, trying all known
-/// Steam installation roots.
-fn find_config_vdf() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let candidates = [
-        home.join(".steam").join("steam").join("config").join("config.vdf"),
-        home.join(".local")
-            .join("share")
-            .join("Steam")
-            .join("config")
-            .join("config.vdf"),
-        home.join("snap")
-            .join("steam")
-            .join("common")
-            .join(".steam")
-            .join("steam")
-            .join("config")
-            .join("config.vdf"),
-        home.join(".var")
-            .join("app")
-            .join("com.valvesoftware.Steam")
-            .join(".steam")
-            .join("steam")
-            .join("config")
-            .join("config.vdf"),
-    ];
-    candidates.into_iter().find(|p| p.is_file())
+/// Return the leading whitespace prefix of `line` (tabs and spaces).
+fn leading_whitespace(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
 }
 
-/// Parse `config.vdf` text and return the `CompatToolMapping > <app_id> > name`
-/// value for `app_id`, if present.
-///
-/// The returned string is the tool identifier Steam stored, which may be a
-/// short name (`proton_experimental`, `proton_9`) or a full directory name
-/// (`Proton 9.0-3`).  Returns `None` when no mapping exists for the app.
-pub fn parse_compat_tool_from_config_vdf(contents: &str, app_id: u32) -> Option<String> {
-    let app_id_str = app_id.to_string();
-    let mut depth: i32 = 0;
+/// Escape a string for use as a value inside VDF double-quotes.
+fn escape_vdf_value(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
 
-    #[derive(PartialEq)]
-    enum State {
-        LookingForCompatMapping,
-        InCompatMapping,
-        InApp,
+/// Format a string as a Python string literal (double-quoted, backslash-escaped).
+fn python_str_literal(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Return the path to Steam's `localconfig.vdf` for the active user account.
+///
+/// The file is at `<steam_root>/userdata/<userid>/config/localconfig.vdf`.
+/// When multiple user directories are present the most recently modified file
+/// is returned.  Returns `None` when Steam is not found or no user has a
+/// `localconfig.vdf`.
+pub fn find_localconfig_vdf() -> Option<PathBuf> {
+    let steam_root = find_steam_root()?;
+    let userdata = steam_root.join("userdata");
+    if !userdata.is_dir() {
+        return None;
     }
 
-    let mut state = State::LookingForCompatMapping;
-    let mut compat_depth: i32 = -1;
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    if let Ok(entries) = std::fs::read_dir(&userdata) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let cfg = entry.path().join("config").join("localconfig.vdf");
+            if cfg.is_file() {
+                let mtime = cfg
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if best.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true) {
+                    best = Some((cfg, mtime));
+                }
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Edit `localconfig.vdf` text so that the `LaunchOptions` key for `app_id`
+/// is set to `opts`.
+///
+/// Three cases are handled:
+/// * `LaunchOptions` already exists inside the app section → value replaced.
+/// * The app section exists but has no `LaunchOptions` key → key inserted.
+/// * The app section does not exist under `apps` → section + key inserted.
+///
+/// If the top-level `apps` section cannot be found the content is returned
+/// unmodified (graceful degradation for unusual Steam installations).
+pub fn set_launch_options_in_vdf(contents: &str, app_id: u32, opts: &str) -> String {
+    let app_id_str = app_id.to_string();
+    let escaped_opts = escape_vdf_value(opts);
+
+    #[derive(PartialEq)]
+    enum Phase {
+        SeekingApps,
+        InApps,
+        InApp,
+        Done,
+    }
+
+    let mut out = String::with_capacity(contents.len() + 256);
+    let mut phase = Phase::SeekingApps;
+    let mut depth: i32 = 0;
+    let mut apps_depth: i32 = -1;
     let mut app_depth: i32 = -1;
     let mut pending_key: Option<String> = None;
+    let mut launch_options_written = false;
 
     for line in contents.lines() {
         let trimmed = line.trim();
 
         if trimmed == "{" {
             depth += 1;
-            match &state {
-                State::LookingForCompatMapping => {
+            match phase {
+                Phase::SeekingApps => {
                     if pending_key
                         .as_deref()
-                        .map(|k| k.eq_ignore_ascii_case("compattoolmapping"))
+                        .map(|k| k.eq_ignore_ascii_case("apps"))
                         .unwrap_or(false)
                     {
-                        state = State::InCompatMapping;
-                        compat_depth = depth;
+                        phase = Phase::InApps;
+                        apps_depth = depth;
                     }
                 }
-                State::InCompatMapping => {
+                Phase::InApps => {
                     if pending_key.as_deref() == Some(app_id_str.as_str()) {
-                        state = State::InApp;
+                        phase = Phase::InApp;
                         app_depth = depth;
                     }
                 }
-                State::InApp => {}
+                _ => {}
             }
             pending_key = None;
-        } else if trimmed == "}" {
-            match &state {
-                State::InApp if depth == app_depth => {
-                    state = State::InCompatMapping;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if trimmed == "}" {
+            match phase {
+                Phase::InApp if depth == app_depth => {
+                    // Leaving the app section — insert LaunchOptions if it was
+                    // never encountered in this section.
+                    if !launch_options_written {
+                        let ind = leading_whitespace(line);
+                        out.push_str(ind);
+                        out.push('\t');
+                        out.push_str(&format!(
+                            "\"LaunchOptions\"\t\t\"{escaped_opts}\"\n"
+                        ));
+                        launch_options_written = true;
+                    }
+                    phase = Phase::Done;
                     app_depth = -1;
                 }
-                State::InCompatMapping if depth == compat_depth => {
-                    state = State::LookingForCompatMapping;
-                    compat_depth = -1;
+                Phase::InApps if depth == apps_depth => {
+                    // Leaving the apps section without finding the app — insert
+                    // the whole section before the closing brace.
+                    let ind = leading_whitespace(line);
+                    out.push_str(ind);
+                    out.push('\t');
+                    out.push_str(&format!("\"{app_id_str}\"\n"));
+                    out.push_str(ind);
+                    out.push('\t');
+                    out.push_str("{\n");
+                    out.push_str(ind);
+                    out.push_str("\t\t");
+                    out.push_str(&format!("\"LaunchOptions\"\t\t\"{escaped_opts}\"\n"));
+                    out.push_str(ind);
+                    out.push('\t');
+                    out.push_str("}\n");
+                    launch_options_written = true;
+                    phase = Phase::Done;
+                    apps_depth = -1;
                 }
                 _ => {}
             }
             depth -= 1;
             pending_key = None;
-        } else if let Some((key, value)) = parse_vdf_key_value(trimmed) {
-            if state == State::InApp && key.eq_ignore_ascii_case("name") && !value.is_empty() {
-                return Some(value);
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // Key-value pair or bare section-name key.
+        if let Some((key, _)) = parse_vdf_key_value(trimmed) {
+            if phase == Phase::InApp && key.eq_ignore_ascii_case("launchoptions") {
+                // Replace the value in-place, preserving the line's indentation.
+                let ind = leading_whitespace(line);
+                out.push_str(ind);
+                out.push_str(&format!("\"LaunchOptions\"\t\t\"{escaped_opts}\"\n"));
+                launch_options_written = true;
+                pending_key = None;
+                continue; // skip pushing the original line
             }
             pending_key = None;
-        } else if let Some(section_name) = parse_vdf_section_name(trimmed) {
-            pending_key = Some(section_name);
+        } else if let Some(name) = parse_vdf_section_name(trimmed) {
+            pending_key = Some(name);
         } else {
             pending_key = None;
         }
+
+        out.push_str(line);
+        out.push('\n');
     }
 
-    None
+    out
 }
 
-/// Convert a Proton tool identifier read from `config.vdf` into a directory
-/// name prefix used to locate the Proton installation folder.
+/// Write a Python 3 wrapper script to `/tmp/linkmm_<app_id>_launch.py`.
 ///
-/// Examples:
-/// * `"proton_experimental"` → `"Proton Experimental"`
-/// * `"proton_9"`            → `"Proton 9"`
-/// * `"Proton 9.0-3"`        → `"Proton 9.0-3"` (already a full name)
-fn tool_name_to_dir_prefix(tool_name: &str) -> String {
-    if tool_name.contains(' ') {
-        // Already looks like a full directory name (e.g. "Proton 9.0-3").
-        tool_name.to_string()
-    } else {
-        // Convert underscore-separated identifier to title-cased, space-
-        // separated prefix, e.g. "proton_experimental" → "Proton Experimental".
-        tool_name
-            .split('_')
-            .map(|part| {
-                let mut chars = part.chars();
-                match chars.next() {
-                    None => String::new(),
-                    Some(first) => first.to_uppercase().to_string() + chars.as_str(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
+/// The script is invoked by Steam as `<script> %command%`, where `%command%`
+/// expands to Steam's full Proton launch command.  The script replaces the
+/// argument that ends with `default_exe` with the full path to `chosen_exe`,
+/// then `exec`s into the modified command.  This causes Proton to run the
+/// chosen executable (e.g. `skse64_loader.exe`) while Steam still tracks the
+/// game session through its normal process-monitoring infrastructure.
+fn write_exe_override_script(
+    app_id: u32,
+    default_exe: &str,
+    chosen_exe: &PathBuf,
+) -> Result<PathBuf, String> {
+    let script_path = PathBuf::from(format!("/tmp/linkmm_{app_id}_launch.py"));
 
-/// Return the `proton` run-script for the Proton version that Steam has
-/// configured for `app_id`.
-///
-/// Reads `~/.steam/steam/config/config.vdf` to determine which Proton tool
-/// Steam assigned to the game, then locates that tool in the Steam libraries.
-/// Falls back to [`find_proton_run`] (highest available version) when:
-/// * `config.vdf` cannot be read or contains no mapping for `app_id`, or
-/// * the configured Proton version is not installed.
-pub fn find_proton_for_app(app_id: u32) -> Option<PathBuf> {
-    let libraries = find_steam_libraries();
+    let default_py = python_str_literal(default_exe);
+    let chosen_py = python_str_literal(&chosen_exe.to_string_lossy());
 
-    if let Some(tool_name) = find_config_vdf()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|contents| parse_compat_tool_from_config_vdf(&contents, app_id))
+    // The script substitutes `default_exe` for `chosen_exe` in argv, matching
+    // by the final path component so it works regardless of the full path that
+    // Steam embeds in the Proton command.
+    let script = format!(
+        "#!/usr/bin/env python3\n\
+         # Generated by linkmm — do not edit\n\
+         import sys, os\n\
+         DEFAULT = {default_py}\n\
+         CHOSEN  = {chosen_py}\n\
+         args = list(sys.argv[1:])\n\
+         for i, a in enumerate(args):\n\
+         \tif a == DEFAULT or a.endswith(\"/\" + DEFAULT) or a.endswith(\"\\\\\\\\\" + DEFAULT):\n\
+         \t\targs[i] = CHOSEN\n\
+         \t\tbreak\n\
+         if args:\n\
+         \tos.execvp(args[0], args)\n"
+    );
+
+    std::fs::write(&script_path, script.as_bytes())
+        .map_err(|e| format!("Failed to write launcher script: {e}"))?;
+
+    #[cfg(unix)]
     {
-        if !tool_name.is_empty() {
-            let dir_prefix = tool_name_to_dir_prefix(&tool_name);
-            let mut candidates: Vec<PathBuf> = Vec::new();
-
-            for lib in &libraries {
-                let common = lib.path.join("common");
-                if let Ok(entries) = std::fs::read_dir(&common) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        // Accept an exact match or a directory whose name starts
-                        // with the prefix (handles versioned suffixes like "-3").
-                        if name == dir_prefix || name.starts_with(&(dir_prefix.clone() + " ")) {
-                            let proton_script = entry.path().join("proton");
-                            if proton_script.is_file() {
-                                candidates.push(proton_script);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !candidates.is_empty() {
-                candidates.sort();
-                return candidates.into_iter().last();
-            }
-        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Failed to make launcher script executable: {e}"))?;
     }
 
-    // Fallback: use the highest available Proton version.
-    find_proton_run()
+    Ok(script_path)
 }
 
-/// Launch a game executable.
+/// Atomically update the `LaunchOptions` for `app_id` in Steam's
+/// `localconfig.vdf`.
 ///
-/// * The **primary** game binary (first entry in
-///   [`GameKind::known_executables`]) is launched through the Steam URL
-///   scheme (`steam://run/<app_id>`) so that Steam is properly notified:
-///   the overlay is active, playtime is tracked, and cloud-saves sync as
-///   expected.
+/// Pass an empty string to clear any previously set launch override (Steam
+/// will use its default executable).
 ///
-/// * **Script-extender loaders** and other secondary executables (SKSE,
-///   F4SE, NVSE, …) are launched directly via Proton because
-///   `steam://run/<app_id>` always starts the game's default executable —
-///   it does not respect which binary the user has selected.  Running via
-///   Proton ensures the selected binary actually starts inside the correct
-///   Wine environment.
+/// Returns an error when `localconfig.vdf` cannot be found or written.
+pub fn set_steam_launch_option(app_id: u32, opts: &str) -> Result<(), String> {
+    let path = find_localconfig_vdf()
+        .ok_or_else(|| "Steam localconfig.vdf not found".to_string())?;
+
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+
+    let modified = set_launch_options_in_vdf(&contents, app_id, opts);
+
+    // Write to a temp file first, then rename for atomicity.
+    let tmp = path.with_extension("vdf.linkmm_tmp");
+    std::fs::write(&tmp, modified.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Failed to update {}: {e}", path.display())
+    })?;
+
+    Ok(())
+}
+
+/// Launch a game executable, always routing through the Steam client.
 ///
-/// Required environment variables for Proton launches (set automatically):
-/// * `STEAM_COMPAT_DATA_PATH` — the game's per-app Wine prefix as configured
-///   by Steam (`compatdata/<app_id>` in the Steam library that holds the
-///   game).
-/// * `STEAM_COMPAT_CLIENT_INSTALL_PATH` — Steam installation root, used by
-///   Proton to locate its own runtime libraries and scripts.
+/// For the **primary** game binary any previously written exe override is
+/// cleared (Steam's default launch is restored) before opening
+/// `steam://run/<app_id>`.
 ///
-/// The Proton binary used is the one Steam has configured for this specific
-/// game (read from `config/config.vdf`), falling back to the highest
-/// available Proton version when no per-app mapping exists.
+/// For **non-primary** executables (script-extender loaders such as SKSE64,
+/// F4SE, NVSE, OBSE, …) a small Python 3 wrapper script is written to `/tmp`
+/// and registered as the game's `LaunchOptions` in Steam's
+/// `userdata/.../localconfig.vdf`.  The wrapper intercepts Steam's Proton
+/// invocation and substitutes the chosen executable for the default one,
+/// so that Proton runs the script extender while Steam still tracks the
+/// session: the game appears as "Running" in the library, the overlay is
+/// active, and playtime is counted.
 ///
-/// Returns `Ok(())` if the process was successfully spawned, or an error
-/// message string on failure.
+/// All launches use `xdg-open steam://run/<app_id>` so the Steam client is
+/// always the process that starts the game.
+///
+/// Returns `Ok(())` on successful spawn, or an error message string on
+/// failure.
 pub fn launch_game_executable(
     game: &crate::core::games::Game,
     exe_name: &str,
@@ -507,9 +543,6 @@ pub fn launch_game_executable(
         .steam_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
 
-    // Determine whether this is the primary game executable.  Script-extender
-    // loaders (skse64_loader.exe, f4se_loader.exe, …) are NOT the primary exe
-    // and must be launched via Proton so the selected binary actually runs.
     let is_primary = game
         .kind
         .known_executables()
@@ -518,41 +551,32 @@ pub fn launch_game_executable(
         .unwrap_or(false);
 
     if is_primary {
-        // Use the Steam URL scheme so that the game starts through Steam,
-        // enabling the overlay, playtime tracking, and cloud-save sync.
-        std::process::Command::new("xdg-open")
-            .arg(format!("steam://run/{app_id}"))
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Failed to launch {exe_name} via Steam: {e}"))
+        // Clear any exe override left by a previous script-extender launch.
+        // Ignore errors — the Steam launch still works without this step.
+        let _ = set_steam_launch_option(app_id, "");
     } else {
-        // Run the selected executable (e.g. SKSE, F4SE) via Proton directly.
-        // steam://run/<app_id> would always launch the game's default exe and
-        // would ignore the user's choice, so Proton is the correct path here.
-        // Use the Proton version that Steam has configured for this specific
-        // game (read from config.vdf), falling back to the highest available.
-        let proton = find_proton_for_app(app_id)
-            .ok_or_else(|| "No Proton installation found in Steam libraries".to_string())?;
-
-        let steam_root = find_steam_root()
-            .ok_or_else(|| "Steam installation not found".to_string())?;
-
-        let compatdata = find_compatdata_path(app_id)
-            .ok_or_else(|| format!("Steam compatdata not found for app {app_id}"))?;
-
-        std::process::Command::new(&proton)
-            .arg("run")
-            .arg(&exe_path)
-            // STEAM_COMPAT_DATA_PATH points Proton to the game's Wine prefix
-            // (the per-app compatdata directory created by Steam).
-            // STEAM_COMPAT_CLIENT_INSTALL_PATH tells Proton where the Steam
-            // installation root is so it can locate its own runtime files.
-            .env("STEAM_COMPAT_DATA_PATH", &compatdata)
-            .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &steam_root)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Failed to launch {exe_name} via Proton: {e}"))
+        // Write a launcher wrapper that substitutes the chosen exe inside
+        // Steam's Proton command, then register it as the game's LaunchOptions
+        // so that `steam://run/<app_id>` runs the chosen binary through Steam.
+        let default_exe = game
+            .kind
+            .known_executables()
+            .first()
+            .copied()
+            .unwrap_or("");
+        let script = write_exe_override_script(app_id, default_exe, &exe_path)?;
+        set_steam_launch_option(
+            app_id,
+            &format!("\"{}\" %command%", script.display()),
+        )?;
     }
+
+    // Always launch via Steam so playtime, overlay, and "Running" status work.
+    std::process::Command::new("xdg-open")
+        .arg(format!("steam://run/{app_id}"))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open steam://run/{app_id}: {e}"))
 }
 
 #[cfg(test)]
@@ -612,13 +636,152 @@ mod tests {
 
     #[test]
     fn launch_game_executable_fails_for_script_extender_when_not_found() {
-        // Script extenders are launched via Proton (not steam://).
-        // The executable-existence check is performed before any Proton/Steam
-        // lookup, so a missing loader still returns an error immediately.
+        // The executable-existence check happens before any Steam/localconfig
+        // lookup, so a missing loader exe returns "Executable not found" immediately.
         let tmp = tempfile::tempdir().expect("tempdir");
         let game = Game::new(GameKind::SkyrimSE, tmp.path().to_path_buf());
         let result = launch_game_executable(&game, "skse64_loader.exe");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Executable not found"));
+    }
+
+    #[test]
+    fn launch_game_executable_script_extender_fails_without_localconfig() {
+        // When the exe exists on disk but Steam is not installed (no
+        // localconfig.vdf), launching a non-primary exe should fail with a
+        // descriptive error about localconfig.vdf.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("skse64_loader.exe"), b"fake").unwrap();
+        let game = Game::new(GameKind::SkyrimSE, tmp.path().to_path_buf());
+        let result = launch_game_executable(&game, "skse64_loader.exe");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("localconfig") || err.contains("launcher script"),
+            "expected error about localconfig.vdf or launcher script, got: {err}"
+        );
+    }
+
+    // ── set_launch_options_in_vdf tests ──────────────────────────────────────
+
+    /// Minimal localconfig.vdf with a LaunchOptions key already present.
+    const VDF_WITH_LAUNCH_OPTIONS: &str = r#""UserLocalConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"apps"
+				{
+					"489830"
+					{
+						"LaunchOptions"		""
+						"LastPlayed"		"1000"
+					}
+				}
+			}
+		}
+	}
+}
+"#;
+
+    /// Minimal localconfig.vdf where the app section exists but has no
+    /// LaunchOptions key.
+    const VDF_WITHOUT_LAUNCH_OPTIONS_KEY: &str = r#""UserLocalConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"apps"
+				{
+					"489830"
+					{
+						"LastPlayed"		"1000"
+					}
+				}
+			}
+		}
+	}
+}
+"#;
+
+    /// Minimal localconfig.vdf where the target app section is absent.
+    const VDF_WITHOUT_APP_SECTION: &str = r#""UserLocalConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"apps"
+				{
+					"99999"
+					{
+						"LastPlayed"		"1000"
+					}
+				}
+			}
+		}
+	}
+}
+"#;
+
+    #[test]
+    fn set_launch_options_replaces_existing_key() {
+        let result = set_launch_options_in_vdf(VDF_WITH_LAUNCH_OPTIONS, 489830, "/tmp/x.py %command%");
+        assert!(result.contains("\"LaunchOptions\""));
+        assert!(result.contains("/tmp/x.py %command%"), "new value should appear");
+        // The old empty value should be gone
+        assert!(
+            !result.contains("\"LaunchOptions\"\t\t\"\""),
+            "old empty value should be replaced"
+        );
+        // Unrelated key must be preserved
+        assert!(result.contains("\"LastPlayed\""));
+    }
+
+    #[test]
+    fn set_launch_options_inserts_key_when_missing() {
+        let result = set_launch_options_in_vdf(
+            VDF_WITHOUT_LAUNCH_OPTIONS_KEY,
+            489830,
+            "/tmp/x.py %command%",
+        );
+        assert!(result.contains("\"LaunchOptions\""), "key should be inserted");
+        assert!(result.contains("/tmp/x.py %command%"));
+        assert!(result.contains("\"LastPlayed\""), "existing key preserved");
+    }
+
+    #[test]
+    fn set_launch_options_inserts_app_section_when_missing() {
+        let result = set_launch_options_in_vdf(VDF_WITHOUT_APP_SECTION, 489830, "myopts");
+        assert!(result.contains("\"489830\""), "app section should be created");
+        assert!(result.contains("\"LaunchOptions\""));
+        assert!(result.contains("myopts"));
+        assert!(result.contains("\"99999\""), "other app section preserved");
+    }
+
+    #[test]
+    fn set_launch_options_clears_when_opts_empty() {
+        let vdf = VDF_WITH_LAUNCH_OPTIONS.replace("\"\"", "\"/old/script.py %command%\"");
+        let result = set_launch_options_in_vdf(&vdf, 489830, "");
+        assert!(result.contains("\"LaunchOptions\""));
+        assert!(
+            !result.contains("/old/script.py"),
+            "old launch options should be removed"
+        );
+    }
+
+    #[test]
+    fn set_launch_options_vdf_value_is_escaped() {
+        // Backslashes and double-quotes in opts must be escaped in the output.
+        let result = set_launch_options_in_vdf(VDF_WITH_LAUNCH_OPTIONS, 489830, r#"a\b"c"#);
+        assert!(result.contains(r#"a\\b\"c"#), "special chars should be escaped");
     }
 }
