@@ -225,7 +225,6 @@ pub fn build_settings_page(
         });
     }
 
-    profiles_group.add(&profiles_list);
     content_box.append(&profiles_group);
 
     clamp.set_child(Some(&content_box));
