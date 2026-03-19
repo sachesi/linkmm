@@ -1,6 +1,5 @@
 use crate::core::games::Game;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,11 +61,6 @@ pub struct AppConfig {
     pub profiles: Vec<Profile>,
     #[serde(default = "default_active_profile_id")]
     pub active_profile_id: String,
-    /// User's preferred launch executable per game (game ID → exe filename).
-    /// When set, the launch button defaults to this executable instead of the
-    /// first discovered executable.  Persisted across restarts.
-    #[serde(default)]
-    pub preferred_executables: HashMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -81,7 +75,6 @@ impl Default for AppConfig {
             installed_archives: Vec::new(),
             profiles: default_profiles(),
             active_profile_id: default_active_profile_id(),
-            preferred_executables: HashMap::new(),
         }
     }
 }
@@ -205,51 +198,6 @@ mod tests {
         assert_eq!(
             cfg.downloads_dir(Some("   ")),
             PathBuf::from("/tmp/linkmm/downloads")
-        );
-    }
-
-    #[test]
-    fn preferred_executables_defaults_empty_and_round_trips_through_json() {
-        let cfg = AppConfig::default();
-        assert!(cfg.preferred_executables.is_empty());
-
-        let json = serde_json::to_string(&cfg).unwrap();
-        let loaded: AppConfig = serde_json::from_str(&json).unwrap();
-        assert!(loaded.preferred_executables.is_empty());
-    }
-
-    #[test]
-    fn preferred_executables_persists_per_game_choice() {
-        let mut cfg = AppConfig::default();
-        cfg.preferred_executables
-            .insert("skyrim_se".to_string(), "skse64_loader.exe".to_string());
-
-        let json = serde_json::to_string(&cfg).unwrap();
-        let loaded: AppConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            loaded.preferred_executables.get("skyrim_se").map(String::as_str),
-            Some("skse64_loader.exe")
-        );
-    }
-
-    #[test]
-    fn preferred_executables_missing_from_old_config_defaults_to_empty() {
-        // Simulate a config.json that predates the preferred_executables field.
-        let old_json = serde_json::json!({
-            "version": 1,
-            "first_run": false,
-            "current_game_id": null,
-            "nexus_api_key": null,
-            "games": [],
-            "installed_archives": [],
-            "profiles": [{"id": "default", "name": "Default"}],
-            "active_profile_id": "default"
-        })
-        .to_string();
-        let cfg: AppConfig = serde_json::from_str(&old_json).unwrap();
-        assert!(
-            cfg.preferred_executables.is_empty(),
-            "field should default to empty map when absent from JSON"
         );
     }
 }
