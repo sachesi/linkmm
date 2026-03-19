@@ -71,46 +71,6 @@ impl GameKind {
         }
     }
 
-    /// Ordered list of well-known executable names for this game.
-    ///
-    /// The first entry is the primary (vanilla) game executable.  Later
-    /// entries are the launcher and any script-extender loaders (SKSE, F4SE,
-    /// NVSE, FOSE, OBSE) that live in the game root directory.
-    pub fn known_executables(&self) -> &'static [&'static str] {
-        match self {
-            GameKind::SkyrimSE => &[
-                "SkyrimSE.exe",
-                "SkyrimSELauncher.exe",
-                "skse64_loader.exe",
-            ],
-            GameKind::SkyrimLE => &[
-                "TESV.exe",
-                "SkyrimLauncher.exe",
-                "skse_loader.exe",
-            ],
-            GameKind::Fallout4 => &[
-                "Fallout4.exe",
-                "Fallout4Launcher.exe",
-                "f4se_loader.exe",
-            ],
-            GameKind::Fallout3 => &[
-                "Fallout3.exe",
-                "Fallout3Launcher.exe",
-                "fose_loader.exe",
-            ],
-            GameKind::FalloutNV => &[
-                "FalloutNV.exe",
-                "FalloutNVLauncher.exe",
-                "nvse_loader.exe",
-            ],
-            GameKind::Oblivion => &[
-                "Oblivion.exe",
-                "OblivionLauncher.exe",
-                "obse_loader.exe",
-            ],
-        }
-    }
-
     /// Canonical vanilla master plugins for this game, in load-order priority.
     pub fn vanilla_masters(&self) -> &'static [&'static str] {
         match self {
@@ -242,58 +202,10 @@ impl Game {
     pub fn plugins_txt_path(&self) -> Option<PathBuf> {
         Some(self.plugins_txt_dir()?.join("plugins.txt"))
     }
-
-    /// Returns the subset of [`GameKind::known_executables`] that actually
-    /// exist as files inside [`Game::root_path`], in their canonical order.
-    ///
-    /// The first item (if any) is always the primary game executable; later
-    /// items are launchers and script-extender loaders installed by the user.
-    pub fn discover_executables(&self) -> Vec<String> {
-        self.kind
-            .known_executables()
-            .iter()
-            .filter(|name| self.root_path.join(name).is_file())
-            .map(|&name| name.to_string())
-            .collect()
-    }
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn known_executables_are_non_empty_for_all_games() {
-        for kind in GameKind::all() {
-            let exes = kind.known_executables();
-            assert!(!exes.is_empty(), "{:?} has no known executables", kind);
-            // Primary exe must end with .exe
-            assert!(
-                exes[0].ends_with(".exe"),
-                "primary exe for {:?} should end with .exe",
-                kind
-            );
-        }
-    }
-
-    #[test]
-    fn discover_executables_returns_only_existing_files() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Create two of the three known SkyrimSE executables
-        std::fs::write(tmp.path().join("SkyrimSE.exe"), b"").unwrap();
-        std::fs::write(tmp.path().join("skse64_loader.exe"), b"").unwrap();
-
-        let game = Game::new(GameKind::SkyrimSE, tmp.path().to_path_buf());
-        let exes = game.discover_executables();
-
-        assert_eq!(exes, vec!["SkyrimSE.exe", "skse64_loader.exe"]);
-    }
-
-    #[test]
-    fn discover_executables_returns_empty_when_none_exist() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let game = Game::new(GameKind::Fallout4, tmp.path().to_path_buf());
-        assert!(game.discover_executables().is_empty());
-    }
 }
