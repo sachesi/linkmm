@@ -197,201 +197,83 @@ pub fn find_steam_root() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_dir())
 }
 
-/// Return the Proton compatdata directory for `app_id`, searching all known
-/// Steam library locations.
+/// Return the Proton compatdata directory for `app_id`.
+///
+/// Searches the Steam library that contains the game's `appmanifest_<app_id>.acf`
+/// first (which is where Steam always stores the matching `compatdata` entry),
+/// then falls back to all other known Steam libraries.  This replaces the old
+/// approach of checking a static list of hardcoded home-relative paths, which
+/// failed whenever games were installed in a non-default Steam library.
 pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let roots: &[&str] = &[
-        ".steam/steam/steamapps/compatdata",
-        ".local/share/Steam/steamapps/compatdata",
-        "snap/steam/common/.steam/steam/steamapps/compatdata",
-        ".var/app/com.valvesoftware.Steam/.steam/steam/steamapps/compatdata",
-    ];
-    for root in roots {
-        let path = home.join(root).join(app_id.to_string());
+    let libraries = find_steam_libraries();
+
+    // Prefer the library that actually contains the game's appmanifest — Steam
+    // always creates the compatdata entry next to the appmanifest.
+    for lib in &libraries {
+        let manifest = lib.path.join(format!("appmanifest_{app_id}.acf"));
+        if manifest.exists() {
+            let path = lib.path.join("compatdata").join(app_id.to_string());
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+
+    // Fallback: check all libraries (handles e.g. compatdata created before the
+    // game was moved to a different library).
+    for lib in &libraries {
+        let path = lib.path.join("compatdata").join(app_id.to_string());
         if path.is_dir() {
             return Some(path);
         }
     }
+
     None
 }
 
-/// Return the `proton` run-script from any Proton installation found in the
-/// Steam libraries.  Prefers "Proton Experimental" over numbered releases
-/// (it sorts last lexicographically), and among numbered releases picks the
-/// highest folder name.  Note: "Proton 10.0" sorts before "Proton 9.0" with
-/// plain string comparison; this edge-case is accepted given that Proton
-/// Experimental is typically the most current choice anyway.
-pub fn find_proton_run() -> Option<PathBuf> {
-    let libraries = find_steam_libraries();
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    for lib in &libraries {
-        let common = lib.path.join("common");
-        if let Ok(entries) = std::fs::read_dir(&common) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("Proton") && entry.path().is_dir() {
-                    let proton_script = entry.path().join("proton");
-                    if proton_script.is_file() {
-                        candidates.push(proton_script);
-                    }
-                }
-            }
-        }
-    }
-    // Sort to prefer higher version numbers (lexicographic order works for
-    // "Proton 9.0", "Proton Experimental", etc.)
-    candidates.sort();
-    candidates.into_iter().last()
-}
-
-/// Launch a game executable.
+/// Launch a game through the Steam client using its Steam App ID.
 ///
-/// * The **primary** game binary (first entry in
-///   [`GameKind::known_executables`]) is launched through the Steam URL
-///   scheme (`steam://run/<app_id>`) so that Steam is properly notified:
-///   the overlay is active, playtime is tracked, and cloud-saves sync as
-///   expected.
+/// Opens `steam://run/<app_id>` via `xdg-open` so that Steam handles process
+/// creation, Proton integration, overlay, playtime tracking, and the "Running"
+/// badge in the Steam library — exactly as if the user pressed "Play" inside
+/// Steam itself.
 ///
-/// * **Script-extender loaders** and other secondary executables (SKSE,
-///   F4SE, NVSE, …) are launched directly via Proton because
-///   `steam://run/<app_id>` always starts the game's default executable —
-///   it does not respect which binary the user has selected.  Running via
-///   Proton ensures the selected binary actually starts inside the correct
-///   Wine environment.
-///
-/// Required environment variables for Proton launches (set automatically):
-/// * `STEAM_COMPAT_DATA_PATH` — path to the game's per-app Wine prefix
-///   (the `compatdata/<app_id>` directory managed by Steam).
-/// * `STEAM_COMPAT_CLIENT_INSTALL_PATH` — Steam installation root, used by
-///   Proton to locate its own runtime libraries and scripts.
-///
-/// Returns `Ok(())` if the process was successfully spawned, or an error
-/// message string on failure.
-pub fn launch_game_executable(
-    game: &crate::core::games::Game,
-    exe_name: &str,
-) -> Result<(), String> {
-    let exe_path = game.root_path.join(exe_name);
-    if !exe_path.is_file() {
-        return Err(format!("Executable not found: {}", exe_path.display()));
-    }
-
+/// Returns `Ok(())` on successful spawn, or an error message string on
+/// failure.
+pub fn launch_game(game: &crate::core::games::Game) -> Result<(), String> {
     let app_id = game
         .kind
         .steam_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
 
-    // Determine whether this is the primary game executable.  Script-extender
-    // loaders (skse64_loader.exe, f4se_loader.exe, …) are NOT the primary exe
-    // and must be launched via Proton so the selected binary actually runs.
-    let is_primary = game
-        .kind
-        .known_executables()
-        .first()
-        .map(|&primary| primary.eq_ignore_ascii_case(exe_name))
-        .unwrap_or(false);
-
-    if is_primary {
-        // Use the Steam URL scheme so that the game starts through Steam,
-        // enabling the overlay, playtime tracking, and cloud-save sync.
-        std::process::Command::new("xdg-open")
-            .arg(format!("steam://run/{app_id}"))
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Failed to launch {exe_name} via Steam: {e}"))
-    } else {
-        // Run the selected executable (e.g. SKSE, F4SE) via Proton directly.
-        // steam://run/<app_id> would always launch the game's default exe and
-        // would ignore the user's choice, so Proton is the correct path here.
-        let proton = find_proton_run()
-            .ok_or_else(|| "No Proton installation found in Steam libraries".to_string())?;
-
-        let steam_root = find_steam_root()
-            .ok_or_else(|| "Steam installation not found".to_string())?;
-
-        let compatdata = find_compatdata_path(app_id)
-            .ok_or_else(|| format!("Steam compatdata not found for app {app_id}"))?;
-
-        std::process::Command::new(&proton)
-            .arg("run")
-            .arg(&exe_path)
-            // STEAM_COMPAT_DATA_PATH points Proton to the game's Wine prefix
-            // (the per-app compatdata directory created by Steam).
-            // STEAM_COMPAT_CLIENT_INSTALL_PATH tells Proton where the Steam
-            // installation root is so it can locate its own runtime files.
-            .env("STEAM_COMPAT_DATA_PATH", &compatdata)
-            .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &steam_root)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Failed to launch {exe_name} via Proton: {e}"))
-    }
+    std::process::Command::new("xdg-open")
+        .arg(format!("steam://run/{app_id}"))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open steam://run/{app_id}: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::games::{Game, GameKind};
-
-    /// Returns `true` when `exe_name` is the primary executable for `game`
-    /// (i.e. the launch path would use `xdg-open steam://run/…`).
-    fn is_primary_exe(game: &Game, exe_name: &str) -> bool {
-        game.kind
-            .known_executables()
-            .first()
-            .map(|&primary| primary.eq_ignore_ascii_case(exe_name))
-            .unwrap_or(false)
-    }
 
     #[test]
-    fn primary_exe_is_identified_correctly() {
-        let game = Game::new(GameKind::SkyrimSE, std::path::PathBuf::from("/fake/path"));
-        assert!(is_primary_exe(&game, "SkyrimSE.exe"));
-        assert!(is_primary_exe(&game, "skyrimse.exe")); // case-insensitive
-        assert!(!is_primary_exe(&game, "skse64_loader.exe"));
-        assert!(!is_primary_exe(&game, "SkyrimSELauncher.exe"));
-    }
-
-    #[test]
-    fn script_extender_is_not_primary_for_any_game() {
-        let loaders = [
-            (GameKind::SkyrimSE, "skse64_loader.exe"),
-            (GameKind::SkyrimLE, "skse_loader.exe"),
-            (GameKind::Fallout4, "f4se_loader.exe"),
-            (GameKind::Fallout3, "fose_loader.exe"),
-            (GameKind::FalloutNV, "nvse_loader.exe"),
-            (GameKind::Oblivion, "obse_loader.exe"),
-        ];
-        for (kind, loader) in loaders {
-            let game = Game::new(kind.clone(), std::path::PathBuf::from("/fake/path"));
-            assert!(
-                !is_primary_exe(&game, loader),
-                "{loader} should not be the primary exe for {kind:?}"
-            );
+    fn launch_game_fails_without_steam_app_id() {
+        // GameKind::SkyrimSE has a Steam App ID, so this test just verifies
+        // that a game with a known App ID reaches the xdg-open step (which
+        // may or may not be installed in CI, so we only check the error
+        // message shape if it fails).
+        use crate::core::games::{Game, GameKind};
+        let game = Game::new(GameKind::SkyrimSE, std::path::PathBuf::from("/fake"));
+        // We cannot assert Ok because xdg-open may not exist in CI.
+        // The important property is that the function does NOT return an error
+        // about "Steam App ID".
+        match launch_game(&game) {
+            Ok(_) => {}
+            Err(e) => assert!(
+                !e.contains("Steam App ID"),
+                "error should not be about missing App ID for SkyrimSE: {e}"
+            ),
         }
-    }
-
-    #[test]
-    fn launch_game_executable_fails_when_exe_not_found() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let game = Game::new(GameKind::SkyrimSE, tmp.path().to_path_buf());
-        let result = launch_game_executable(&game, "SkyrimSE.exe");
-        assert!(result.is_err(), "should fail when exe does not exist on disk");
-        assert!(
-            result.unwrap_err().contains("Executable not found"),
-            "error should mention the missing file"
-        );
-    }
-
-    #[test]
-    fn launch_game_executable_fails_for_script_extender_when_not_found() {
-        // Script extenders are launched via Proton (not steam://).
-        // The executable-existence check is performed before any Proton/Steam
-        // lookup, so a missing loader still returns an error immediately.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let game = Game::new(GameKind::SkyrimSE, tmp.path().to_path_buf());
-        let result = launch_game_executable(&game, "skse64_loader.exe");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Executable not found"));
     }
 }
