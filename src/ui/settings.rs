@@ -10,28 +10,40 @@ use libadwaita::prelude::*;
 use crate::core::config::{AppConfig, Profile};
 use crate::core::nexus::NexusClient;
 
-/// Show the Preferences / Settings dialog.
-pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
-    let dialog = adw::PreferencesDialog::builder()
-        .title("Preferences")
-        .follows_content_size(false)
-        .content_width(760)
-        .content_height(520)
-        .build();
+/// Build the inline Preferences page shown as a tab in the main window.
+pub fn build_settings_page(
+    config: Rc<RefCell<AppConfig>>,
+    parent_window: &gtk4::Window,
+) -> gtk4::Widget {
+    let toolbar_view = adw::ToolbarView::new();
+    let header = adw::HeaderBar::new();
+    let title_widget = adw::WindowTitle::new("Preferences", "");
+    header.set_title_widget(Some(&title_widget));
+    toolbar_view.add_top_bar(&header);
 
-    // ── General page ──────────────────────────────────────────────────────
-    let general_page = adw::PreferencesPage::builder()
-        .title("General")
-        .icon_name("preferences-system-symbolic")
-        .build();
+    // Toast overlay so validation results and profile actions can show inline
+    // notifications without needing the old dialog's toast mechanism.
+    let toast_overlay = adw::ToastOverlay::new();
 
-    // NexusMods group
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(900);
+    clamp.set_margin_top(12);
+    clamp.set_margin_bottom(12);
+    clamp.set_margin_start(12);
+    clamp.set_margin_end(12);
+
+    let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+
+    // ── NexusMods group ───────────────────────────────────────────────────
     let nexus_group = adw::PreferencesGroup::builder()
         .title("NexusMods")
         .description("Your NexusMods API key is used to browse and download mods.")
         .build();
 
-    // "Validate" button in the group header
     let validate_btn = gtk4::Button::with_label("Validate");
     validate_btn.add_css_class("suggested-action");
     validate_btn.set_valign(gtk4::Align::Center);
@@ -47,7 +59,6 @@ pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>
         api_key_row.set_text(key);
     }
 
-    // Save API key when the apply button is pressed (or Enter is hit)
     {
         let config_clone = Rc::clone(&config);
         let api_key_row_clone = api_key_row.clone();
@@ -59,19 +70,17 @@ pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>
         });
     }
 
-    // Validate button: save the current key, then hit the NexusMods API
     {
         let config_c = Rc::clone(&config);
         let api_key_row_c = api_key_row.clone();
-        let dialog_c = dialog.clone();
+        let toast_overlay_c = toast_overlay.clone();
         validate_btn.connect_clicked(move |btn| {
             let key = api_key_row_c.text().to_string();
             if key.is_empty() {
-                dialog_c.add_toast(adw::Toast::new("Please enter an API key first."));
+                toast_overlay_c.add_toast(adw::Toast::new("Please enter an API key first."));
                 return;
             }
 
-            // Persist the key immediately
             {
                 let mut cfg = config_c.borrow_mut();
                 cfg.nexus_api_key = Some(key.clone());
@@ -87,20 +96,21 @@ pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>
             });
 
             let btn_c = btn.clone();
-            let dialog_c2 = dialog_c.clone();
+            let toast_overlay_c2 = toast_overlay_c.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
                 match rx.try_recv() {
                     Ok(Ok(username)) => {
                         btn_c.set_sensitive(true);
-                        dialog_c2.add_toast(adw::Toast::new(&format!(
+                        toast_overlay_c2.add_toast(adw::Toast::new(&format!(
                             "API key valid — logged in as {username}."
                         )));
                         glib::ControlFlow::Break
                     }
                     Ok(Err(e)) => {
                         btn_c.set_sensitive(true);
-                        dialog_c2
-                            .add_toast(adw::Toast::new(&format!("Validation failed: {e}")));
+                        toast_overlay_c2.add_toast(adw::Toast::new(&format!(
+                            "Validation failed: {e}"
+                        )));
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -114,54 +124,35 @@ pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>
     }
 
     nexus_group.add(&api_key_row);
-    general_page.add(&nexus_group);
-    dialog.add(&general_page);
+    content_box.append(&nexus_group);
 
-    // ── Profiles page ─────────────────────────────────────────────────────
-    let profiles_page = adw::PreferencesPage::builder()
-        .title("Profiles")
-        .icon_name("people-symbolic")
-        .build();
-
+    // ── Profiles group ────────────────────────────────────────────────────
     let profiles_group = adw::PreferencesGroup::builder()
         .title("Mod Profiles")
-        .description(
-            "Profiles let you save and switch between different mod configurations.",
-        )
+        .description("Profiles let you save and switch between different mod configurations.")
         .build();
 
-    // "Add Profile" button in the group header
     let add_profile_btn = gtk4::Button::new();
     add_profile_btn.set_icon_name("list-add-symbolic");
     add_profile_btn.add_css_class("flat");
     add_profile_btn.set_tooltip_text(Some("Add Profile"));
     profiles_group.set_header_suffix(Some(&add_profile_btn));
 
-    // A ListBox inside the group serves as the dynamic profile list
     let profiles_list = gtk4::ListBox::new();
     profiles_list.add_css_class("boxed-list");
     profiles_list.set_selection_mode(gtk4::SelectionMode::None);
     profiles_group.add(&profiles_list);
 
-    // ── Rebuild function ─────────────────────────────────────────────────
-    //
-    // We store the rebuild closure in an Rc<RefCell<...>> so that callbacks
-    // created *inside* it can call it again via a Weak reference.
-    // The add_profile_btn closure holds the only *strong* Rc clone, which
-    // keeps `rebuild` alive for the lifetime of the dialog.
     let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
-
-    // Weak reference used inside callback closures (avoids Rc cycle)
     let rebuild_weak = Rc::downgrade(&rebuild);
 
     {
         let profiles_list_c = profiles_list.clone();
         let config_c = Rc::clone(&config);
         let rebuild_weak_c = rebuild_weak.clone();
-        let dialog_c = dialog.clone();
+        let toast_overlay_c = toast_overlay.clone();
 
         *rebuild.borrow_mut() = Box::new(move || {
-            // Clear current rows
             while let Some(child) = profiles_list_c.first_child() {
                 profiles_list_c.remove(&child);
             }
@@ -182,7 +173,6 @@ pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>
                     row.add_suffix(&icon);
                     row.set_subtitle("Active");
                 } else {
-                    // Delete button (only on non-active profiles)
                     let del_btn = gtk4::Button::new();
                     del_btn.set_icon_name("edit-delete-symbolic");
                     del_btn.add_css_class("flat");
@@ -204,15 +194,14 @@ pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>
                     });
                     row.add_suffix(&del_btn);
 
-                    // Activate row → switch to this profile
                     let profile_id_s = profile.id.clone();
                     let config_s = Rc::clone(&config_c);
                     let rebuild_s = rebuild_weak_c.clone();
-                    let dialog_s = dialog_c.clone();
+                    let toast_overlay_s = toast_overlay_c.clone();
                     row.connect_activated(move |_| {
                         config_s.borrow_mut().active_profile_id = profile_id_s.clone();
                         config_s.borrow().save();
-                        dialog_s.add_toast(adw::Toast::new("Profile switched."));
+                        toast_overlay_s.add_toast(adw::Toast::new("Profile switched."));
                         if let Some(rb) = rebuild_s.upgrade() {
                             (rb.borrow())();
                         }
@@ -224,25 +213,27 @@ pub fn show_settings_dialog(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>
         });
     }
 
-    // Initial population
     (rebuild.borrow())();
 
-    // Add profile button: holds a strong clone of `rebuild` so the Rc lives
-    // for the full lifetime of the dialog.
     {
         let rebuild_strong = Rc::clone(&rebuild);
         let config_c = Rc::clone(&config);
-        let parent_c = parent.clone();
+        let parent_c = parent_window.clone();
 
         add_profile_btn.connect_clicked(move |_| {
             show_add_profile_dialog(&parent_c, Rc::clone(&config_c), Rc::clone(&rebuild_strong));
         });
     }
 
-    profiles_page.add(&profiles_group);
-    dialog.add(&profiles_page);
+    profiles_group.add(&profiles_list);
+    content_box.append(&profiles_group);
 
-    dialog.present(Some(parent));
+    clamp.set_child(Some(&content_box));
+    scrolled.set_child(Some(&clamp));
+    toast_overlay.set_child(Some(&scrolled));
+    toolbar_view.set_content(Some(&toast_overlay));
+
+    toolbar_view.upcast()
 }
 
 // ── Add-profile dialog ────────────────────────────────────────────────────────
