@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use gio;
 use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -24,6 +25,9 @@ pub fn build_ui(app: &libadwaita::Application) {
     if config.borrow().first_run || config.borrow().games.is_empty() {
         setup_wizard::show_setup_wizard(&window, Rc::clone(&config), on_setup_done);
     }
+    // Ensure this app is registered as the NXM protocol handler so that
+    // clicking "Download with NXM" in the browser sends links here.
+    register_nxm_handler();
 }
 
 // ── Navigation constants ───────────────────────────────────────────────────
@@ -576,15 +580,95 @@ fn show_about_dialog(parent: &gtk4::Window) {
 
 // ── NXM protocol handler ──────────────────────────────────────────────────
 
+const NXM_DESKTOP_ID: &str = "io.github.sachesi.linkmm.desktop";
+const NXM_SCHEME: &str = "x-scheme-handler/nxm";
+
+/// Ensure this application is registered as the `nxm://` protocol handler.
+///
+/// Checks the current handler via GIO; if it is not already set to this app,
+/// writes the `.desktop` file to `~/.local/share/applications/` (if absent)
+/// and calls `xdg-mime default` to register it — the same operation a user
+/// would run manually.  Both steps are no-ops when already set, so calling
+/// this on every startup is safe.
+fn register_nxm_handler() {
+    // Check whether we are already the registered handler.
+    let already_set = gio::AppInfo::default_for_type(NXM_SCHEME, false)
+        .and_then(|a| a.id())
+        .map(|id| id.as_str() == NXM_DESKTOP_ID)
+        .unwrap_or(false);
+    if already_set {
+        return;
+    }
+
+    // Ensure the .desktop file exists somewhere GIO can find it.  If it was
+    // installed system-wide (e.g. via a package) this directory write is
+    // skipped; we only write it when it is genuinely absent.
+    let apps_dir = match dirs::data_local_dir() {
+        Some(d) => d.join("applications"),
+        None => {
+            log::warn!("register_nxm_handler: could not determine local applications directory");
+            return;
+        }
+    };
+
+    let desktop_path = apps_dir.join(NXM_DESKTOP_ID);
+    if !desktop_path.exists() {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("register_nxm_handler: could not determine executable path: {e}");
+                return;
+            }
+        };
+
+        let desktop_content = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Linkmm\n\
+             Comment=Link-based mod manager for Bethesda games\n\
+             Exec={} %u\n\
+             Icon=applications-games-symbolic\n\
+             Terminal=false\n\
+             Categories=Game;Utility;\n\
+             MimeType=x-scheme-handler/nxm;\n\
+             StartupNotify=true\n",
+            exe.display()
+        );
+
+        if let Err(e) = std::fs::create_dir_all(&apps_dir) {
+            log::warn!("register_nxm_handler: could not create applications directory: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::write(&desktop_path, &desktop_content) {
+            log::warn!("register_nxm_handler: could not write desktop file: {e}");
+            return;
+        }
+
+        // Refresh the desktop database so xdg-mime and GIO find the new file.
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(&apps_dir)
+            .status();
+    }
+
+    // Register as the default handler — equivalent to running:
+    //   xdg-mime default io.github.sachesi.linkmm.desktop x-scheme-handler/nxm
+    match std::process::Command::new("xdg-mime")
+        .args(["default", NXM_DESKTOP_ID, NXM_SCHEME])
+        .status()
+    {
+        Ok(s) if s.success() => log::info!("Registered as nxm:// handler via xdg-mime"),
+        Ok(s) => log::warn!("xdg-mime default exited with status {s}"),
+        Err(e) => log::warn!("register_nxm_handler: xdg-mime not available: {e}"),
+    }
+}
+
 /// Handle an `nxm://` URL received from the browser.
 ///
 /// Parses the URL, fetches the download link from the Nexus API, downloads the
 /// file to the configured downloads directory, and shows a toast on the active
-/// window.
+/// window.  When the Nexus domain does not match the currently active game, a
+/// warning dialog is shown before the download begins.
 pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
-    use crate::core::download;
-    use crate::core::download_state;
-    use crate::core::nexus::NexusClient;
     use crate::core::nxm::NxmUrl;
 
     let config = AppConfig::load_or_default();
@@ -614,17 +698,111 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
         nxm.file_id
     );
 
-    let managed_game_id = config
+    // Find the game whose Nexus domain matches the NXM URL
+    let matching_game = config
         .games
         .iter()
         .find(|g| g.kind.nexus_game_id() == nxm.game_domain)
-        .map(|g| g.id.as_str())
-        .or(config.current_game_id.as_deref());
-    let downloads_dir = config.downloads_dir(managed_game_id);
+        .cloned();
+    let current_game = config.current_game().cloned();
+
+    // Determine which game folder receives the download
+    let download_target = matching_game.clone().or_else(|| current_game.clone());
+    let downloads_dir = config.downloads_dir(download_target.as_ref().map(|g| g.id.as_str()));
     if let Err(e) = std::fs::create_dir_all(&downloads_dir) {
         log::error!("Failed to create downloads directory: {e}");
         return;
     }
+
+    // Check whether the NXM domain mismatches the currently active game
+    let mismatch_msg: Option<String> = match (&matching_game, &current_game) {
+        // A different configured game matches the domain
+        (Some(matched), Some(current)) if matched.id != current.id => Some(format!(
+            "This mod is for \"{}\", but your currently active game is \"{}\".\n\nThe archive will be saved to {}'s download folder.",
+            matched.name, current.name, matched.name
+        )),
+        // No configured game matches the domain at all
+        (None, _) => Some(format!(
+            "No game configured for Nexus domain \"{}\".\n\nThe archive will be saved to the default download folder.",
+            nxm.game_domain
+        )),
+        _ => None,
+    };
+
+    let app_c = app.clone();
+    let nxm_c = nxm.clone();
+    let api_key_c = api_key.clone();
+    let downloads_dir_c = downloads_dir.clone();
+    let download_target_c = download_target.clone();
+
+    if let Some(msg) = mismatch_msg {
+        let window = app.active_window();
+        show_nxm_game_mismatch_dialog(
+            window.as_ref(),
+            &msg,
+            app,
+            nxm,
+            api_key,
+            downloads_dir,
+            download_target,
+        );
+    } else {
+        start_nxm_download(&app_c, nxm_c, api_key_c, downloads_dir_c, download_target_c);
+    }
+}
+
+/// Show a warning dialog when the NXM download's game domain does not match
+/// the currently active game.  Starts the download only if the user chooses
+/// "Download Anyway".
+fn show_nxm_game_mismatch_dialog(
+    parent: Option<&gtk4::Window>,
+    message: &str,
+    app: &libadwaita::Application,
+    nxm: crate::core::nxm::NxmUrl,
+    api_key: String,
+    downloads_dir: std::path::PathBuf,
+    download_target: Option<crate::core::games::Game>,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Game Mismatch")
+        .body(message)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("download", "Download Anyway");
+    dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let app_c = app.clone();
+    let nxm_c = nxm.clone();
+    let api_key_c = api_key.clone();
+    let downloads_dir_c = downloads_dir.clone();
+    let download_target_c = download_target.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "download" {
+            start_nxm_download(
+                &app_c,
+                nxm_c.clone(),
+                api_key_c.clone(),
+                downloads_dir_c.clone(),
+                download_target_c.clone(),
+            );
+        }
+    });
+    dialog.present(parent);
+}
+
+/// Spawn the background download thread for an NXM link and poll for
+/// completion on the GTK main thread.
+fn start_nxm_download(
+    app: &libadwaita::Application,
+    nxm: crate::core::nxm::NxmUrl,
+    api_key: String,
+    downloads_dir: std::path::PathBuf,
+    download_target: Option<crate::core::games::Game>,
+) {
+    use crate::core::download;
+    use crate::core::download_state;
+    use crate::core::nexus::NexusClient;
 
     if let Some(window) = app.active_window() {
         show_nxm_toast(
@@ -658,10 +836,12 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
 
             let dest_path = downloads_dir.join(&file_name);
             if dest_path.exists() {
-                if let Err(e) =
-                    write_nxm_download_metadata(&dest_path, &nxm.game_domain, nxm.mod_id as u32)
-                {
-                    log::warn!("Failed to update NXM metadata for {}: {e}", file_name);
+                if let Some(ref game) = download_target {
+                    if let Err(e) =
+                        game.write_nxm_mod_id(&file_name, &nxm.game_domain, nxm.mod_id as u32)
+                    {
+                        log::warn!("Failed to update NXM metadata for {}: {e}", file_name);
+                    }
                 }
                 return Ok(format!("{file_name} (already downloaded)"));
             }
@@ -691,10 +871,12 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
             download_state::clear_active(download_id);
             download_result?;
 
-            if let Err(e) =
-                write_nxm_download_metadata(&dest_path, &nxm.game_domain, nxm.mod_id as u32)
-            {
-                log::warn!("Failed to write NXM metadata for {}: {e}", file_name);
+            if let Some(ref game) = download_target {
+                if let Err(e) =
+                    game.write_nxm_mod_id(&file_name, &nxm.game_domain, nxm.mod_id as u32)
+                {
+                    log::warn!("Failed to write NXM metadata for {}: {e}", file_name);
+                }
             }
 
             Ok(file_name)
@@ -752,21 +934,4 @@ fn walk_for_toast_overlay(widget: &gtk4::Widget, message: &str) {
     }
 }
 
-fn nxm_metadata_path_for_archive(archive_path: &std::path::Path) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.nxm.json", archive_path.to_string_lossy()))
-}
 
-fn write_nxm_download_metadata(
-    archive_path: &std::path::Path,
-    game_domain: &str,
-    mod_id: u32,
-) -> Result<(), String> {
-    let payload = serde_json::json!({
-        "game_domain": game_domain,
-        "mod_id": mod_id
-    });
-    let path = nxm_metadata_path_for_archive(archive_path);
-    let body = serde_json::to_string_pretty(&payload)
-        .map_err(|e| format!("Failed to serialize NXM metadata: {e}"))?;
-    std::fs::write(&path, body).map_err(|e| format!("Failed to write {}: {e}", path.display()))
-}
