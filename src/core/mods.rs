@@ -125,8 +125,15 @@ pub struct ModDatabase {
 }
 
 impl ModDatabase {
+    /// Path to the `mods.json` configuration file for this game.
+    ///
+    /// Always located at `~/.config/linkmm/<game_id>/mods.json`.
+    fn db_path(game: &Game) -> std::path::PathBuf {
+        game.config_dir().join("mods.json")
+    }
+
     pub fn load(game: &Game) -> Self {
-        let path = game.mods_dir().join("mods.json");
+        let path = Self::db_path(game);
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(contents) => match serde_json::from_str::<ModDatabase>(&contents) {
@@ -140,16 +147,44 @@ impl ModDatabase {
                 }
             }
         }
+        // Migration: fall back to the old location inside mods_dir if the new
+        // config-dir path does not yet exist.
+        let legacy_path = game.mods_dir().join("mods.json");
+        if legacy_path.exists() {
+            match std::fs::read_to_string(&legacy_path) {
+                Ok(contents) => match serde_json::from_str::<ModDatabase>(&contents) {
+                    Ok(db) => {
+                        log::info!(
+                            "Migrating mods.json from {} to {}",
+                            legacy_path.display(),
+                            path.display()
+                        );
+                        // Save immediately to the new location so the
+                        // migration only happens once.
+                        db.save(game);
+                        return db;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to parse legacy mods database: {e}, using empty database"
+                        );
+                    }
+                },
+                Err(e) => {
+                    log::warn!("Failed to read legacy mods database: {e}");
+                }
+            }
+        }
         Self::default()
     }
 
     pub fn save(&self, game: &Game) {
-        let mods_dir = game.mods_dir();
-        if let Err(e) = std::fs::create_dir_all(&mods_dir) {
-            log::error!("Failed to create mods directory: {e}");
+        let dir = game.config_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::error!("Failed to create game config directory: {e}");
             return;
         }
-        let path = mods_dir.join("mods.json");
+        let path = Self::db_path(game);
         match serde_json::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {

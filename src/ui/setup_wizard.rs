@@ -476,11 +476,25 @@ fn build_nexus_page(
     header_label.set_halign(gtk4::Align::Start);
     page.append(&header_label);
 
-    let desc_label = gtk4::Label::new(Some(
-        "Enter your NexusMods API key to browse and download mods.",
-    ));
+    let existing_key = config.borrow().nexus_api_key.clone();
+    let (desc_text, desc_class) = if existing_key.is_some() {
+        (
+            "Your NexusMods API key is already configured. You can keep it or enter a new one.",
+            Some("success"),
+        )
+    } else {
+        (
+            "Enter your NexusMods API key to browse and download mods.",
+            None,
+        )
+    };
+
+    let desc_label = gtk4::Label::new(Some(desc_text));
     desc_label.set_wrap(true);
     desc_label.set_halign(gtk4::Align::Start);
+    if let Some(css) = desc_class {
+        desc_label.add_css_class(css);
+    }
     page.append(&desc_label);
 
     let link_btn = gtk4::LinkButton::builder()
@@ -493,6 +507,12 @@ fn build_nexus_page(
     let prefs_group = adw::PreferencesGroup::new();
     // PasswordEntryRow (libadwaita 1.2+) includes a built-in visibility toggle
     let api_key_row = adw::PasswordEntryRow::builder().title("API Key").build();
+
+    // Pre-fill the key if one is already configured so the user doesn't have
+    // to re-enter it when adding a second game.
+    if let Some(ref key) = existing_key {
+        api_key_row.set_text(key);
+    }
 
     prefs_group.add(&api_key_row);
     page.append(&prefs_group);
@@ -631,15 +651,24 @@ fn finish_wizard(
         if let Some((kind, path)) = selected_game.borrow().clone() {
             let game = Game::new(kind, path);
             let game_id = game.id.clone();
-            cfg.games.push(game);
-            cfg.current_game_id = Some(game_id);
+            // Only add the game if it isn't already in the list
+            if !cfg.games.iter().any(|g| g.id == game_id) {
+                cfg.games.push(game);
+            }
+            cfg.current_game_id = Some(game_id.clone());
+
+            // Store per-game settings for the newly added game
+            let gs = cfg.game_settings_mut(&game_id);
+            if let Some(app_dir) = selected_app_dir.borrow().clone() {
+                gs.app_data_dir = Some(app_dir);
+            }
+            // Ensure the game always has at least a default profile
+            if gs.profiles.is_empty() {
+                gs.profiles = crate::core::config::default_active_profile_id_vec();
+            }
         }
 
-        if let Some(app_dir) = selected_app_dir.borrow().clone() {
-            cfg.app_data_dir = Some(app_dir);
-        }
-
-        // Resolve mods directories based on app_data_dir for all games
+        // Resolve mods directories based on per-game app_data_dir for all games
         cfg.apply_mods_base_dirs();
 
         cfg.save();
