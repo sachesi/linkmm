@@ -14,7 +14,7 @@ use crate::core::games::Game;
 use crate::core::installer::{
     DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
     InstallStep, InstallStrategy, PluginDependencies, PluginType, detect_strategy,
-    install_mod_from_archive_with_nexus_ticking, parse_fomod_from_archive,
+    install_mod_from_archive_with_nexus, parse_fomod_from_archive,
     read_archive_file_bytes,
 };
 use crate::core::mods::ModDatabase;
@@ -707,41 +707,106 @@ fn do_install(
         ctx.label.set_text(&format!("Installing \"{}\"…", mod_name));
         ctx.progress.set_fraction(0.0);
         ctx.progress.set_text(Some("Extracting archive…"));
-        // Dispatch one event to let the Revealer animation frame start before
-        // the blocking extraction work begins.
-        gtk4::glib::MainContext::default().iteration(false);
     }
 
     let nexus_id = read_nxm_mod_id_for_archive(archive_path, game);
 
-    // For non-zip archives (7z, rar, …) the underlying 7z process can take
-    // several seconds to extract a large archive.  Provide a tick callback so
-    // the progress bar pulses every ~50 ms and the UI stays responsive.
-    // The nexus_id check is factored out once here so the tick closure doesn't
-    // need to be duplicated across branches.
-    let install_result = {
-        let tick: Box<dyn Fn()> = if let Some(ctx) = status_ctx {
-            let progress = ctx.progress.clone();
-            Box::new(move || {
-                progress.pulse();
-                // Process one pending event so the animation frame clock can
-                // advance without draining the entire event queue at once,
-                // which would cause the progress animation to stutter.
-                gtk4::glib::MainContext::default().iteration(false);
-            })
-        } else {
-            Box::new(|| {})
-        };
-        install_mod_from_archive_with_nexus_ticking(
-            archive_path,
-            game,
-            &mod_name,
-            strategy,
+    // Clone all Send data needed by the background thread.  GTK types (Rc,
+    // widgets) must NOT be passed to the thread; they are captured by the
+    // glib::timeout_add_local closure that runs on the main thread.
+    let ap = archive_path.to_path_buf();
+    let game_clone = game.clone();
+    let mod_name_bg = mod_name.clone();
+    let strategy_clone = strategy.clone();
+
+    // Channel used to pass the install result back to the GTK main thread.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<crate::core::mods::Mod, String>>();
+
+    // Run the blocking extraction on a dedicated thread so the GTK event loop
+    // is never blocked, regardless of archive size or compression ratio.
+    std::thread::spawn(move || {
+        let result = install_mod_from_archive_with_nexus(
+            &ap,
+            &game_clone,
+            &mod_name_bg,
+            &strategy_clone,
             nexus_id,
-            tick.as_ref(),
-        )
-    };
-    match install_result {
+        );
+        let _ = tx.send(result);
+    });
+
+    // Clone UI handles needed by the completion closure (all 'static + main-thread-only).
+    let config_c = Rc::clone(config);
+    let container_c = container.clone();
+    let game_rc_c = Rc::clone(game_rc);
+    let archive_name_s = archive_name.to_string();
+    let mod_name_s = mod_name.clone();
+    let search_query_s = search_query.to_string();
+    let status_ctx_clone = status_ctx.cloned();
+
+    // Poll the channel from the GTK main thread.  While the background thread
+    // is running, pulse the progress bar so the user sees activity.  When the
+    // thread finishes, handle success / error and restore the UI.
+    gtk4::glib::timeout_add_local(
+        std::time::Duration::from_millis(50),
+        move || {
+            match rx.try_recv() {
+                Ok(result) => {
+                    on_install_complete(
+                        result,
+                        &archive_name_s,
+                        &mod_name_s,
+                        &config_c,
+                        hide_installed,
+                        &search_query_s,
+                        &game_rc_c,
+                        status_ctx_clone.as_ref(),
+                        &container_c,
+                    );
+                    gtk4::glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still extracting — pulse so the user sees activity.
+                    if let Some(ctx) = &status_ctx_clone {
+                        ctx.progress.pulse();
+                    }
+                    gtk4::glib::ControlFlow::Continue
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Thread terminated without sending a result (panic etc.).
+                    log::error!("Install thread terminated unexpectedly for \"{mod_name_s}\"");
+                    on_install_complete(
+                        Err("Install thread terminated unexpectedly".to_string()),
+                        &archive_name_s,
+                        &mod_name_s,
+                        &config_c,
+                        hide_installed,
+                        &search_query_s,
+                        &game_rc_c,
+                        status_ctx_clone.as_ref(),
+                        &container_c,
+                    );
+                    gtk4::glib::ControlFlow::Break
+                }
+            }
+        },
+    );
+}
+
+/// Handle the install result on the GTK main thread once the background thread
+/// has finished.  Updates the status popup, config, and refreshes the list.
+fn on_install_complete(
+    result: Result<crate::core::mods::Mod, String>,
+    archive_name: &str,
+    mod_name: &str,
+    config: &Rc<RefCell<AppConfig>>,
+    hide_installed: bool,
+    search_query: &str,
+    game_rc: &Rc<Option<Game>>,
+    status_ctx: Option<&InstallStatusCtx>,
+    container: &gtk4::Box,
+) {
+    match result {
         Ok(_) => {
             let mut cfg = config.borrow_mut();
             if !cfg.installed_archives.contains(&archive_name.to_string()) {
@@ -786,6 +851,7 @@ fn do_install(
         }
     }
 }
+
 
 // ── FOMOD wizard ──────────────────────────────────────────────────────────────
 
