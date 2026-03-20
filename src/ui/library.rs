@@ -53,12 +53,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     toolbar_view.add_top_bar(&header);
 
-    let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content_container.set_vexpand(true);
-    content_container.set_margin_start(12);
-    content_container.set_margin_end(12);
-    content_container.set_margin_top(8);
-    content_container.set_margin_bottom(8);
 
     let status_revealer = gtk4::Revealer::new();
     status_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
@@ -104,6 +100,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         &search_query.borrow(),
         Rc::clone(&search_query),
         Rc::clone(&selected_mod_id),
+        true,
     );
 
     toolbar_view.set_content(Some(&content_container));
@@ -123,6 +120,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &search_c.borrow(),
                 Rc::clone(&search_c),
                 Rc::clone(&selected_c),
+                false,
             );
         });
     }
@@ -277,6 +275,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     &search_c.borrow(),
                     Rc::clone(&search_c),
                     Rc::clone(&selected_c),
+                    true,
                 );
             });
         });
@@ -294,14 +293,17 @@ fn refresh_library_content_with_search(
     search_query: &str,
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
+    do_scan: bool,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
 
     let mut db = ModDatabase::load(game);
-    db.scan_mods_dir(game);
-    db.save(game);
+    if do_scan {
+        db.scan_mods_dir(game);
+        db.save(game);
+    }
 
     if let Some(selected) = selected_mod_id.borrow().as_ref() {
         if !db.mods.iter().any(|m| &m.id == selected) {
@@ -502,6 +504,7 @@ fn build_mod_row(
                         &search_c.borrow(),
                         Rc::clone(&search_c),
                         Rc::clone(&selected_c),
+                        false,
                     );
                 }
             }
@@ -529,6 +532,7 @@ fn build_mod_row(
                         &search_c.borrow(),
                         Rc::clone(&search_c),
                         Rc::clone(&selected_c),
+                        false,
                     );
                 }
             }
@@ -585,6 +589,7 @@ fn build_mod_row(
                     &search_drop.borrow(),
                     Rc::clone(&search_drop),
                     Rc::clone(&selected_drop),
+                    false,
                 );
             }
             true
@@ -669,6 +674,7 @@ fn build_mod_row(
                 &search_c.borrow(),
                 Rc::clone(&search_c),
                 Rc::clone(&selected_c),
+                false,
             );
         });
 
@@ -714,6 +720,7 @@ fn build_mod_row(
                     &search_idle.borrow(),
                     Rc::clone(&search_idle),
                     Rc::clone(&selected_idle),
+                    false,
                 );
             });
         });
@@ -902,6 +909,7 @@ fn build_mod_row(
                     &search_enable.borrow(),
                     Rc::clone(&search_enable),
                     Rc::clone(&selected_enable),
+                    false,
                 );
             });
 
@@ -925,6 +933,7 @@ fn build_mod_row(
                     &search_disable.borrow(),
                     Rc::clone(&search_disable),
                     Rc::clone(&selected_disable),
+                    false,
                 );
             });
 
@@ -1011,6 +1020,7 @@ fn show_move_to_position_dialog_for_mod(
                     &search_state.borrow(),
                     Rc::clone(&search_state),
                     Rc::clone(&selected_mod_id),
+                    false,
                 );
             }
         }

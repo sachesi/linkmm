@@ -44,6 +44,13 @@ struct InstallStatusCtx {
     refresh_btn: gtk4::Button,
     // main list (grayed while busy)
     list_container: gtk4::Box,
+    /// `true` while a mod archive is being extracted/installed so the download
+    /// progress poll timer does not trigger a disruptive list rebuild.
+    is_installing: Rc<RefCell<bool>>,
+    /// Progress bars for each in-progress download, keyed by download ID.
+    /// Populated on every full refresh so the poll timer can update bars
+    /// in-place without rebuilding the whole list on every progress tick.
+    active_progress_bars: Rc<RefCell<HashMap<u64, gtk4::ProgressBar>>>,
 }
 
 // ── Public entry-point ────────────────────────────────────────────────────────
@@ -131,11 +138,16 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         clean_btn: clean_btn.clone(),
         refresh_btn: refresh_btn.clone(),
         list_container: list_container.clone(),
+        is_installing: Rc::new(RefCell::new(false)),
+        active_progress_bars: Rc::new(RefCell::new(HashMap::new())),
     };
 
     let hide_installed = Rc::new(RefCell::new(false));
     let search_query = Rc::new(RefCell::new(String::new()));
+    // Full progress fingerprint (includes bytes) — drives in-place bar updates.
     let active_download_fingerprint = Rc::new(RefCell::new(String::new()));
+    // Identity-only fingerprint (name, no bytes) — drives full list rebuilds.
+    let download_identity_fingerprint = Rc::new(RefCell::new(String::new()));
     let game_rc: Rc<Option<Game>> = Rc::new(game.cloned());
 
     refresh_content_with_search(
@@ -225,21 +237,31 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         let hide_c = Rc::clone(&hide_installed);
         let search_c = Rc::clone(&search_query);
         let game_c = Rc::clone(&game_rc);
-        let active_download_fingerprint_c = Rc::clone(&active_download_fingerprint);
+        let progress_fingerprint_c = Rc::clone(&active_download_fingerprint);
+        let identity_fingerprint_c = Rc::clone(&download_identity_fingerprint);
         let ctx_c = status_ctx.clone();
         gtk4::glib::timeout_add_local(
             std::time::Duration::from_millis(DOWNLOAD_PROGRESS_POLL_INTERVAL_MS),
             move || {
+                // Skip list rebuilds while a mod is being installed to avoid
+                // disrupting the extraction in progress.
+                if *ctx_c.is_installing.borrow() {
+                    return gtk4::glib::ControlFlow::Continue;
+                }
                 let active = download_state::all_active();
-                let mut download_state_key = String::new();
+                let mut identity_key = String::new();
+                let mut progress_key = String::new();
                 for (id, entry) in &active {
-                    download_state_key.push_str(&format!(
+                    identity_key.push_str(&format!("{id}:{}|", entry.file_name));
+                    progress_key.push_str(&format!(
                         "{id}:{}:{}:{}|",
                         entry.file_name, entry.downloaded, entry.total
                     ));
                 }
-                if *active_download_fingerprint_c.borrow() != download_state_key {
-                    *active_download_fingerprint_c.borrow_mut() = download_state_key;
+                if *identity_fingerprint_c.borrow() != identity_key {
+                    // A download started or finished → full rebuild of both sections.
+                    *identity_fingerprint_c.borrow_mut() = identity_key;
+                    *progress_fingerprint_c.borrow_mut() = progress_key;
                     refresh_content_with_search(
                         &container_c,
                         &config_c,
@@ -248,6 +270,24 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
                         &search_c.borrow(),
                         &ctx_c,
                     );
+                } else if *progress_fingerprint_c.borrow() != progress_key {
+                    // Only bytes changed → update existing progress bars in-place
+                    // without touching the static file rows or their buttons.
+                    *progress_fingerprint_c.borrow_mut() = progress_key;
+                    let bars = ctx_c.active_progress_bars.borrow();
+                    for (id, entry) in &active {
+                        if let Some(pb) = bars.get(id) {
+                            if entry.total > 0 {
+                                let fraction =
+                                    (entry.downloaded as f64 / entry.total as f64).clamp(0.0, 1.0);
+                                pb.set_fraction(fraction);
+                                pb.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+                            } else {
+                                pb.pulse();
+                                pb.set_text(Some(&format_size(entry.downloaded)));
+                            }
+                        }
+                    }
                 }
                 gtk4::glib::ControlFlow::Continue
             },
@@ -270,6 +310,8 @@ fn refresh_content_with_search(
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
+    // Discard stale bar references; they will be repopulated below.
+    status_ctx.active_progress_bars.borrow_mut().clear();
 
     let downloads_dir = config
         .borrow()
@@ -339,9 +381,13 @@ fn refresh_content_with_search(
     let list_box = gtk4::ListBox::new();
     list_box.add_css_class("boxed-list");
     list_box.set_selection_mode(gtk4::SelectionMode::None);
-    for (download_id, active) in active_downloads.iter().rev() {
-        let row = build_active_download_row(*download_id, active);
-        list_box.append(&row);
+    {
+        let mut bars = status_ctx.active_progress_bars.borrow_mut();
+        for (download_id, active) in active_downloads.iter().rev() {
+            let (row, progress_bar) = build_active_download_row(*download_id, active);
+            bars.insert(*download_id, progress_bar);
+            list_box.append(&row);
+        }
     }
     for entry in &visible {
         let row = build_entry_row(
@@ -373,7 +419,10 @@ fn refresh_content_with_search(
     container.append(&scrolled);
 }
 
-fn build_active_download_row(download_id: u64, active: &download_state::ActiveDownload) -> adw::ActionRow {
+fn build_active_download_row(
+    download_id: u64,
+    active: &download_state::ActiveDownload,
+) -> (adw::ActionRow, gtk4::ProgressBar) {
     let row = adw::ActionRow::builder()
         .title(&active.file_name)
         .subtitle("Downloading…")
@@ -404,7 +453,7 @@ fn build_active_download_row(download_id: u64, active: &download_state::ActiveDo
     });
     row.add_suffix(&cancel_btn);
 
-    row
+    (row, progress)
 }
 
 // ── Row builder ───────────────────────────────────────────────────────────────
@@ -1555,6 +1604,7 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 /// Disable all interactive Downloads controls while an install is in progress,
 /// visually indicating to the user that the UI is locked.
 fn set_downloads_busy(ctx: &InstallStatusCtx, busy: bool) {
+    *ctx.is_installing.borrow_mut() = busy;
     let sensitive = !busy;
     ctx.search_entry.set_sensitive(sensitive);
     ctx.hide_btn.set_sensitive(sensitive);
