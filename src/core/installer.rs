@@ -436,16 +436,15 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
             let lower = p.to_lowercase().replace('\\', "/");
             lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
         });
-        return if has_fomod {
-            // Parse the config to get required_files; only extracts the small
-            // XML rather than the whole archive.
-            match parse_fomod_from_archive(archive_path) {
-                Ok(config) => Ok(InstallStrategy::Fomod(config.required_files.clone())),
-                Err(_) => Ok(InstallStrategy::Data),
-            }
+        // Return without parsing the full FOMOD XML here — the caller should
+        // call parse_fomod_from_archive separately when the full config is
+        // needed (e.g. to show the wizard).  This avoids a redundant 7z
+        // subprocess invocation inside detect_strategy.
+        return Ok(if has_fomod {
+            InstallStrategy::Fomod(vec![])
         } else {
-            Ok(InstallStrategy::Data)
-        };
+            InstallStrategy::Data
+        });
     }
 
     let file =
