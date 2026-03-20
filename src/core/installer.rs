@@ -1,6 +1,5 @@
 use std::io::{BufWriter, Read};
 use std::path::Path;
-use std::process::Command;
 
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
@@ -1444,15 +1443,21 @@ fn has_zip_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Full-archive extraction using 7-Zip.
+fn has_rar_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("rar"))
+        .unwrap_or(false)
+}
+
+/// Full-archive extraction for non-zip archives (7z, rar, \u2026) using native
+/// Rust crates.
 ///
-/// Extract all files from a non-zip archive (7z, rar, …) into `dest_dir`.
+/// - `.7z` archives are handled by [`sevenz_rust2`].
+/// - `.rar` archives are handled by [`unrar`].
 ///
-/// This function is intended to be called from a **background thread** so it
-/// may block for as long as the `7z` process takes.  Callers that need to
-/// keep a GTK/UI event loop running during extraction should run this on a
-/// worker thread and poll for completion on the main thread (e.g. with
-/// `glib::timeout_add_local`).
+/// This function may block while decompressing; callers that need to keep the
+/// GTK/UI event loop running should call it on a background thread.
 fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| {
         format!(
@@ -1460,91 +1465,88 @@ fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), S
             dest_dir.display()
         )
     })?;
-    let output_arg = format!("-o{}", dest_dir.display());
 
-    let output = Command::new("7z")
-        .arg("x")
-        .arg("-y")
-        .arg(&output_arg)
-        .arg(archive_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| {
-            format!(
-                "Failed to start 7z extractor ({e}). Install 7-Zip (the '7z' command) to extract .7z and .rar archives."
-            )
-        })?;
-
-    if output.status.success() {
-        Ok(())
+    if has_rar_extension(archive_path) {
+        extract_rar_archive(archive_path, dest_dir)
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "Failed to extract non-zip archive with 7z. stderr: {stderr}"
-        ))
+        extract_7z_archive(archive_path, dest_dir)
     }
 }
 
-/// List all file/directory paths stored inside a non-zip archive by running
-/// `7z l -slt` (technical listing, no extraction).
-///
-/// This is fast for large archives because no data is decompressed — 7z only
-/// reads the archive headers.  The returned paths are exactly as stored inside
-/// the archive (case and separator are preserved).
-fn list_archive_entries_with_7z(archive_path: &Path) -> Result<Vec<String>, String> {
-    let output = Command::new("7z")
-        .args(["l", "-slt"])
-        .arg(archive_path)
-        .output()
-        .map_err(|e| {
-            format!(
-                "Failed to start 7z lister ({e}). Install 7-Zip (the '7z' command) to handle .7z and .rar archives."
-            )
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("7z list failed for {}: {stderr}", archive_path.display()));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_7z_slt_paths(&stdout))
+/// Extract a `.7z` archive to `dest_dir` using `sevenz_rust2`.
+fn extract_7z_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
+    sevenz_rust2::decompress_file(archive_path, dest_dir)
+        .map_err(|e| format!("Failed to extract 7z archive {}: {e}", archive_path.display()))
 }
 
-/// Parse `Path = …` lines from the output of `7z l -slt`.
-///
-/// The output contains two kinds of sections:
-/// - An archive-info block starting with `--` (contains the archive's own path
-///   and global metadata).
-/// - Per-entry blocks, each preceded by a `----------` (10-dash) separator.
-///
-/// We only collect paths from per-entry blocks, skipping the archive-info
-/// block, so the archive's own filesystem path is never included.
-fn parse_7z_slt_paths(output: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut in_file_section = false;
-    for line in output.lines() {
-        if line.starts_with("----------") {
-            in_file_section = true;
-            continue;
-        }
-        if in_file_section {
-            if let Some(path) = line.strip_prefix("Path = ") {
-                let p = path.trim().to_string();
-                if !p.is_empty() {
-                    paths.push(p);
-                }
+/// Extract a `.rar` archive to `dest_dir` using `unrar`.
+fn extract_rar_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
+    let mut archive = unrar::Archive::new(archive_path)
+        .open_for_processing()
+        .map_err(|e| format!("Failed to open RAR archive {}: {e}", archive_path.display()))?;
+    loop {
+        match archive.read_header() {
+            Err(e) => return Err(format!("Failed to read RAR header: {e}")),
+            Ok(None) => break,
+            Ok(Some(header)) => {
+                archive = header.extract_with_base(dest_dir).map_err(|e| {
+                    format!("Failed to extract RAR entry: {e}")
+                })?;
             }
         }
     }
-    paths
+    Ok(())
+}
+
+/// List all file/directory paths stored inside a non-zip archive using native
+/// Rust crates (no subprocess).
+///
+/// - `.7z` archives: parsed with [`sevenz_rust2::ArchiveReader`].
+/// - `.rar` archives: iterated with [`unrar::Archive`].
+///
+/// The returned paths are exactly as stored in the archive (case and
+/// separator preserved).
+fn list_archive_entries_with_7z(archive_path: &Path) -> Result<Vec<String>, String> {
+    if has_rar_extension(archive_path) {
+        list_rar_entries(archive_path)
+    } else {
+        list_7z_entries(archive_path)
+    }
+}
+
+/// List entries in a `.7z` archive.
+fn list_7z_entries(archive_path: &Path) -> Result<Vec<String>, String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
+    let reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
+        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
+    let paths = reader
+        .archive()
+        .files
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    Ok(paths)
+}
+
+/// List entries in a `.rar` archive.
+fn list_rar_entries(archive_path: &Path) -> Result<Vec<String>, String> {
+    let archive = unrar::Archive::new(archive_path)
+        .open_for_listing()
+        .map_err(|e| format!("Failed to open RAR archive {}: {e}", archive_path.display()))?;
+    let mut paths = Vec::new();
+    for entry in archive.flatten() {
+        paths.push(entry.filename.to_string_lossy().to_string());
+    }
+    Ok(paths)
 }
 
 /// Extract a single file from a non-zip archive to `dest_dir`, preserving
 /// the directory structure from the archive root.
 ///
-/// `file_path_in_archive` must be the exact path as stored in the archive (use
-/// [`list_archive_entries_with_7z`] to discover it).  The file will be placed
-/// at `dest_dir / file_path_in_archive`.
+/// `file_path_in_archive` must be the exact path as stored in the archive
+/// (use [`list_archive_entries_with_7z`] to discover it).  The file will be
+/// placed at `dest_dir / file_path_in_archive`.
 fn extract_single_file_with_7z(
     archive_path: &Path,
     file_path_in_archive: &str,
@@ -1556,28 +1558,72 @@ fn extract_single_file_with_7z(
             dest_dir.display()
         )
     })?;
-    let output_arg = format!("-o{}", dest_dir.display());
-    let output = Command::new("7z")
-        .arg("x")
-        .arg("-y")
-        .arg(output_arg)
-        .arg(archive_path)
-        .arg("--")
-        .arg(file_path_in_archive)
-        .output()
-        .map_err(|e| {
-            format!(
-                "Failed to start 7z extractor ({e}). Install 7-Zip (the '7z' command) to extract .7z and .rar archives."
-            )
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "Failed to extract '{file_path_in_archive}' from archive. stdout: {stdout}; stderr: {stderr}"
-        ));
+
+    if has_rar_extension(archive_path) {
+        extract_single_rar_file(archive_path, file_path_in_archive, dest_dir)
+    } else {
+        extract_single_7z_file(archive_path, file_path_in_archive, dest_dir)
     }
-    Ok(())
+}
+
+/// Extract a single file from a `.7z` archive using `sevenz_rust2`.
+fn extract_single_7z_file(
+    archive_path: &Path,
+    file_path_in_archive: &str,
+    dest_dir: &Path,
+) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
+    let mut reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
+        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
+    let data = reader.read_file(file_path_in_archive).map_err(|e| {
+        format!(
+            "Failed to read '{file_path_in_archive}' from {}: {e}",
+            archive_path.display()
+        )
+    })?;
+    let out_path = dest_dir.join(Path::new(&normalise_path(file_path_in_archive)));
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent directory: {e}"))?;
+    }
+    std::fs::write(&out_path, &data)
+        .map_err(|e| format!("Failed to write extracted file {}: {e}", out_path.display()))
+}
+
+/// Extract a single file from a `.rar` archive using `unrar`.
+fn extract_single_rar_file(
+    archive_path: &Path,
+    file_path_in_archive: &str,
+    dest_dir: &Path,
+) -> Result<(), String> {
+    let target_lower = file_path_in_archive.to_lowercase().replace('\\', "/");
+    let mut archive = unrar::Archive::new(archive_path)
+        .open_for_processing()
+        .map_err(|e| format!("Failed to open RAR archive {}: {e}", archive_path.display()))?;
+    loop {
+        match archive.read_header() {
+            Err(e) => return Err(format!("Failed to read RAR header: {e}")),
+            Ok(None) => break,
+            Ok(Some(header)) => {
+                let entry_name = header.entry().filename.to_string_lossy().to_string();
+                let entry_lower = entry_name.to_lowercase().replace('\\', "/");
+                if entry_lower == target_lower {
+                    archive = header.extract_with_base(dest_dir).map_err(|e| {
+                        format!("Failed to extract RAR entry '{entry_name}': {e}")
+                    })?;
+                    return Ok(());
+                }
+                archive = header.skip().map_err(|e| {
+                    format!("Failed to skip RAR entry '{entry_name}': {e}")
+                })?;
+            }
+        }
+    }
+    Err(format!(
+        "File '{file_path_in_archive}' not found in RAR archive {}",
+        archive_path.display()
+    ))
 }
 
 /// Install a zip-format Data mod into `mod_dir`.
@@ -2342,46 +2388,8 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
-    // ── parse_7z_slt_paths ────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_7z_slt_paths_skips_archive_info_block() {
-        // Simulated `7z l -slt` output: first section is archive metadata
-        // (starting with `--`), then per-entry sections after `----------`.
-        let output = "\
-7-Zip 23.01 (x64) : Copyright (c) 1999-2023 Igor Pavlov : 2023-06-20\n\
-\n\
-Listing archive: /path/to/mod.7z\n\
-\n\
---\n\
-Path = /path/to/mod.7z\n\
-Type = 7z\n\
-Physical Size = 1234\n\
-\n\
-----------\n\
-Path = fomod\n\
-Size = 0\n\
-\n\
-Path = fomod/ModuleConfig.xml\n\
-Size = 256\n\
-\n\
-Path = Data/textures/sky.dds\n\
-Size = 9\n\
-";
-        let paths = parse_7z_slt_paths(output);
-        // Should include per-file entries but NOT the archive path line
-        assert_eq!(
-            paths,
-            vec!["fomod", "fomod/ModuleConfig.xml", "Data/textures/sky.dds"]
-        );
-        assert!(!paths.iter().any(|p| p.contains("/path/to/")));
-    }
-
     #[test]
     fn list_archive_entries_with_7z_returns_paths() {
-        if !has_7z() {
-            return;
-        }
         let tmp = tempdir();
         let Some(archive) = create_test_7z(&tmp, "list_test.7z") else {
             return;
@@ -2394,7 +2402,7 @@ Size = 9\n\
             "expected Data/textures/sky.dds in listing, got: {lower:?}");
     }
 
-    /// Create a simple zip archive in `dir` containing the given entries.
+        /// Create a simple zip archive in `dir` containing the given entries.
     /// Each entry is (name, content).  Names ending with `/` are directories.
     fn create_test_zip(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
         let archive_path = dir.join("test_mod.zip");
@@ -2416,60 +2424,24 @@ Size = 9\n\
         archive_path
     }
 
-    fn has_7z() -> bool {
-        Command::new("7z").arg("--help").output().is_ok()
-    }
-
     fn create_test_7z(root: &Path, archive_name: &str) -> Option<PathBuf> {
-        if !has_7z() {
-            return None;
-        }
         let archive_path = root.join(archive_name);
         let staging = root.join("staging");
-        if let Err(e) = std::fs::create_dir_all(staging.join("fomod")) {
-            eprintln!("create_test_7z: failed to create fomod dir: {e}");
-            return None;
-        }
-        if let Err(e) = std::fs::create_dir_all(staging.join("Data/textures")) {
-            eprintln!("create_test_7z: failed to create Data/textures dir: {e}");
-            return None;
-        }
-        if let Err(e) = std::fs::write(
+        std::fs::create_dir_all(staging.join("fomod")).ok()?;
+        std::fs::create_dir_all(staging.join("Data/textures")).ok()?;
+        std::fs::write(
             staging.join("fomod/ModuleConfig.xml"),
             r#"<config>
   <requiredInstallFiles>
     <file source="Data/textures/sky.dds" destination="Data/textures/sky.dds" />
   </requiredInstallFiles>
 </config>"#,
-        ) {
-            eprintln!("create_test_7z: failed to write ModuleConfig.xml: {e}");
-            return None;
-        }
-        if let Err(e) = std::fs::write(staging.join("Data/textures/sky.dds"), "dds") {
-            eprintln!("create_test_7z: failed to write test data file: {e}");
-            return None;
-        }
-        let output = Command::new("7z")
-            .current_dir(&staging)
-            .arg("a")
-            .arg("-y")
-            .arg(&archive_path)
-            .arg(".")
-            .output();
-        let output = match output {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("create_test_7z: failed to launch 7z: {e}");
-                return None;
-            }
-        };
-        if output.status.success() {
-            Some(archive_path)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("7z test archive creation failed: {stderr}");
-            None
-        }
+        )
+        .ok()?;
+        std::fs::write(staging.join("Data/textures/sky.dds"), b"dds").ok()?;
+        let out_file = std::fs::File::create(&archive_path).ok()?;
+        sevenz_rust2::compress(staging.as_path(), out_file).ok()?;
+        Some(archive_path)
     }
 
     /// Create a 7z archive containing a FOMOD image for testing.
@@ -2480,48 +2452,15 @@ Size = 9\n\
     /// Data/textures/sky.dds
     /// ```
     fn create_test_7z_with_image(root: &Path, archive_name: &str) -> Option<PathBuf> {
-        if !has_7z() {
-            return None;
-        }
         let archive_path = root.join(archive_name);
         let staging = root.join("staging_img");
-        if let Err(e) = std::fs::create_dir_all(staging.join("fomod/images")) {
-            eprintln!("create_test_7z_with_image: {e}");
-            return None;
-        }
-        if let Err(e) = std::fs::create_dir_all(staging.join("Data/textures")) {
-            eprintln!("create_test_7z_with_image: {e}");
-            return None;
-        }
-        if let Err(e) = std::fs::write(staging.join("fomod/images/preview.png"), b"pngdata") {
-            eprintln!("create_test_7z_with_image: {e}");
-            return None;
-        }
-        if let Err(e) = std::fs::write(staging.join("Data/textures/sky.dds"), b"dds") {
-            eprintln!("create_test_7z_with_image: {e}");
-            return None;
-        }
-        let output = Command::new("7z")
-            .current_dir(&staging)
-            .arg("a")
-            .arg("-y")
-            .arg(&archive_path)
-            .arg(".")
-            .output();
-        match output {
-            Ok(o) if o.status.success() => Some(archive_path),
-            Ok(o) => {
-                eprintln!(
-                    "7z image archive creation failed: {}",
-                    String::from_utf8_lossy(&o.stderr)
-                );
-                None
-            }
-            Err(e) => {
-                eprintln!("create_test_7z_with_image: failed to launch 7z: {e}");
-                None
-            }
-        }
+        std::fs::create_dir_all(staging.join("fomod/images")).ok()?;
+        std::fs::create_dir_all(staging.join("Data/textures")).ok()?;
+        std::fs::write(staging.join("fomod/images/preview.png"), b"pngdata").ok()?;
+        std::fs::write(staging.join("Data/textures/sky.dds"), b"dds").ok()?;
+        let out_file = std::fs::File::create(&archive_path).ok()?;
+        sevenz_rust2::compress(staging.as_path(), out_file).ok()?;
+        Some(archive_path)
     }
 
     #[test]
