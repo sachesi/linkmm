@@ -202,6 +202,100 @@ impl Game {
     pub fn plugins_txt_path(&self) -> Option<PathBuf> {
         Some(self.plugins_txt_dir()?.join("plugins.txt"))
     }
+
+    // ── Per-game configuration directory ─────────────────────────────────────
+
+    /// Return the directory used to store per-game configuration files such as
+    /// `mods.json` and `nxm_metadata.json`.
+    ///
+    /// Always resolves to `~/.config/linkmm/<game_id>/`, independent of the
+    /// user-configured `app_data_dir` / `mods_base_dir`.
+    pub fn config_dir(&self) -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("linkmm")
+            .join(&self.id)
+    }
+
+    // ── NXM download metadata ─────────────────────────────────────────────────
+
+    /// Read the Nexus mod ID associated with `archive_name` from the
+    /// consolidated per-game metadata file
+    /// `~/.config/linkmm/<game_id>/nxm_metadata.json`.
+    ///
+    /// Returns `None` if the file does not exist, the archive is not listed,
+    /// or the stored game domain does not match this game.
+    pub fn read_nxm_mod_id(&self, archive_name: &str) -> Option<u32> {
+        let path = self.config_dir().join("nxm_metadata.json");
+        let contents = std::fs::read_to_string(&path).ok()?;
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&contents).ok()?;
+        let entry = map.get(archive_name)?;
+        let stored_domain = entry.get("game_domain")?.as_str()?;
+        if stored_domain != self.kind.nexus_game_id() {
+            return None;
+        }
+        entry
+            .get("mod_id")?
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+    }
+
+    /// Write or update the Nexus mod ID for `archive_name` in the consolidated
+    /// per-game metadata file
+    /// `~/.config/linkmm/<game_id>/nxm_metadata.json`.
+    ///
+    /// Creates the file and its parent directory if they do not exist.
+    pub fn write_nxm_mod_id(
+        &self,
+        archive_name: &str,
+        game_domain: &str,
+        mod_id: u32,
+    ) -> Result<(), String> {
+        let dir = self.config_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create game config dir: {e}"))?;
+        let path = dir.join("nxm_metadata.json");
+        let mut map: serde_json::Map<String, serde_json::Value> = if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|c| serde_json::from_str(&c).ok())
+                .unwrap_or_default()
+        } else {
+            serde_json::Map::new()
+        };
+        map.insert(
+            archive_name.to_string(),
+            serde_json::json!({ "game_domain": game_domain, "mod_id": mod_id }),
+        );
+        let body = serde_json::to_string_pretty(&serde_json::Value::Object(map))
+            .map_err(|e| format!("Failed to serialize NXM metadata: {e}"))?;
+        std::fs::write(&path, body)
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+    }
+
+    /// Remove the NXM metadata entry for `archive_name` from the consolidated
+    /// per-game metadata file, if it exists.
+    pub fn remove_nxm_mod_id(&self, archive_name: &str) {
+        let path = self.config_dir().join("nxm_metadata.json");
+        if !path.exists() {
+            return;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(mut map) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&contents)
+        else {
+            return;
+        };
+        if map.remove(archive_name).is_none() {
+            return; // nothing to do
+        }
+        if let Ok(body) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+            let _ = std::fs::write(&path, body);
+        }
+    }
 }
 
 
