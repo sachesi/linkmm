@@ -221,6 +221,34 @@ fn score_as_data_root(prefix: &str, paths: &[&str]) -> i32 {
     score
 }
 
+/// Find the directory that directly contains the `fomod/` subdirectory in the
+/// given path list, if any.
+///
+/// Returns `Some("")` when `fomod/` lives at the archive root, `Some("dir")`
+/// when it lives one level deep (e.g. `"MyMod/fomod/ModuleConfig.xml"`
+/// → `Some("MyMod")`), or `None` when no FOMOD config is present.
+fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
+    for path in paths {
+        // Normalise separators and case for the detection check, but keep the
+        // original path available so we can return the original-case parent name.
+        let norm = path.to_lowercase().replace('\\', "/");
+        let norm = norm.trim_start_matches('/');
+        if norm == "fomod/moduleconfig.xml" {
+            return Some(String::new());
+        }
+        if norm.ends_with("/fomod/moduleconfig.xml") {
+            // Derive the first path component from the *original* path so that
+            // the returned prefix preserves the original capitalisation and can
+            // be used to strip archive entry names verbatim.
+            let orig = path.replace('\\', "/");
+            let orig = orig.trim_start_matches('/');
+            let parent = orig.split('/').next().unwrap_or("").to_string();
+            return Some(parent);
+        }
+    }
+    None
+}
+
 /// Scan all paths in an archive and return the prefix (with trailing `/`) that
 /// best corresponds to the game's `Data/` directory.
 ///
@@ -236,6 +264,20 @@ fn score_as_data_root(prefix: &str, paths: &[&str]) -> i32 {
 /// stripping.  If all scores are zero the empty string (archive root) is
 /// returned and the caller should apply a secondary heuristic.
 pub fn find_data_root_in_paths(paths: &[&str]) -> String {
+    // If the archive contains a FOMOD config file, the directory that holds
+    // the `fomod/` subdirectory is the wrapper root.  Variant subdirectories
+    // inside that wrapper (e.g. `MyMod/Option A/textures/`) would otherwise
+    // be scored as data roots because they contain known data subdirs, which
+    // is incorrect.  Return the FOMOD wrapper directory directly instead of
+    // scoring all candidates.
+    if let Some(fomod_parent) = find_fomod_parent_dir(paths) {
+        return if fomod_parent.is_empty() {
+            String::new()
+        } else {
+            format!("{fomod_parent}/")
+        };
+    }
+
     // Collect all unique ancestor directories (candidates).  The archive root
     // ("")  is always included.  Limit depth to 6 levels to avoid O(n²) work
     // on pathological archives with very deep nesting.
@@ -429,9 +471,15 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
     }
     if !has_zip_extension(archive_path) {
         // Use fast header listing (no extraction) to detect FOMOD presence.
-        // If listing fails (e.g. 7z not installed or corrupt archive), fall
-        // back gracefully to Data strategy.
-        let entries = list_archive_entries_with_7z(archive_path).unwrap_or_default();
+        // If listing fails (e.g. 7z not installed or corrupt/solid archive),
+        // log a warning and fall back gracefully to Data strategy.
+        let entries = list_archive_entries_with_7z(archive_path).unwrap_or_else(|e| {
+            log::warn!(
+                "Failed to list entries in {}: {e}; falling back to Data strategy",
+                archive_path.display()
+            );
+            vec![]
+        });
         let has_fomod = entries.iter().any(|p| {
             let lower = p.to_lowercase().replace('\\', "/");
             lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
@@ -458,7 +506,7 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         let entry = zip
             .by_index(i)
             .map_err(|e| format!("Cannot read zip entry: {e}"))?;
-        let name_lower = entry.name().to_lowercase();
+        let name_lower = entry.name().to_lowercase().replace('\\', "/");
 
         if name_lower == "fomod/moduleconfig.xml" || name_lower.ends_with("/fomod/moduleconfig.xml")
         {
@@ -466,13 +514,15 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         }
     }
 
-    if has_fomod {
-        let config = parse_fomod_from_zip(archive_path)?;
-        // Return Fomod with empty file list – the caller will run the wizard
-        Ok(InstallStrategy::Fomod(config.required_files.clone()))
+    // Return Fomod with empty file list – the caller will run the wizard and
+    // parse the full XML separately (via parse_fomod_from_archive).  This
+    // avoids propagating an XML-parse error from inside strategy *detection*,
+    // which should be a best-effort, non-fatal operation.
+    Ok(if has_fomod {
+        InstallStrategy::Fomod(vec![])
     } else {
-        Ok(InstallStrategy::Data)
-    }
+        InstallStrategy::Data
+    })
 }
 
 fn top_level_component(path: &str) -> &str {
@@ -3382,6 +3432,74 @@ mod tests {
         assert!(
             !data_dest.join("TEXTURES").exists(),
             "uppercase TEXTURES dir should be gone after normalisation"
+        );
+    }
+
+    #[test]
+    fn detect_strategy_zip_fomod_with_backslash_separator() {
+        // Some ZIP archives created on Windows use `\` as the path separator.
+        // detect_strategy should still recognise the FOMOD config.
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("fomod\\ModuleConfig.xml", b"<config/>"),
+                ("Data\\textures\\sky.dds", b"dds"),
+            ],
+        );
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(
+            matches!(strategy, InstallStrategy::Fomod(_)),
+            "expected Fomod strategy for zip with backslash paths, got Data"
+        );
+    }
+
+    #[test]
+    fn detect_strategy_zip_fomod_wrapped_backslash() {
+        // A wrapped archive (single root dir) with backslash separators.
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("MyMod\\fomod\\ModuleConfig.xml", b"<config/>"),
+                ("MyMod\\Data\\textures\\sky.dds", b"dds"),
+            ],
+        );
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(
+            matches!(strategy, InstallStrategy::Fomod(_)),
+            "expected Fomod strategy for wrapped zip with backslash paths, got Data"
+        );
+    }
+
+    #[test]
+    fn find_data_root_returns_fomod_wrapper_not_variant_subdir() {
+        // A FOMOD archive where variant subdirs contain known data dirs.
+        // find_data_root_in_paths should return the wrapper (MyMod/) not a
+        // variant subdir (MyMod/Option A/).
+        let paths = &[
+            "MyMod/fomod/ModuleConfig.xml",
+            "MyMod/Option A/textures/body.dds",
+            "MyMod/Option B/textures/body_alt.dds",
+        ];
+        let root = find_data_root_in_paths(paths);
+        assert_eq!(
+            root, "MyMod/",
+            "expected FOMOD wrapper dir as root, got {root:?}"
+        );
+    }
+
+    #[test]
+    fn find_data_root_fomod_at_archive_root_returns_empty() {
+        // fomod/ lives directly at the archive root → data root is ""
+        let paths = &[
+            "fomod/ModuleConfig.xml",
+            "Option A/textures/body.dds",
+        ];
+        let root = find_data_root_in_paths(paths);
+        assert_eq!(
+            root, "",
+            "FOMOD at archive root should yield empty data root, got {root:?}"
         );
     }
 }
