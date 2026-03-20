@@ -240,6 +240,11 @@ fn build_main_window(
         downloads::build_downloads_page(current_game.as_ref(), Rc::clone(&config));
     content_stack.add_named(&downloads_widget, Some("downloads"));
 
+    // Preferences
+    let preferences_widget =
+        settings::build_settings_page(Rc::clone(&config), window.upcast_ref::<gtk4::Window>());
+    content_stack.add_named(&preferences_widget, Some("preferences"));
+
     let content_page = adw::NavigationPage::builder()
         .title("Library")
         .child(&content_stack)
@@ -268,8 +273,6 @@ fn build_main_window(
         let content_stack_c = content_stack.clone();
         let content_page_c = content_page.clone();
         let config_c = Rc::clone(&config);
-        let window_c = window.clone();
-        let nav_list_c = nav_list.clone();
 
         nav_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
@@ -313,11 +316,8 @@ fn build_main_window(
                     content_stack_c.set_visible_child_name("downloads");
                 }
                 NAV_PREFERENCES => {
-                    settings::show_settings_dialog(
-                        window_c.upcast_ref::<gtk4::Window>(),
-                        Rc::clone(&config_c),
-                    );
-                    nav_list_c.select_row(nav_list_c.row_at_index(NAV_LIBRARY).as_ref());
+                    content_page_c.set_title("Preferences");
+                    content_stack_c.set_visible_child_name("preferences");
                 }
                 _ => {}
             }
