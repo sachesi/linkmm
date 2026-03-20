@@ -1868,14 +1868,15 @@ fn install_zip_data_mod(archive_path: &Path, mod_dir: &Path, tick: &dyn Fn()) ->
     Ok(())
 }
 
-fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(), String> {
+fn install_data_archive_non_zip(
+    archive_path: &Path,
+    mod_dir: &Path,
+    tick: &dyn Fn(),
+) -> Result<(), String> {
     // Pre-list archive entries to determine the install strategy before
     // performing the (potentially large) extraction.
     let entries = list_archive_entries_with_7z(archive_path).unwrap_or_default();
     let path_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
-
-    let tmp_extract = create_temp_extract_dir()?;
-    extract_archive_with_7z(archive_path, &tmp_extract)?;
 
     let data_dir = mod_dir.join("Data");
     std::fs::create_dir_all(&data_dir)
@@ -1885,10 +1886,8 @@ fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(
         if is_bain_archive(&path_refs) {
             // BAIN: merge all numbered packages in ascending order.
             for bain_dir in collect_bain_top_dirs(&path_refs) {
-                let src = tmp_extract.join(&bain_dir);
-                if src.is_dir() {
-                    copy_dir_contents(&src, &data_dir)?;
-                }
+                let bain_prefix = format!("{bain_dir}/");
+                extract_non_zip_to(archive_path, &data_dir, &bain_prefix, tick)?;
             }
             return Ok(());
         }
@@ -1898,20 +1897,8 @@ fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(
         let best_score = score_as_data_root(root_trimmed, &path_refs);
 
         if best_score > 0 {
-            // Scoring found the data root: copy from the extracted subtree.
-            let src = if root_trimmed.is_empty() {
-                tmp_extract.clone()
-            } else {
-                // Join path components individually to handle '/' separators.
-                let mut p = tmp_extract.clone();
-                for component in root_trimmed.split('/') {
-                    if !component.is_empty() {
-                        p = p.join(component);
-                    }
-                }
-                p
-            };
-            copy_dir_contents(&src, &data_dir)?;
+            // Scoring found the data root: stream directly into mod_dir/Data/.
+            extract_non_zip_to(archive_path, &data_dir, &data_root, tick)?;
             return Ok(());
         }
 
@@ -1933,23 +1920,10 @@ fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(
             .collect();
         let stripped_refs: Vec<&str> = stripped.iter().map(|s| s.as_str()).collect();
 
-        let src_root = if simple_prefix.is_empty() {
-            tmp_extract.clone()
-        } else {
-            let prefix_trimmed = simple_prefix.trim_end_matches('/');
-            let mut p = tmp_extract.clone();
-            for component in prefix_trimmed.split('/') {
-                if !component.is_empty() {
-                    p = p.join(component);
-                }
-            }
-            p
-        };
-
         if looks_like_root_level_mod(&stripped_refs) {
-            copy_dir_contents(&src_root, mod_dir)?;
+            extract_non_zip_to(archive_path, mod_dir, &simple_prefix, tick)?;
         } else {
-            copy_dir_contents(&src_root, &data_dir)?;
+            extract_non_zip_to(archive_path, &data_dir, &simple_prefix, tick)?;
         }
         Ok(())
     })();
@@ -1959,13 +1933,6 @@ fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(
     // consistently on case-sensitive (Linux) filesystems.
     if data_dir.is_dir() {
         normalize_paths_to_lowercase(&data_dir);
-    }
-
-    if let Err(e) = std::fs::remove_dir_all(&tmp_extract) {
-        log::warn!(
-            "Failed to remove temporary extraction directory {}: {e}",
-            tmp_extract.display()
-        );
     }
 
     install_result
@@ -1995,6 +1962,68 @@ fn create_temp_extract_dir() -> Result<std::path::PathBuf, String> {
         }
     }
     Err("Failed to allocate a temporary extraction directory".to_string())
+}
+
+/// Like [`create_temp_extract_dir`] but creates the temp directory *inside*
+/// `parent`, keeping it on the same filesystem as the final destination.
+/// This allows rename-based (O(1)) moves rather than cross-device copies.
+fn create_temp_extract_dir_in(parent: &Path) -> Result<std::path::PathBuf, String> {
+    for attempt in 0..100u32 {
+        let temp_extract_path = parent.join(format!(
+            ".linkmm_tmp_{}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            attempt
+        ));
+        match std::fs::create_dir(&temp_extract_path) {
+            Ok(()) => return Ok(temp_extract_path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to create temporary extraction directory {}: {e}",
+                    temp_extract_path.display()
+                ));
+            }
+        }
+    }
+    Err("Failed to allocate a temporary extraction directory".to_string())
+}
+
+/// Move all direct children of `src` into `dst` using `rename`.
+///
+/// When `src` and `dst` are on the same filesystem, `rename` is a single
+/// directory-entry update — orders of magnitude faster than a byte copy.
+/// Falls back to a copy if the rename fails (e.g. cross-device move).
+fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst)
+        .map_err(|e| format!("Failed to create destination {}: {e}", dst.display()))?;
+    for entry in std::fs::read_dir(src)
+        .map_err(|e| format!("Failed to read {}: {e}", src.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        // Try a fast rename first; fall back to copy+delete on cross-device error.
+        if let Err(_) = std::fs::rename(&from, &to) {
+            if from.is_dir() {
+                copy_dir_contents(&from, &to)?;
+                let _ = std::fs::remove_dir_all(&from);
+            } else if from.is_file() {
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create parent dir: {e}"))?;
+                }
+                std::fs::copy(&from, &to).map_err(|e| {
+                    format!("Failed to move {} → {}: {e}", from.display(), to.display())
+                })?;
+                let _ = std::fs::remove_file(&from);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
