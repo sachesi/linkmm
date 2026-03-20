@@ -577,57 +577,124 @@ fn show_install_dialog(
     game_rc: &Rc<Option<Game>>,
     status_ctx: &InstallStatusCtx,
 ) {
-    let strategy = match detect_strategy(archive_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("Failed to detect install strategy: {e}");
-            show_toast(anchor.upcast_ref(), &format!("Error: {e}"));
-            return;
-        }
-    };
+    // Show the status bar immediately so the user sees activity.  For non-zip
+    // archives (7z / rar) strategy detection and FOMOD XML parsing require
+    // spawning 7z subprocesses which can take seconds on large archives.  We
+    // do all of that work on a background thread so the GTK event loop keeps
+    // running.
+    set_downloads_busy(status_ctx, true);
+    status_ctx.revealer.set_reveal_child(true);
+    status_ctx.label.set_text("Reading archive…");
+    status_ctx.progress.set_fraction(0.0);
+    status_ctx.progress.set_text(Some("Detecting install type…"));
 
-    if let InstallStrategy::Fomod(_) = &strategy {
-        match parse_fomod_from_archive(archive_path) {
-            Ok(fomod_config) => {
-                let parent = anchor
-                    .root()
-                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
-                show_fomod_wizard(
-                    parent.as_ref(),
-                    archive_path,
-                    archive_name,
-                    game,
-                    config,
-                    container,
-                    hide_installed,
-                    search_query,
-                    &fomod_config,
-                    game_rc,
-                    Some(status_ctx),
-                );
-                return;
-            }
-            Err(e) => {
-                log::warn!("Failed to parse FOMOD config, falling back: {e}");
-            }
-        }
-    }
+    // Clone Send-able data for the background thread (no Rc / GTK widget).
+    let ap = archive_path.to_path_buf();
 
-    let parent = anchor
-        .root()
-        .and_then(|r| r.downcast::<gtk4::Window>().ok());
-    show_strategy_picker(
-        parent.as_ref(),
-        archive_path,
-        archive_name,
-        game,
-        config,
-        container,
-        hide_installed,
-        search_query,
-        &strategy,
-        game_rc,
-        status_ctx,
+    // Channel carries the result back to the GTK main thread.
+    let (tx, rx) =
+        std::sync::mpsc::channel::<Result<(InstallStrategy, Option<FomodConfig>), String>>();
+
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(InstallStrategy, Option<FomodConfig>), String> {
+            let strategy = detect_strategy(&ap)?;
+            let fomod_config = if let InstallStrategy::Fomod(_) = &strategy {
+                match parse_fomod_from_archive(&ap) {
+                    Ok(cfg) => Some(cfg),
+                    Err(e) => {
+                        log::warn!("Failed to parse FOMOD config, falling back: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            Ok((strategy, fomod_config))
+        })();
+        let _ = tx.send(result);
+    });
+
+    // Clone GTK-side handles for the completion closure (main-thread-only).
+    let anchor_c = anchor.clone();
+    let archive_path_c = archive_path.to_path_buf();
+    let archive_name_s = archive_name.to_string();
+    let game_c = game.clone();
+    let config_c = Rc::clone(config);
+    let container_c = container.clone();
+    let game_rc_c = Rc::clone(game_rc);
+    let search_query_s = search_query.to_string();
+    let status_ctx_c = status_ctx.clone();
+
+    // Poll the channel every 50 ms; pulse the progress bar while waiting.
+    gtk4::glib::timeout_add_local(
+        std::time::Duration::from_millis(50),
+        move || {
+            match rx.try_recv() {
+                Ok(Ok((strategy, fomod_config_opt))) => {
+                    set_downloads_busy(&status_ctx_c, false);
+                    status_ctx_c.revealer.set_reveal_child(false);
+
+                    if let Some(fomod_config) = fomod_config_opt {
+                        let parent = anchor_c
+                            .root()
+                            .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                        show_fomod_wizard(
+                            parent.as_ref(),
+                            &archive_path_c,
+                            &archive_name_s,
+                            &game_c,
+                            &config_c,
+                            &container_c,
+                            hide_installed,
+                            &search_query_s,
+                            &fomod_config,
+                            &game_rc_c,
+                            Some(&status_ctx_c),
+                        );
+                    } else {
+                        let parent = anchor_c
+                            .root()
+                            .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                        show_strategy_picker(
+                            parent.as_ref(),
+                            &archive_path_c,
+                            &archive_name_s,
+                            &game_c,
+                            &config_c,
+                            &container_c,
+                            hide_installed,
+                            &search_query_s,
+                            &strategy,
+                            &game_rc_c,
+                            &status_ctx_c,
+                        );
+                    }
+                    gtk4::glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    log::error!("Failed to detect install strategy: {e}");
+                    set_downloads_busy(&status_ctx_c, false);
+                    hide_status_popup_later(status_ctx_c.revealer.clone());
+                    show_toast(
+                        status_ctx_c.list_container.upcast_ref(),
+                        &format!("Error: {e}"),
+                    );
+                    gtk4::glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still detecting — pulse the bar to show activity.
+                    status_ctx_c.progress.pulse();
+                    gtk4::glib::ControlFlow::Continue
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Background thread panicked.
+                    log::error!("Strategy detection thread terminated unexpectedly");
+                    set_downloads_busy(&status_ctx_c, false);
+                    hide_status_popup_later(status_ctx_c.revealer.clone());
+                    gtk4::glib::ControlFlow::Break
+                }
+            }
+        },
     );
 }
 
