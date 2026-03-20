@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use gio;
 use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -24,6 +25,9 @@ pub fn build_ui(app: &libadwaita::Application) {
     if config.borrow().first_run || config.borrow().games.is_empty() {
         setup_wizard::show_setup_wizard(&window, Rc::clone(&config), on_setup_done);
     }
+    // Ensure this app is registered as the NXM protocol handler so that
+    // clicking "Download with NXM" in the browser sends links here.
+    register_nxm_handler();
 }
 
 // ── Navigation constants ───────────────────────────────────────────────────
@@ -576,6 +580,94 @@ fn show_about_dialog(parent: &gtk4::Window) {
 
 // ── NXM protocol handler ──────────────────────────────────────────────────
 
+const NXM_DESKTOP_ID: &str = "io.github.sachesi.linkmm.desktop";
+const NXM_SCHEME: &str = "x-scheme-handler/nxm";
+
+/// Ensure this application is registered as the `nxm://` protocol handler.
+///
+/// On first run (or when the handler is unset), this installs the `.desktop`
+/// file to `~/.local/share/applications/` and calls
+/// `gio::AppInfo::set_as_default_for_type`.  Both steps are no-ops if already
+/// done, so the function is safe to call on every startup.
+fn register_nxm_handler() {
+    use gio::prelude::AppInfoExt;
+
+    // Check whether we are already the registered handler.
+    let already_set = gio::AppInfo::default_for_type(NXM_SCHEME, false)
+        .and_then(|a| a.id())
+        .map(|id| id.as_str() == NXM_DESKTOP_ID)
+        .unwrap_or(false);
+    if already_set {
+        return;
+    }
+
+    // Try to use a desktop file that was already installed system-wide or
+    // by a previous run of this function.
+    if let Some(app_info) = gio::DesktopAppInfo::new(NXM_DESKTOP_ID) {
+        match app_info.set_as_default_for_type(NXM_SCHEME) {
+            Ok(()) => {
+                log::info!("Registered as nxm:// handler");
+                return;
+            }
+            Err(e) => log::warn!("set_as_default_for_type failed: {e}"),
+        }
+    }
+
+    // Desktop file not found in search path; write one to the user's local
+    // applications directory so GIO can pick it up.
+    let Some(apps_dir) = dirs::data_local_dir().map(|d| d.join("applications")) else {
+        log::warn!("Could not determine local applications directory");
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&apps_dir) {
+        log::warn!("Could not create applications directory: {e}");
+        return;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Could not determine executable path: {e}");
+            return;
+        }
+    };
+
+    let desktop_content = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Linkmm\n\
+         Comment=Link-based mod manager for Bethesda games\n\
+         Exec={} %u\n\
+         Icon=applications-games-symbolic\n\
+         Terminal=false\n\
+         Categories=Game;Utility;\n\
+         MimeType=x-scheme-handler/nxm;\n\
+         StartupNotify=true\n",
+        exe.display()
+    );
+
+    let desktop_path = apps_dir.join(NXM_DESKTOP_ID);
+    if let Err(e) = std::fs::write(&desktop_path, &desktop_content) {
+        log::warn!("Could not write desktop file: {e}");
+        return;
+    }
+
+    // Refresh the desktop database so GIO finds the newly written file.
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .status();
+
+    // Now re-try registration with the freshly installed file.
+    if let Some(app_info) = gio::DesktopAppInfo::new(NXM_DESKTOP_ID) {
+        match app_info.set_as_default_for_type(NXM_SCHEME) {
+            Ok(()) => log::info!("Installed desktop file and registered as nxm:// handler"),
+            Err(e) => log::warn!("set_as_default_for_type (after install) failed: {e}"),
+        }
+    } else {
+        log::warn!("Desktop file not found even after writing to {}", desktop_path.display());
+    }
+}
+
 /// Handle an `nxm://` URL received from the browser.
 ///
 /// Parses the URL, fetches the download link from the Nexus API, downloads the
@@ -649,25 +741,33 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
     let downloads_dir_c = downloads_dir.clone();
     let download_target_c = download_target.clone();
 
-    let do_download = move || {
-        start_nxm_download(&app_c, nxm_c, api_key_c, downloads_dir_c, download_target_c);
-    };
-
     if let Some(msg) = mismatch_msg {
         let window = app.active_window();
-        show_nxm_game_mismatch_dialog(window.as_ref(), &msg, do_download);
+        show_nxm_game_mismatch_dialog(
+            window.as_ref(),
+            &msg,
+            app,
+            nxm,
+            api_key,
+            downloads_dir,
+            download_target,
+        );
     } else {
-        do_download();
+        start_nxm_download(&app_c, nxm_c, api_key_c, downloads_dir_c, download_target_c);
     }
 }
 
 /// Show a warning dialog when the NXM download's game domain does not match
-/// the currently active game.  Calls `on_confirm` only if the user chooses
+/// the currently active game.  Starts the download only if the user chooses
 /// "Download Anyway".
-fn show_nxm_game_mismatch_dialog<F: FnOnce() + 'static>(
+fn show_nxm_game_mismatch_dialog(
     parent: Option<&gtk4::Window>,
     message: &str,
-    on_confirm: F,
+    app: &libadwaita::Application,
+    nxm: crate::core::nxm::NxmUrl,
+    api_key: String,
+    downloads_dir: std::path::PathBuf,
+    download_target: Option<crate::core::games::Game>,
 ) {
     let dialog = adw::AlertDialog::builder()
         .heading("Game Mismatch")
@@ -678,13 +778,20 @@ fn show_nxm_game_mismatch_dialog<F: FnOnce() + 'static>(
     dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
-    // Wrap FnOnce in Option<Cell> so we can call it at most once inside the Fn closure
-    let on_confirm_cell = std::cell::Cell::new(Some(on_confirm));
+    let app_c = app.clone();
+    let nxm_c = nxm.clone();
+    let api_key_c = api_key.clone();
+    let downloads_dir_c = downloads_dir.clone();
+    let download_target_c = download_target.clone();
     dialog.connect_response(None, move |_, response| {
         if response == "download" {
-            if let Some(f) = on_confirm_cell.take() {
-                f();
-            }
+            start_nxm_download(
+                &app_c,
+                nxm_c.clone(),
+                api_key_c.clone(),
+                downloads_dir_c.clone(),
+                download_target_c.clone(),
+            );
         }
     });
     dialog.present(parent);
