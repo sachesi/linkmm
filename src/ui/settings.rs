@@ -157,8 +157,18 @@ pub fn build_settings_page(
                 profiles_list_c.remove(&child);
             }
 
-            let profiles = config_c.borrow().profiles.clone();
-            let active_id = config_c.borrow().active_profile_id.clone();
+            // Load profiles from per-game settings for the active game.
+            let (profiles, active_id) = {
+                let cfg = config_c.borrow();
+                if let Some(game_id) = cfg.current_game_id.as_deref() {
+                    let gs = cfg.game_settings_ref(game_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    (gs.profiles, gs.active_profile_id)
+                } else {
+                    (crate::core::config::default_active_profile_id_vec(), "default".to_string())
+                }
+            };
 
             for profile in &profiles {
                 let is_active = profile.id == active_id;
@@ -183,11 +193,14 @@ pub fn build_settings_page(
                     let config_d = Rc::clone(&config_c);
                     let rebuild_d = rebuild_weak_c.clone();
                     del_btn.connect_clicked(move |_| {
-                        config_d
-                            .borrow_mut()
-                            .profiles
-                            .retain(|p| p.id != profile_id_d);
-                        config_d.borrow().save();
+                        let mut cfg = config_d.borrow_mut();
+                        if let Some(game_id) = cfg.current_game_id.clone() {
+                            cfg.game_settings_mut(&game_id)
+                                .profiles
+                                .retain(|p| p.id != profile_id_d);
+                        }
+                        cfg.save();
+                        drop(cfg);
                         if let Some(rb) = rebuild_d.upgrade() {
                             (rb.borrow())();
                         }
@@ -199,8 +212,13 @@ pub fn build_settings_page(
                     let rebuild_s = rebuild_weak_c.clone();
                     let toast_overlay_s = toast_overlay_c.clone();
                     row.connect_activated(move |_| {
-                        config_s.borrow_mut().active_profile_id = profile_id_s.clone();
-                        config_s.borrow().save();
+                        let mut cfg = config_s.borrow_mut();
+                        if let Some(game_id) = cfg.current_game_id.clone() {
+                            cfg.game_settings_mut(&game_id).active_profile_id =
+                                profile_id_s.clone();
+                        }
+                        cfg.save();
+                        drop(cfg);
                         toast_overlay_s.add_toast(adw::Toast::new("Profile switched."));
                         if let Some(rb) = rebuild_s.upgrade() {
                             (rb.borrow())();
@@ -283,8 +301,12 @@ fn show_add_profile_dialog(
             let name = name_entry_c.text().trim().to_string();
             if !name.is_empty() {
                 let profile = Profile::new(name);
-                config_c.borrow_mut().profiles.push(profile);
-                config_c.borrow().save();
+                let mut cfg = config_c.borrow_mut();
+                if let Some(game_id) = cfg.current_game_id.clone() {
+                    cfg.game_settings_mut(&game_id).profiles.push(profile);
+                }
+                cfg.save();
+                drop(cfg);
                 (rebuild_c.borrow())();
             }
             add_dialog_c.destroy();
