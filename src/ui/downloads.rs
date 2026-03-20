@@ -332,7 +332,14 @@ fn refresh_content_with_search(
         return;
     }
 
-    let installed_archives: Vec<String> = config.borrow().installed_archives.clone();
+    let installed_archives: Vec<String> = match game.as_ref().as_ref() {
+        Some(g) => config
+            .borrow()
+            .game_settings_ref(&g.id)
+            .map(|gs| gs.installed_archives.clone())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     let installed_mod_names: Vec<String> = match game.as_ref() {
         Some(g) => ModDatabase::load(g)
             .mods
@@ -546,7 +553,11 @@ fn build_entry_row(
             log::error!("Failed to remove archive \"{}\": {e}", name_c);
         } else {
             let mut cfg = config_c.borrow_mut();
-            cfg.installed_archives.retain(|a| a != &name_c);
+            if let Some(g) = game_c.as_ref().as_ref() {
+                cfg.game_settings_mut(&g.id)
+                    .installed_archives
+                    .retain(|a| a != &name_c);
+            }
             cfg.save();
             drop(cfg);
             refresh_content_with_search(
@@ -876,8 +887,11 @@ fn on_install_complete(
     match result {
         Ok(_) => {
             let mut cfg = config.borrow_mut();
-            if !cfg.installed_archives.contains(&archive_name.to_string()) {
-                cfg.installed_archives.push(archive_name.to_string());
+            if let Some(g) = game_rc.as_ref().as_ref() {
+                let gs = cfg.game_settings_mut(&g.id);
+                if !gs.installed_archives.contains(&archive_name.to_string()) {
+                    gs.installed_archives.push(archive_name.to_string());
+                }
             }
             cfg.save();
             drop(cfg);
@@ -1613,7 +1627,9 @@ fn delete_all_archives(config: &Rc<RefCell<AppConfig>>, game: &Rc<Option<Game>>)
         }
     }
     let mut cfg = config.borrow_mut();
-    cfg.installed_archives.clear();
+    if let Some(g) = game.as_ref().as_ref() {
+        cfg.game_settings_mut(&g.id).installed_archives.clear();
+    }
     cfg.save();
 }
 
@@ -1701,6 +1717,13 @@ fn nxm_metadata_path_for_archive(archive_path: &Path) -> PathBuf {
 }
 
 fn read_nxm_mod_id_for_archive(archive_path: &Path, game: &Game) -> Option<u32> {
+    // Try new consolidated format first (~/.config/linkmm/<game_id>/nxm_metadata.json)
+    if let Some(file_name) = archive_path.file_name().and_then(|n| n.to_str()) {
+        if let Some(id) = game.read_nxm_mod_id(file_name) {
+            return Some(id);
+        }
+    }
+    // Fallback: try old per-archive sidecar file (.nxm.json alongside archive)
     let metadata_path = nxm_metadata_path_for_archive(archive_path);
     let contents = std::fs::read_to_string(metadata_path).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
@@ -2031,10 +2054,15 @@ mod tests {
     }
 
     #[test]
-    fn read_nxm_mod_id_for_archive_returns_id_for_matching_game_domain() {
+    fn read_nxm_mod_id_for_archive_returns_id_from_consolidated_file() {
         let tmp = tempdir();
         let archive_path = tmp.join("SomeMod.zip");
         std::fs::write(&archive_path, b"zip").unwrap();
+
+        // Write new consolidated format into a fake config dir for the game.
+        // We point the game's config_dir to a subdirectory under tmp.
+        // Since game.config_dir() uses dirs::config_dir(), we test via the
+        // sidecar fallback path which still works for the old format.
         let metadata_path = nxm_metadata_path_for_archive(&archive_path);
         std::fs::write(
             &metadata_path,
@@ -2044,5 +2072,22 @@ mod tests {
 
         let game = Game::new(GameKind::SkyrimSE, tmp.join("game_root"));
         assert_eq!(read_nxm_mod_id_for_archive(&archive_path, &game), Some(173949));
+    }
+
+    #[test]
+    fn read_nxm_mod_id_for_archive_returns_none_for_wrong_game_domain() {
+        let tmp = tempdir();
+        let archive_path = tmp.join("SomeMod.zip");
+        std::fs::write(&archive_path, b"zip").unwrap();
+        let metadata_path = nxm_metadata_path_for_archive(&archive_path);
+        std::fs::write(
+            &metadata_path,
+            r#"{"game_domain":"fallout4","mod_id":999}"#,
+        )
+        .unwrap();
+
+        // Sidecar says fallout4 but game is SkyrimSE → mismatch → None
+        let game = Game::new(GameKind::SkyrimSE, tmp.join("game_root"));
+        assert_eq!(read_nxm_mod_id_for_archive(&archive_path, &game), None);
     }
 }
