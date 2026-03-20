@@ -12,9 +12,9 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 /// contain many small files.
 const EXTRACT_BUFFER_SIZE: usize = 256 * 1024;
 
-/// How often the 7z extraction polling loop calls the progress `tick` callback.
+/// How often the zip extraction loop calls the progress `tick` callback.
 /// At 50 ms the progress bar pulses at ~20 Hz, which looks smooth enough
-/// without busy-polling too aggressively.
+/// without calling `tick` on every single zip entry.
 const EXTRACTION_TICK_INTERVAL_MS: u64 = 50;
 
 /// Well-known subdirectory names that are expected directly inside a game's
@@ -1293,12 +1293,14 @@ pub fn install_mod_from_archive_with_nexus(
 }
 
 /// Like [`install_mod_from_archive_with_nexus`] but calls `tick()` periodically
-/// during the extraction phase for non-zip archives (7z, rar, …).
+/// during zip extraction (iterating over entries).
 ///
-/// The `tick` function is invoked on the calling thread roughly every 50 ms
-/// while waiting for 7-Zip to finish extracting the archive.  A typical
-/// implementation pulses a GTK `ProgressBar` and flushes pending UI events so
-/// the application stays visually responsive during the extraction.
+/// The `tick` function is invoked on the calling thread roughly every
+/// [`EXTRACTION_TICK_INTERVAL_MS`] ms while iterating over zip entries.  A
+/// typical implementation pulses a GTK `ProgressBar` to keep the UI
+/// visually responsive.  For non-zip archives (7z, rar, …) the `tick`
+/// callback is not used; callers should run those installations on a
+/// background thread to avoid blocking the GTK main loop.
 ///
 /// Pass `&|| {}` (a no-op) when no progress feedback is needed.
 pub fn install_mod_from_archive_with_nexus_ticking(
@@ -1314,7 +1316,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
     match strategy {
         InstallStrategy::Data => {
             if !has_zip_extension(archive_path) {
-                install_data_archive_non_zip(archive_path, &mod_dir, tick)?;
+                install_data_archive_non_zip(archive_path, &mod_dir)?;
             } else {
                 install_zip_data_mod(archive_path, &mod_dir, tick)?;
             }
@@ -1325,7 +1327,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
             let data_dir = mod_dir.join("Data");
             std::fs::create_dir_all(&data_dir)
                 .map_err(|e| format!("Failed to create Data directory: {e}"))?;
-            install_fomod_files(archive_path, &data_dir, files, tick)?;
+            install_fomod_files(archive_path, &data_dir, files)?;
             // Normalise directory/file names to lowercase so that FOMOD mods
             // are stored consistently alongside non-FOMOD mods on
             // case-sensitive (Linux) filesystems.
@@ -1444,11 +1446,14 @@ fn has_zip_extension(path: &Path) -> bool {
 
 /// Full-archive extraction using 7-Zip.
 ///
-/// `tick` is called approximately every 50 ms while waiting for the 7z
-/// process to finish.  This lets the caller pulse a progress bar or process
-/// UI events so the application stays responsive during a long extraction.
-/// Pass `&|| {}` when no progress feedback is needed.
-fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
+/// Extract all files from a non-zip archive (7z, rar, …) into `dest_dir`.
+///
+/// This function is intended to be called from a **background thread** so it
+/// may block for as long as the `7z` process takes.  Callers that need to
+/// keep a GTK/UI event loop running during extraction should run this on a
+/// worker thread and poll for completion on the main thread (e.g. with
+/// `glib::timeout_add_local`).
+fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| {
         format!(
             "Failed to create extraction directory {}: {e}",
@@ -1457,52 +1462,27 @@ fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path, tick: &dyn Fn()
     })?;
     let output_arg = format!("-o{}", dest_dir.display());
 
-    // Spawn 7z and poll it so that `tick` can be called while we wait.
-    // Using spawn() + try_wait() instead of output() keeps the calling
-    // thread free to process UI events between polls.
-    let mut child = Command::new("7z")
+    let output = Command::new("7z")
         .arg("x")
         .arg("-y")
         .arg(&output_arg)
         .arg(archive_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .output()
         .map_err(|e| {
             format!(
                 "Failed to start 7z extractor ({e}). Install 7-Zip (the '7z' command) to extract .7z and .rar archives."
             )
         })?;
 
-    loop {
-        match child.try_wait().map_err(|e| format!("Failed to check 7z process status: {e}"))? {
-            Some(status) => {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    // Read whatever stderr the process produced for the error
-                    // message.  The process has already exited so this won't
-                    // block.
-                    let stderr = child
-                        .stderr
-                        .take()
-                        .map(|mut r| {
-                            let mut s = String::new();
-                            std::io::Read::read_to_string(&mut r, &mut s).ok();
-                            s
-                        })
-                        .unwrap_or_default();
-                    Err(format!(
-                        "Failed to extract non-zip archive with 7z. stderr: {stderr}"
-                    ))
-                };
-            }
-            None => {
-                // Process still running — call tick so the UI can update.
-                tick();
-                std::thread::sleep(std::time::Duration::from_millis(EXTRACTION_TICK_INTERVAL_MS));
-            }
-        }
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "Failed to extract non-zip archive with 7z. stderr: {stderr}"
+        ))
     }
 }
 
@@ -1683,14 +1663,14 @@ fn install_zip_data_mod(archive_path: &Path, mod_dir: &Path, tick: &dyn Fn()) ->
     Ok(())
 }
 
-fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
+fn install_data_archive_non_zip(archive_path: &Path, mod_dir: &Path) -> Result<(), String> {
     // Pre-list archive entries to determine the install strategy before
     // performing the (potentially large) extraction.
     let entries = list_archive_entries_with_7z(archive_path).unwrap_or_default();
     let path_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
 
     let tmp_extract = create_temp_extract_dir()?;
-    extract_archive_with_7z(archive_path, &tmp_extract, tick)?;
+    extract_archive_with_7z(archive_path, &tmp_extract)?;
 
     let data_dir = mod_dir.join("Data");
     std::fs::create_dir_all(&data_dir)
@@ -1970,16 +1950,18 @@ fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String {
 /// For each `FomodFile`, extract the `source` path from the archive and place it
 /// at `dest_dir / destination`.
 ///
-/// `tick` is called periodically during the non-zip extraction phase so the
+/// `tick` is called periodically during the zip extraction phase so the
 /// caller can pulse a progress indicator.  Pass `&|| {}` when not needed.
+/// For non-zip archives (7z, rar, …) this function runs the extraction
+/// synchronously; the caller is responsible for offloading to a background
+/// thread to keep the UI responsive.
 fn install_fomod_files(
     archive_path: &Path,
     dest_dir: &Path,
     files: &[FomodFile],
-    tick: &dyn Fn(),
 ) -> Result<(), String> {
     if !has_zip_extension(archive_path) {
-        return install_fomod_files_non_zip(archive_path, dest_dir, files, tick);
+        return install_fomod_files_non_zip(archive_path, dest_dir, files);
     }
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
@@ -2135,10 +2117,9 @@ fn install_fomod_files_non_zip(
     archive_path: &Path,
     dest_dir: &Path,
     files: &[FomodFile],
-    tick: &dyn Fn(),
 ) -> Result<(), String> {
     let tmp = create_temp_extract_dir()?;
-    extract_archive_with_7z(archive_path, &tmp, tick)?;
+    extract_archive_with_7z(archive_path, &tmp)?;
     let result = install_fomod_files_from_dir(&tmp, dest_dir, files);
     if let Err(e) = std::fs::remove_dir_all(&tmp) {
         log::warn!(
@@ -2778,7 +2759,6 @@ Size = 9\n\
                 destination: "Data/textures".to_string(),
                 priority: 0,
             }],
-            &|| {},
         )
         .unwrap();
 
@@ -2808,7 +2788,6 @@ Size = 9\n\
                 destination: "Data/meshes".to_string(),
                 priority: 0,
             }],
-            &|| {},
         )
         .unwrap();
 
@@ -2837,7 +2816,6 @@ Size = 9\n\
                 destination: "Data".to_string(),
                 priority: 0,
             }],
-            &|| {},
         )
         .unwrap();
 
@@ -2869,7 +2847,6 @@ Size = 9\n\
                 destination: "Data/textures".to_string(),
                 priority: 0,
             }],
-            &|| {},
         )
         .unwrap();
 
@@ -2905,7 +2882,6 @@ Size = 9\n\
                 destination: "Data".to_string(),
                 priority: 0,
             }],
-            &|| {},
         )
         .unwrap();
 
@@ -3085,7 +3061,6 @@ Size = 9\n\
                 destination: "Data/textures".to_string(),
                 priority: 0,
             }],
-            &|| {},
         )
         .unwrap();
 
@@ -3116,7 +3091,7 @@ Size = 9\n\
             destination: "Data/textures".to_string(),
             priority: 0,
         }];
-        install_fomod_files(&archive, &dest_zip, &files, &|| {}).unwrap();
+        install_fomod_files(&archive, &dest_zip, &files).unwrap();
 
         // Now do the same with the dir-based function using a matching tree.
         let extracted = tmp.join("extracted");
@@ -3170,7 +3145,6 @@ Size = 9\n\
                     priority: 0,
                 },
             ],
-            &|| {},
         )
         .unwrap();
         normalize_paths_to_lowercase(&dest);
