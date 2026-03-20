@@ -7,13 +7,10 @@ Summary:        Link-based mod manager for Bethesda games
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/sachesi/%{crate}
-Source0:        %{url}/archive/v%{version}/%{crate}-%{version}.tar.gz
-# To generate the vendor tarball:
-#   spectool -g linkmm.spec
-#   tar -xf linkmm-%%{version}.tar.gz
-#   cd linkmm-%%{version}
-#   cargo vendor
-#   tar -czf linkmm-%%{version}-vendor.tar.gz vendor/
+# Source tarballs must be generated locally from the private repository.
+# Run `make sources` (requires SSH access) to populate ~/rpmbuild/SOURCES/:
+#   make sources VERSION=%{version}
+Source0:        %{crate}-%{version}.tar.gz
 Source1:        %{crate}-%{version}-vendor.tar.gz
 
 BuildRequires:  cargo-rpm-macros >= 24
