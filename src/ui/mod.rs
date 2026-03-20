@@ -585,13 +585,12 @@ const NXM_SCHEME: &str = "x-scheme-handler/nxm";
 
 /// Ensure this application is registered as the `nxm://` protocol handler.
 ///
-/// On first run (or when the handler is unset), this installs the `.desktop`
-/// file to `~/.local/share/applications/` and calls
-/// `gio::AppInfo::set_as_default_for_type`.  Both steps are no-ops if already
-/// done, so the function is safe to call on every startup.
+/// Checks the current handler via GIO; if it is not already set to this app,
+/// writes the `.desktop` file to `~/.local/share/applications/` (if absent)
+/// and calls `xdg-mime default` to register it — the same operation a user
+/// would run manually.  Both steps are no-ops when already set, so calling
+/// this on every startup is safe.
 fn register_nxm_handler() {
-    use gio::prelude::AppInfoExt;
-
     // Check whether we are already the registered handler.
     let already_set = gio::AppInfo::default_for_type(NXM_SCHEME, false)
         .and_then(|a| a.id())
@@ -601,70 +600,65 @@ fn register_nxm_handler() {
         return;
     }
 
-    // Try to use a desktop file that was already installed system-wide or
-    // by a previous run of this function.
-    if let Some(app_info) = gio::DesktopAppInfo::new(NXM_DESKTOP_ID) {
-        match app_info.set_as_default_for_type(NXM_SCHEME) {
-            Ok(()) => {
-                log::info!("Registered as nxm:// handler");
-                return;
-            }
-            Err(e) => log::warn!("set_as_default_for_type failed: {e}"),
-        }
-    }
-
-    // Desktop file not found in search path; write one to the user's local
-    // applications directory so GIO can pick it up.
-    let Some(apps_dir) = dirs::data_local_dir().map(|d| d.join("applications")) else {
-        log::warn!("Could not determine local applications directory");
-        return;
-    };
-    if let Err(e) = std::fs::create_dir_all(&apps_dir) {
-        log::warn!("Could not create applications directory: {e}");
-        return;
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("Could not determine executable path: {e}");
+    // Ensure the .desktop file exists somewhere GIO can find it.  If it was
+    // installed system-wide (e.g. via a package) this directory write is
+    // skipped; we only write it when it is genuinely absent.
+    let apps_dir = match dirs::data_local_dir() {
+        Some(d) => d.join("applications"),
+        None => {
+            log::warn!("register_nxm_handler: could not determine local applications directory");
             return;
         }
     };
 
-    let desktop_content = format!(
-        "[Desktop Entry]\n\
-         Type=Application\n\
-         Name=Linkmm\n\
-         Comment=Link-based mod manager for Bethesda games\n\
-         Exec={} %u\n\
-         Icon=applications-games-symbolic\n\
-         Terminal=false\n\
-         Categories=Game;Utility;\n\
-         MimeType=x-scheme-handler/nxm;\n\
-         StartupNotify=true\n",
-        exe.display()
-    );
-
     let desktop_path = apps_dir.join(NXM_DESKTOP_ID);
-    if let Err(e) = std::fs::write(&desktop_path, &desktop_content) {
-        log::warn!("Could not write desktop file: {e}");
-        return;
+    if !desktop_path.exists() {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("register_nxm_handler: could not determine executable path: {e}");
+                return;
+            }
+        };
+
+        let desktop_content = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Linkmm\n\
+             Comment=Link-based mod manager for Bethesda games\n\
+             Exec={} %u\n\
+             Icon=applications-games-symbolic\n\
+             Terminal=false\n\
+             Categories=Game;Utility;\n\
+             MimeType=x-scheme-handler/nxm;\n\
+             StartupNotify=true\n",
+            exe.display()
+        );
+
+        if let Err(e) = std::fs::create_dir_all(&apps_dir) {
+            log::warn!("register_nxm_handler: could not create applications directory: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::write(&desktop_path, &desktop_content) {
+            log::warn!("register_nxm_handler: could not write desktop file: {e}");
+            return;
+        }
+
+        // Refresh the desktop database so xdg-mime and GIO find the new file.
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(&apps_dir)
+            .status();
     }
 
-    // Refresh the desktop database so GIO finds the newly written file.
-    let _ = std::process::Command::new("update-desktop-database")
-        .arg(&apps_dir)
-        .status();
-
-    // Now re-try registration with the freshly installed file.
-    if let Some(app_info) = gio::DesktopAppInfo::new(NXM_DESKTOP_ID) {
-        match app_info.set_as_default_for_type(NXM_SCHEME) {
-            Ok(()) => log::info!("Installed desktop file and registered as nxm:// handler"),
-            Err(e) => log::warn!("set_as_default_for_type (after install) failed: {e}"),
-        }
-    } else {
-        log::warn!("Desktop file not found even after writing to {}", desktop_path.display());
+    // Register as the default handler — equivalent to running:
+    //   xdg-mime default io.github.sachesi.linkmm.desktop x-scheme-handler/nxm
+    match std::process::Command::new("xdg-mime")
+        .args(["default", NXM_DESKTOP_ID, NXM_SCHEME])
+        .status()
+    {
+        Ok(s) if s.success() => log::info!("Registered as nxm:// handler via xdg-mime"),
+        Ok(s) => log::warn!("xdg-mime default exited with status {s}"),
+        Err(e) => log::warn!("register_nxm_handler: xdg-mime not available: {e}"),
     }
 }
 
