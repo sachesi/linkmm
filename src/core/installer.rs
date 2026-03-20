@@ -1292,14 +1292,11 @@ pub fn install_mod_from_archive_with_nexus(
 }
 
 /// Like [`install_mod_from_archive_with_nexus`] but calls `tick()` periodically
-/// during zip extraction (iterating over entries).
+/// during extraction (iterating over entries).
 ///
 /// The `tick` function is invoked on the calling thread roughly every
-/// [`EXTRACTION_TICK_INTERVAL_MS`] ms while iterating over zip entries.  A
-/// typical implementation pulses a GTK `ProgressBar` to keep the UI
-/// visually responsive.  For non-zip archives (7z, rar, …) the `tick`
-/// callback is not used; callers should run those installations on a
-/// background thread to avoid blocking the GTK main loop.
+/// [`EXTRACTION_TICK_INTERVAL_MS`] ms.  A typical implementation pulses a GTK
+/// `ProgressBar` to keep the UI visually responsive.
 ///
 /// Pass `&|| {}` (a no-op) when no progress feedback is needed.
 pub fn install_mod_from_archive_with_nexus_ticking(
@@ -1315,7 +1312,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
     match strategy {
         InstallStrategy::Data => {
             if !has_zip_extension(archive_path) {
-                install_data_archive_non_zip(archive_path, &mod_dir)?;
+                install_data_archive_non_zip(archive_path, &mod_dir, tick)?;
             } else {
                 install_zip_data_mod(archive_path, &mod_dir, tick)?;
             }
@@ -1477,6 +1474,168 @@ fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), S
 fn extract_7z_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
     sevenz_rust2::decompress_file(archive_path, dest_dir)
         .map_err(|e| format!("Failed to extract 7z archive {}: {e}", archive_path.display()))
+}
+
+/// Stream-extract a `.7z` archive directly to `dest_dir`, stripping
+/// `strip_prefix` from every stored path before writing.
+///
+/// Unlike [`extract_7z_archive`] this function uses
+/// [`sevenz_rust2::decompress_file_with_extract_fn`] to write each file
+/// directly to `dest_dir` without an intermediate temp directory.
+/// `strip_prefix` is matched case-insensitively; entries outside the prefix
+/// are silently skipped.
+///
+/// Stored paths that use backslash separators (Windows-created archives) are
+/// normalised to forward slashes before any prefix matching or output-path
+/// construction, so they are handled correctly on Linux.
+///
+/// `tick` is called approximately every [`EXTRACTION_TICK_INTERVAL_MS`] for
+/// progress feedback.
+fn extract_7z_archive_to(
+    archive_path: &Path,
+    dest_dir: &Path,
+    strip_prefix: &str,
+    tick: &dyn Fn(),
+) -> Result<(), String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| {
+        format!(
+            "Failed to create extraction directory {}: {e}",
+            dest_dir.display()
+        )
+    })?;
+
+    let prefix_lower = strip_prefix.to_lowercase().replace('\\', "/");
+    let dest_dir_buf = dest_dir.to_path_buf();
+    let mut last_tick = std::time::Instant::now();
+
+    sevenz_rust2::decompress_file_with_extract_fn(
+        archive_path,
+        dest_dir,
+        |entry, reader, _default_dest| {
+            // Periodic tick for progress feedback.
+            let now = std::time::Instant::now();
+            if now.duration_since(last_tick).as_millis() as u64 >= EXTRACTION_TICK_INTERVAL_MS {
+                tick();
+                last_tick = now;
+            }
+
+            // Normalise the stored name: convert backslash separators from
+            // Windows-created archives and strip leading/trailing slashes.
+            let raw_name = normalise_path(entry.name());
+
+            // Determine the relative path after stripping the prefix (case-insensitive).
+            let rel_name = if prefix_lower.is_empty() {
+                raw_name.clone()
+            } else {
+                let raw_lower = raw_name.to_lowercase().replace('\\', "/");
+                match raw_lower.strip_prefix(&prefix_lower) {
+                    Some(r) => raw_name[raw_name.len() - r.len()..].to_string(),
+                    // Entry is outside the selected prefix – skip it.
+                    None => return Ok(true),
+                }
+            };
+
+            let rel_name = rel_name.trim_start_matches('/').to_string();
+            if rel_name.is_empty() {
+                // The entry is the prefix directory itself – nothing to write.
+                return Ok(true);
+            }
+
+            // Zip-slip protection: reject entries that escape the destination.
+            if !is_safe_relative_path(&rel_name) {
+                log::warn!("Skipping 7z entry with unsafe path: {rel_name}");
+                return Ok(true);
+            }
+
+            let out_path = dest_dir_buf.join(&rel_name);
+
+            if entry.is_directory() {
+                std::fs::create_dir_all(&out_path)?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let out_file = std::fs::File::create(&out_path)?;
+                let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
+                std::io::copy(reader, &mut buffered)?;
+            }
+
+            Ok(true)
+        },
+    )
+    .map_err(|e| format!("Failed to extract 7z archive {}: {e}", archive_path.display()))
+}
+
+/// Extract a `.rar` archive to `dest_dir` with prefix stripping.
+///
+/// Extracts the full archive into a temporary directory created inside
+/// `dest_dir` (keeping everything on the same filesystem), then moves the
+/// appropriate subtree into `dest_dir` using O(1) `rename` syscalls via
+/// [`move_dir_contents`].
+fn extract_rar_archive_to(
+    archive_path: &Path,
+    dest_dir: &Path,
+    strip_prefix: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| {
+        format!(
+            "Failed to create extraction directory {}: {e}",
+            dest_dir.display()
+        )
+    })?;
+
+    // Extract into a temp dir *inside* dest_dir so the two paths share the
+    // same filesystem, enabling cheap rename-based moves.
+    let tmp = create_temp_extract_dir_in(dest_dir)?;
+
+    extract_rar_archive(archive_path, &tmp)?;
+
+    let result = (|| {
+        if strip_prefix.is_empty() {
+            return move_dir_contents(&tmp, dest_dir);
+        }
+        let prefix_trimmed = strip_prefix.trim_end_matches('/');
+        let mut src = tmp.clone();
+        for component in prefix_trimmed.split('/') {
+            if !component.is_empty() {
+                src = src.join(component);
+            }
+        }
+        if src.is_dir() {
+            move_dir_contents(&src, dest_dir)
+        } else {
+            // Prefix path not found – fall back to moving the whole extraction.
+            move_dir_contents(&tmp, dest_dir)
+        }
+    })();
+
+    if let Err(e) = std::fs::remove_dir_all(&tmp) {
+        log::warn!(
+            "Failed to remove temporary extraction directory {}: {e}",
+            tmp.display()
+        );
+    }
+
+    result
+}
+
+/// Dispatch prefix-stripped extraction for a non-zip archive (7z or RAR).
+///
+/// * For `.7z` archives: calls [`extract_7z_archive_to`] which streams files
+///   directly to `dest_dir` without any intermediate temp directory.
+/// * For `.rar` archives: calls [`extract_rar_archive_to`] which extracts to
+///   a temp directory inside `dest_dir` and then renames in place.
+fn extract_non_zip_to(
+    archive_path: &Path,
+    dest_dir: &Path,
+    strip_prefix: &str,
+    tick: &dyn Fn(),
+) -> Result<(), String> {
+    if has_rar_extension(archive_path) {
+        extract_rar_archive_to(archive_path, dest_dir, strip_prefix)
+    } else {
+        extract_7z_archive_to(archive_path, dest_dir, strip_prefix, tick)
+    }
 }
 
 /// Extract a `.rar` archive to `dest_dir` using `unrar`.
