@@ -1326,6 +1326,10 @@ pub fn install_mod_from_archive_with_nexus_ticking(
             std::fs::create_dir_all(&data_dir)
                 .map_err(|e| format!("Failed to create Data directory: {e}"))?;
             install_fomod_files(archive_path, &data_dir, files, tick)?;
+            // Normalise directory/file names to lowercase so that FOMOD mods
+            // are stored consistently alongside non-FOMOD mods on
+            // case-sensitive (Linux) filesystems.
+            normalize_paths_to_lowercase(&data_dir);
         }
     }
 
@@ -2655,7 +2659,7 @@ Size = 9\n\
         std::fs::create_dir_all(&dest).unwrap();
         let data_dest = dest.join("Data");
         std::fs::create_dir_all(&data_dest).unwrap();
-        extract_zip_to(&archive, &data_dest, &|| {}).unwrap();
+        extract_zip_to(&archive, &data_dest, "", &|| {}).unwrap();
 
         assert!(dest.join("Data").join("textures").join("sky.dds").exists());
         assert!(dest.join("Data").join("plugin.esp").exists());
@@ -2681,7 +2685,7 @@ Size = 9\n\
         assert!(!archive_has_data_folder(&archive));
         let data_dest = dest.join("Data");
         std::fs::create_dir_all(&data_dest).unwrap();
-        extract_zip_to(&archive, &data_dest, &|| {}).unwrap();
+        extract_zip_to(&archive, &data_dest, "Data/", &|| {}).unwrap();
 
         assert!(dest.join("Data").join("textures").join("sky.dds").exists());
     }
@@ -2702,7 +2706,7 @@ Size = 9\n\
         let dest = tmp.join("mod_dir");
         std::fs::create_dir_all(&dest).unwrap();
         assert!(archive_has_data_folder(&archive));
-        extract_zip_to(&archive, &dest, &|| {}).unwrap();
+        extract_zip_to(&archive, &dest, "MyMod/", &|| {}).unwrap();
 
         assert!(dest.join("Data").join("textures").join("sky.dds").exists());
     }
@@ -2720,9 +2724,7 @@ Size = 9\n\
         );
         let dest = tmp.join("extracted");
         std::fs::create_dir_all(&dest).unwrap();
-        extract_zip_to(&archive, &dest, &|| {}).unwrap();
-
-        // Common prefix "MyMod/" is stripped
+        extract_zip_to(&archive, &dest, "MyMod/", &|| {}).unwrap();
         assert!(dest.join("textures").join("sky.dds").exists());
         assert!(dest.join("plugin.esp").exists());
     }
@@ -3134,6 +3136,71 @@ Size = 9\n\
         );
     }
 
+    #[test]
+    fn install_fomod_files_normalizes_uppercase_dirs_to_lowercase() {
+        // FOMOD archives can contain mixed-case directories such as
+        // "CalienteTools/" or "TEXTURES/".  After installation they should be
+        // normalised to lowercase so that they do not clash with directories
+        // already installed by non-FOMOD mods (which are always normalised).
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("fomod/", b""),
+                ("fomod/ModuleConfig.xml", b"<config/>"),
+                ("CalienteTools/BodySlide/SliderSets/CBBE.osp", b"osp_data"),
+                ("TEXTURES/actors/character/cbbe.dds", b"dds_data"),
+            ],
+        );
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[
+                FomodFile {
+                    source: "CalienteTools".to_string(),
+                    destination: "Data/CalienteTools".to_string(),
+                    priority: 0,
+                },
+                FomodFile {
+                    source: "TEXTURES".to_string(),
+                    destination: "Data/TEXTURES".to_string(),
+                    priority: 0,
+                },
+            ],
+            &|| {},
+        )
+        .unwrap();
+        normalize_paths_to_lowercase(&dest);
+
+        assert!(
+            dest.join("calientetools")
+                .join("bodyslide")
+                .join("slidersets")
+                .join("cbbe.osp")
+                .exists(),
+            "CalienteTools directory should be normalised to calientetools"
+        );
+        assert!(
+            !dest.join("CalienteTools").exists(),
+            "original CalienteTools dir should be gone after normalisation"
+        );
+        assert!(
+            dest.join("textures")
+                .join("actors")
+                .join("character")
+                .join("cbbe.dds")
+                .exists(),
+            "TEXTURES directory should be normalised to textures"
+        );
+        assert!(
+            !dest.join("TEXTURES").exists(),
+            "original TEXTURES dir should be gone after normalisation"
+        );
+    }
+
     fn tempdir() -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CTR: AtomicU32 = AtomicU32::new(0);
@@ -3205,7 +3272,7 @@ Size = 9\n\
         std::fs::create_dir_all(&dest).unwrap();
         let data_dest = dest.join("Data");
         std::fs::create_dir_all(&data_dest).unwrap();
-        extract_zip_to(&archive, &data_dest, &|| {}).unwrap();
+        extract_zip_to(&archive, &data_dest, "", &|| {}).unwrap();
         normalize_paths_to_lowercase(&data_dest);
 
         assert!(
