@@ -7,7 +7,7 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::core::config::{AppConfig, GameSettings, Profile};
+use crate::core::config::{AppConfig, Profile};
 use crate::core::nexus::NexusClient;
 
 /// Build the inline Preferences page shown as a tab in the main window.
