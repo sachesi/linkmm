@@ -5,10 +5,13 @@ use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use log::Level;
 
 use crate::core::config::AppConfig;
 use crate::core::logger;
-use log::Level;
+
+/// Polling interval for the log viewer auto-refresh.
+const LOG_REFRESH_INTERVAL_MS: u64 = 500;
 
 /// Open a read-only log viewer window.
 ///
@@ -179,7 +182,7 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
     let refresh_timeout = Rc::clone(&refresh_rc);
     let win_weak = win.downgrade();
 
-    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+    glib::timeout_add_local(std::time::Duration::from_millis(LOG_REFRESH_INTERVAL_MS), move || {
         // Stop the timer once the window is closed.
         if win_weak.upgrade().is_none() {
             return glib::ControlFlow::Break;
