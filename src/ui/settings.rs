@@ -245,6 +245,54 @@ pub fn build_settings_page(
 
     content_box.append(&profiles_group);
 
+    // ── Debug Logging group ───────────────────────────────────────────────
+    let logging_group = adw::PreferencesGroup::builder()
+        .title("Debug Logging")
+        .description("Choose which log categories are shown in the log viewer.")
+        .build();
+
+    // Helper that creates a toggle row wired to a config bool field.
+    macro_rules! log_toggle_row {
+        ($title:expr, $subtitle:expr, $getter:ident, $setter:ident) => {{
+            let row = adw::SwitchRow::builder()
+                .title($title)
+                .subtitle($subtitle)
+                .build();
+            row.set_active(config.borrow().$getter);
+            let config_t = Rc::clone(&config);
+            row.connect_active_notify(move |r| {
+                let mut cfg = config_t.borrow_mut();
+                cfg.$setter = r.is_active();
+                cfg.save();
+            });
+            row
+        }};
+    }
+
+    let errors_row = log_toggle_row!(
+        "Errors",
+        "Show error messages in the log viewer",
+        log_errors,
+        log_errors
+    );
+    let warnings_row = log_toggle_row!(
+        "Warnings",
+        "Show warning messages in the log viewer",
+        log_warnings,
+        log_warnings
+    );
+    let activity_row = log_toggle_row!(
+        "Installation Activity",
+        "Show download and installation progress in the log viewer",
+        log_activity,
+        log_activity
+    );
+
+    logging_group.add(&errors_row);
+    logging_group.add(&warnings_row);
+    logging_group.add(&activity_row);
+    content_box.append(&logging_group);
+
     clamp.set_child(Some(&content_box));
     scrolled.set_child(Some(&clamp));
     toast_overlay.set_child(Some(&scrolled));
