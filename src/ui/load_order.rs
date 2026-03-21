@@ -27,8 +27,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     search_entry.set_sensitive(game.is_some());
     header.pack_start(&search_entry);
 
-    // Sort button – sorts non-vanilla plugins by type (ESM → ESL → ESP) then
-    // alphabetically, matching the baseline LOOT sorting strategy.
+    // Sort button – sorts non-vanilla plugins using LOOT metadata.
     let sort_btn = gtk4::Button::new();
     sort_btn.set_icon_name("view-sort-ascending-symbolic");
     sort_btn.set_sensitive(game.is_some());
@@ -51,9 +50,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             content_container.append(&status);
         }
         Some(g) => {
-            sort_btn.set_tooltip_text(Some(
-                "Sort plugins by type: ESM → ESL → ESP, then alphabetically",
-            ));
+            sort_btn.set_tooltip_text(Some("Sort plugins using LOOT load order rules"));
             let game_rc = Rc::new(g.clone());
             let search_query = Rc::new(RefCell::new(String::new()));
 
