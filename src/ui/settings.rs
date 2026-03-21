@@ -253,16 +253,16 @@ pub fn build_settings_page(
 
     // Helper that creates a toggle row wired to a config bool field.
     macro_rules! log_toggle_row {
-        ($title:expr, $subtitle:expr, $getter:ident, $setter:ident) => {{
+        ($title:expr, $subtitle:expr, $field:ident) => {{
             let row = adw::SwitchRow::builder()
                 .title($title)
                 .subtitle($subtitle)
                 .build();
-            row.set_active(config.borrow().$getter);
+            row.set_active(config.borrow().$field);
             let config_t = Rc::clone(&config);
             row.connect_active_notify(move |r| {
                 let mut cfg = config_t.borrow_mut();
-                cfg.$setter = r.is_active();
+                cfg.$field = r.is_active();
                 cfg.save();
             });
             row
@@ -272,19 +272,16 @@ pub fn build_settings_page(
     let errors_row = log_toggle_row!(
         "Errors",
         "Show error messages in the log viewer",
-        log_errors,
         log_errors
     );
     let warnings_row = log_toggle_row!(
         "Warnings",
         "Show warning messages in the log viewer",
-        log_warnings,
         log_warnings
     );
     let activity_row = log_toggle_row!(
         "Installation Activity",
         "Show download and installation progress in the log viewer",
-        log_activity,
         log_activity
     );
 
