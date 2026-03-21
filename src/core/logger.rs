@@ -13,13 +13,14 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    /// Format the timestamp as `HH:MM:SS`.
+    /// Format the timestamp as `HH:MM:SS UTC`.
     pub fn time_str(&self) -> String {
         let secs = self.timestamp_secs;
+        // The timestamp is seconds since UNIX epoch (UTC).
         let h = (secs / 3600) % 24;
         let m = (secs / 60) % 60;
         let s = secs % 60;
-        format!("{h:02}:{m:02}:{s:02}")
+        format!("{h:02}:{m:02}:{s:02} UTC")
     }
 
     /// Short uppercase label for the log level.
