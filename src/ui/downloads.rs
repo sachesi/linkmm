@@ -2019,6 +2019,106 @@ mod tests {
     }
 
     #[test]
+    fn resolve_fomod_files_diamond_skin_pattern_no_direct_plugin_files() {
+        // Simulates Diamond Skin: plugins have ONLY conditionFlags (no direct
+        // <files> elements).  All actual files come from conditionalFileInstalls.
+        let config = FomodConfig {
+            mod_name: Some("Diamond Skin".to_string()),
+            required_files: Vec::new(),
+            steps: vec![InstallStep {
+                name: "Body Type".to_string(),
+                visible: None,
+                groups: vec![PluginGroup {
+                    name: "Body".to_string(),
+                    group_type: GroupType::SelectExactlyOne,
+                    plugins: vec![
+                        FomodPlugin {
+                            name: "CBBE".to_string(),
+                            description: None,
+                            image_path: None,
+                            files: Vec::new(), // No direct files
+                            type_descriptor: PluginType::Optional,
+                            condition_flags: vec![ConditionFlag {
+                                name: "isCBBE".to_string(),
+                                value: "selected".to_string(),
+                            }],
+                            dependencies: None,
+                        },
+                        FomodPlugin {
+                            name: "UNP".to_string(),
+                            description: None,
+                            image_path: None,
+                            files: Vec::new(), // No direct files
+                            type_descriptor: PluginType::Optional,
+                            condition_flags: vec![ConditionFlag {
+                                name: "isUNP".to_string(),
+                                value: "selected".to_string(),
+                            }],
+                            dependencies: None,
+                        },
+                    ],
+                }],
+            }],
+            conditional_file_installs: vec![
+                crate::core::installer::ConditionalFileInstall {
+                    dependencies: PluginDependencies {
+                        operator: DependencyOperator::And,
+                        flags: vec![FlagDependency {
+                            flag: "isCBBE".to_string(),
+                            value: "selected".to_string(),
+                        }],
+                    },
+                    files: vec![FomodFile {
+                        source: "CBBE 4K".to_string(),
+                        destination: String::new(),
+                        priority: 0,
+                    }],
+                },
+                crate::core::installer::ConditionalFileInstall {
+                    dependencies: PluginDependencies {
+                        operator: DependencyOperator::And,
+                        flags: vec![FlagDependency {
+                            flag: "isUNP".to_string(),
+                            value: "selected".to_string(),
+                        }],
+                    },
+                    files: vec![FomodFile {
+                        source: "UNP 4K".to_string(),
+                        destination: String::new(),
+                        priority: 0,
+                    }],
+                },
+            ],
+        };
+
+        // Select CBBE (index 0): should get CBBE 4K files, not UNP 4K.
+        let cbbe_selected = vec![vec![vec![0usize]]];
+        let cbbe_files = resolve_fomod_files(&config, &cbbe_selected);
+        let cbbe_sources: Vec<String> = cbbe_files.into_iter().map(|f| f.source).collect();
+        assert!(
+            cbbe_sources.contains(&"CBBE 4K".to_string()),
+            "CBBE 4K should be installed when CBBE is selected"
+        );
+        assert!(
+            !cbbe_sources.contains(&"UNP 4K".to_string()),
+            "UNP 4K should NOT be installed when CBBE is selected"
+        );
+
+        // Select UNP (index 1): should get UNP 4K files, not CBBE 4K.
+        let unp_selected = vec![vec![vec![1usize]]];
+        let unp_files = resolve_fomod_files(&config, &unp_selected);
+        let unp_sources: Vec<String> = unp_files.into_iter().map(|f| f.source).collect();
+        assert!(
+            unp_sources.contains(&"UNP 4K".to_string()),
+            "UNP 4K should be installed when UNP is selected"
+        );
+        assert!(
+            !unp_sources.contains(&"CBBE 4K".to_string()),
+            "CBBE 4K should NOT be installed when UNP is selected"
+        );
+    }
+
+    #[test]
     fn matches_query_is_case_insensitive_and_trim_aware() {
         assert!(matches_query("MyCoolMod.zip", ""));
         assert!(matches_query("MyCoolMod.zip", "  cool "));
