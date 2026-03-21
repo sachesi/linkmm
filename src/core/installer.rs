@@ -221,6 +221,34 @@ fn score_as_data_root(prefix: &str, paths: &[&str]) -> i32 {
     score
 }
 
+/// Find the directory that directly contains the `fomod/` subdirectory in the
+/// given path list, if any.
+///
+/// Returns `Some("")` when `fomod/` lives at the archive root, `Some("dir")`
+/// when it lives one level deep (e.g. `"MyMod/fomod/ModuleConfig.xml"`
+/// → `Some("MyMod")`), or `None` when no FOMOD config is present.
+fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
+    for path in paths {
+        // Normalise separators and case for the detection check, but keep the
+        // original path available so we can return the original-case parent name.
+        let norm = path.to_lowercase().replace('\\', "/");
+        let norm = norm.trim_start_matches('/');
+        if norm == "fomod/moduleconfig.xml" {
+            return Some(String::new());
+        }
+        if norm.ends_with("/fomod/moduleconfig.xml") {
+            // Derive the first path component from the *original* path so that
+            // the returned prefix preserves the original capitalisation and can
+            // be used to strip archive entry names verbatim.
+            let orig = path.replace('\\', "/");
+            let orig = orig.trim_start_matches('/');
+            let parent = orig.split('/').next().unwrap_or("").to_string();
+            return Some(parent);
+        }
+    }
+    None
+}
+
 /// Scan all paths in an archive and return the prefix (with trailing `/`) that
 /// best corresponds to the game's `Data/` directory.
 ///
@@ -236,6 +264,20 @@ fn score_as_data_root(prefix: &str, paths: &[&str]) -> i32 {
 /// stripping.  If all scores are zero the empty string (archive root) is
 /// returned and the caller should apply a secondary heuristic.
 pub fn find_data_root_in_paths(paths: &[&str]) -> String {
+    // If the archive contains a FOMOD config file, the directory that holds
+    // the `fomod/` subdirectory is the wrapper root.  Variant subdirectories
+    // inside that wrapper (e.g. `MyMod/Option A/textures/`) would otherwise
+    // be scored as data roots because they contain known data subdirs, which
+    // is incorrect.  Return the FOMOD wrapper directory directly instead of
+    // scoring all candidates.
+    if let Some(fomod_parent) = find_fomod_parent_dir(paths) {
+        return if fomod_parent.is_empty() {
+            String::new()
+        } else {
+            format!("{fomod_parent}/")
+        };
+    }
+
     // Collect all unique ancestor directories (candidates).  The archive root
     // ("")  is always included.  Limit depth to 6 levels to avoid O(n²) work
     // on pathological archives with very deep nesting.
@@ -429,9 +471,15 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
     }
     if !has_zip_extension(archive_path) {
         // Use fast header listing (no extraction) to detect FOMOD presence.
-        // If listing fails (e.g. 7z not installed or corrupt archive), fall
-        // back gracefully to Data strategy.
-        let entries = list_archive_entries_with_7z(archive_path).unwrap_or_default();
+        // If listing fails (e.g. 7z not installed or corrupt/solid archive),
+        // log a warning and fall back gracefully to Data strategy.
+        let entries = list_archive_entries_with_7z(archive_path).unwrap_or_else(|e| {
+            log::warn!(
+                "Failed to list entries in {}: {e}; falling back to Data strategy",
+                archive_path.display()
+            );
+            vec![]
+        });
         let has_fomod = entries.iter().any(|p| {
             let lower = p.to_lowercase().replace('\\', "/");
             lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
@@ -458,7 +506,7 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         let entry = zip
             .by_index(i)
             .map_err(|e| format!("Cannot read zip entry: {e}"))?;
-        let name_lower = entry.name().to_lowercase();
+        let name_lower = entry.name().to_lowercase().replace('\\', "/");
 
         if name_lower == "fomod/moduleconfig.xml" || name_lower.ends_with("/fomod/moduleconfig.xml")
         {
@@ -466,13 +514,15 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         }
     }
 
-    if has_fomod {
-        let config = parse_fomod_from_zip(archive_path)?;
-        // Return Fomod with empty file list – the caller will run the wizard
-        Ok(InstallStrategy::Fomod(config.required_files.clone()))
+    // Return Fomod with empty file list – the caller will run the wizard and
+    // parse the full XML separately (via parse_fomod_from_archive).  This
+    // avoids propagating an XML-parse error from inside strategy *detection*,
+    // which should be a best-effort, non-fatal operation.
+    Ok(if has_fomod {
+        InstallStrategy::Fomod(vec![])
     } else {
-        Ok(InstallStrategy::Data)
-    }
+        InstallStrategy::Data
+    })
 }
 
 fn top_level_component(path: &str) -> &str {
@@ -620,7 +670,8 @@ fn find_fomod_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String, 
         let entry = zip
             .by_index(i)
             .map_err(|e| format!("Cannot read zip entry: {e}"))?;
-        let lower = entry.name().to_lowercase();
+        // Normalise backslashes so Windows-created ZIPs are handled correctly.
+        let lower = entry.name().to_lowercase().replace('\\', "/");
         if lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml") {
             return Ok(entry.name().to_string());
         }
@@ -3382,6 +3433,278 @@ mod tests {
         assert!(
             !data_dest.join("TEXTURES").exists(),
             "uppercase TEXTURES dir should be gone after normalisation"
+        );
+    }
+
+    #[test]
+    fn detect_strategy_zip_fomod_with_backslash_separator() {
+        // Some ZIP archives created on Windows use `\` as the path separator.
+        // detect_strategy should still recognise the FOMOD config.
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("fomod\\ModuleConfig.xml", b"<config/>"),
+                ("Data\\textures\\sky.dds", b"dds"),
+            ],
+        );
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(
+            matches!(strategy, InstallStrategy::Fomod(_)),
+            "expected Fomod strategy for zip with backslash paths, got Data"
+        );
+    }
+
+    #[test]
+    fn detect_strategy_zip_fomod_wrapped_backslash() {
+        // A wrapped archive (single root dir) with backslash separators.
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("MyMod\\fomod\\ModuleConfig.xml", b"<config/>"),
+                ("MyMod\\Data\\textures\\sky.dds", b"dds"),
+            ],
+        );
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(
+            matches!(strategy, InstallStrategy::Fomod(_)),
+            "expected Fomod strategy for wrapped zip with backslash paths, got Data"
+        );
+    }
+
+    #[test]
+    fn find_data_root_returns_fomod_wrapper_not_variant_subdir() {
+        // A FOMOD archive where variant subdirs contain known data dirs.
+        // find_data_root_in_paths should return the wrapper (MyMod/) not a
+        // variant subdir (MyMod/Option A/).
+        let paths = &[
+            "MyMod/fomod/ModuleConfig.xml",
+            "MyMod/Option A/textures/body.dds",
+            "MyMod/Option B/textures/body_alt.dds",
+        ];
+        let root = find_data_root_in_paths(paths);
+        assert_eq!(
+            root, "MyMod/",
+            "expected FOMOD wrapper dir as root, got {root:?}"
+        );
+    }
+
+    #[test]
+    fn find_data_root_fomod_at_archive_root_returns_empty() {
+        // fomod/ lives directly at the archive root → data root is ""
+        let paths = &[
+            "fomod/ModuleConfig.xml",
+            "Option A/textures/body.dds",
+        ];
+        let root = find_data_root_in_paths(paths);
+        assert_eq!(
+            root, "",
+            "FOMOD at archive root should yield empty data root, got {root:?}"
+        );
+    }
+
+    /// Helper: create a ZIP that mimics a "Diamond Skin"-style FOMOD archive.
+    ///
+    /// Structure:
+    /// ```
+    /// fomod/ModuleConfig.xml
+    /// fomod/images/cbbe.png
+    /// CBBE 4K/textures/actors/character/female/femalebody_1.dds
+    /// CBBE 2K/textures/actors/character/female/femalebody_1.dds
+    /// UNP 4K/textures/actors/character/female/femalebody_1.dds
+    /// ```
+    ///
+    /// The ModuleConfig.xml uses conditionFlags in plugins and
+    /// conditionalFileInstalls (no direct files in <plugin>).
+    fn create_diamond_skin_zip(dir: &Path) -> PathBuf {
+        let fomod_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+    <moduleName>Diamond Skin</moduleName>
+    <installSteps order="Explicit">
+        <installStep name="Choose Body Type">
+            <optionalFileGroups order="Explicit">
+                <group name="Body Type" type="SelectExactlyOne">
+                    <plugins order="Explicit">
+                        <plugin name="CBBE">
+                            <description>CBBE textures</description>
+                            <conditionFlags>
+                                <flag name="isCBBE">selected</flag>
+                            </conditionFlags>
+                            <typeDescriptor>
+                                <type name="Recommended"/>
+                            </typeDescriptor>
+                        </plugin>
+                        <plugin name="UNP">
+                            <description>UNP textures</description>
+                            <conditionFlags>
+                                <flag name="isUNP">selected</flag>
+                            </conditionFlags>
+                            <typeDescriptor>
+                                <type name="Optional"/>
+                            </typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+                <group name="Texture Resolution" type="SelectExactlyOne">
+                    <plugins order="Explicit">
+                        <plugin name="4K">
+                            <description>4K resolution</description>
+                            <conditionFlags>
+                                <flag name="res">4k</flag>
+                            </conditionFlags>
+                            <typeDescriptor>
+                                <type name="Recommended"/>
+                            </typeDescriptor>
+                        </plugin>
+                        <plugin name="2K">
+                            <description>2K resolution</description>
+                            <conditionFlags>
+                                <flag name="res">2k</flag>
+                            </conditionFlags>
+                            <typeDescriptor>
+                                <type name="Optional"/>
+                            </typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+            </optionalFileGroups>
+        </installStep>
+    </installSteps>
+    <conditionalFileInstalls>
+        <patterns>
+            <pattern>
+                <dependencies operator="And">
+                    <flagDependency flag="isCBBE" value="selected"/>
+                    <flagDependency flag="res" value="4k"/>
+                </dependencies>
+                <files>
+                    <folder source="CBBE 4K" destination=""/>
+                </files>
+            </pattern>
+            <pattern>
+                <dependencies operator="And">
+                    <flagDependency flag="isCBBE" value="selected"/>
+                    <flagDependency flag="res" value="2k"/>
+                </dependencies>
+                <files>
+                    <folder source="CBBE 2K" destination=""/>
+                </files>
+            </pattern>
+            <pattern>
+                <dependencies operator="And">
+                    <flagDependency flag="isUNP" value="selected"/>
+                    <flagDependency flag="res" value="4k"/>
+                </dependencies>
+                <files>
+                    <folder source="UNP 4K" destination=""/>
+                </files>
+            </pattern>
+        </patterns>
+    </conditionalFileInstalls>
+</config>"#;
+        create_test_zip(
+            dir,
+            &[
+                ("fomod/ModuleConfig.xml", fomod_xml.as_bytes()),
+                ("fomod/images/cbbe.png", b"png"),
+                (
+                    "CBBE 4K/textures/actors/character/female/femalebody_1.dds",
+                    b"cbbe4k",
+                ),
+                (
+                    "CBBE 2K/textures/actors/character/female/femalebody_1.dds",
+                    b"cbbe2k",
+                ),
+                (
+                    "UNP 4K/textures/actors/character/female/femalebody_1.dds",
+                    b"unp4k",
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn detect_strategy_diamond_skin_style_zip_uses_fomod_strategy() {
+        // An archive with conditionFlags plugins + conditionalFileInstalls.
+        let tmp = tempdir();
+        let archive = create_diamond_skin_zip(&tmp);
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(
+            matches!(strategy, InstallStrategy::Fomod(_)),
+            "expected Fomod strategy for Diamond Skin-style ZIP"
+        );
+    }
+
+    #[test]
+    fn parse_fomod_xml_diamond_skin_conditional_files_pattern() {
+        // Verify that conditionFlags are parsed into plugin.condition_flags,
+        // and that conditionalFileInstalls patterns are collected correctly.
+        let tmp = tempdir();
+        let archive = create_diamond_skin_zip(&tmp);
+        let config = parse_fomod_from_zip(&archive).unwrap();
+
+        assert_eq!(config.mod_name.as_deref(), Some("Diamond Skin"));
+        assert!(config.required_files.is_empty(), "no required files expected");
+        assert_eq!(config.steps.len(), 1);
+
+        let step = &config.steps[0];
+        assert_eq!(step.groups.len(), 2);
+
+        let body_group = &step.groups[0];
+        assert_eq!(body_group.plugins.len(), 2);
+
+        // CBBE plugin should have conditionFlag, no direct files
+        let cbbe = &body_group.plugins[0];
+        assert_eq!(cbbe.name, "CBBE");
+        assert!(cbbe.files.is_empty(), "CBBE plugin should have no direct files");
+        assert_eq!(cbbe.condition_flags.len(), 1);
+        assert_eq!(cbbe.condition_flags[0].name, "isCBBE");
+        assert_eq!(cbbe.condition_flags[0].value, "selected");
+
+        // Should have at least 3 conditional patterns
+        assert!(
+            config.conditional_file_installs.len() >= 3,
+            "expected at least 3 conditional patterns, got {}",
+            config.conditional_file_installs.len()
+        );
+
+        // First pattern: isCBBE=selected + res=4k → install "CBBE 4K"
+        let first = &config.conditional_file_installs[0];
+        assert_eq!(first.dependencies.flags.len(), 2);
+        assert_eq!(first.files.len(), 1);
+        assert_eq!(first.files[0].source, "CBBE 4K");
+        assert_eq!(first.files[0].destination, "");
+    }
+
+    #[test]
+    fn install_fomod_files_diamond_skin_conditional_pattern() {
+        // Full install test: CBBE 4K selected → only CBBE 4K files installed.
+        let tmp = tempdir();
+        let archive = create_diamond_skin_zip(&tmp);
+        let dest = tmp.join("Data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Simulate user selecting CBBE 4K: install from "CBBE 4K" folder.
+        let files = vec![FomodFile {
+            source: "CBBE 4K".to_string(),
+            destination: String::new(),
+            priority: 0,
+        }];
+        install_fomod_files(&archive, &dest, &files).unwrap();
+
+        assert!(
+            dest.join("textures/actors/character/female/femalebody_1.dds").exists(),
+            "CBBE 4K texture should be installed under textures/"
+        );
+        assert!(
+            !dest.join("CBBE 4K").exists(),
+            "the source folder itself should not appear in dest"
+        );
+        assert!(
+            !dest.join("CBBE 2K").exists(),
+            "CBBE 2K folder should not be present (not selected)"
         );
     }
 }
