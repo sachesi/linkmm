@@ -670,7 +670,8 @@ fn find_fomod_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String, 
         let entry = zip
             .by_index(i)
             .map_err(|e| format!("Cannot read zip entry: {e}"))?;
-        let lower = entry.name().to_lowercase();
+        // Normalise backslashes so Windows-created ZIPs are handled correctly.
+        let lower = entry.name().to_lowercase().replace('\\', "/");
         if lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml") {
             return Ok(entry.name().to_string());
         }
@@ -3500,6 +3501,210 @@ mod tests {
         assert_eq!(
             root, "",
             "FOMOD at archive root should yield empty data root, got {root:?}"
+        );
+    }
+
+    /// Helper: create a ZIP that mimics a "Diamond Skin"-style FOMOD archive.
+    ///
+    /// Structure:
+    /// ```
+    /// fomod/ModuleConfig.xml
+    /// fomod/images/cbbe.png
+    /// CBBE 4K/textures/actors/character/female/femalebody_1.dds
+    /// CBBE 2K/textures/actors/character/female/femalebody_1.dds
+    /// UNP 4K/textures/actors/character/female/femalebody_1.dds
+    /// ```
+    ///
+    /// The ModuleConfig.xml uses conditionFlags in plugins and
+    /// conditionalFileInstalls (no direct files in <plugin>).
+    fn create_diamond_skin_zip(dir: &Path) -> PathBuf {
+        let fomod_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+    <moduleName>Diamond Skin</moduleName>
+    <installSteps order="Explicit">
+        <installStep name="Choose Body Type">
+            <optionalFileGroups order="Explicit">
+                <group name="Body Type" type="SelectExactlyOne">
+                    <plugins order="Explicit">
+                        <plugin name="CBBE">
+                            <description>CBBE textures</description>
+                            <conditionFlags>
+                                <flag name="isCBBE">selected</flag>
+                            </conditionFlags>
+                            <typeDescriptor>
+                                <type name="Recommended"/>
+                            </typeDescriptor>
+                        </plugin>
+                        <plugin name="UNP">
+                            <description>UNP textures</description>
+                            <conditionFlags>
+                                <flag name="isUNP">selected</flag>
+                            </conditionFlags>
+                            <typeDescriptor>
+                                <type name="Optional"/>
+                            </typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+                <group name="Texture Resolution" type="SelectExactlyOne">
+                    <plugins order="Explicit">
+                        <plugin name="4K">
+                            <description>4K resolution</description>
+                            <conditionFlags>
+                                <flag name="res">4k</flag>
+                            </conditionFlags>
+                            <typeDescriptor>
+                                <type name="Recommended"/>
+                            </typeDescriptor>
+                        </plugin>
+                        <plugin name="2K">
+                            <description>2K resolution</description>
+                            <conditionFlags>
+                                <flag name="res">2k</flag>
+                            </conditionFlags>
+                            <typeDescriptor>
+                                <type name="Optional"/>
+                            </typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+            </optionalFileGroups>
+        </installStep>
+    </installSteps>
+    <conditionalFileInstalls>
+        <patterns>
+            <pattern>
+                <dependencies operator="And">
+                    <flagDependency flag="isCBBE" value="selected"/>
+                    <flagDependency flag="res" value="4k"/>
+                </dependencies>
+                <files>
+                    <folder source="CBBE 4K" destination=""/>
+                </files>
+            </pattern>
+            <pattern>
+                <dependencies operator="And">
+                    <flagDependency flag="isCBBE" value="selected"/>
+                    <flagDependency flag="res" value="2k"/>
+                </dependencies>
+                <files>
+                    <folder source="CBBE 2K" destination=""/>
+                </files>
+            </pattern>
+            <pattern>
+                <dependencies operator="And">
+                    <flagDependency flag="isUNP" value="selected"/>
+                    <flagDependency flag="res" value="4k"/>
+                </dependencies>
+                <files>
+                    <folder source="UNP 4K" destination=""/>
+                </files>
+            </pattern>
+        </patterns>
+    </conditionalFileInstalls>
+</config>"#;
+        create_test_zip(
+            dir,
+            &[
+                ("fomod/ModuleConfig.xml", fomod_xml.as_bytes()),
+                ("fomod/images/cbbe.png", b"png"),
+                (
+                    "CBBE 4K/textures/actors/character/female/femalebody_1.dds",
+                    b"cbbe4k",
+                ),
+                (
+                    "CBBE 2K/textures/actors/character/female/femalebody_1.dds",
+                    b"cbbe2k",
+                ),
+                (
+                    "UNP 4K/textures/actors/character/female/femalebody_1.dds",
+                    b"unp4k",
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn detect_strategy_diamond_skin_style_zip_uses_fomod_strategy() {
+        // An archive with conditionFlags plugins + conditionalFileInstalls.
+        let tmp = tempdir();
+        let archive = create_diamond_skin_zip(&tmp);
+        let strategy = detect_strategy(&archive).unwrap();
+        assert!(
+            matches!(strategy, InstallStrategy::Fomod(_)),
+            "expected Fomod strategy for Diamond Skin-style ZIP"
+        );
+    }
+
+    #[test]
+    fn parse_fomod_xml_diamond_skin_conditional_files_pattern() {
+        // Verify that conditionFlags are parsed into plugin.condition_flags,
+        // and that conditionalFileInstalls patterns are collected correctly.
+        let tmp = tempdir();
+        let archive = create_diamond_skin_zip(&tmp);
+        let config = parse_fomod_from_zip(&archive).unwrap();
+
+        assert_eq!(config.mod_name.as_deref(), Some("Diamond Skin"));
+        assert!(config.required_files.is_empty(), "no required files expected");
+        assert_eq!(config.steps.len(), 1);
+
+        let step = &config.steps[0];
+        assert_eq!(step.groups.len(), 2);
+
+        let body_group = &step.groups[0];
+        assert_eq!(body_group.plugins.len(), 2);
+
+        // CBBE plugin should have conditionFlag, no direct files
+        let cbbe = &body_group.plugins[0];
+        assert_eq!(cbbe.name, "CBBE");
+        assert!(cbbe.files.is_empty(), "CBBE plugin should have no direct files");
+        assert_eq!(cbbe.condition_flags.len(), 1);
+        assert_eq!(cbbe.condition_flags[0].name, "isCBBE");
+        assert_eq!(cbbe.condition_flags[0].value, "selected");
+
+        // Should have at least 3 conditional patterns
+        assert!(
+            config.conditional_file_installs.len() >= 3,
+            "expected at least 3 conditional patterns, got {}",
+            config.conditional_file_installs.len()
+        );
+
+        // First pattern: isCBBE=selected + res=4k → install "CBBE 4K"
+        let first = &config.conditional_file_installs[0];
+        assert_eq!(first.dependencies.flags.len(), 2);
+        assert_eq!(first.files.len(), 1);
+        assert_eq!(first.files[0].source, "CBBE 4K");
+        assert_eq!(first.files[0].destination, "");
+    }
+
+    #[test]
+    fn install_fomod_files_diamond_skin_conditional_pattern() {
+        // Full install test: CBBE 4K selected → only CBBE 4K files installed.
+        let tmp = tempdir();
+        let archive = create_diamond_skin_zip(&tmp);
+        let dest = tmp.join("Data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Simulate user selecting CBBE 4K: install from "CBBE 4K" folder.
+        let files = vec![FomodFile {
+            source: "CBBE 4K".to_string(),
+            destination: String::new(),
+            priority: 0,
+        }];
+        install_fomod_files(&archive, &dest, &files).unwrap();
+
+        assert!(
+            dest.join("textures/actors/character/female/femalebody_1.dds").exists(),
+            "CBBE 4K texture should be installed under textures/"
+        );
+        assert!(
+            !dest.join("CBBE 4K").exists(),
+            "the source folder itself should not appear in dest"
+        );
+        assert!(
+            !dest.join("CBBE 2K").exists(),
+            "CBBE 2K folder should not be present (not selected)"
         );
     }
 }
