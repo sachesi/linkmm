@@ -1,4 +1,5 @@
 use crate::core::games::Game;
+use crate::core::deployment;
 use libloot::{Game as LootGame, GameType as LootGameType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -484,24 +485,14 @@ pub struct ModManager;
 
 impl ModManager {
     pub fn enable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        let target_dir = &game.data_path;
-        if !target_dir.is_dir() {
-            std::fs::create_dir_all(target_dir)
-                .map_err(|e| format!("Failed to create target directory: {e}"))?;
-        }
-        let data_dir = mod_entry.source_path.join("Data");
-        if data_dir.is_dir() {
-            // Link the contents of Data/ into the game Data directory, flattening
-            // any nested Data/ subdirectory to prevent game_dir/Data/Data/ nesting.
-            link_mod_data(&data_dir, target_dir)?;
-            // Link any items at the mod root alongside Data/ into the game root
-            // directory (next to the game executable).  This covers libraries,
-            // ENB DLLs, SKSE root files, etc. that must live beside the exe.
-            link_items_alongside_data(&mod_entry.source_path, &game.root_path)?;
-        } else {
-            // Legacy flat layout: link from mod root directly.
-            link_directory_contents(&mod_entry.source_path, target_dir)?;
-        }
+        // Use new deployment module with improved link management
+        let report = deployment::deploy_mod(game, mod_entry)?;
+        log::info!(
+            "Deployed mod '{}': {} data links, {} root links",
+            mod_entry.name,
+            report.data_links_created,
+            report.root_links_created
+        );
         Ok(())
     }
 
@@ -521,10 +512,7 @@ impl ModManager {
     ///
     /// Batch deploy/undeploy flows should call this once after unlinking mods.
     pub fn purge_legacy_nested_data_dir(game: &Game) {
-        let legacy_nested = game.data_path.join("Data");
-        if legacy_nested.is_dir() {
-            purge_symlinks(&legacy_nested);
-        }
+        deployment::cleanup_legacy_nested_data(game);
     }
 
     fn disable_mod_internal(
@@ -532,25 +520,20 @@ impl ModManager {
         mod_entry: &Mod,
         run_legacy_cleanup: bool,
     ) -> Result<(), String> {
-        let target_dir = &game.data_path;
-        let data_dir = mod_entry.source_path.join("Data");
-        if data_dir.is_dir() {
-            // Unlink Data/ contents, mirroring the flatten logic used on deploy.
-            unlink_mod_data(&data_dir, target_dir)?;
-            // Unlink items alongside Data/ from the game root (current layout).
-            unlink_items_alongside_data(&mod_entry.source_path, &game.root_path)?;
-            // Migration: also try removing from game Data dir in case a previous
-            // version incorrectly deployed root items there.
-            unlink_items_alongside_data(&mod_entry.source_path, target_dir)?;
-            // Migration: aggressively clean up the legacy nested Data/Data/
-            // structure by removing ALL symlinks from it (not just ones belonging
-            // to this mod), then removing any empty directories left behind.
-            if run_legacy_cleanup {
-                Self::purge_legacy_nested_data_dir(game);
-            }
-        } else {
-            unlink_directory_contents(&mod_entry.source_path, target_dir)?;
+        // Use new deployment module with improved link management
+        let report = deployment::undeploy_mod(game, mod_entry)?;
+        log::info!(
+            "Undeployed mod '{}': removed {} data links, {} root links",
+            mod_entry.name,
+            report.data_links_removed,
+            report.root_links_removed
+        );
+
+        // Legacy cleanup if requested
+        if run_legacy_cleanup {
+            deployment::cleanup_legacy_nested_data(game);
         }
+
         Ok(())
     }
 
