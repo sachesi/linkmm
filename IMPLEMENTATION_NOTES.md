@@ -1,8 +1,18 @@
-# Mod Installation Reimplementation - COMPLETED
+# Mod Installation Reimplementation - COMPLETED ✅
 
 ## Summary
 
-This PR successfully reimplements the mod installation system following the Bethesda Mod Installation guidelines for linkmm. The new system is now **fully integrated** into the existing codebase with all tests passing.
+This PR successfully reimplements the mod installation system following the Bethesda Mod Installation guidelines for linkmm. The new system is now **fully integrated** into the existing codebase with critical bugfixes applied.
+
+## ⚠️ Critical Bugfixes Applied (Latest Update)
+
+Three critical bugs discovered after initial integration have been **fixed** in commit b3f370b:
+
+1. **FOMOD Detection Failures** - Fixed fallback behavior when new detection algorithm can't identify Data/ root
+2. **Empty Folders in Managed Mods** - Added validation to prevent empty mod directories from being created
+3. **7z Archive 3-5 Minute Hang** - Rewrote FOMOD extraction to use selective file extraction instead of full archive extraction
+
+See `BUGFIX_NOTES.md` for detailed analysis and fixes. These issues are now **resolved**.
 
 ## Completed Work
 
