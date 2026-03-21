@@ -1,4 +1,5 @@
 use crate::core::games::Game;
+use libloot::{Game as LootGame, GameType as LootGameType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -125,6 +126,57 @@ pub struct ModDatabase {
 }
 
 impl ModDatabase {
+    fn loot_game_type(game: &Game) -> LootGameType {
+        match game.kind {
+            crate::core::games::GameKind::SkyrimSE => LootGameType::SkyrimSE,
+            crate::core::games::GameKind::SkyrimLE => LootGameType::Skyrim,
+            crate::core::games::GameKind::Fallout4 => LootGameType::Fallout4,
+            crate::core::games::GameKind::Fallout3 => LootGameType::Fallout3,
+            crate::core::games::GameKind::FalloutNV => LootGameType::FalloutNV,
+            crate::core::games::GameKind::Oblivion => LootGameType::Oblivion,
+        }
+    }
+
+    fn try_sort_with_loot(plugins: &[PluginFile], game: &Game) -> Result<Vec<String>, String> {
+        let local_path = game
+            .plugins_txt_dir()
+            .unwrap_or_else(|| game.root_path.clone());
+        let loot_game_type = Self::loot_game_type(game);
+        let mut loot_game =
+            LootGame::with_local_path(loot_game_type, &game.root_path, &local_path).map_err(
+                |e| {
+                    format!(
+                        "Failed to create libloot game handle (type: {loot_game_type:?}, root: {}, local: {}): {e}",
+                        game.root_path.display(),
+                        local_path.display()
+                    )
+                },
+            )?;
+
+        let plugin_paths: Vec<PathBuf> = plugins
+            .iter()
+            .map(|plugin| game.data_path.join(&plugin.name))
+            .collect();
+        let plugin_path_refs: Vec<&Path> = plugin_paths.iter().map(PathBuf::as_path).collect();
+        loot_game
+            .load_plugins(&plugin_path_refs)
+            .map_err(|e| {
+                format!(
+                    "Failed to load plugins for libloot sorting from {}: {e}",
+                    game.data_path.display()
+                )
+            })?;
+
+        let plugin_names: Vec<&str> = plugins.iter().map(|plugin| plugin.name.as_str()).collect();
+        loot_game
+            .sort_plugins(&plugin_names)
+            .map_err(|e| format!("Failed to sort plugins with libloot for {}: {e}", game.id))
+    }
+
+    fn sort_plugins_fallback_by_type(plugins: &mut [PluginFile]) {
+        plugins.sort_by_cached_key(|p| (p.kind.sort_priority(), p.name.to_lowercase()));
+    }
+
     /// Path to the `mods.json` configuration file for this game.
     ///
     /// Always located at `~/.config/linkmm/<game_id>/mods.json`.
@@ -308,21 +360,47 @@ impl ModDatabase {
         result
     }
 
-    /// Sort non-vanilla plugins by type priority (ESM → ESL → ESP) then
-    /// alphabetically (case-insensitive) within each type.
+    /// Sort non-vanilla plugins using libloot and fall back to deterministic
+    /// type sorting (ESM → ESL → ESP, then case-insensitive name) if libloot
+    /// cannot sort the current plugin set.
     ///
     /// Vanilla masters are always kept first in their canonical game order and
     /// are never reordered.  After sorting, `plugin_load_order` is updated and
     /// the database can be saved / written to `plugins.txt` by the caller.
     pub fn sort_plugins_by_type(&mut self, game: &Game) {
-        let mut plugins = self.get_ordered_plugins(game);
+        let plugins = self.get_ordered_plugins(game);
         // Vanilla plugins are placed first by get_ordered_plugins; find where
         // the non-vanilla section starts.
         let vanilla_end = plugins.iter().take_while(|p| p.is_vanilla).count();
-        plugins[vanilla_end..].sort_by_cached_key(|p| {
-            (p.kind.sort_priority(), p.name.to_lowercase())
-        });
-        self.set_plugin_order(&plugins);
+        let mut non_vanilla = plugins[vanilla_end..].to_vec();
+
+        match Self::try_sort_with_loot(&non_vanilla, game) {
+            Ok(sorted_names) => {
+                let mut by_name: HashMap<String, PluginFile> = non_vanilla
+                    .into_iter()
+                    .map(|plugin| (plugin.name.to_lowercase(), plugin))
+                    .collect();
+                let mut sorted_non_vanilla = Vec::with_capacity(sorted_names.len());
+                for name in sorted_names {
+                    if let Some(plugin) = by_name.remove(&name.to_lowercase()) {
+                        sorted_non_vanilla.push(plugin);
+                    }
+                }
+                let mut remaining: Vec<PluginFile> = by_name.into_values().collect();
+                Self::sort_plugins_fallback_by_type(&mut remaining);
+                sorted_non_vanilla.extend(remaining);
+                let mut ordered = plugins[..vanilla_end].to_vec();
+                ordered.extend(sorted_non_vanilla);
+                self.set_plugin_order(&ordered);
+            }
+            Err(e) => {
+                log::warn!("{e}; falling back to type-based plugin sorting");
+                Self::sort_plugins_fallback_by_type(&mut non_vanilla);
+                let mut ordered = plugins[..vanilla_end].to_vec();
+                ordered.extend(non_vanilla);
+                self.set_plugin_order(&ordered);
+            }
+        }
     }
 
     /// Update `plugin_load_order` and `plugin_disabled` from the given ordered list.
@@ -1193,6 +1271,47 @@ mod tests {
         let encoded = serde_json::to_string(&db).unwrap();
         assert_eq!(encoded.matches("A.esp").count(), 1);
         assert_eq!(encoded.matches("B.esm").count(), 1);
+    }
+
+    #[test]
+    fn sort_plugins_by_type_falls_back_when_libloot_cannot_parse_plugins() {
+        use crate::core::games::{Game, GameKind};
+
+        let tmp = tempdir();
+        let game_root = tmp.join("game");
+        let data_dir = game_root.join("Data");
+        let mods_base = tmp.join("mods_base");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(mods_base.join("mods").join("test_game")).unwrap();
+
+        for file in ["z.esp", "a.esm", "b.esl", "c.esp"] {
+            std::fs::write(data_dir.join(file), b"not-a-real-plugin").unwrap();
+        }
+
+        let game = Game {
+            id: "test_game".to_string(),
+            name: "Test Game".to_string(),
+            kind: GameKind::SkyrimSE,
+            root_path: game_root,
+            data_path: data_dir,
+            mods_base_dir: Some(mods_base),
+        };
+
+        let mut db = ModDatabase {
+            plugin_load_order: vec!["z.esp".to_string(), "a.esm".to_string()],
+            ..ModDatabase::default()
+        };
+        db.sort_plugins_by_type(&game);
+
+        assert_eq!(
+            db.plugin_load_order,
+            vec![
+                "a.esm".to_string(),
+                "b.esl".to_string(),
+                "c.esp".to_string(),
+                "z.esp".to_string()
+            ]
+        );
     }
 
     #[cfg(unix)]
