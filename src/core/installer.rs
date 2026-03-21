@@ -1,5 +1,5 @@
 use std::io::{BufWriter, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
@@ -2399,12 +2399,13 @@ fn install_fomod_files_non_zip(
     // List all entries in the archive without extracting
     let entries = list_archive_entries_with_7z(archive_path)?;
 
-    // Build entry map for case-insensitive matching
-    let mut entry_map: Vec<(String, String)> = entries
+    // Build entry map for case-insensitive matching (with indices)
+    let entry_map: Vec<(String, String, usize)> = entries
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(idx, e)| {
             let lower = normalise_path(e).to_lowercase();
-            (lower, e.clone())
+            (lower, e.clone(), idx)
         })
         .collect();
 
@@ -2454,12 +2455,12 @@ fn install_fomod_files_non_zip(
             } else if source_lower == "data" || source_lower == "data/" {
                 matching_entries = entry_map
                     .iter()
-                    .filter(|(nl, _)| {
+                    .filter(|(nl, _, _)| {
                         !(nl == "fomod"
                             || nl.starts_with("fomod/")
                             || nl.contains("/fomod/"))
                     })
-                    .map(|(_, orig)| (orig.clone(), 0))
+                    .map(|(_, orig, idx)| (orig.clone(), *idx))
                     .collect();
                 if !matching_entries.is_empty() {
                     matched_source = String::new();
