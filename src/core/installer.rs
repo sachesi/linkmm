@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
+use crate::core::installer_new;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -258,18 +259,11 @@ fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
 /// `mod_dir/Data/`).
 ///
 /// # Algorithm
-/// Every ancestor directory of every path is scored with [`score_as_data_root`].
-/// The directory with the highest score becomes the install root.  Ties are
-/// broken in favour of the shallowest (shortest) directory to avoid over-
-/// stripping.  If all scores are zero the empty string (archive root) is
-/// returned and the caller should apply a secondary heuristic.
+/// Uses the improved detection from installer_new module which scores directories
+/// based on Data/ indicators (subdirs, plugin files, archives).
 pub fn find_data_root_in_paths(paths: &[&str]) -> String {
     // If the archive contains a FOMOD config file, the directory that holds
-    // the `fomod/` subdirectory is the wrapper root.  Variant subdirectories
-    // inside that wrapper (e.g. `MyMod/Option A/textures/`) would otherwise
-    // be scored as data roots because they contain known data subdirs, which
-    // is incorrect.  Return the FOMOD wrapper directory directly instead of
-    // scoring all candidates.
+    // the `fomod/` subdirectory is the wrapper root.
     if let Some(fomod_parent) = find_fomod_parent_dir(paths) {
         return if fomod_parent.is_empty() {
             String::new()
@@ -278,51 +272,22 @@ pub fn find_data_root_in_paths(paths: &[&str]) -> String {
         };
     }
 
-    // Collect all unique ancestor directories (candidates).  The archive root
-    // ("")  is always included.  Limit depth to 6 levels to avoid O(n²) work
-    // on pathological archives with very deep nesting.
-    const MAX_DEPTH: usize = 6;
+    // Convert &[&str] to Vec<String> for new module
+    let paths_owned: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
 
-    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    dirs.insert(String::new());
-
-    for path in paths {
-        let p = path.replace('\\', "/");
-        let p = p.trim_start_matches('/');
-        let mut current = String::new();
-        let mut depth = 0usize;
-        for component in p.split('/') {
-            if component.is_empty() {
-                continue;
+    // Use new improved detection
+    match installer_new::detect_data_root(&paths_owned) {
+        Some(prefix) => {
+            if prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", prefix)
             }
-            depth += 1;
-            if depth > MAX_DEPTH {
-                break;
-            }
-            if !current.is_empty() {
-                current.push('/');
-            }
-            current.push_str(component);
-            dirs.insert(current.clone());
         }
-    }
-
-    let mut best_dir = String::new();
-    let mut best_score = -1i32;
-
-    for dir in &dirs {
-        let score = score_as_data_root(dir, paths);
-        // Prefer a higher score; on a tie keep the shallower (shorter) path.
-        if score > best_score || (score == best_score && dir.len() < best_dir.len()) {
-            best_score = score;
-            best_dir = dir.clone();
+        None => {
+            // Fallback to empty string if detection fails
+            String::new()
         }
-    }
-
-    if best_dir.is_empty() {
-        String::new()
-    } else {
-        format!("{best_dir}/")
     }
 }
 
