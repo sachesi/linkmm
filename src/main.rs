@@ -6,6 +6,7 @@ mod core {
     pub mod games;
     pub mod installer;
     pub mod installer_new;
+    pub mod logger;
     pub mod mods;
     pub mod nexus;
     pub mod nxm;
@@ -18,7 +19,9 @@ use gio::prelude::FileExt;
 use gtk4::prelude::{ApplicationExt, ApplicationExtManual, GtkApplicationExt};
 
 fn main() {
-    env_logger::init();
+    if let Err(e) = crate::core::logger::init() {
+        eprintln!("Failed to initialise logger: {e}");
+    }
 
     let app = libadwaita::Application::builder()
         .application_id("io.github.sachesi.linkmm")
