@@ -14,6 +14,7 @@ use crate::core::mods::ModDatabase;
 pub mod downloads;
 pub mod library;
 pub mod load_order;
+pub mod logs;
 pub mod mod_list;
 pub mod settings;
 pub mod setup_wizard;
@@ -52,6 +53,7 @@ fn build_main_window(
 
     // Register app-level About action
     register_about_action(app, &window);
+    register_logs_action(app, &window, Rc::clone(&config));
 
     let split_view = adw::NavigationSplitView::new();
     split_view.set_min_sidebar_width(200.0);
@@ -69,6 +71,7 @@ fn build_main_window(
     let menu_btn = gtk4::MenuButton::new();
     menu_btn.set_icon_name("open-menu-symbolic");
     let menu = gio::Menu::new();
+    menu.append(Some("View Logs"), Some("app.logs"));
     menu.append(Some("About Linkmm"), Some("app.about"));
     menu_btn.set_menu_model(Some(&menu));
     sidebar_header.pack_end(&menu_btn);
@@ -561,6 +564,21 @@ fn register_about_action(app: &libadwaita::Application, window: &adw::Applicatio
     let window_c = window.clone();
     action.connect_activate(move |_, _| {
         show_about_dialog(window_c.upcast_ref::<gtk4::Window>());
+    });
+    app.add_action(&action);
+}
+
+// ── Logs action ────────────────────────────────────────────────────────────
+
+fn register_logs_action(
+    app: &libadwaita::Application,
+    window: &adw::ApplicationWindow,
+    config: Rc<RefCell<AppConfig>>,
+) {
+    let action = gio::SimpleAction::new("logs", None);
+    let window_c = window.clone();
+    action.connect_activate(move |_, _| {
+        logs::show_log_window(window_c.upcast_ref::<gtk4::Window>(), Rc::clone(&config));
     });
     app.add_action(&action);
 }
