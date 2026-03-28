@@ -649,7 +649,8 @@ fn build_mod_row(
                     // so Downloads reflects that this mod is no longer installed.
                     let mod_name_lower = m.name.to_lowercase();
                     let mut cfg = config_c.borrow_mut();
-                    cfg.installed_archives.retain(|archive| {
+                    let gs = cfg.game_settings_mut(&game_c.id);
+                    gs.installed_archives.retain(|archive| {
                         let archive_stem = Path::new(archive)
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_lowercase())
