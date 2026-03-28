@@ -178,18 +178,18 @@ impl ModDatabase {
         plugins.sort_by_cached_key(|p| (p.kind.sort_priority(), p.name.to_lowercase()));
     }
 
-    /// Path to the `mods.json` configuration file for this game.
+    /// Path to the `mods.toml` configuration file for this game.
     ///
-    /// Always located at `~/.config/linkmm/<game_id>/mods.json`.
+    /// Always located at `~/.config/linkmm/<game_id>/mods.toml`.
     fn db_path(game: &Game) -> std::path::PathBuf {
-        game.config_dir().join("mods.json")
+        game.config_dir().join("mods.toml")
     }
 
     pub fn load(game: &Game) -> Self {
         let path = Self::db_path(game);
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(contents) => match serde_json::from_str::<ModDatabase>(&contents) {
+                Ok(contents) => match toml::from_str::<ModDatabase>(&contents) {
                     Ok(db) => return db,
                     Err(e) => {
                         log::warn!("Failed to parse mods database: {e}, using empty database");
@@ -197,34 +197,6 @@ impl ModDatabase {
                 },
                 Err(e) => {
                     log::warn!("Failed to read mods database: {e}");
-                }
-            }
-        }
-        // Migration: fall back to the old location inside mods_dir if the new
-        // config-dir path does not yet exist.
-        let legacy_path = game.mods_dir().join("mods.json");
-        if legacy_path.exists() {
-            match std::fs::read_to_string(&legacy_path) {
-                Ok(contents) => match serde_json::from_str::<ModDatabase>(&contents) {
-                    Ok(db) => {
-                        log::info!(
-                            "Migrating mods.json from {} to {}",
-                            legacy_path.display(),
-                            path.display()
-                        );
-                        // Save immediately to the new location so the
-                        // migration only happens once.
-                        db.save(game);
-                        return db;
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to parse legacy mods database: {e}, using empty database"
-                        );
-                    }
-                },
-                Err(e) => {
-                    log::warn!("Failed to read legacy mods database: {e}");
                 }
             }
         }
@@ -238,7 +210,7 @@ impl ModDatabase {
             return;
         }
         let path = Self::db_path(game);
-        match serde_json::to_string_pretty(self) {
+        match toml::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {
                     log::error!("Failed to write mods database: {e}");
