@@ -150,23 +150,53 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load_or_default() -> Self {
         let path = Self::config_path();
+
+        // Try loading TOML config first
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
+                Ok(contents) => match toml::from_str::<AppConfig>(&contents) {
                     Ok(mut config) => {
                         config.migrate_legacy_global_settings();
                         config.apply_mods_base_dirs();
                         return config;
                     }
                     Err(e) => {
-                        log::warn!("Failed to parse config: {e}, using defaults");
+                        log::warn!("Failed to parse TOML config: {e}");
                     }
                 },
                 Err(e) => {
-                    log::warn!("Failed to read config file: {e}, using defaults");
+                    log::warn!("Failed to read config file: {e}");
                 }
             }
         }
+
+        // Try migrating from JSON if TOML doesn't exist
+        let json_path = Self::json_config_path();
+        if json_path.exists() {
+            log::info!("Migrating config from JSON to TOML");
+            match std::fs::read_to_string(&json_path) {
+                Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
+                    Ok(mut config) => {
+                        config.migrate_legacy_global_settings();
+                        config.apply_mods_base_dirs();
+                        // Save as TOML
+                        config.save();
+                        // Optionally remove old JSON file
+                        if let Err(e) = std::fs::remove_file(&json_path) {
+                            log::warn!("Failed to remove old JSON config: {e}");
+                        }
+                        return config;
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse JSON config during migration: {e}");
+                    }
+                },
+                Err(e) => {
+                    log::warn!("Failed to read JSON config during migration: {e}");
+                }
+            }
+        }
+
         Self::default()
     }
 
@@ -209,7 +239,7 @@ impl AppConfig {
                 return;
             }
         }
-        match serde_json::to_string_pretty(self) {
+        match toml::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {
                     log::error!("Failed to write config file: {e}");
@@ -281,6 +311,13 @@ impl AppConfig {
     }
 
     pub fn config_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("linkmm")
+            .join("config.toml")
+    }
+
+    fn json_config_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("linkmm")
