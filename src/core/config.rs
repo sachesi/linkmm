@@ -152,7 +152,7 @@ impl AppConfig {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
+                Ok(contents) => match toml::from_str::<AppConfig>(&contents) {
                     Ok(mut config) => {
                         config.migrate_legacy_global_settings();
                         config.apply_mods_base_dirs();
@@ -209,7 +209,7 @@ impl AppConfig {
                 return;
             }
         }
-        match serde_json::to_string_pretty(self) {
+        match toml::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {
                     log::error!("Failed to write config file: {e}");
@@ -284,7 +284,7 @@ impl AppConfig {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("linkmm")
-            .join("config.json")
+            .join("config.toml")
     }
 
     pub fn current_game(&self) -> Option<&Game> {
