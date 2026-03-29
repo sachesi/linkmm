@@ -1,6 +1,7 @@
 use crate::core::games::GameKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 pub struct SteamLibrary {
     pub path: PathBuf,
     pub apps: Vec<u32>,
@@ -383,6 +384,7 @@ pub fn find_steam_root() -> Option<PathBuf> {
 /// Detect if Steam is running as a Flatpak installation.
 ///
 /// Returns true if the Steam root is in the Flatpak directory.
+#[allow(dead_code)]
 pub fn is_steam_flatpak() -> bool {
     if let Some(steam_root) = find_steam_root() {
         let steam_root_str = steam_root.to_string_lossy();
@@ -396,7 +398,7 @@ pub fn is_steam_flatpak() -> bool {
 ///
 /// This is more reliable than checking steam_root alone, since Proton or compatdata
 /// may be installed in the Flatpak directory even if steam_root points to a symlink.
-pub fn is_path_in_flatpak(path: &PathBuf) -> bool {
+pub fn is_path_in_flatpak(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     path_str.contains("/.var/app/com.valvesoftware.Steam/")
 }
@@ -643,11 +645,11 @@ fn launch_tool_native(
 
 /// Launch tool using Flatpak Steam wrapper.
 fn launch_tool_with_flatpak(
-    proton_script: &PathBuf,
-    exe_path: &PathBuf,
+    proton_script: &Path,
+    exe_path: &Path,
     arguments: &str,
-    steam_root: &PathBuf,
-    compatdata_path: &PathBuf,
+    steam_root: &Path,
+    compatdata_path: &Path,
     app_id: u32,
 ) -> Result<std::process::Child, String> {
     // Build the shell command to run inside Flatpak

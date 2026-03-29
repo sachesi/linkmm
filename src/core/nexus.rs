@@ -15,6 +15,7 @@ pub struct NexusUser {
     pub is_supporter: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NexusMod {
     pub mod_id: u64,
@@ -25,6 +26,7 @@ pub struct NexusMod {
 }
 
 /// Richer mod info returned by list endpoints (trending, latest, etc.).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NexusModInfo {
     pub mod_id: u64,
@@ -37,6 +39,7 @@ pub struct NexusModInfo {
 }
 
 /// A downloadable file belonging to a Nexus mod.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NexusModFile {
     pub file_id: u64,

@@ -95,6 +95,7 @@ pub struct FomodFile {
 
 /// Selection type for a FOMOD plugin group.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum GroupType {
     SelectAtLeastOne,
     SelectAtMostOne,
@@ -646,6 +647,7 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
     }
 }
 
+#[allow(dead_code)]
 fn top_level_component(path: &str) -> &str {
     let stripped = path.strip_prefix('/').unwrap_or(path);
     stripped.split('/').next().unwrap_or("")
@@ -660,6 +662,7 @@ fn top_level_component(path: &str) -> &str {
 /// - `SomeMod/Data/textures/sky.dds` → common prefix `SomeMod/` stripped →
 ///   remaining starts with `Data/` → returns `true`.
 /// - `textures/sky.dds` → no prefix → returns `false`.
+#[allow(dead_code)]
 fn archive_has_data_folder(archive_path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(archive_path) else {
         return false;
@@ -906,6 +909,7 @@ pub fn read_archive_files_bytes(
 /// Load a file from an archive by path, using case-insensitive matching and
 /// common FOMOD-relative fallbacks.  Supports both zip archives and non-zip
 /// archives (7z, rar, etc. — extracted via the `7z` command).
+#[allow(dead_code)]
 pub fn read_archive_file_bytes(
     archive_path: &Path,
     relative_path: &str,
@@ -1046,6 +1050,7 @@ fn read_archive_files_bytes_non_zip(
 /// Instead of fully extracting the archive, this function first lists the
 /// archive's contents to find the exact stored path, then extracts only that
 /// single file.  This is orders of magnitude faster for large archives.
+#[allow(dead_code)]
 fn read_archive_file_bytes_non_zip(
     archive_path: &Path,
     relative_path: &str,
@@ -1105,6 +1110,7 @@ fn read_archive_file_bytes_non_zip(
 
 /// Recursively collect all regular files under `dir`, returning tuples of
 /// `(lowercase_relative_path, full_path)` relative to `root`.
+#[allow(dead_code)]
 fn collect_fs_files(root: &Path, dir: &Path, result: &mut Vec<(String, std::path::PathBuf)>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -1629,6 +1635,7 @@ fn get_attr(event: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<Str
 ///    always uses the `{uuid}/Data/…` structure.
 /// 2. Updates the mod database.
 /// 3. Returns the created `Mod` entry.
+#[allow(dead_code)]
 pub fn install_mod_from_archive(
     archive_path: &Path,
     game: &Game,
@@ -2135,6 +2142,7 @@ fn list_rar_entries(archive_path: &Path) -> Result<Vec<String>, String> {
 /// `file_path_in_archive` must be the exact path as stored in the archive
 /// (use [`list_archive_entries_with_7z`] to discover it).  The file will be
 /// placed at `dest_dir / file_path_in_archive`.
+#[allow(dead_code)]
 fn extract_single_file_with_7z(
     archive_path: &Path,
     file_path_in_archive: &str,
@@ -2160,6 +2168,7 @@ fn extract_single_file_with_7z(
 /// so that we can first try the efficient `read_file()` path (which uses the
 /// archive's built-in file index) and only fall back to a full sequential scan
 /// with case-insensitive matching if the exact-name lookup fails.
+#[allow(dead_code)]
 fn extract_single_7z_file(
     archive_path: &Path,
     file_path_in_archive: &str,
@@ -2856,6 +2865,7 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
     Ok(())
 }
 
+#[allow(dead_code)]
 fn install_fomod_files(
     archive_path: &Path,
     dest_dir: &Path,

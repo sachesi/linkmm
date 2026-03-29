@@ -592,6 +592,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[allow(dead_code)]
     fn tempdir() -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CTR: AtomicU32 = AtomicU32::new(0);

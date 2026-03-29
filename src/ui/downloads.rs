@@ -470,6 +470,7 @@ fn build_active_download_row(
 
 // ── Row builder ───────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_entry_row(
     entry: &DownloadEntry,
     installed_archives: &[String],
@@ -579,6 +580,7 @@ fn build_entry_row(
 
 // ── Install dialog ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn show_install_dialog(
     anchor: &gtk4::Button,
     archive_path: &Path,
@@ -608,6 +610,7 @@ fn show_install_dialog(
     let ap = archive_path.to_path_buf();
 
     // Channel carries the result back to the GTK main thread.
+    #[allow(clippy::type_complexity)]
     let (tx, rx) = std::sync::mpsc::channel::<
         Result<
             (
@@ -620,6 +623,7 @@ fn show_install_dialog(
     >();
 
     std::thread::spawn(move || {
+        #[allow(clippy::type_complexity)]
         let result = (|| -> Result<(InstallStrategy, Option<FomodConfig>, HashMap<String, Vec<u8>>), String> {
             let strategy = detect_strategy(&ap)?;
             let mut images_data = HashMap::new();
@@ -737,6 +741,7 @@ fn show_install_dialog(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_strategy_picker(
     parent: Option<&gtk4::Window>,
     archive_path: &Path,
@@ -790,6 +795,7 @@ fn show_strategy_picker(
     dialog.present(parent);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_install(
     archive_path: &Path,
     archive_name: &str,
@@ -898,6 +904,7 @@ fn do_install(
 
 /// Handle the install result on the GTK main thread once the background thread
 /// has finished.  Updates the status popup, config, and refreshes the list.
+#[allow(clippy::too_many_arguments)]
 fn on_install_complete(
     result: Result<crate::core::mods::Mod, String>,
     archive_name: &str,
@@ -1155,6 +1162,7 @@ fn load_fomod_option_image(
     cache.borrow().get(image_path).cloned()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_fomod_wizard(
     parent: Option<&gtk4::Window>,
     archive_path: &Path,
@@ -1562,6 +1570,7 @@ fn show_fomod_wizard(
 }
 
 /// Public entry point for the FOMOD wizard, callable from the Library page.
+#[allow(clippy::too_many_arguments)]
 pub fn show_fomod_wizard_from_library(
     parent: Option<&gtk4::Window>,
     archive_path: &Path,
