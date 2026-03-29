@@ -8,7 +8,7 @@ use super::paths::{
 };
 use super::types::{
     DataArchivePlan, InstallStrategy,
-    KNOWN_DATA_SUBDIRS, KNOWN_PLUGIN_EXTS, KNOWN_ARCHIVE_EXTS,
+    KNOWN_DATA_SUBDIRS, KNOWN_PLUGIN_EXTS, KNOWN_ARCHIVE_EXTS, JUNK_TOPLEVEL_ENTRIES,
 };
 
 /// Score a path prefix as a candidate game Data-root directory.
@@ -221,6 +221,10 @@ pub fn find_data_root_in_paths(paths: &[&str]) -> String {
 }
 
 /// Compute the common single-level top-directory prefix.
+///
+/// Entries whose top-level component is in `JUNK_TOPLEVEL_DIRS` (e.g.
+/// `__MACOSX/`) are ignored.  Comparison is case-insensitive to handle minor
+/// casing differences in the wrapper-dir name across entries.
 pub(super) fn find_common_prefix_from_paths(paths: &[&str]) -> String {
     if paths.is_empty() {
         return String::new();
@@ -235,9 +239,12 @@ pub(super) fn find_common_prefix_from_paths(paths: &[&str]) -> String {
         if top.is_empty() {
             continue;
         }
+        if JUNK_TOPLEVEL_ENTRIES.contains(&top.to_lowercase().as_str()) {
+            continue;
+        }
         match &first_top {
             None => first_top = Some(top.to_string()),
-            Some(ft) if ft.as_str() != top => {
+            Some(ft) if ft.to_lowercase() != top.to_lowercase() => {
                 all_same = false;
                 break;
             }

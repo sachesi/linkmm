@@ -1456,3 +1456,108 @@ fn test_dependency_evaluate_or() {
     active.clear();
     assert!(!deps.evaluate(&active));
 }
+
+// ── FOMOD __MACOSX / wrapper-dir regression tests ────────────────────────────
+
+/// A zip that contains both real content and macOS `__MACOSX/` resource-fork
+/// entries must still install the correct files.  Before the fix,
+/// `find_common_prefix` saw two different top-level dirs and returned `""`,
+/// so no archive entries matched the FOMOD source paths.
+#[test]
+fn install_fomod_succeeds_when_zip_contains_macosx_entries() {
+    let tmp = tempdir();
+    let archive = create_test_zip(
+        &tmp,
+        &[
+            // macOS resource-fork junk
+            ("__MACOSX/", b""),
+            (
+                "__MACOSX/Diamond mod/textures/._femalebody_1_msn.dds",
+                b"junk",
+            ),
+            // real content under a wrapper directory
+            ("Diamond mod/", b""),
+            ("Diamond mod/fomod/", b""),
+            ("Diamond mod/fomod/ModuleConfig.xml", b"<config/>"),
+            ("Diamond mod/00main/", b""),
+            ("Diamond mod/00main/textures/", b""),
+            (
+                "Diamond mod/00main/textures/femalebody_1_msn.dds",
+                b"dds_data",
+            ),
+        ],
+    );
+    let dest = tmp.join("mod_data");
+    std::fs::create_dir_all(&dest).unwrap();
+
+    install_fomod_files(
+        &archive,
+        &dest,
+        &[FomodFile {
+            source: "00main/textures".to_string(),
+            destination: "textures".to_string(),
+            priority: 0,
+        }],
+    )
+    .unwrap();
+
+    assert!(
+        dest.join("textures").join("femalebody_1_msn.dds").exists(),
+        "real content should be installed even when __MACOSX/ entries are present"
+    );
+}
+
+/// A zip with a single wrapper directory (Diamond-style) should have its
+/// FOMOD source paths resolved relative to that wrapper directory.
+#[test]
+fn install_fomod_diamond_style_wrapper_dir() {
+    let tmp = tempdir();
+    let archive = create_test_zip(
+        &tmp,
+        &[
+            ("Diamond 3BA Puffy Pussy normal maps/", b""),
+            ("Diamond 3BA Puffy Pussy normal maps/fomod/", b""),
+            (
+                "Diamond 3BA Puffy Pussy normal maps/fomod/ModuleConfig.xml",
+                b"<config/>",
+            ),
+            (
+                "Diamond 3BA Puffy Pussy normal maps/00main/textures/femalebody_1_msn.dds",
+                b"dds1",
+            ),
+            (
+                "Diamond 3BA Puffy Pussy normal maps/body_n/smooth map/textures/body_smooth.dds",
+                b"dds2",
+            ),
+        ],
+    );
+    let dest = tmp.join("mod_data");
+    std::fs::create_dir_all(&dest).unwrap();
+
+    install_fomod_files(
+        &archive,
+        &dest,
+        &[
+            FomodFile {
+                source: "00main\\textures".to_string(),
+                destination: "textures".to_string(),
+                priority: 0,
+            },
+            FomodFile {
+                source: "body_n\\smooth map\\textures".to_string(),
+                destination: "textures".to_string(),
+                priority: 1,
+            },
+        ],
+    )
+    .unwrap();
+
+    assert!(
+        dest.join("textures").join("femalebody_1_msn.dds").exists(),
+        "00main/textures content should be installed"
+    );
+    assert!(
+        dest.join("textures").join("body_smooth.dds").exists(),
+        "body_n/smooth map/textures content should be installed"
+    );
+}
