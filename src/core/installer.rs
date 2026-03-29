@@ -2464,10 +2464,9 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
     let archive_prefix = if let Some(zip) = &mut zip_archive {
         normalise_path(&find_common_prefix(zip))
     } else {
-        find_common_prefix_from_paths(&entries.iter().map(|s| s.as_str()).collect())
+        let entry_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+        find_common_prefix_from_paths(&entry_refs)
     };
-    let archive_prefix_lower = archive_prefix.to_lowercase();
-
     // Build entry map for case-insensitive matching (with indices)
     let entry_map: Vec<(String, String, usize)> = entries
         .iter()
@@ -2503,7 +2502,11 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
             for cand in &candidates {
                 final_candidates.push(cand.clone());
                 if !archive_prefix.is_empty() {
-                    final_candidates.push(format!("{}/{}", archive_prefix, cand));
+                    final_candidates.push(normalise_path(&format!(
+                        "{}/{}",
+                        archive_prefix.trim_end_matches('/'),
+                        cand
+                    )));
                 }
             }
 
@@ -2537,11 +2540,20 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
         let matched_source_lower = matched_source.to_lowercase();
 
         for (orig_entry, idx) in matching_entries {
-            let entry_lower = orig_entry.to_lowercase();
-            let rel = if entry_lower == matched_source_lower {
+            let entry_norm = normalise_path(&orig_entry);
+            let entry_lower = entry_norm.to_lowercase();
+            let rel = if matched_source_lower.is_empty() {
+                if destination.is_empty() {
+                    entry_norm.clone()
+                } else {
+                    format!("{}/{}", destination, entry_norm)
+                }
+            } else if entry_lower == matched_source_lower {
                 destination.clone()
             } else if let Some(suffix) =
-                entry_lower.strip_prefix(&format!("{}/", matched_source_lower))
+                entry_norm
+                    .get(matched_source_lower.len() + 1..)
+                    .filter(|_| entry_lower.starts_with(&format!("{}/", matched_source_lower)))
             {
                 if destination.is_empty() {
                     suffix.to_string()
@@ -2646,6 +2658,14 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
     }
 
     Ok(())
+}
+
+fn install_fomod_files(
+    archive_path: &Path,
+    dest_dir: &Path,
+    files: &[FomodFile],
+) -> Result<(), String> {
+    install_fomod(archive_path, dest_dir, files)
 }
 
 /// Install FOMOD-selected files from an already-extracted directory tree.
