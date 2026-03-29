@@ -81,6 +81,7 @@ pub fn all_active() -> Vec<(u64, ActiveDownload)> {
     active
 }
 
+#[allow(dead_code)]
 pub fn current() -> Option<ActiveDownload> {
     all_active().last().map(|(_, active)| active.clone())
 }
