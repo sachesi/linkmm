@@ -9,6 +9,22 @@ pub struct Profile {
     pub name: String,
 }
 
+/// Configuration for a single external tool (e.g., BodySlide, xEdit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolConfig {
+    /// Unique identifier for this tool.
+    pub id: String,
+    /// User-friendly name for this tool.
+    pub name: String,
+    /// Path to the Windows .exe file.
+    pub exe_path: PathBuf,
+    /// Optional command-line arguments.
+    #[serde(default)]
+    pub arguments: String,
+    /// Steam App ID to determine which game's Proton prefix to use.
+    pub app_id: u32,
+}
+
 impl Profile {
     /// Create a new profile with a unique ID derived from the name and current time.
     pub fn new(name: impl Into<String>) -> Self {
@@ -74,6 +90,9 @@ pub struct GameSettings {
     /// The profile currently active for this game.
     #[serde(default = "default_active_profile_id")]
     pub active_profile_id: String,
+    /// External tools configured for this game.
+    #[serde(default)]
+    pub tools: Vec<ToolConfig>,
 }
 
 impl Default for GameSettings {
@@ -83,6 +102,7 @@ impl Default for GameSettings {
             installed_archives: Vec::new(),
             profiles: default_profiles(),
             active_profile_id: default_active_profile_id(),
+            tools: Vec::new(),
         }
     }
 }
@@ -193,6 +213,7 @@ impl AppConfig {
             } else {
                 self.active_profile_id.clone()
             },
+            tools: Vec::new(),
         };
         for game in &self.games {
             self.game_settings
