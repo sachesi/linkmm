@@ -461,64 +461,83 @@ fn collect_bain_top_dirs(paths: &[&str]) -> Vec<String> {
 ///   the caller must run the wizard to populate it).
 /// - Otherwise → `Data` (all content is placed under a `Data/` subdirectory
 ///   inside the mod folder and symlinked into `<game_root>/Data`).
-pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
-    if !archive_path.exists() {
-        return Err(format!("Cannot open archive: {}", archive_path.display()));
-    }
-    if !has_zip_extension(archive_path) {
-        // Use fast header listing (no extraction) to detect FOMOD presence.
-        // If listing fails (e.g. 7z not installed or corrupt/solid archive),
-        // log a warning and fall back gracefully to Data strategy.
-        let entries = list_archive_entries_with_7z(archive_path).unwrap_or_else(|e| {
+fn is_fomod_archive(archive_path: &Path) -> bool {
+    let entries = if has_zip_extension(archive_path) {
+        if let Ok(file) = std::fs::File::open(archive_path) {
+            if let Ok(zip) = zip::ZipArchive::new(file) {
+                zip.file_names().map(|s| s.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        }
+    } else {
+        list_archive_entries_with_7z(archive_path).unwrap_or_else(|e| {
             log::warn!(
-                "Failed to list entries in {}: {e}; falling back to Data strategy",
+                "Failed to list entries in {}: {e}; assuming not a FOMOD archive",
                 archive_path.display()
             );
             vec![]
-        });
-        let has_fomod = entries.iter().any(|p| {
-            let lower = p.to_lowercase().replace('\\', "/");
-            lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
-        });
-        // Return without parsing the full FOMOD XML here — the caller should
-        // call parse_fomod_from_archive separately when the full config is
-        // needed (e.g. to show the wizard).  This avoids a redundant 7z
-        // subprocess invocation inside detect_strategy.
-        return Ok(if has_fomod {
-            InstallStrategy::Fomod(vec![])
-        } else {
-            InstallStrategy::Data
-        });
+        })
+    };
+
+    if entries.is_empty() {
+        return false;
     }
 
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
-    let mut zip =
-        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
+    // Fast path: check for standard FOMOD config file.
+    if entries.iter().any(|p| {
+        let lower = p.to_lowercase().replace('\\', "/");
+        lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
+    }) {
+        return true;
+    }
 
-    let mut has_fomod = false;
+    // Slow path: check for other XML files that look like FOMOD configs.
+    let xml_files: Vec<&str> = entries
+        .iter()
+        .filter(|p| p.to_lowercase().ends_with(".xml"))
+        .map(|s| s.as_str())
+        .collect();
 
-    for i in 0..zip.len() {
-        let entry = zip
-            .by_index(i)
-            .map_err(|e| format!("Cannot read zip entry: {e}"))?;
-        let name_lower = entry.name().to_lowercase().replace('\\', "/");
+    if xml_files.is_empty() {
+        return false;
+    }
 
-        if name_lower == "fomod/moduleconfig.xml" || name_lower.ends_with("/fomod/moduleconfig.xml")
-        {
-            has_fomod = true;
+    if let Ok(xml_contents) = read_archive_files_bytes(archive_path, &xml_files) {
+        for bytes in xml_contents.values() {
+            // Very simple heuristic: check for tags as substrings.
+            // Using a proper XML parser would be too slow for detection.
+            if let Ok(content) = std::str::from_utf8(bytes) {
+                let lower_content = content.to_lowercase();
+                if lower_content.contains("<modulename>")
+                    && (lower_content.contains("<installsteps>")
+                        || lower_content.contains("<requiredinstallfiles>"))
+                {
+                    return true;
+                }
+            }
         }
+    }
+
+    false
+}
+
+pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
+    if !archive_path.exists() {
+        return Err(format!("Cannot open archive: {}", archive_path.display()));
     }
 
     // Return Fomod with empty file list – the caller will run the wizard and
     // parse the full XML separately (via parse_fomod_from_archive).  This
     // avoids propagating an XML-parse error from inside strategy *detection*,
     // which should be a best-effort, non-fatal operation.
-    Ok(if has_fomod {
-        InstallStrategy::Fomod(vec![])
+    if is_fomod_archive(archive_path) {
+        Ok(InstallStrategy::Fomod(vec![]))
     } else {
-        InstallStrategy::Data
-    })
+        Ok(InstallStrategy::Data)
+    }
 }
 
 fn top_level_component(path: &str) -> &str {
@@ -1518,7 +1537,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
             let data_dir = mod_dir.join("Data");
             std::fs::create_dir_all(&data_dir)
                 .map_err(|e| format!("Failed to create Data directory: {e}"))?;
-            install_fomod_files(archive_path, &data_dir, files)?;
+            install_fomod(archive_path, &data_dir, files)?;
 
             // Verify that files were actually installed. If the Data/ directory
             // is empty (all file matching failed), clean up and return error.
@@ -2422,277 +2441,102 @@ fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String {
 
 /// Install FOMOD-selected files from an archive.
 ///
-/// Supports both zip archives and non-zip archives (7z, rar, etc.).  For
-/// non-zip archives the archive is first fully extracted to a temporary
-/// directory; the per-file selection logic is then applied to the extracted
-/// tree before the temp directory is removed.
-///
-/// For each `FomodFile`, extract the `source` path from the archive and place it
-/// at `dest_dir / destination`.
-///
-/// `tick` is called periodically during the zip extraction phase so the
-/// caller can pulse a progress indicator.  Pass `&|| {}` when not needed.
-/// For non-zip archives (7z, rar, …) this function runs the extraction
-/// synchronously; the caller is responsible for offloading to a background
-/// thread to keep the UI responsive.
-fn install_fomod_files(
-    archive_path: &Path,
-    dest_dir: &Path,
-    files: &[FomodFile],
-) -> Result<(), String> {
-    if !has_zip_extension(archive_path) {
-        return install_fomod_files_non_zip(archive_path, dest_dir, files);
-    }
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
-    let mut zip =
-        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
-    let archive_prefix = normalise_path(&find_common_prefix(&zip));
+/// This function is optimized to handle both ZIP and solid 7z archives
+/// efficiently. It resolves file paths based on the FOMOD configuration and
+/// extracts only the necessary files.
+fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> Result<(), String> {
+    // 1. Get entries and create entry_map
+    let is_zip = has_zip_extension(archive_path);
+    let mut zip_archive = if is_zip {
+        let file =
+            std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
+        Some(zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?)
+    } else {
+        None
+    };
+
+    let entries = if let Some(zip) = &mut zip_archive {
+        zip.file_names().map(|s| s.to_string()).collect::<Vec<_>>()
+    } else {
+        list_archive_entries_with_7z(archive_path)?
+    };
+
+    let archive_prefix = if let Some(zip) = &mut zip_archive {
+        normalise_path(&find_common_prefix(zip))
+    } else {
+        find_common_prefix_from_paths(&entries.iter().map(|s| s.as_str()).collect())
+    };
     let archive_prefix_lower = archive_prefix.to_lowercase();
-
-    // Build a map of lowercased entry names → indices for case-insensitive
-    // matching.
-    let mut entry_map: Vec<(String, String, usize)> = Vec::new(); // (lower, original, index)
-    for i in 0..zip.len() {
-        let Ok(entry) = zip.by_index(i) else {
-            continue;
-        };
-        let name = entry.name().to_string();
-        let lower = name.to_lowercase();
-        entry_map.push((lower, name, i));
-    }
-
-    // Sort files by priority (higher priority wins for same destination)
-    let mut sorted_files = files.to_vec();
-    sorted_files.sort_by(|a, b| a.priority.cmp(&b.priority));
-
-    for fomod_file in &sorted_files {
-        let source = normalise_path(&fomod_file.source);
-        // Strip a leading "Data/" segment: FOMOD destinations are relative to
-        // the game root, but dest_dir is already mod_dir/Data/.  Without this
-        // stripping a destination of "Data/textures" would produce the double-
-        // nested mod_dir/Data/Data/textures/ layout.
-        let destination = strip_data_prefix(&normalise_path(&fomod_file.destination));
-        let source_lower = source.to_lowercase();
-
-        // Find matching entry indices. Some FOMODs reference files under
-        // "Data/..." while the archive has the same files at root (or vice
-        // versa), so try fallback source aliases.
-        let mut matched_source = source.clone();
-        let mut matching_indices = collect_matching_entries(&entry_map, &source_lower);
-
-        if matching_indices.is_empty() {
-            if !archive_prefix_lower.is_empty() {
-                let wrapped_source_lower = format!("{archive_prefix_lower}/{source_lower}");
-                matching_indices = collect_matching_entries(&entry_map, &wrapped_source_lower);
-                if !matching_indices.is_empty() {
-                    matched_source = format!("{archive_prefix}/{source}");
-                }
-            }
-        }
-
-        if matching_indices.is_empty() {
-            let stripped_source = strip_data_prefix(&source);
-            let stripped_lower = stripped_source.to_lowercase();
-            if !stripped_source.is_empty() && stripped_lower != source_lower {
-                matching_indices = collect_matching_entries(&entry_map, &stripped_lower);
-                if !matching_indices.is_empty() {
-                    matched_source = stripped_source;
-                } else if !archive_prefix_lower.is_empty() {
-                    let wrapped_stripped_lower = format!("{archive_prefix_lower}/{stripped_lower}");
-                    matching_indices =
-                        collect_matching_entries(&entry_map, &wrapped_stripped_lower);
-                    if !matching_indices.is_empty() {
-                        matched_source = format!("{archive_prefix}/{stripped_source}");
-                    }
-                }
-            } else if source_lower == "data" || source_lower == "data/" {
-                matching_indices = entry_map
-                    .iter()
-                    .filter(|(nl, _, _)| {
-                        !(nl == "fomod" || nl.starts_with("fomod/") || nl.contains("/fomod/"))
-                    })
-                    .map(|(_, orig, idx)| (orig.clone(), *idx))
-                    .collect();
-                if !matching_indices.is_empty() {
-                    matched_source = String::new();
-                }
-            }
-        }
-
-        if matching_indices.is_empty() && !source_lower.is_empty() {
-            let prefixed = format!("data/{source_lower}");
-            matching_indices = collect_matching_entries(&entry_map, &prefixed);
-            if !matching_indices.is_empty() {
-                matched_source = prefixed;
-            } else if !archive_prefix_lower.is_empty() {
-                let wrapped_prefixed = format!("{archive_prefix_lower}/{prefixed}");
-                matching_indices = collect_matching_entries(&entry_map, &wrapped_prefixed);
-                if !matching_indices.is_empty() {
-                    matched_source = format!("{archive_prefix}/data/{source}");
-                }
-            }
-        }
-
-        let matched_source_lower = matched_source.to_lowercase();
-
-        for (entry_name, entry_idx) in matching_indices {
-            let entry_lower = entry_name.to_lowercase();
-            // Compute the relative portion after the source prefix
-            let rel = if entry_lower == matched_source_lower {
-                // Single file
-                Path::new(&entry_name)
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            } else {
-                entry_name[matched_source.len()..]
-                    .trim_start_matches('/')
-                    .to_string()
-            };
-
-            if rel.is_empty() {
-                continue;
-            }
-
-            // Zip-slip protection on the combined destination + rel path
-            let combined = if destination.is_empty() {
-                std::borrow::Cow::Borrowed(rel.as_str())
-            } else {
-                std::borrow::Cow::Owned(format!("{destination}/{rel}"))
-            };
-            if !is_safe_relative_path(combined.as_ref()) {
-                log::warn!("Skipping fomod entry with unsafe path: {combined}");
-                continue;
-            }
-
-            let out_path = dest_dir.join(&destination).join(&rel);
-
-            // Use by_index to avoid long-lived borrow issues
-            let mut entry = zip
-                .by_index(entry_idx)
-                .map_err(|e| format!("Cannot read entry {entry_name}: {e}"))?;
-
-            if entry.is_dir() {
-                continue;
-            }
-
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create parent dir: {e}"))?;
-            }
-
-            let out_file = std::fs::File::create(&out_path)
-                .map_err(|e| format!("Failed to create file: {e}"))?;
-            let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
-            std::io::copy(&mut entry, &mut buffered)
-                .map_err(|e| format!("Failed to extract: {e}"))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Extract a non-zip archive to a temporary directory, run the FOMOD file
-/// selection logic on the extracted tree, then remove the temp directory.
-///
-/// OPTIMIZATION: Instead of extracting the entire archive (which can take
-/// 3-5 minutes for large mods like CBBE), we:
-/// 1. List all archive entries (fast - no extraction)
-/// 2. Match FOMOD file selections against entry list (fast)
-/// 3. Extract ONLY the matched files (fast - selective extraction)
-fn install_fomod_files_non_zip(
-    archive_path: &Path,
-    dest_dir: &Path,
-    files: &[FomodFile],
-) -> Result<(), String> {
-    // List all entries in the archive without extracting
-    let entries = list_archive_entries_with_7z(archive_path)?;
 
     // Build entry map for case-insensitive matching (with indices)
     let entry_map: Vec<(String, String, usize)> = entries
         .iter()
         .enumerate()
-        .map(|(idx, e)| {
-            let lower = normalise_path(e).to_lowercase();
-            (lower, e.clone(), idx)
-        })
+        .map(|(idx, e)| (normalise_path(e).to_lowercase(), e.clone(), idx))
         .collect();
 
-    // Find common prefix
-    let paths_for_prefix: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
-    let archive_prefix = find_common_prefix_from_paths(&paths_for_prefix);
-    let archive_prefix_lower = archive_prefix.to_lowercase();
-
-    // Sort files by priority
+    // 2. Resolve files to extract
     let mut sorted_files = files.to_vec();
     sorted_files.sort_by(|a, b| a.priority.cmp(&b.priority));
 
-    // Collect all files that need to be extracted
-    let mut files_to_extract: Vec<(String, PathBuf)> = Vec::new(); // (archive_path, dest_path)
+    let mut files_to_extract: Vec<(String, PathBuf, usize)> = Vec::new(); // (archive_path, dest_path, index)
 
     for fomod_file in &sorted_files {
         let source = normalise_path(&fomod_file.source);
         let destination = strip_data_prefix(&normalise_path(&fomod_file.destination));
         let source_lower = source.to_lowercase();
 
-        // Try to find matching files in archive (same logic as install_fomod_files_from_dir)
-        let mut matched_source = source.clone();
-        let mut matching_entries = collect_matching_entries(&entry_map, &source_lower);
+        let (matched_source, matching_entries) = {
+            let mut candidates = vec![source.clone()];
+            let source_has_data = source_lower.starts_with("data/");
 
-        if matching_entries.is_empty() && !archive_prefix_lower.is_empty() {
-            let wrapped = format!("{archive_prefix_lower}/{source_lower}");
-            matching_entries = collect_matching_entries(&entry_map, &wrapped);
-            if !matching_entries.is_empty() {
-                matched_source = format!("{archive_prefix}/{source}");
-            }
-        }
-
-        if matching_entries.is_empty() {
-            let stripped = strip_data_prefix(&source);
-            let stripped_lower = stripped.to_lowercase();
-            if !stripped.is_empty() && stripped_lower != source_lower {
-                matching_entries = collect_matching_entries(&entry_map, &stripped_lower);
-                if !matching_entries.is_empty() {
-                    matched_source = stripped.clone();
-                } else if !archive_prefix_lower.is_empty() {
-                    let wrapped_stripped = format!("{archive_prefix_lower}/{stripped_lower}");
-                    matching_entries = collect_matching_entries(&entry_map, &wrapped_stripped);
-                    if !matching_entries.is_empty() {
-                        matched_source = format!("{archive_prefix}/{stripped}");
-                    }
+            if source_has_data {
+                let stripped = strip_data_prefix(&source);
+                if !stripped.is_empty() && stripped != source {
+                    candidates.push(stripped);
                 }
-            } else if source_lower == "data" || source_lower == "data/" {
-                matching_entries = entry_map
+            } else if !source_lower.is_empty() && source_lower != "data" {
+                candidates.push(format!("data/{}", source));
+            }
+
+            let mut final_candidates = Vec::new();
+            for cand in &candidates {
+                final_candidates.push(cand.clone());
+                if !archive_prefix.is_empty() {
+                    final_candidates.push(format!("{}/{}", archive_prefix, cand));
+                }
+            }
+
+            let mut result_source = String::new();
+            let mut result_entries = Vec::new();
+
+            for cand in final_candidates {
+                let entries = collect_matching_entries(&entry_map, &cand.to_lowercase());
+                if !entries.is_empty() {
+                    result_source = cand;
+                    result_entries = entries;
+                    break;
+                }
+            }
+
+            if result_entries.is_empty() && (source_lower == "data" || source_lower == "data/") {
+                result_entries = entry_map
                     .iter()
                     .filter(|(nl, _, _)| {
                         !(nl == "fomod" || nl.starts_with("fomod/") || nl.contains("/fomod/"))
                     })
                     .map(|(_, orig, idx)| (orig.clone(), *idx))
                     .collect();
-                if !matching_entries.is_empty() {
-                    matched_source = String::new();
+                if !result_entries.is_empty() {
+                    result_source = String::new();
                 }
             }
-        }
-
-        if matching_entries.is_empty() && !source_lower.is_empty() {
-            let prefixed = format!("data/{source_lower}");
-            matching_entries = collect_matching_entries(&entry_map, &prefixed);
-            if !matching_entries.is_empty() {
-                matched_source = prefixed;
-            } else if !archive_prefix_lower.is_empty() {
-                let wrapped_prefixed = format!("{archive_prefix_lower}/data/{source_lower}");
-                matching_entries = collect_matching_entries(&entry_map, &wrapped_prefixed);
-                if !matching_entries.is_empty() {
-                    matched_source = format!("{archive_prefix}/data/{source}");
-                }
-            }
-        }
+            (result_source, result_entries)
+        };
 
         let matched_source_lower = matched_source.to_lowercase();
 
-        for (orig_entry, _idx) in matching_entries {
+        for (orig_entry, idx) in matching_entries {
             let entry_lower = orig_entry.to_lowercase();
             let rel = if entry_lower == matched_source_lower {
                 destination.clone()
@@ -2711,89 +2555,95 @@ fn install_fomod_files_non_zip(
             if rel.is_empty() || rel.ends_with('/') {
                 continue;
             }
+            if !is_safe_relative_path(&rel) {
+                log::warn!("Skipping fomod entry with unsafe path: {rel}");
+                continue;
+            }
 
             let dest_path = dest_dir.join(&rel);
-            files_to_extract.push((orig_entry, dest_path));
+            files_to_extract.push((orig_entry, dest_path, idx));
         }
     }
 
-    // Now extract only the required files
+    // 3. Extract
     log::info!(
         "Extracting {} files from FOMOD archive",
         files_to_extract.len()
     );
-
-    if has_rar_extension(archive_path) {
-        // For RAR, we need to fall back to full extraction as unrar doesn't
-        // support efficient selective extraction via the Rust API
-        let tmp = create_temp_extract_dir()?;
-        extract_archive_with_7z(archive_path, &tmp)?;
-
-        for (_archive_path, dest_path) in &files_to_extract {
-            // Find the file in the extracted directory
-            if let Some(parent) = dest_path.parent() {
+    if let Some(zip) = &mut zip_archive {
+        for (_, out_path, entry_idx) in files_to_extract {
+            let mut entry = zip
+                .by_index(entry_idx)
+                .map_err(|e| format!("Cannot read entry at index {entry_idx}: {e}"))?;
+            if entry.is_dir() {
+                continue;
+            }
+            if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create parent dir: {e}"))?;
             }
-            // Copy from temp to dest
-            // This is complex, so fall back to old behavior for RAR
+            let out_file = std::fs::File::create(&out_path)
+                .map_err(|e| format!("Failed to create file: {e}"))?;
+            let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
+            std::io::copy(&mut entry, &mut buffered)
+                .map_err(|e| format!("Failed to extract: {e}"))?;
+        }
+    } else {
+        // non-zip
+        if has_rar_extension(archive_path) {
+            let tmp = create_temp_extract_dir()?;
+            extract_archive_with_7z(archive_path, &tmp)?;
+            let result = install_fomod_files_from_dir(&tmp, dest_dir, files);
+            let _ = std::fs::remove_dir_all(&tmp);
+            return result;
         }
 
-        let result = install_fomod_files_from_dir(&tmp, dest_dir, files);
-        let _ = std::fs::remove_dir_all(&tmp);
-        return result;
-    }
+        // 7z sequential
+        sevenz_rust2::decompress_file_with_extract_fn(
+            archive_path,
+            dest_dir,
+            |entry, reader, _default_dest| {
+                let entry_name = entry.name();
 
-    // For 7z, use a single sequential pass over the archive.
-    // Random access (ArchiveReader::read_file) is extremely slow for solid 7z
-    // archives because it has to decompress from the beginning of the solid block
-    // for every file. Sequential extraction fixes this 3-5 minute hang.
-    sevenz_rust2::decompress_file_with_extract_fn(
-        archive_path,
-        dest_dir,
-        |entry, reader, _default_dest| {
-            let entry_name = entry.name();
+                let destinations: Vec<PathBuf> = files_to_extract
+                    .iter()
+                    .filter(|(src, _, _)| src == entry_name)
+                    .map(|(_, dest, _)| dest.clone())
+                    .collect();
 
-            // Find all destinations for this archive entry
-            let mut destinations = Vec::new();
-            for (src, dest) in &files_to_extract {
-                if src == entry_name {
-                    destinations.push(dest.clone());
-                }
-            }
-
-            if !destinations.is_empty() && !entry.is_directory() {
-                if destinations.len() == 1 {
-                    let dest_path = &destinations[0];
-                    if let Some(parent) = dest_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Ok(out_file) = std::fs::File::create(dest_path) {
-                        let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
-                        let _ = std::io::copy(reader, &mut buffered);
-                    }
-                } else {
-                    let mut data = Vec::with_capacity(entry.size() as usize);
-                    if reader.read_to_end(&mut data).is_ok() {
-                        for dest_path in destinations {
-                            if let Some(parent) = dest_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                if !destinations.is_empty() && !entry.is_directory() {
+                    if destinations.len() == 1 {
+                        let dest_path = &destinations[0];
+                        if let Some(parent) = dest_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Ok(out_file) = std::fs::File::create(dest_path) {
+                            let mut buffered =
+                                BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
+                            let _ = std::io::copy(reader, &mut buffered);
+                        }
+                    } else {
+                        let mut data = Vec::with_capacity(entry.size() as usize);
+                        if reader.read_to_end(&mut data).is_ok() {
+                            for dest_path in destinations {
+                                if let Some(parent) = dest_path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let _ = std::fs::write(&dest_path, &data);
                             }
-                            let _ = std::fs::write(&dest_path, &data);
                         }
                     }
                 }
-            }
-
-            Ok(true)
-        },
-    )
-    .map_err(|e| {
-        format!(
-            "Failed to extract 7z archive {}: {e}",
-            archive_path.display()
+                Ok(true)
+            },
         )
-    })?;
+        .map_err(|e| {
+            format!(
+                "Failed to extract 7z archive {}: {e}",
+                archive_path.display()
+            )
+        })?;
+    }
 
     Ok(())
 }
