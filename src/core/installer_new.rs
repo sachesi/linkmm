@@ -279,8 +279,15 @@ pub fn detect_data_root(paths: &[String]) -> Option<String> {
         }
     }
 
+    log::debug!(
+        "[DataRoot] Scanning archive | top_level_dirs={}, total_paths={}",
+        top_level_dirs.len(),
+        paths.len()
+    );
+
     // Case 1: Root level already looks like Data/ (most direct)
     if has_root_level_data_indicators {
+        log::debug!("[DataRoot] Root level already has data indicators, no prefix to strip");
         return Some(String::new()); // No prefix to strip
     }
 
@@ -288,6 +295,12 @@ pub fn detect_data_root(paths: &[String]) -> Option<String> {
     if top_level_dirs.len() == 1 {
         let candidate = top_level_dirs.iter().next().unwrap();
         let score = score_as_data_root(candidate, paths);
+
+        log::debug!(
+            "[DataRoot] Single wrapper directory | candidate={}, score={}",
+            candidate,
+            score
+        );
 
         // Only accept if score is reasonable (at least one indicator)
         if score >= 10 {
@@ -309,6 +322,11 @@ pub fn detect_data_root(paths: &[String]) -> Option<String> {
     // Try each top-level directory
     for dir in &top_level_dirs {
         let score = score_as_data_root(dir, paths);
+        log::debug!(
+            "[DataRoot] Candidate scoring | prefix='{}', score={}",
+            dir,
+            score
+        );
         if score > best_score {
             best_score = score;
             best_prefix = dir.clone();
@@ -317,8 +335,17 @@ pub fn detect_data_root(paths: &[String]) -> Option<String> {
 
     // Require minimum score threshold
     if best_score >= 10 {
+        log::debug!(
+            "[DataRoot] Best candidate selected | prefix='{}', score={}",
+            best_prefix,
+            best_score
+        );
         Some(best_prefix)
     } else {
+        log::debug!(
+            "[DataRoot] No candidate met threshold | best_score={}, threshold=10",
+            best_score
+        );
         None // User must select root
     }
 }
@@ -398,20 +425,43 @@ pub struct PluginDependencies {
 impl PluginDependencies {
     /// Check if dependencies are satisfied given current flags
     pub fn evaluate(&self, active_flags: &HashMap<String, String>) -> bool {
-        match self.operator {
+        let result = match self.operator {
             DependencyOperator::And => {
                 self.flags.iter().all(|dep| {
-                    active_flags.get(&dep.flag.to_lowercase())
-                        == Some(&dep.value.to_lowercase())
+                    let matched = active_flags.get(&dep.flag.to_lowercase())
+                        == Some(&dep.value.to_lowercase());
+                    log::debug!(
+                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
+                        dep.flag,
+                        dep.value,
+                        matched,
+                        self.operator
+                    );
+                    matched
                 })
             }
             DependencyOperator::Or => {
                 self.flags.iter().any(|dep| {
-                    active_flags.get(&dep.flag.to_lowercase())
-                        == Some(&dep.value.to_lowercase())
+                    let matched = active_flags.get(&dep.flag.to_lowercase())
+                        == Some(&dep.value.to_lowercase());
+                    log::debug!(
+                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
+                        dep.flag,
+                        dep.value,
+                        matched,
+                        self.operator
+                    );
+                    matched
                 })
             }
-        }
+        };
+        log::debug!(
+            "[Dependency Group] operator={:?}, flag_count={}, overall_result={}",
+            self.operator,
+            self.flags.len(),
+            result
+        );
+        result
     }
 }
 
@@ -490,9 +540,28 @@ pub fn resolve_file_conflicts(mut files: Vec<FomodFile>) -> Vec<FomodFile> {
 
     // Keep first occurrence of each destination (= winner)
     let mut seen = HashSet::new();
+    let total_before = files.len();
     files.retain(|f| {
-        seen.insert(normalize_path_lowercase(&f.destination))
+        let dest_norm = normalize_path_lowercase(&f.destination);
+        let is_new = seen.insert(dest_norm.clone());
+        if !is_new {
+            log::debug!(
+                "[Conflict] Duplicate destination skipped | dest={}, source={}, priority={}",
+                dest_norm,
+                f.source,
+                f.priority
+            );
+        }
+        is_new
     });
+    let conflicts_resolved = total_before - files.len();
+    if conflicts_resolved > 0 {
+        log::info!(
+            "[Conflict] Resolved {} file conflicts, {} files remaining",
+            conflicts_resolved,
+            files.len()
+        );
+    }
 
     files
 }

@@ -246,6 +246,10 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
 ///
 /// Flattens nested Data/Data/ structures to prevent double-nesting.
 pub fn deploy_mod(game: &Game, mod_entry: &Mod) -> Result<DeploymentReport, String> {
+    let _span = crate::core::logger::span(
+        "deploy_mod",
+        &format!("mod={}", mod_entry.name),
+    );
     let mut report = DeploymentReport::default();
 
     // Deploy Data/ folder contents
@@ -279,6 +283,10 @@ pub fn deploy_mod(game: &Game, mod_entry: &Mod) -> Result<DeploymentReport, Stri
 /// Only removes links that point to this mod's files. Preserves vanilla
 /// content and other mods' files.
 pub fn undeploy_mod(game: &Game, mod_entry: &Mod) -> Result<DeploymentReport, String> {
+    let _span = crate::core::logger::span(
+        "undeploy_mod",
+        &format!("mod={}", mod_entry.name),
+    );
     let mut report = DeploymentReport::default();
 
     let data_dir = mod_entry.source_path.join("Data");
