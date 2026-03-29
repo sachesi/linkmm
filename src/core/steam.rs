@@ -1,6 +1,7 @@
 use crate::core::games::GameKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 pub struct SteamLibrary {
     pub path: PathBuf,
     pub apps: Vec<u32>,
@@ -101,13 +102,11 @@ fn parse_library_folders_vdf(contents: &str) -> Vec<PathBuf> {
                 in_entry = false;
             }
             depth -= 1;
-        } else if in_entry && depth == 2 {
-            if let Some((key, value)) = parse_vdf_key_value(trimmed) {
-                if key == "path" {
+        } else if in_entry && depth == 2
+            && let Some((key, value)) = parse_vdf_key_value(trimmed)
+                && key == "path" {
                     paths.push(PathBuf::from(value));
                 }
-            }
-        }
     }
 
     paths
@@ -135,11 +134,10 @@ fn parse_vdf_key_value(line: &str) -> Option<(String, String)> {
 fn parse_acf_install_dir(contents: &str) -> Option<String> {
     for line in contents.lines() {
         let trimmed = line.trim();
-        if let Some((key, value)) = parse_vdf_key_value(trimmed) {
-            if key == "installdir" {
+        if let Some((key, value)) = parse_vdf_key_value(trimmed)
+            && key == "installdir" {
                 return Some(value);
             }
-        }
     }
     None
 }
@@ -162,13 +160,12 @@ fn parse_per_game_proton_config(app_id: u32) -> Option<String> {
             continue;
         }
 
-        if let Ok(contents) = std::fs::read_to_string(&config_path) {
-            if let Some(tool_name) = parse_compat_tool_mapping(&contents, app_id) {
+        if let Ok(contents) = std::fs::read_to_string(&config_path)
+            && let Some(tool_name) = parse_compat_tool_mapping(&contents, app_id) {
                 log::debug!("Found per-game Proton config for {}: {} in {}",
                     app_id, tool_name, config_path.display());
                 return Some(tool_name);
             }
-        }
     }
 
     None
@@ -193,16 +190,15 @@ fn parse_compat_tool_mapping(contents: &str, app_id: u32) -> Option<String> {
         } else if trimmed.contains("CompatToolMapping") {
             in_compat_mapping = true;
         } else if in_compat_mapping && depth > 0 {
-            if let Some((key, _)) = parse_vdf_key_value(trimmed) {
-                if key == app_id_str {
+            if let Some((key, _)) = parse_vdf_key_value(trimmed)
+                && key == app_id_str {
                     // Next section should have "name" key with the tool
                     continue;
                 }
-            }
             // Check for nested structure: app_id { "name" "tool_name" }
             if trimmed.starts_with(&format!("\"{}\"", app_id_str)) {
                 // Found our app, look for the tool name in subsequent lines
-                let mut found_app_section = true;
+                let _found_app_section = true;
                 let mut search_depth = depth;
 
                 for next_line in contents.lines().skip_while(|l| l.trim() != trimmed).skip(1) {
@@ -214,11 +210,10 @@ fn parse_compat_tool_mapping(contents: &str, app_id: u32) -> Option<String> {
                         if search_depth < depth {
                             break;
                         }
-                    } else if let Some((key, value)) = parse_vdf_key_value(next_trimmed) {
-                        if key == "name" || key == "Priority" {
+                    } else if let Some((key, value)) = parse_vdf_key_value(next_trimmed)
+                        && (key == "name" || key == "Priority") {
                             return Some(value);
                         }
-                    }
                 }
             }
         }
@@ -340,16 +335,14 @@ pub fn find_game_path(app_id: u32) -> Option<PathBuf> {
     let libraries = find_steam_libraries();
     for lib in &libraries {
         let manifest_path = lib.path.join(format!("appmanifest_{app_id}.acf"));
-        if manifest_path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&manifest_path) {
-                if let Some(install_dir) = parse_acf_install_dir(&contents) {
+        if manifest_path.exists()
+            && let Ok(contents) = std::fs::read_to_string(&manifest_path)
+                && let Some(install_dir) = parse_acf_install_dir(&contents) {
                     let game_path = lib.path.join("common").join(install_dir);
                     if game_path.is_dir() {
                         return Some(game_path);
                     }
                 }
-            }
-        }
     }
     None
 }
@@ -357,11 +350,10 @@ pub fn find_game_path(app_id: u32) -> Option<PathBuf> {
 pub fn detect_games() -> Vec<(GameKind, PathBuf)> {
     let mut found = Vec::new();
     for kind in GameKind::all() {
-        if let Some(app_id) = kind.steam_app_id() {
-            if let Some(path) = find_game_path(app_id) {
+        if let Some(app_id) = kind.steam_app_id()
+            && let Some(path) = find_game_path(app_id) {
                 found.push((kind, path));
             }
-        }
     }
     found
 }
@@ -392,6 +384,7 @@ pub fn find_steam_root() -> Option<PathBuf> {
 /// Detect if Steam is running as a Flatpak installation.
 ///
 /// Returns true if the Steam root is in the Flatpak directory.
+#[allow(dead_code)]
 pub fn is_steam_flatpak() -> bool {
     if let Some(steam_root) = find_steam_root() {
         let steam_root_str = steam_root.to_string_lossy();
@@ -405,7 +398,7 @@ pub fn is_steam_flatpak() -> bool {
 ///
 /// This is more reliable than checking steam_root alone, since Proton or compatdata
 /// may be installed in the Flatpak directory even if steam_root points to a symlink.
-pub fn is_path_in_flatpak(path: &PathBuf) -> bool {
+pub fn is_path_in_flatpak(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     path_str.contains("/.var/app/com.valvesoftware.Steam/")
 }
@@ -652,11 +645,11 @@ fn launch_tool_native(
 
 /// Launch tool using Flatpak Steam wrapper.
 fn launch_tool_with_flatpak(
-    proton_script: &PathBuf,
-    exe_path: &PathBuf,
+    proton_script: &Path,
+    exe_path: &Path,
     arguments: &str,
-    steam_root: &PathBuf,
-    compatdata_path: &PathBuf,
+    steam_root: &Path,
+    compatdata_path: &Path,
     app_id: u32,
 ) -> Result<std::process::Child, String> {
     // Build the shell command to run inside Flatpak

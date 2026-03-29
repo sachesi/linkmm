@@ -470,6 +470,7 @@ fn build_active_download_row(
 
 // ── Row builder ───────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_entry_row(
     entry: &DownloadEntry,
     installed_archives: &[String],
@@ -483,7 +484,7 @@ fn build_entry_row(
     let is_installed = installed_archives.contains(&entry.name);
     let row = adw::ActionRow::builder()
         .title(&entry.name)
-        .subtitle(&format_size(entry.size_bytes))
+        .subtitle(format_size(entry.size_bytes))
         .build();
 
     if is_installed {
@@ -495,8 +496,8 @@ fn build_entry_row(
     }
 
     // Install button (when a game is selected)
-    if !is_installed {
-        if let Some(ref g) = **game {
+    if !is_installed
+        && let Some(ref g) = **game {
             let ext = entry
                 .path
                 .extension()
@@ -536,7 +537,6 @@ fn build_entry_row(
             });
             row.add_suffix(&install_btn);
         }
-    }
 
     let delete_btn = gtk4::Button::new();
     delete_btn.set_icon_name("user-trash-symbolic");
@@ -580,6 +580,7 @@ fn build_entry_row(
 
 // ── Install dialog ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn show_install_dialog(
     anchor: &gtk4::Button,
     archive_path: &Path,
@@ -609,6 +610,7 @@ fn show_install_dialog(
     let ap = archive_path.to_path_buf();
 
     // Channel carries the result back to the GTK main thread.
+    #[allow(clippy::type_complexity)]
     let (tx, rx) = std::sync::mpsc::channel::<
         Result<
             (
@@ -621,6 +623,7 @@ fn show_install_dialog(
     >();
 
     std::thread::spawn(move || {
+        #[allow(clippy::type_complexity)]
         let result = (|| -> Result<(InstallStrategy, Option<FomodConfig>, HashMap<String, Vec<u8>>), String> {
             let strategy = detect_strategy(&ap)?;
             let mut images_data = HashMap::new();
@@ -637,11 +640,10 @@ fn show_install_dialog(
                                 }
                             }
                         }
-                        if !image_paths.is_empty() {
-                            if let Ok(data) = read_archive_files_bytes(&ap, &image_paths) {
+                        if !image_paths.is_empty()
+                            && let Ok(data) = read_archive_files_bytes(&ap, &image_paths) {
                                 images_data = data;
                             }
-                        }
                         Some(cfg)
                     }
                     Err(e) => {
@@ -739,6 +741,7 @@ fn show_install_dialog(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_strategy_picker(
     parent: Option<&gtk4::Window>,
     archive_path: &Path,
@@ -754,7 +757,7 @@ fn show_strategy_picker(
 ) {
     let dialog = adw::AlertDialog::builder()
         .heading("Install Mod")
-        .body(&format!(
+        .body(format!(
             "Install \"{archive_name}\" into the game's Data folder?"
         ))
         .build();
@@ -792,6 +795,7 @@ fn show_strategy_picker(
     dialog.present(parent);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_install(
     archive_path: &Path,
     archive_name: &str,
@@ -900,6 +904,7 @@ fn do_install(
 
 /// Handle the install result on the GTK main thread once the background thread
 /// has finished.  Updates the status popup, config, and refreshes the list.
+#[allow(clippy::too_many_arguments)]
 fn on_install_complete(
     result: Result<crate::core::mods::Mod, String>,
     archive_name: &str,
@@ -1089,18 +1094,16 @@ fn sanitize_step_selection(
                 if selected.len() > 1 {
                     selected.truncate(1);
                 }
-                if selected.is_empty() {
-                    if let Some(first) = visible.first() {
+                if selected.is_empty()
+                    && let Some(first) = visible.first() {
                         selected.push(*first);
                     }
-                }
             }
             GroupType::SelectAtLeastOne => {
-                if selected.is_empty() {
-                    if let Some(first) = visible.first() {
+                if selected.is_empty()
+                    && let Some(first) = visible.first() {
                         selected.push(*first);
                     }
-                }
             }
             GroupType::SelectAtMostOne => {
                 if selected.len() > 1 {
@@ -1159,6 +1162,7 @@ fn load_fomod_option_image(
     cache.borrow().get(image_path).cloned()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_fomod_wizard(
     parent: Option<&gtk4::Window>,
     archive_path: &Path,
@@ -1196,7 +1200,7 @@ fn show_fomod_wizard(
     }
 
     let dialog = adw::Window::builder()
-        .title(&format!("Install: {mod_display_name}"))
+        .title(format!("Install: {mod_display_name}"))
         .modal(true)
         .default_width(900)
         .default_height(620)
@@ -1396,11 +1400,10 @@ fn show_fomod_wizard(
                         continue;
                     }
                     let row = adw::ActionRow::builder().title(&plugin.name).build();
-                    if let Some(ref d) = plugin.description {
-                        if !d.is_empty() {
+                    if let Some(ref d) = plugin.description
+                        && !d.is_empty() {
                             row.set_subtitle(d);
                         }
-                    }
                     let check = gtk4::CheckButton::new();
                     if use_radio {
                         if let Some(ref first) = first_radio_button {
@@ -1440,8 +1443,8 @@ fn show_fomod_wizard(
                     check.set_valign(gtk4::Align::Center);
                     row.add_prefix(&check);
                     row.set_activatable_widget(Some(&check));
-                    if let Some(ref image_path) = plugin.image_path {
-                        if let Some(texture) = load_fomod_option_image(image_path, &img_cache) {
+                    if let Some(ref image_path) = plugin.image_path
+                        && let Some(texture) = load_fomod_option_image(image_path, &img_cache) {
                             has_step_preview = true;
                             if check.is_active() || default_preview.is_none() {
                                 default_preview = Some((texture.clone(), plugin.name.clone()));
@@ -1468,7 +1471,6 @@ fn show_fomod_wizard(
                             });
                             check.add_controller(check_motion);
                         }
-                    }
                     let tl = match plugin.type_descriptor {
                         PluginType::Required => Some("Required"),
                         PluginType::Recommended => Some("Recommended"),
@@ -1568,6 +1570,7 @@ fn show_fomod_wizard(
 }
 
 /// Public entry point for the FOMOD wizard, callable from the Library page.
+#[allow(clippy::too_many_arguments)]
 pub fn show_fomod_wizard_from_library(
     parent: Option<&gtk4::Window>,
     archive_path: &Path,
@@ -1731,11 +1734,10 @@ fn nxm_metadata_path_for_archive(archive_path: &Path) -> PathBuf {
 
 fn read_nxm_mod_id_for_archive(archive_path: &Path, game: &Game) -> Option<u32> {
     // Try new consolidated format first (~/.config/linkmm/<game_id>/nxm_metadata.json)
-    if let Some(file_name) = archive_path.file_name().and_then(|n| n.to_str()) {
-        if let Some(id) = game.read_nxm_mod_id(file_name) {
+    if let Some(file_name) = archive_path.file_name().and_then(|n| n.to_str())
+        && let Some(id) = game.read_nxm_mod_id(file_name) {
             return Some(id);
         }
-    }
     // Fallback: try old per-archive sidecar file (.nxm.json alongside archive)
     let metadata_path = nxm_metadata_path_for_archive(archive_path);
     let contents = std::fs::read_to_string(metadata_path).ok()?;

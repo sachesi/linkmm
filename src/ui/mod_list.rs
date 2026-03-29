@@ -48,8 +48,8 @@ pub fn build_mod_list(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widg
         let config_clone2 = Rc::clone(&config_clone);
         let container_clone2 = container_clone.clone();
         dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
-            if let Ok(file) = result {
-                if let Some(path) = file.path() {
+            if let Ok(file) = result
+                && let Some(path) = file.path() {
                     let mod_name = path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -64,7 +64,6 @@ pub fn build_mod_list(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widg
                     // Refresh the list to show the newly added mod
                     refresh_mod_list(&container_clone2, &game_clone2, Rc::clone(&config_clone2));
                 }
-            }
         });
     });
 
