@@ -138,12 +138,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let status_progress_c = status_progress.clone();
         let status_revealer_c = status_revealer.clone();
         deploy_btn.connect_clicked(move |btn| {
-            set_library_busy(
-                &search_entry_c,
-                &deploy_btn_c,
-                &container_c,
-                true,
-            );
+            set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, true);
             status_revealer_c.set_reveal_child(true);
             status_label_c.set_text("Preparing deployment…");
             status_progress_c.set_fraction(0.0);
@@ -260,12 +255,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 status_label_c.set_text(&msg);
                 status_progress_c.set_fraction(1.0);
                 status_progress_c.set_text(Some("100%"));
-                set_library_busy(
-                    &search_entry_c,
-                    &deploy_btn_c,
-                    &container_c,
-                    false,
-                );
+                set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
                 hide_status_popup_later(status_revealer_c.clone());
                 show_toast(btn.upcast_ref(), &msg);
                 refresh_library_content_with_search(
@@ -647,15 +637,21 @@ fn build_mod_row(
                 } else {
                     // Keep downloaded archives on disk, but clear install marker
                     // so Downloads reflects that this mod is no longer installed.
-                    let mod_name_lower = m.name.to_lowercase();
                     let mut cfg = config_c.borrow_mut();
-                    cfg.installed_archives.retain(|archive| {
-                        let archive_stem = Path::new(archive)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_lowercase())
-                            .unwrap_or_default();
-                        archive_stem != mod_name_lower
-                    });
+                    let gs = cfg.game_settings_mut(&game_c.id);
+                    if let Some(archive_name) = &m.archive_name {
+                        gs.installed_archives
+                            .retain(|archive| archive != archive_name);
+                    } else {
+                        let mod_name_lower = m.name.to_lowercase();
+                        gs.installed_archives.retain(|archive| {
+                            let archive_stem = Path::new(archive)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_lowercase())
+                                .unwrap_or_default();
+                            archive_stem != mod_name_lower
+                        });
+                    }
                     cfg.save();
                 }
             }
@@ -979,9 +975,7 @@ fn show_move_to_position_dialog_for_mod(
     };
     let mod_name = db.mods[current_pos].name.clone();
 
-    let body = format!(
-        "Enter the new position for \"{mod_name}\".\nValid range: 1–{total}.",
-    );
+    let body = format!("Enter the new position for \"{mod_name}\".\nValid range: 1–{total}.",);
 
     let dialog = adw::AlertDialog::builder()
         .heading("Move to Position")
@@ -1129,7 +1123,8 @@ fn compute_global_conflict_states(mods: &[Mod]) -> HashMap<String, ConflictState
             if all_files[j].is_empty() {
                 continue;
             }
-            let shared: BTreeSet<String> = all_files[i].intersection(&all_files[j]).cloned().collect();
+            let shared: BTreeSet<String> =
+                all_files[i].intersection(&all_files[j]).cloned().collect();
             if shared.is_empty() {
                 continue;
             }
@@ -1275,6 +1270,7 @@ mod tests {
             nexus_id: None,
             source_path: PathBuf::from(path),
             installed_from_nexus: false,
+            archive_name: None,
         }
     }
 
