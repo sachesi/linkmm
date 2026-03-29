@@ -144,6 +144,198 @@ fn parse_acf_install_dir(contents: &str) -> Option<String> {
     None
 }
 
+/// Parse config.vdf to find per-game compatibility tool mapping.
+///
+/// Returns the tool name (e.g., "proton_8", "GE-Proton9-2") for the given app_id.
+fn parse_per_game_proton_config(app_id: u32) -> Option<String> {
+    let home = dirs::home_dir()?;
+
+    let candidate_config_paths = vec![
+        home.join(".steam").join("steam").join("config").join("config.vdf"),
+        home.join(".local").join("share").join("Steam").join("config").join("config.vdf"),
+        home.join("snap").join("steam").join("common").join(".steam").join("steam").join("config").join("config.vdf"),
+        home.join(".var").join("app").join("com.valvesoftware.Steam").join(".steam").join("steam").join("config").join("config.vdf"),
+    ];
+
+    for config_path in candidate_config_paths {
+        if !config_path.exists() {
+            continue;
+        }
+
+        if let Ok(contents) = std::fs::read_to_string(&config_path) {
+            if let Some(tool_name) = parse_compat_tool_mapping(&contents, app_id) {
+                log::debug!("Found per-game Proton config for {}: {} in {}",
+                    app_id, tool_name, config_path.display());
+                return Some(tool_name);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse the CompatToolMapping section from config.vdf.
+fn parse_compat_tool_mapping(contents: &str, app_id: u32) -> Option<String> {
+    let mut in_compat_mapping = false;
+    let mut depth = 0i32;
+    let app_id_str = app_id.to_string();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+
+        if trimmed == "{" {
+            depth += 1;
+        } else if trimmed == "}" {
+            if in_compat_mapping && depth == 1 {
+                in_compat_mapping = false;
+            }
+            depth -= 1;
+        } else if trimmed.contains("CompatToolMapping") {
+            in_compat_mapping = true;
+        } else if in_compat_mapping && depth > 0 {
+            if let Some((key, _)) = parse_vdf_key_value(trimmed) {
+                if key == app_id_str {
+                    // Next section should have "name" key with the tool
+                    continue;
+                }
+            }
+            // Check for nested structure: app_id { "name" "tool_name" }
+            if trimmed.starts_with(&format!("\"{}\"", app_id_str)) {
+                // Found our app, look for the tool name in subsequent lines
+                let mut found_app_section = true;
+                let mut search_depth = depth;
+
+                for next_line in contents.lines().skip_while(|l| l.trim() != trimmed).skip(1) {
+                    let next_trimmed = next_line.trim();
+                    if next_trimmed == "{" {
+                        search_depth += 1;
+                    } else if next_trimmed == "}" {
+                        search_depth -= 1;
+                        if search_depth < depth {
+                            break;
+                        }
+                    } else if let Some((key, value)) = parse_vdf_key_value(next_trimmed) {
+                        if key == "name" || key == "Priority" {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Find all possible Proton installation directories.
+fn find_proton_directories() -> Vec<PathBuf> {
+    let mut proton_dirs = Vec::new();
+    let libraries = find_steam_libraries();
+
+    for lib in &libraries {
+        // Check steamapps/common for official Proton
+        if let Some(steamapps_parent) = lib.path.parent() {
+            let common_path = steamapps_parent.join("common");
+            if common_path.is_dir() {
+                proton_dirs.push(common_path);
+            }
+        }
+
+        // Check compatibilitytools.d for custom Proton (GE-Proton, etc.)
+        if let Some(steam_root) = lib.path.parent() {
+            let compat_tools_path = steam_root.join("compatibilitytools.d");
+            if compat_tools_path.is_dir() {
+                proton_dirs.push(compat_tools_path);
+            }
+        }
+    }
+
+    // Also check for compatibilitytools.d in Steam roots directly
+    if let Some(home) = dirs::home_dir() {
+        let roots = vec![
+            home.join(".steam").join("steam"),
+            home.join(".local").join("share").join("Steam"),
+            home.join(".var").join("app").join("com.valvesoftware.Steam").join(".steam").join("steam"),
+        ];
+
+        for root in roots {
+            let compat_path = root.join("compatibilitytools.d");
+            if compat_path.is_dir() && !proton_dirs.contains(&compat_path) {
+                proton_dirs.push(compat_path);
+            }
+        }
+    }
+
+    proton_dirs
+}
+
+/// Search for a Proton installation by name.
+///
+/// Searches in both steamapps/common and compatibilitytools.d directories.
+/// Matches tool names like "proton_8", "GE-Proton9-2", etc.
+fn find_proton_by_name(tool_name: &str) -> Option<PathBuf> {
+    let proton_dirs = find_proton_directories();
+
+    for base_dir in &proton_dirs {
+        if let Ok(entries) = std::fs::read_dir(base_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let dir_name = entry.file_name().to_string_lossy().to_string();
+
+                // Check for exact match or normalized match
+                if dir_name == tool_name || normalize_proton_name(&dir_name) == normalize_proton_name(tool_name) {
+                    // Verify it has a proton script
+                    if path.join("proton").exists() {
+                        log::debug!("Found Proton at: {}", path.display());
+                        return Some(path);
+                    }
+                }
+
+                // Also check for partial matches (e.g., "Proton 8.0" matches "proton_8")
+                if tool_name.contains("proton") && dir_name.to_lowercase().contains("proton") {
+                    let tool_lower = tool_name.to_lowercase();
+                    let dir_lower = dir_name.to_lowercase();
+
+                    // Extract version numbers for comparison
+                    if tools_match_version(&tool_lower, &dir_lower) && path.join("proton").exists() {
+                        log::debug!("Found Proton at: {} (version match)", path.display());
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Normalize Proton tool names for comparison.
+fn normalize_proton_name(name: &str) -> String {
+    name.to_lowercase()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+        .replace(".", "")
+}
+
+/// Check if two Proton tool names refer to the same version.
+fn tools_match_version(tool1: &str, tool2: &str) -> bool {
+    // Extract numbers from both names
+    let nums1: Vec<&str> = tool1.split(|c: char| !c.is_numeric()).filter(|s| !s.is_empty()).collect();
+    let nums2: Vec<&str> = tool2.split(|c: char| !c.is_numeric()).filter(|s| !s.is_empty()).collect();
+
+    // If we have version numbers, they should match
+    if !nums1.is_empty() && !nums2.is_empty() {
+        nums1.first() == nums2.first()
+    } else {
+        false
+    }
+}
+
 pub fn find_game_path(app_id: u32) -> Option<PathBuf> {
     let libraries = find_steam_libraries();
     for lib in &libraries {
@@ -257,12 +449,31 @@ pub fn launch_game(game: &crate::core::games::Game) -> Result<(), String> {
 ///
 /// Returns the path to the Proton directory (e.g., `~/.steam/steam/steamapps/common/Proton 8.0`)
 /// and the `compatdata` directory for the game.
+///
+/// This function now checks Steam's config.vdf for per-game Proton settings, supporting:
+/// - Native Steam installations (~/.local/share/Steam)
+/// - Flatpak Steam (~/.var/app/com.valvesoftware.Steam)
+/// - Custom Proton versions (GE-Proton in compatibilitytools.d)
 pub fn find_proton_for_game(app_id: u32) -> Result<(PathBuf, PathBuf), String> {
     // Find the compatdata path first
     let compatdata_path = find_compatdata_path(app_id)
         .ok_or_else(|| format!("Could not find compatdata for App ID {}", app_id))?;
 
-    // Check for a toolmanifest.vdf inside compatdata to determine which Proton version is used
+    log::debug!("Finding Proton for app_id: {}", app_id);
+
+    // Step 1: Check config.vdf for per-game Proton configuration
+    if let Some(tool_name) = parse_per_game_proton_config(app_id) {
+        log::info!("Per-game Proton config found: {}", tool_name);
+
+        if let Some(proton_path) = find_proton_by_name(&tool_name) {
+            log::info!("Using configured Proton: {}", proton_path.display());
+            return Ok((proton_path, compatdata_path));
+        } else {
+            log::warn!("Configured Proton '{}' not found, falling back to detection", tool_name);
+        }
+    }
+
+    // Step 2: Check compatdata version file
     let tool_manifest = compatdata_path.join("version");
     let proton_version = if tool_manifest.exists() {
         std::fs::read_to_string(&tool_manifest)
@@ -275,45 +486,41 @@ pub fn find_proton_for_game(app_id: u32) -> Result<(PathBuf, PathBuf), String> {
         None
     };
 
-    // Try to find Proton in common directories
-    let libraries = find_steam_libraries();
-    for lib in &libraries {
-        let common_path = lib.path.parent()
-            .map(|p| p.join("common"))
-            .unwrap_or_else(|| lib.path.join("common"));
+    if let Some(ref version) = proton_version {
+        log::debug!("Compatdata version file contains: {}", version);
 
-        if !common_path.is_dir() {
-            continue;
+        // Try to find Proton matching this version
+        if let Some(proton_path) = find_proton_by_name(version) {
+            log::info!("Found Proton matching version file: {}", proton_path.display());
+            return Ok((proton_path, compatdata_path));
         }
+    }
 
-        // If we have a specific version from compatdata, look for it
-        if let Some(ref version) = proton_version {
-            // Try exact match first (e.g., "Proton 8.0")
-            let proton_path = common_path.join(format!("Proton {}", version));
-            if proton_path.join("proton").exists() {
-                return Ok((proton_path, compatdata_path));
-            }
-        }
+    // Step 3: Fallback - search for any Proton installation
+    log::debug!("Falling back to automatic Proton detection");
+    let proton_dirs = find_proton_directories();
 
-        // Fallback: find any Proton installation
-        if let Ok(entries) = std::fs::read_dir(&common_path) {
-            let mut proton_dirs: Vec<_> = entries
+    for base_dir in &proton_dirs {
+        if let Ok(entries) = std::fs::read_dir(base_dir) {
+            let mut proton_candidates: Vec<_> = entries
                 .flatten()
                 .filter(|e| {
                     let name = e.file_name().to_string_lossy().to_string();
-                    name.starts_with("Proton") && e.path().join("proton").exists()
+                    name.to_lowercase().contains("proton") && e.path().join("proton").exists()
                 })
                 .collect();
 
             // Sort to prefer newer versions (reverse alphabetical often works)
-            proton_dirs.sort_by(|a, b| {
+            proton_candidates.sort_by(|a, b| {
                 b.file_name()
                     .to_string_lossy()
                     .cmp(&a.file_name().to_string_lossy())
             });
 
-            if let Some(proton_dir) = proton_dirs.first() {
-                return Ok((proton_dir.path(), compatdata_path));
+            if let Some(proton_dir) = proton_candidates.first() {
+                let proton_path = proton_dir.path();
+                log::info!("Using fallback Proton: {}", proton_path.display());
+                return Ok((proton_path, compatdata_path));
             }
         }
     }
@@ -408,5 +615,60 @@ mod tests {
                 "error should not be about missing App ID for SkyrimSE: {e}"
             ),
         }
+    }
+
+    #[test]
+    fn parse_compat_tool_mapping_finds_app_config() {
+        let config_vdf = r#"
+"InstallConfigStore"
+{
+    "Software"
+    {
+        "Valve"
+        {
+            "Steam"
+            {
+                "CompatToolMapping"
+                {
+                    "489830"
+                    {
+                        "name"        "proton_8"
+                        "config"      ""
+                        "Priority"    "250"
+                    }
+                    "377160"
+                    {
+                        "name"        "GE-Proton9-2"
+                        "config"      ""
+                        "Priority"    "250"
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+        let result = parse_compat_tool_mapping(config_vdf, 489830);
+        assert_eq!(result, Some("proton_8".to_string()));
+
+        let result2 = parse_compat_tool_mapping(config_vdf, 377160);
+        assert_eq!(result2, Some("GE-Proton9-2".to_string()));
+
+        let result3 = parse_compat_tool_mapping(config_vdf, 999999);
+        assert_eq!(result3, None);
+    }
+
+    #[test]
+    fn normalize_proton_name_removes_separators() {
+        assert_eq!(normalize_proton_name("Proton-8.0"), "proton80");
+        assert_eq!(normalize_proton_name("GE-Proton9-2"), "geproton92");
+        assert_eq!(normalize_proton_name("proton_experimental"), "protonexperimental");
+    }
+
+    #[test]
+    fn tools_match_version_compares_numbers() {
+        assert!(tools_match_version("proton_8", "Proton 8.0"));
+        assert!(tools_match_version("GE-Proton9-2", "geproton9"));
+        assert!(!tools_match_version("proton_8", "proton_9"));
     }
 }
