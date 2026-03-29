@@ -2538,6 +2538,8 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
         };
 
         let matched_source_lower = matched_source.to_lowercase();
+        let source_prefix_lower = (!matched_source_lower.is_empty())
+            .then(|| format!("{matched_source_lower}/"));
 
         for (orig_entry, idx) in matching_entries {
             let entry_norm = normalise_path(&orig_entry);
@@ -2550,10 +2552,9 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
                 }
             } else if entry_lower == matched_source_lower {
                 destination.clone()
-            } else if let Some(suffix) =
-                entry_norm
-                    .get(matched_source_lower.len() + 1..)
-                    .filter(|_| entry_lower.starts_with(&format!("{}/", matched_source_lower)))
+            } else if let Some(suffix) = source_prefix_lower
+                .as_deref()
+                .and_then(|prefix| entry_norm.get(prefix.len()..).filter(|_| entry_lower.starts_with(prefix)))
             {
                 if destination.is_empty() {
                     suffix.to_string()
@@ -3260,7 +3261,7 @@ mod tests {
     }
 
     #[test]
-    fn install_fomod_files_data_root_fallback_preserves_original_filename_case() {
+    fn install_fomod_preserves_case_with_data_root_fallback() {
         let tmp = tempdir();
         let archive = create_test_zip(
             &tmp,
