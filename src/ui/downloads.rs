@@ -12,9 +12,10 @@ use crate::core::config::AppConfig;
 use crate::core::download_state;
 use crate::core::games::Game;
 use crate::core::installer::{
-    DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
-    InstallStep, InstallStrategy, PluginDependencies, PluginType, detect_strategy,
-    install_mod_from_archive_with_nexus, parse_fomod_from_archive, read_archive_files_bytes,
+    DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodGroupType, FomodInstallStep,
+    FomodPlugin, FomodPluginType, InstallStrategy, PluginDependencies,
+    detect_strategy, install_mod_from_archive_with_nexus, parse_fomod_from_archive,
+    read_archive_files_bytes,
 };
 
 // ── Archive extensions ────────────────────────────────────────────────────────
@@ -1041,7 +1042,7 @@ fn dependencies_match(
 }
 
 fn step_is_visible_with_flags(
-    step: &InstallStep,
+    step: &FomodInstallStep,
     active_flags: &HashMap<String, HashSet<String>>,
 ) -> bool {
     let Some(visible) = &step.visible else {
@@ -1087,10 +1088,10 @@ fn sanitize_step_selection(
             .collect();
         selected.retain(|pi| visible.contains(pi));
         match group.group_type {
-            GroupType::SelectAll => {
+            FomodGroupType::SelectAll => {
                 *selected = visible;
             }
-            GroupType::SelectExactlyOne => {
+            FomodGroupType::SelectExactlyOne => {
                 if selected.len() > 1 {
                     selected.truncate(1);
                 }
@@ -1099,18 +1100,18 @@ fn sanitize_step_selection(
                         selected.push(*first);
                     }
             }
-            GroupType::SelectAtLeastOne => {
+            FomodGroupType::SelectAtLeastOne => {
                 if selected.is_empty()
                     && let Some(first) = visible.first() {
                         selected.push(*first);
                     }
             }
-            GroupType::SelectAtMostOne => {
+            FomodGroupType::SelectAtMostOne => {
                 if selected.len() > 1 {
                     selected.truncate(1);
                 }
             }
-            GroupType::SelectAny => {}
+            FomodGroupType::SelectAny => {}
         }
         selected.sort();
         selected.dedup();
@@ -1228,8 +1229,8 @@ fn show_fomod_wizard(
                 for (idx, plugin) in group.plugins.iter().enumerate() {
                     if matches!(
                         plugin.type_descriptor,
-                        PluginType::Required | PluginType::Recommended
-                    ) || group.group_type == GroupType::SelectAll
+                        FomodPluginType::Required | FomodPluginType::Recommended
+                    ) || group.group_type == FomodGroupType::SelectAll
                     {
                         gs.push(idx);
                     }
@@ -1237,7 +1238,7 @@ fn show_fomod_wizard(
                 if gs.is_empty()
                     && matches!(
                         group.group_type,
-                        GroupType::SelectExactlyOne | GroupType::SelectAtLeastOne
+                        FomodGroupType::SelectExactlyOne | FomodGroupType::SelectAtLeastOne
                     )
                     && !group.plugins.is_empty()
                 {
@@ -1376,11 +1377,11 @@ fn show_fomod_wizard(
             let mut default_preview: Option<(gtk4::gdk::Texture, String)> = None;
             for (gi, group) in step.groups.iter().enumerate() {
                 let type_desc = match group.group_type {
-                    GroupType::SelectExactlyOne => "select one",
-                    GroupType::SelectAtMostOne => "select at most one",
-                    GroupType::SelectAtLeastOne => "select at least one",
-                    GroupType::SelectAll => "all required",
-                    GroupType::SelectAny => "select any",
+                    FomodGroupType::SelectExactlyOne => "select one",
+                    FomodGroupType::SelectAtMostOne => "select at most one",
+                    FomodGroupType::SelectAtLeastOne => "select at least one",
+                    FomodGroupType::SelectAll => "all required",
+                    FomodGroupType::SelectAny => "select any",
                 };
                 let frame = gtk4::Frame::new(Some(&format!("{} ({type_desc})", group.name)));
                 frame.add_css_class("card");
@@ -1392,7 +1393,7 @@ fn show_fomod_wizard(
                 lb.set_hexpand(true);
                 let use_radio = matches!(
                     group.group_type,
-                    GroupType::SelectExactlyOne | GroupType::SelectAtMostOne
+                    FomodGroupType::SelectExactlyOne | FomodGroupType::SelectAtMostOne
                 );
                 let mut first_radio_button: Option<gtk4::CheckButton> = None;
                 for (pi, plugin) in group.plugins.iter().enumerate() {
@@ -1418,7 +1419,7 @@ fn show_fomod_wizard(
                             check.set_active(gs.contains(&pi));
                         }
                     }
-                    if group.group_type == GroupType::SelectAll {
+                    if group.group_type == FomodGroupType::SelectAll {
                         check.set_active(true);
                         check.set_sensitive(false);
                     }
@@ -1472,10 +1473,10 @@ fn show_fomod_wizard(
                             check.add_controller(check_motion);
                         }
                     let tl = match plugin.type_descriptor {
-                        PluginType::Required => Some("Required"),
-                        PluginType::Recommended => Some("Recommended"),
-                        PluginType::NotUsable => Some("Not Usable"),
-                        PluginType::Optional => None,
+                        FomodPluginType::Required => Some("Required"),
+                        FomodPluginType::Recommended => Some("Recommended"),
+                        FomodPluginType::NotUsable => Some("Not Usable"),
+                        FomodPluginType::Optional => None,
                     };
                     if let Some(lt) = tl {
                         let badge = gtk4::Label::new(Some(lt));
@@ -1799,8 +1800,8 @@ mod tests {
     use super::*;
     use crate::core::games::{Game, GameKind};
     use crate::core::installer::{
-        ConditionFlag, DependencyOperator, FlagDependency, FomodPlugin, InstallStep,
-        PluginDependencies, PluginGroup,
+        ConditionFlag, DependencyOperator, FlagDependency, FomodInstallStep, FomodPlugin,
+        FomodPluginGroup, PluginDependencies,
     };
     use std::path::PathBuf;
 
@@ -1819,7 +1820,7 @@ mod tests {
                 destination: "Data".to_string(),
                 priority: 0,
             }],
-            type_descriptor: PluginType::Optional,
+            type_descriptor: FomodPluginType::Optional,
             condition_flags,
             dependencies,
         }
@@ -1844,12 +1845,12 @@ mod tests {
             steps: Vec::new(),
             conditional_file_installs: Vec::new(),
         };
-        config.steps.push(InstallStep {
+        config.steps.push(FomodInstallStep {
             name: "Flags".to_string(),
             visible: None,
-            groups: vec![PluginGroup {
+            groups: vec![FomodPluginGroup {
                 name: "Feature".to_string(),
-                group_type: GroupType::SelectExactlyOne,
+                group_type: FomodGroupType::SelectExactlyOne,
                 plugins: vec![
                     test_plugin(
                         "Enable +",
@@ -1872,12 +1873,12 @@ mod tests {
                 ],
             }],
         });
-        config.steps.push(InstallStep {
+        config.steps.push(FomodInstallStep {
             name: "Variant".to_string(),
             visible: None,
-            groups: vec![PluginGroup {
+            groups: vec![FomodPluginGroup {
                 name: "Pick".to_string(),
-                group_type: GroupType::SelectAny,
+                group_type: FomodGroupType::SelectAny,
                 plugins: vec![
                     test_plugin(
                         "Plus variant",
@@ -1922,21 +1923,21 @@ mod tests {
             mod_name: Some("Test".to_string()),
             required_files: Vec::new(),
             conditional_file_installs: Vec::new(),
-            steps: vec![InstallStep {
+            steps: vec![FomodInstallStep {
                 name: "Main".to_string(),
                 visible: None,
                 groups: vec![
-                    PluginGroup {
+                    FomodPluginGroup {
                         name: "Exactly one".to_string(),
-                        group_type: GroupType::SelectExactlyOne,
+                        group_type: FomodGroupType::SelectExactlyOne,
                         plugins: vec![
                             test_plugin("A", "a.txt", Vec::new(), None),
                             test_plugin("B", "b.txt", Vec::new(), None),
                         ],
                     },
-                    PluginGroup {
+                    FomodPluginGroup {
                         name: "At most one".to_string(),
-                        group_type: GroupType::SelectAtMostOne,
+                        group_type: FomodGroupType::SelectAtMostOne,
                         plugins: vec![
                             test_plugin("C", "c.txt", Vec::new(), None),
                             test_plugin("D", "d.txt", Vec::new(), None),
@@ -1961,12 +1962,12 @@ mod tests {
             mod_name: Some("Test".to_string()),
             required_files: Vec::new(),
             steps: vec![
-                InstallStep {
+                FomodInstallStep {
                     name: "Flags".to_string(),
                     visible: None,
-                    groups: vec![PluginGroup {
+                    groups: vec![FomodPluginGroup {
                         name: "Feature".to_string(),
-                        group_type: GroupType::SelectExactlyOne,
+                        group_type: FomodGroupType::SelectExactlyOne,
                         plugins: vec![
                             test_plugin(
                                 "Enable Underwear",
@@ -1981,7 +1982,7 @@ mod tests {
                         ],
                     }],
                 },
-                InstallStep {
+                FomodInstallStep {
                     name: "Underwear Options".to_string(),
                     visible: Some(PluginDependencies {
                         operator: DependencyOperator::And,
@@ -1990,9 +1991,9 @@ mod tests {
                             value: "On".to_string(),
                         }],
                     }),
-                    groups: vec![PluginGroup {
+                    groups: vec![FomodPluginGroup {
                         name: "Color".to_string(),
-                        group_type: GroupType::SelectExactlyOne,
+                        group_type: FomodGroupType::SelectExactlyOne,
                         plugins: vec![test_plugin(
                             "Black",
                             "underwear-black.txt",
@@ -2041,19 +2042,19 @@ mod tests {
         let config = FomodConfig {
             mod_name: Some("Diamond Skin".to_string()),
             required_files: Vec::new(),
-            steps: vec![InstallStep {
+            steps: vec![FomodInstallStep {
                 name: "Body Type".to_string(),
                 visible: None,
-                groups: vec![PluginGroup {
+                groups: vec![FomodPluginGroup {
                     name: "Body".to_string(),
-                    group_type: GroupType::SelectExactlyOne,
+                    group_type: FomodGroupType::SelectExactlyOne,
                     plugins: vec![
                         FomodPlugin {
                             name: "CBBE".to_string(),
                             description: None,
                             image_path: None,
                             files: Vec::new(), // No direct files
-                            type_descriptor: PluginType::Optional,
+                            type_descriptor: FomodPluginType::Optional,
                             condition_flags: vec![ConditionFlag {
                                 name: "isCBBE".to_string(),
                                 value: "selected".to_string(),
@@ -2065,7 +2066,7 @@ mod tests {
                             description: None,
                             image_path: None,
                             files: Vec::new(), // No direct files
-                            type_descriptor: PluginType::Optional,
+                            type_descriptor: FomodPluginType::Optional,
                             condition_flags: vec![ConditionFlag {
                                 name: "isUNP".to_string(),
                                 value: "selected".to_string(),
