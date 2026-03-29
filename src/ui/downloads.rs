@@ -483,7 +483,7 @@ fn build_entry_row(
     let is_installed = installed_archives.contains(&entry.name);
     let row = adw::ActionRow::builder()
         .title(&entry.name)
-        .subtitle(&format_size(entry.size_bytes))
+        .subtitle(format_size(entry.size_bytes))
         .build();
 
     if is_installed {
@@ -495,8 +495,8 @@ fn build_entry_row(
     }
 
     // Install button (when a game is selected)
-    if !is_installed {
-        if let Some(ref g) = **game {
+    if !is_installed
+        && let Some(ref g) = **game {
             let ext = entry
                 .path
                 .extension()
@@ -536,7 +536,6 @@ fn build_entry_row(
             });
             row.add_suffix(&install_btn);
         }
-    }
 
     let delete_btn = gtk4::Button::new();
     delete_btn.set_icon_name("user-trash-symbolic");
@@ -637,11 +636,10 @@ fn show_install_dialog(
                                 }
                             }
                         }
-                        if !image_paths.is_empty() {
-                            if let Ok(data) = read_archive_files_bytes(&ap, &image_paths) {
+                        if !image_paths.is_empty()
+                            && let Ok(data) = read_archive_files_bytes(&ap, &image_paths) {
                                 images_data = data;
                             }
-                        }
                         Some(cfg)
                     }
                     Err(e) => {
@@ -754,7 +752,7 @@ fn show_strategy_picker(
 ) {
     let dialog = adw::AlertDialog::builder()
         .heading("Install Mod")
-        .body(&format!(
+        .body(format!(
             "Install \"{archive_name}\" into the game's Data folder?"
         ))
         .build();
@@ -1089,18 +1087,16 @@ fn sanitize_step_selection(
                 if selected.len() > 1 {
                     selected.truncate(1);
                 }
-                if selected.is_empty() {
-                    if let Some(first) = visible.first() {
+                if selected.is_empty()
+                    && let Some(first) = visible.first() {
                         selected.push(*first);
                     }
-                }
             }
             GroupType::SelectAtLeastOne => {
-                if selected.is_empty() {
-                    if let Some(first) = visible.first() {
+                if selected.is_empty()
+                    && let Some(first) = visible.first() {
                         selected.push(*first);
                     }
-                }
             }
             GroupType::SelectAtMostOne => {
                 if selected.len() > 1 {
@@ -1196,7 +1192,7 @@ fn show_fomod_wizard(
     }
 
     let dialog = adw::Window::builder()
-        .title(&format!("Install: {mod_display_name}"))
+        .title(format!("Install: {mod_display_name}"))
         .modal(true)
         .default_width(900)
         .default_height(620)
@@ -1396,11 +1392,10 @@ fn show_fomod_wizard(
                         continue;
                     }
                     let row = adw::ActionRow::builder().title(&plugin.name).build();
-                    if let Some(ref d) = plugin.description {
-                        if !d.is_empty() {
+                    if let Some(ref d) = plugin.description
+                        && !d.is_empty() {
                             row.set_subtitle(d);
                         }
-                    }
                     let check = gtk4::CheckButton::new();
                     if use_radio {
                         if let Some(ref first) = first_radio_button {
@@ -1440,8 +1435,8 @@ fn show_fomod_wizard(
                     check.set_valign(gtk4::Align::Center);
                     row.add_prefix(&check);
                     row.set_activatable_widget(Some(&check));
-                    if let Some(ref image_path) = plugin.image_path {
-                        if let Some(texture) = load_fomod_option_image(image_path, &img_cache) {
+                    if let Some(ref image_path) = plugin.image_path
+                        && let Some(texture) = load_fomod_option_image(image_path, &img_cache) {
                             has_step_preview = true;
                             if check.is_active() || default_preview.is_none() {
                                 default_preview = Some((texture.clone(), plugin.name.clone()));
@@ -1468,7 +1463,6 @@ fn show_fomod_wizard(
                             });
                             check.add_controller(check_motion);
                         }
-                    }
                     let tl = match plugin.type_descriptor {
                         PluginType::Required => Some("Required"),
                         PluginType::Recommended => Some("Recommended"),
@@ -1731,11 +1725,10 @@ fn nxm_metadata_path_for_archive(archive_path: &Path) -> PathBuf {
 
 fn read_nxm_mod_id_for_archive(archive_path: &Path, game: &Game) -> Option<u32> {
     // Try new consolidated format first (~/.config/linkmm/<game_id>/nxm_metadata.json)
-    if let Some(file_name) = archive_path.file_name().and_then(|n| n.to_str()) {
-        if let Some(id) = game.read_nxm_mod_id(file_name) {
+    if let Some(file_name) = archive_path.file_name().and_then(|n| n.to_str())
+        && let Some(id) = game.read_nxm_mod_id(file_name) {
             return Some(id);
         }
-    }
     // Fallback: try old per-archive sidecar file (.nxm.json alongside archive)
     let metadata_path = nxm_metadata_path_for_archive(archive_path);
     let contents = std::fs::read_to_string(metadata_path).ok()?;
