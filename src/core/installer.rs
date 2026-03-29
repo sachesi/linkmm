@@ -13,6 +13,10 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 /// contain many small files.
 const EXTRACT_BUFFER_SIZE: usize = 256 * 1024;
 
+/// Maximum initial allocation when reading a single file from a 7z archive.
+/// Prevents DoS from archives with inflated size metadata.
+const SINGLE_FILE_READ_CAP: usize = 64 * 1024 * 1024;
+
 /// How often the zip extraction loop calls the progress `tick` callback.
 /// At 50 ms the progress bar pulses at ~20 Hz, which looks smooth enough
 /// without calling `tick` on every single zip entry.
@@ -1007,21 +1011,35 @@ fn read_archive_files_bytes_non_zip(
         }
         let _ = std::fs::remove_dir_all(&tmp);
     } else {
-        // 7z: read each file directly via ArchiveReader for reliability.
+        // 7z: single-pass streaming extraction.
+        // For solid 7z archives, `read_file()` per entry would decompress the
+        // entire solid block from scratch for *each* file.  Instead, iterate
+        // all entries once and collect the ones we need.
+        let target_set: std::collections::HashMap<String, String> = target_to_req
+            .iter()
+            .map(|(entry, rel)| (normalise_path(entry).to_lowercase(), rel.clone()))
+            .collect();
         let mut reader = open_7z_reader(archive_path)?;
-        for (entry_path, rel_path) in &target_to_req {
-            match reader.read_file(entry_path) {
-                Ok(bytes) => {
-                    results.insert(rel_path.clone(), bytes);
+        reader
+            .for_each_entries(|entry, entry_reader| {
+                let entry_lower = normalise_path(entry.name()).to_lowercase();
+                if let Some(rel_path) = target_set.get(&entry_lower) {
+                    if !entry.is_directory() {
+                        let cap = std::cmp::min(entry.size() as usize, SINGLE_FILE_READ_CAP);
+                        let mut buf = Vec::with_capacity(cap);
+                        if entry_reader.read_to_end(&mut buf).is_ok() {
+                            results.insert(rel_path.clone(), buf);
+                        }
+                    }
                 }
-                Err(e) => {
-                    log::debug!(
-                        "[Archive] Failed to read '{}' via read_file: {e}",
-                        entry_path
-                    );
-                }
-            }
-        }
+                Ok(true)
+            })
+            .map_err(|e| {
+                format!(
+                    "Failed to read 7z archive {}: {e}",
+                    archive_path.display()
+                )
+            })?;
     }
 
     Ok(results)
@@ -2210,7 +2228,7 @@ fn extract_single_7z_file(
                             if entry_lower == target_lower && !entry.is_directory() {
                                 // Cap initial allocation to prevent DoS from
                                 // archives with inflated size metadata.
-                                let cap = std::cmp::min(entry.size() as usize, 64 * 1024 * 1024);
+                                let cap = std::cmp::min(entry.size() as usize, SINGLE_FILE_READ_CAP);
                                 let mut buf = Vec::with_capacity(cap);
                                 if entry_reader.read_to_end(&mut buf).is_ok() {
                                     found = Some(buf);
@@ -3754,6 +3772,29 @@ mod tests {
         };
         let bytes = read_archive_file_bytes(&archive, "images/preview.png").unwrap();
         assert_eq!(bytes, b"pngdata");
+    }
+
+    #[test]
+    fn read_archive_files_bytes_non_zip_batch_single_pass() {
+        // Verify batch reading from 7z gathers multiple files in one pass.
+        let tmp = tempdir();
+        let staging = tmp.join("staging_batch");
+        std::fs::create_dir_all(staging.join("fomod/images")).unwrap();
+        std::fs::create_dir_all(staging.join("Data/textures")).unwrap();
+        std::fs::write(staging.join("fomod/images/a.png"), b"aaa").unwrap();
+        std::fs::write(staging.join("fomod/images/b.png"), b"bbb").unwrap();
+        std::fs::write(staging.join("Data/textures/sky.dds"), b"dds").unwrap();
+        let archive_path = tmp.join("batch.7z");
+        let out_file = std::fs::File::create(&archive_path).unwrap();
+        if sevenz_rust2::compress(staging.as_path(), out_file).is_err() {
+            return; // 7z compression not available
+        }
+
+        let result =
+            read_archive_files_bytes(&archive_path, &["images/a.png", "images/b.png"]).unwrap();
+        assert_eq!(result.len(), 2, "expected both images to be read");
+        assert_eq!(result.get("images/a.png").unwrap(), b"aaa");
+        assert_eq!(result.get("images/b.png").unwrap(), b"bbb");
     }
 
     #[test]
