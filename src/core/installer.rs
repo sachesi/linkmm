@@ -56,6 +56,14 @@ const KNOWN_DATA_SUBDIRS: &[&str] = &[
 /// Plugin file extensions that strongly indicate a game data root.
 const KNOWN_PLUGIN_EXTS: &[&str] = &["esp", "esm", "esl"];
 
+fn installer_log_activity(message: impl AsRef<str>) {
+    log::info!("{}", message.as_ref());
+}
+
+fn installer_log_warning(message: impl AsRef<str>) {
+    log::warn!("{}", message.as_ref());
+}
+
 // ── Install strategy ──────────────────────────────────────────────────────────
 
 /// How a mod archive should be installed.
@@ -396,6 +404,56 @@ fn looks_like_root_level_mod(paths: &[&str]) -> bool {
     false
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DataArchivePlan {
+    Bain { top_dirs: Vec<String> },
+    ExtractToData { strip_prefix: String },
+    ExtractToModRoot { strip_prefix: String },
+}
+
+fn build_data_archive_plan(path_refs: &[&str]) -> DataArchivePlan {
+    if is_bain_archive(path_refs) {
+        return DataArchivePlan::Bain {
+            top_dirs: collect_bain_top_dirs(path_refs),
+        };
+    }
+
+    let data_root = find_data_root_in_paths(path_refs);
+    let root_trimmed = data_root.trim_end_matches('/');
+    let best_score = score_as_data_root(root_trimmed, path_refs);
+    if best_score > 0 {
+        return DataArchivePlan::ExtractToData {
+            strip_prefix: data_root,
+        };
+    }
+
+    let simple_prefix = find_common_prefix_from_paths(path_refs);
+    let stripped: Vec<String> = path_refs
+        .iter()
+        .filter_map(|p| {
+            let p_lower = p.to_lowercase().replace('\\', "/");
+            let p_lower = p_lower.trim_start_matches('/').to_string();
+            if simple_prefix.is_empty() {
+                Some(p_lower)
+            } else {
+                p_lower
+                    .strip_prefix(&simple_prefix.to_lowercase())
+                    .map(|s| s.to_string())
+            }
+        })
+        .collect();
+    let stripped_refs: Vec<&str> = stripped.iter().map(|s| s.as_str()).collect();
+    if looks_like_root_level_mod(&stripped_refs) {
+        DataArchivePlan::ExtractToModRoot {
+            strip_prefix: simple_prefix,
+        }
+    } else {
+        DataArchivePlan::ExtractToData {
+            strip_prefix: simple_prefix,
+        }
+    }
+}
+
 /// Return `true` if the archive follows BAIN (Wrye Bash) package conventions.
 ///
 /// BAIN archives have **two or more** top-level directories whose names start
@@ -474,10 +532,10 @@ fn is_fomod_archive(archive_path: &Path) -> bool {
         }
     } else {
         list_archive_entries_with_7z(archive_path).unwrap_or_else(|e| {
-            log::warn!(
+            installer_log_warning(format!(
                 "Failed to list entries in {}: {e}; assuming not a FOMOD archive",
                 archive_path.display()
-            );
+            ));
             vec![]
         })
     };
@@ -615,10 +673,10 @@ pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, Stri
     })();
 
     if let Err(e) = std::fs::remove_dir_all(&tmp_extract) {
-        log::warn!(
+        installer_log_warning(format!(
             "Failed to remove temporary extraction directory {}: {e}",
             tmp_extract.display()
-        );
+        ));
     }
 
     result
@@ -651,10 +709,10 @@ fn find_fomod_config_in_dir(root: &Path) -> Option<std::path::PathBuf> {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                log::warn!(
+                installer_log_warning(format!(
                     "Failed to read extracted archive directory {}: {e}",
                     dir.display()
-                );
+                ));
                 continue;
             }
         };
@@ -1642,7 +1700,7 @@ fn extract_zip_to(
 
         // Zip-slip protection: reject entries with path traversal components
         if !is_safe_relative_path(&rel_name) {
-            log::warn!("Skipping zip entry with unsafe path: {rel_name}");
+            installer_log_warning(format!("Skipping zip entry with unsafe path: {rel_name}"));
             continue;
         }
 
@@ -1781,7 +1839,7 @@ fn extract_7z_archive_to(
 
             // Zip-slip protection: reject entries that escape the destination.
             if !is_safe_relative_path(&rel_name) {
-                log::warn!("Skipping 7z entry with unsafe path: {rel_name}");
+                installer_log_warning(format!("Skipping 7z entry with unsafe path: {rel_name}"));
                 return Ok(true);
             }
 
@@ -1853,10 +1911,10 @@ fn extract_rar_archive_to(
     })();
 
     if let Err(e) = std::fs::remove_dir_all(&tmp) {
-        log::warn!(
+        installer_log_warning(format!(
             "Failed to remove temporary extraction directory {}: {e}",
             tmp.display()
-        );
+        ));
     }
 
     result
@@ -1974,12 +2032,16 @@ fn extract_single_7z_file(
     file_path_in_archive: &str,
     dest_dir: &Path,
 ) -> Result<(), String> {
+    let target_norm = normalise_path(file_path_in_archive);
+    let target_lower = target_norm.to_lowercase();
     let mut data = None;
     sevenz_rust2::decompress_file_with_extract_fn(
         archive_path,
         dest_dir,
         |entry, reader, _default_dest| {
-            if entry.name() == file_path_in_archive && !entry.is_directory() {
+            let entry_norm = normalise_path(entry.name());
+            let entry_lower = entry_norm.to_lowercase();
+            if entry_lower == target_lower && !entry.is_directory() {
                 let mut buf = Vec::with_capacity(entry.size() as usize);
                 if reader.read_to_end(&mut buf).is_ok() {
                     data = Some(buf);
@@ -1997,7 +2059,7 @@ fn extract_single_7z_file(
         )
     })?;
 
-    let out_path = dest_dir.join(Path::new(&normalise_path(file_path_in_archive)));
+    let out_path = dest_dir.join(Path::new(&target_norm));
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create parent directory: {e}"))?;
@@ -2070,58 +2132,32 @@ fn install_zip_data_mod(
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create Data directory: {e}"))?;
 
-    if is_bain_archive(&path_refs) {
-        // BAIN: install all numbered packages, merged in ascending order so
-        // that higher-numbered packages override lower-numbered ones.
-        for bain_dir in collect_bain_top_dirs(&path_refs) {
-            let bain_prefix = format!("{bain_dir}/");
-            extract_zip_to(archive_path, &data_dir, &bain_prefix, tick)?;
-        }
-        normalize_paths_to_lowercase(&data_dir);
-        return Ok(());
-    }
+    let plan = build_data_archive_plan(&path_refs);
+    installer_log_activity(format!(
+        "Archive install plan for {}: {:?}",
+        archive_path.display(),
+        plan
+    ));
 
-    let data_root = find_data_root_in_paths(&path_refs);
-    let root_trimmed = data_root.trim_end_matches('/');
-    let best_score = score_as_data_root(root_trimmed, &path_refs);
-
-    if best_score > 0 {
-        // Scoring found a clear data root: extract into mod_dir/Data/ with
-        // the detected prefix stripped.
-        extract_zip_to(archive_path, &data_dir, &data_root, tick)?;
-        normalize_paths_to_lowercase(&data_dir);
-        return Ok(());
-    }
-
-    // No data-like content found via scoring.  Fall back to the simple
-    // common-prefix approach and check for root-level markers.
-    let simple_prefix = find_common_prefix_from_paths(&path_refs);
-    let stripped: Vec<String> = path_refs
-        .iter()
-        .filter_map(|p| {
-            let p_lower = p.to_lowercase().replace('\\', "/");
-            let p_lower = p_lower.trim_start_matches('/').to_string();
-            if simple_prefix.is_empty() {
-                Some(p_lower)
-            } else {
-                p_lower
-                    .strip_prefix(&simple_prefix.to_lowercase())
-                    .map(|s| s.to_string())
+    match plan {
+        DataArchivePlan::Bain { top_dirs } => {
+            for bain_dir in top_dirs {
+                let bain_prefix = format!("{bain_dir}/");
+                extract_zip_to(archive_path, &data_dir, &bain_prefix, tick)?;
             }
-        })
-        .collect();
-    let stripped_refs: Vec<&str> = stripped.iter().map(|s| s.as_str()).collect();
-
-    if looks_like_root_level_mod(&stripped_refs) {
-        // Root-level mod (ENB, ReShade, …): extract to mod_dir/ so that the
-        // deploy layer can link these files to the game root directory.
-        // mod_dir/Data/ is already created above so enable_mod will take the
-        // "has Data dir" branch and call link_items_alongside_data.
-        extract_zip_to(archive_path, mod_dir, &simple_prefix, tick)?;
-    } else {
-        // Ambiguous – just extract everything to mod_dir/Data/.
-        extract_zip_to(archive_path, &data_dir, &simple_prefix, tick)?;
-        normalize_paths_to_lowercase(&data_dir);
+            normalize_paths_to_lowercase(&data_dir);
+        }
+        DataArchivePlan::ExtractToData { strip_prefix } => {
+            extract_zip_to(archive_path, &data_dir, &strip_prefix, tick)?;
+            normalize_paths_to_lowercase(&data_dir);
+        }
+        DataArchivePlan::ExtractToModRoot { strip_prefix } => {
+            // Root-level mod (ENB, ReShade, …): extract to mod_dir/ so that the
+            // deploy layer can link these files to the game root directory.
+            // mod_dir/Data/ is already created above so enable_mod will take the
+            // "has Data dir" branch and call link_items_alongside_data.
+            extract_zip_to(archive_path, mod_dir, &strip_prefix, tick)?;
+        }
     }
 
     Ok(())
@@ -2141,51 +2177,28 @@ fn install_data_archive_non_zip(
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create Data directory: {e}"))?;
 
-    let install_result = (|| -> Result<(), String> {
-        if is_bain_archive(&path_refs) {
-            // BAIN: merge all numbered packages in ascending order.
-            for bain_dir in collect_bain_top_dirs(&path_refs) {
+    let plan = build_data_archive_plan(&path_refs);
+    installer_log_activity(format!(
+        "Archive install plan for {}: {:?}",
+        archive_path.display(),
+        plan
+    ));
+
+    let install_result = match plan {
+        DataArchivePlan::Bain { top_dirs } => {
+            for bain_dir in top_dirs {
                 let bain_prefix = format!("{bain_dir}/");
                 extract_non_zip_to(archive_path, &data_dir, &bain_prefix, tick)?;
             }
-            return Ok(());
+            Ok(())
         }
-
-        let data_root = find_data_root_in_paths(&path_refs);
-        let root_trimmed = data_root.trim_end_matches('/');
-        let best_score = score_as_data_root(root_trimmed, &path_refs);
-
-        if best_score > 0 {
-            // Scoring found the data root: stream directly into mod_dir/Data/.
-            extract_non_zip_to(archive_path, &data_dir, &data_root, tick)?;
-            return Ok(());
+        DataArchivePlan::ExtractToData { strip_prefix } => {
+            extract_non_zip_to(archive_path, &data_dir, &strip_prefix, tick)
         }
-
-        // Fallback: use simple common prefix, check for root-level markers.
-        let simple_prefix = find_common_prefix_from_paths(&path_refs);
-        let stripped: Vec<String> = path_refs
-            .iter()
-            .filter_map(|p| {
-                let p_lower = p.to_lowercase().replace('\\', "/");
-                let p_lower = p_lower.trim_start_matches('/').to_string();
-                if simple_prefix.is_empty() {
-                    Some(p_lower)
-                } else {
-                    p_lower
-                        .strip_prefix(&simple_prefix.to_lowercase())
-                        .map(|s| s.to_string())
-                }
-            })
-            .collect();
-        let stripped_refs: Vec<&str> = stripped.iter().map(|s| s.as_str()).collect();
-
-        if looks_like_root_level_mod(&stripped_refs) {
-            extract_non_zip_to(archive_path, mod_dir, &simple_prefix, tick)?;
-        } else {
-            extract_non_zip_to(archive_path, &data_dir, &simple_prefix, tick)?;
+        DataArchivePlan::ExtractToModRoot { strip_prefix } => {
+            extract_non_zip_to(archive_path, mod_dir, &strip_prefix, tick)
         }
-        Ok(())
-    })();
+    };
 
     // Normalize folder / file names inside Data/ to lowercase so that mods
     // with mixed-case directories (TEXTURES/, Meshes/, …) are stored
@@ -2329,10 +2342,10 @@ fn normalize_paths_to_lowercase(dir: &Path) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) => {
-            log::warn!(
+            installer_log_warning(format!(
                 "normalize_paths_to_lowercase: cannot read {}: {err}",
                 dir.display()
-            );
+            ));
             return;
         }
     };
@@ -2365,11 +2378,11 @@ fn normalize_paths_to_lowercase(dir: &Path) {
                     for child in children.flatten() {
                         let child_dst = new_path.join(child.file_name());
                         if let Err(e) = std::fs::rename(child.path(), &child_dst) {
-                            log::warn!(
+                            installer_log_warning(format!(
                                 "normalize_paths_to_lowercase: failed to merge {} -> {}: {e}",
                                 child.path().display(),
                                 child_dst.display()
-                            );
+                            ));
                         }
                     }
                 }
@@ -2381,11 +2394,11 @@ fn normalize_paths_to_lowercase(dir: &Path) {
         } else {
             // Safe to rename: lowercase version does not yet exist.
             if let Err(e) = std::fs::rename(&path, &new_path) {
-                log::warn!(
+                installer_log_warning(format!(
                     "normalize_paths_to_lowercase: failed to rename {} -> {}: {e}",
                     path.display(),
                     new_path.display()
-                );
+                ));
                 // Still recurse into the original path if it is a directory.
                 if path.is_dir() {
                     normalize_paths_to_lowercase(&path);
@@ -2464,10 +2477,9 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
     let archive_prefix = if let Some(zip) = &mut zip_archive {
         normalise_path(&find_common_prefix(zip))
     } else {
-        find_common_prefix_from_paths(&entries.iter().map(|s| s.as_str()).collect())
+        let entry_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+        find_common_prefix_from_paths(&entry_refs)
     };
-    let archive_prefix_lower = archive_prefix.to_lowercase();
-
     // Build entry map for case-insensitive matching (with indices)
     let entry_map: Vec<(String, String, usize)> = entries
         .iter()
@@ -2503,7 +2515,11 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
             for cand in &candidates {
                 final_candidates.push(cand.clone());
                 if !archive_prefix.is_empty() {
-                    final_candidates.push(format!("{}/{}", archive_prefix, cand));
+                    final_candidates.push(normalise_path(&format!(
+                        "{}/{}",
+                        archive_prefix.trim_end_matches('/'),
+                        cand
+                    )));
                 }
             }
 
@@ -2535,13 +2551,23 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
         };
 
         let matched_source_lower = matched_source.to_lowercase();
+        let source_prefix_lower = (!matched_source_lower.is_empty())
+            .then(|| format!("{matched_source_lower}/"));
 
         for (orig_entry, idx) in matching_entries {
-            let entry_lower = orig_entry.to_lowercase();
-            let rel = if entry_lower == matched_source_lower {
+            let entry_norm = normalise_path(&orig_entry);
+            let entry_lower = entry_norm.to_lowercase();
+            let rel = if matched_source_lower.is_empty() {
+                if destination.is_empty() {
+                    entry_norm.clone()
+                } else {
+                    format!("{}/{}", destination, entry_norm)
+                }
+            } else if entry_lower == matched_source_lower {
                 destination.clone()
-            } else if let Some(suffix) =
-                entry_lower.strip_prefix(&format!("{}/", matched_source_lower))
+            } else if let Some(suffix) = source_prefix_lower
+                .as_deref()
+                .and_then(|prefix| entry_norm.get(prefix.len()..).filter(|_| entry_lower.starts_with(prefix)))
             {
                 if destination.is_empty() {
                     suffix.to_string()
@@ -2556,7 +2582,7 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
                 continue;
             }
             if !is_safe_relative_path(&rel) {
-                log::warn!("Skipping fomod entry with unsafe path: {rel}");
+                installer_log_warning(format!("Skipping fomod entry with unsafe path: {rel}"));
                 continue;
             }
 
@@ -2566,10 +2592,10 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
     }
 
     // 3. Extract
-    log::info!(
+    installer_log_activity(format!(
         "Extracting {} files from FOMOD archive",
         files_to_extract.len()
-    );
+    ));
     if let Some(zip) = &mut zip_archive {
         for (_, out_path, entry_idx) in files_to_extract {
             let mut entry = zip
@@ -2646,6 +2672,14 @@ fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> R
     }
 
     Ok(())
+}
+
+fn install_fomod_files(
+    archive_path: &Path,
+    dest_dir: &Path,
+    files: &[FomodFile],
+) -> Result<(), String> {
+    install_fomod(archive_path, dest_dir, files)
 }
 
 /// Install FOMOD-selected files from an already-extracted directory tree.
@@ -2758,7 +2792,9 @@ fn install_fomod_files_from_dir(
                 std::borrow::Cow::Owned(format!("{destination}/{rel}"))
             };
             if !is_safe_relative_path(combined.as_ref()) {
-                log::warn!("Skipping fomod entry with unsafe path: {combined}");
+                installer_log_warning(format!(
+                    "Skipping fomod entry with unsafe path: {combined}"
+                ));
                 continue;
             }
 
@@ -2988,12 +3024,57 @@ mod tests {
     }
 
     #[test]
+    fn build_data_archive_plan_identifies_bain_layout() {
+        let paths = vec!["00 Core/textures/a.dds", "10 Optional/textures/b.dds"];
+        let plan = build_data_archive_plan(&paths);
+        assert!(matches!(plan, DataArchivePlan::Bain { .. }));
+    }
+
+    #[test]
+    fn build_data_archive_plan_identifies_root_level_layout() {
+        let paths = vec!["Wrapper/d3d11.dll", "Wrapper/enbseries/effect.txt"];
+        let plan = build_data_archive_plan(&paths);
+        assert!(matches!(plan, DataArchivePlan::ExtractToModRoot { .. }));
+    }
+
+    #[test]
+    fn build_data_archive_plan_identifies_data_layout() {
+        let paths = vec!["MyMod/Data/textures/sky.dds", "MyMod/Data/meshes/rock.nif"];
+        let plan = build_data_archive_plan(&paths);
+        assert!(matches!(plan, DataArchivePlan::ExtractToData { .. }));
+    }
+
+    #[test]
     fn parse_fomod_from_archive_reads_non_zip_module_config() {
         let tmp = tempdir();
         let Some(archive) = create_test_7z(&tmp, "mod.7z") else {
             return;
         };
         let cfg = parse_fomod_from_archive(&archive).unwrap();
+        assert!(!cfg.required_files.is_empty());
+    }
+
+    #[test]
+    fn parse_fomod_from_archive_reads_non_zip_mixed_case_fomod_path() {
+        let tmp = tempdir();
+        let archive_path = tmp.join("mod_case.7z");
+        let staging = tmp.join("staging_case");
+        std::fs::create_dir_all(staging.join("FOMod")).unwrap();
+        std::fs::create_dir_all(staging.join("Data/textures")).unwrap();
+        std::fs::write(
+            staging.join("FOMod/ModuleConfig.xml"),
+            r#"<config>
+  <requiredInstallFiles>
+    <file source="Data/textures/sky.dds" destination="Data/textures/sky.dds" />
+  </requiredInstallFiles>
+</config>"#,
+        )
+        .unwrap();
+        std::fs::write(staging.join("Data/textures/sky.dds"), b"dds").unwrap();
+        let out_file = std::fs::File::create(&archive_path).unwrap();
+        sevenz_rust2::compress(staging.as_path(), out_file).unwrap();
+
+        let cfg = parse_fomod_from_archive(&archive_path).unwrap();
         assert!(!cfg.required_files.is_empty());
     }
 
@@ -3237,6 +3318,34 @@ mod tests {
 
         assert!(dest.join("plugin.esp").exists());
         assert!(!dest.join("fomod").exists());
+    }
+
+    #[test]
+    fn install_fomod_preserves_case_with_data_root_fallback() {
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("fomod/", b""),
+                ("fomod/ModuleConfig.xml", b"<config/>"),
+                ("FileName.ESP", b"esp_data"),
+            ],
+        );
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[FomodFile {
+                source: "Data".to_string(),
+                destination: "Data".to_string(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+
+        assert!(dest.join("FileName.ESP").exists());
     }
 
     #[test]
