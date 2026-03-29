@@ -109,6 +109,7 @@ fn build_welcome_page() -> gtk4::Box {
     page
 }
 
+#[allow(clippy::type_complexity)]
 fn build_game_select_page(
     stack: &gtk4::Stack,
     detected_games: Vec<(GameKind, std::path::PathBuf)>,

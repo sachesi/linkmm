@@ -394,6 +394,7 @@ fn hide_status_popup_later(status_revealer: gtk4::Revealer) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_mod_row(
     mod_entry: &Mod,
     idx: usize,

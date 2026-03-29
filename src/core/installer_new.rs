@@ -15,6 +15,14 @@ use std::path::Path;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
+/// Buffer size for file extraction operations (256 KB)
+#[allow(dead_code)]
+const EXTRACT_BUFFER_SIZE: usize = 256 * 1024;
+
+/// Progress callback interval in milliseconds (50ms = ~20 Hz)
+#[allow(dead_code)]
+const EXTRACTION_TICK_INTERVAL_MS: u64 = 50;
+
 /// Known Data/ subdirectories for detection heuristics
 const KNOWN_DATA_SUBDIRS: &[&str] = &[
     "meshes", "textures", "scripts", "sound", "music", "shaders",
@@ -92,6 +100,7 @@ pub fn normalize_path_lowercase(path: &str) -> String {
 /// - Strips leading slashes
 /// - Trims trailing slashes
 /// - Does NOT lowercase (use normalize_path_lowercase for that)
+#[allow(dead_code)]
 pub fn normalize_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let normalized = normalized.trim_start_matches('/');
@@ -102,6 +111,7 @@ pub fn normalize_path(path: &str) -> String {
 ///
 /// Returns the path without the prefix if present, otherwise returns the
 /// original path unchanged.
+#[allow(dead_code)]
 pub fn strip_data_prefix(path: &str) -> String {
     let normalized = normalize_path(path);
     let lower = normalized.to_lowercase();
@@ -122,6 +132,7 @@ pub fn strip_data_prefix(path: &str) -> String {
 /// - Absolute paths
 ///
 /// This is critical zip-slip protection.
+#[allow(dead_code)]
 pub fn is_safe_relative_path(path: &Path) -> bool {
     if path.is_absolute() {
         return false;
@@ -339,6 +350,237 @@ pub fn detect_data_root(paths: &[String]) -> Option<String> {
         );
         None // User must select root
     }
+}
+
+// ── Installation Strategy ─────────────────────────────────────────────────────
+
+/// How a mod archive should be installed
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum InstallStrategy {
+    /// Simple Data/ mod - extract and deploy
+    SimpleData {
+        /// Prefix to strip from archive paths (e.g., "ModName/" wrapper)
+        strip_prefix: String,
+    },
+    /// FOMOD installer - user must make selections
+    Fomod {
+        /// Parsed FOMOD configuration
+        config: FomodConfig,
+    },
+}
+
+// ── FOMOD Types ───────────────────────────────────────────────────────────────
+
+/// A single file mapping in FOMOD
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct FomodFile {
+    /// Source path in archive (case-insensitive match)
+    pub source: String,
+    /// Destination relative to Data/ directory
+    pub destination: String,
+    /// Priority for conflict resolution (higher wins)
+    pub priority: i32,
+    /// Document order for tie-breaking
+    pub doc_order: usize,
+}
+
+/// FOMOD group selection type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+#[allow(clippy::enum_variant_names)]
+pub enum FomodGroupType {
+    SelectAll,        // All mandatory
+    SelectAny,        // Zero or more
+    SelectExactlyOne, // Exactly one required
+    SelectAtMostOne,  // Zero or one
+    SelectAtLeastOne, // One or more required
+}
+
+/// FOMOD plugin type descriptor
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum FomodPluginType {
+    Required,
+    Optional,
+    Recommended,
+    NotUsable,
+}
+
+/// Flag dependency for conditional logic
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagDependency {
+    pub flag: String,
+    pub value: String,
+}
+
+/// Dependency operator
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyOperator {
+    And,
+    Or,
+}
+
+/// Dependencies for plugin visibility
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct PluginDependencies {
+    pub operator: DependencyOperator,
+    pub flags: Vec<FlagDependency>,
+}
+
+impl PluginDependencies {
+    /// Check if dependencies are satisfied given current flags
+    #[allow(dead_code)]
+    pub fn evaluate(&self, active_flags: &HashMap<String, String>) -> bool {
+        let result = match self.operator {
+            DependencyOperator::And => {
+                self.flags.iter().all(|dep| {
+                    let matched = active_flags.get(&dep.flag.to_lowercase())
+                        == Some(&dep.value.to_lowercase());
+                    log::debug!(
+                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
+                        dep.flag,
+                        dep.value,
+                        matched,
+                        self.operator
+                    );
+                    matched
+                })
+            }
+            DependencyOperator::Or => {
+                self.flags.iter().any(|dep| {
+                    let matched = active_flags.get(&dep.flag.to_lowercase())
+                        == Some(&dep.value.to_lowercase());
+                    log::debug!(
+                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
+                        dep.flag,
+                        dep.value,
+                        matched,
+                        self.operator
+                    );
+                    matched
+                })
+            }
+        };
+        log::debug!(
+            "[Dependency Group] operator={:?}, flag_count={}, overall_result={}",
+            self.operator,
+            self.flags.len(),
+            result
+        );
+        result
+    }
+}
+
+/// Condition flag set by plugin selection
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ConditionFlag {
+    pub name: String,
+    pub value: String,
+}
+
+/// A selectable plugin in a FOMOD group
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FomodPlugin {
+    pub name: String,
+    pub description: Option<String>,
+    pub image_path: Option<String>,
+    pub files: Vec<FomodFile>,
+    pub plugin_type: FomodPluginType,
+    pub condition_flags: Vec<ConditionFlag>,
+    pub dependencies: Option<PluginDependencies>,
+}
+
+/// A group of plugins in a FOMOD install step
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FomodPluginGroup {
+    pub name: String,
+    pub group_type: FomodGroupType,
+    pub plugins: Vec<FomodPlugin>,
+}
+
+/// A single page/step in the FOMOD installer wizard
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FomodInstallStep {
+    pub name: String,
+    pub visible: Option<PluginDependencies>,
+    pub groups: Vec<FomodPluginGroup>,
+}
+
+/// Conditional files activated by flag patterns
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ConditionalFileInstall {
+    pub dependencies: PluginDependencies,
+    pub files: Vec<FomodFile>,
+}
+
+/// Complete parsed FOMOD configuration
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FomodConfig {
+    pub mod_name: Option<String>,
+    pub required_files: Vec<FomodFile>,
+    pub install_steps: Vec<FomodInstallStep>,
+    pub conditional_installs: Vec<ConditionalFileInstall>,
+}
+
+// ── Conflict Resolution ───────────────────────────────────────────────────────
+
+/// Resolve conflicts within a file installation list.
+///
+/// When multiple files target the same destination:
+/// 1. Sort by destination path (group conflicts)
+/// 2. Higher priority wins
+/// 3. Later doc_order wins (tie-breaker)
+/// 4. Keep only the winner for each destination
+#[allow(dead_code)]
+pub fn resolve_file_conflicts(mut files: Vec<FomodFile>) -> Vec<FomodFile> {
+    if files.is_empty() {
+        return files;
+    }
+
+    // Sort: destination (asc), priority (desc), doc_order (desc)
+    files.sort_by(|a, b| {
+        normalize_path_lowercase(&a.destination)
+            .cmp(&normalize_path_lowercase(&b.destination))
+            .then(b.priority.cmp(&a.priority))
+            .then(b.doc_order.cmp(&a.doc_order))
+    });
+
+    // Keep first occurrence of each destination (= winner)
+    let mut seen = HashSet::new();
+    let total_before = files.len();
+    files.retain(|f| {
+        let dest_norm = normalize_path_lowercase(&f.destination);
+        let is_new = seen.insert(dest_norm.clone());
+        if !is_new {
+            log::debug!(
+                "[Conflict] Duplicate destination skipped | dest={}, source={}, priority={}",
+                dest_norm,
+                f.source,
+                f.priority
+            );
+        }
+        is_new
+    });
+    let conflicts_resolved = total_before - files.len();
+    if conflicts_resolved > 0 {
+        log::info!(
+            "[Conflict] Resolved {} file conflicts, {} files remaining",
+            conflicts_resolved,
+            files.len()
+        );
+    }
+
+    files
 }
 
 #[cfg(test)]
