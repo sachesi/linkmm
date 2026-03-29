@@ -269,25 +269,37 @@ pub fn build_settings_page(
         }};
     }
 
-    let errors_row = log_toggle_row!(
-        "Errors",
-        "Show error messages in the log viewer",
-        log_errors
+    let activity_row = log_toggle_row!(
+        "Mod Activity",
+        "Show mod download and installation progress in the log viewer",
+        log_activity
     );
     let warnings_row = log_toggle_row!(
         "Warnings",
         "Show warning messages in the log viewer",
         log_warnings
     );
-    let activity_row = log_toggle_row!(
-        "Installation Activity",
-        "Show download and installation progress in the log viewer",
-        log_activity
+    let errors_row = log_toggle_row!(
+        "Errors",
+        "Show error messages in the log viewer",
+        log_errors
+    );
+    let info_row = log_toggle_row!(
+        "Info",
+        "Show info-level messages in the log viewer",
+        log_info
+    );
+    let debug_row = log_toggle_row!(
+        "Debug",
+        "Show debug-level messages in the log viewer",
+        log_debug
     );
 
-    logging_group.add(&errors_row);
-    logging_group.add(&warnings_row);
     logging_group.add(&activity_row);
+    logging_group.add(&warnings_row);
+    logging_group.add(&errors_row);
+    logging_group.add(&info_row);
+    logging_group.add(&debug_row);
     content_box.append(&logging_group);
 
     clamp.set_child(Some(&content_box));
