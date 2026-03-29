@@ -5,11 +5,10 @@
 // This module handles deploying and undeploying mods using symbolic or hard links.
 // Core principle: Game Data/ directory contains ONLY links, never copies of mod files.
 
-use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::installer_new::{determine_link_type, normalize_path_lowercase, LinkKind};
+use super::installer_new::{determine_link_type, LinkKind};
 use crate::core::games::Game;
 use crate::core::mods::Mod;
 
@@ -47,12 +46,11 @@ pub fn create_link(src: &Path, dest: &Path) -> Result<LinkKind, String> {
                     .map_err(|e| format!("Failed to remove broken symlink {}: {}", dest.display(), e))?;
             } else {
                 // Valid symlink or file - check if it points to our source
-                if let Ok(target) = fs::read_link(dest) {
-                    if target == src {
+                if let Ok(target) = fs::read_link(dest)
+                    && target == src {
                         // Already linked correctly
                         return Ok(LinkKind::Symlink);
                     }
-                }
                 // Points elsewhere - skip to avoid overwriting another mod's link
                 return Err(format!("Destination {} already exists (conflict)", dest.display()));
             }
@@ -106,13 +104,12 @@ pub fn remove_link_if_matches(src: &Path, dest: &Path) -> Result<bool, String> {
 
     if dest.is_symlink() {
         // Check if symlink points to our source
-        if let Ok(target) = fs::read_link(dest) {
-            if target == src {
+        if let Ok(target) = fs::read_link(dest)
+            && target == src {
                 fs::remove_file(dest)
                     .map_err(|e| format!("Failed to remove symlink {}: {}", dest.display(), e))?;
                 return Ok(true);
             }
-        }
         return Ok(false); // Points elsewhere
     }
 
@@ -225,13 +222,12 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
 
     // Try to remove empty destination directory
     // Ignore errors - directory might have other mods' files or vanilla content
-    if let Err(e) = fs::remove_dir(dest_dir) {
-        if e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    if let Err(e) = fs::remove_dir(dest_dir)
+        && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
             && e.kind() != std::io::ErrorKind::NotFound
         {
             log::debug!("Could not remove directory {}: {}", dest_dir.display(), e);
         }
-    }
 
     Ok(unlink_count)
 }

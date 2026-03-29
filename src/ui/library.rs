@@ -295,11 +295,10 @@ fn refresh_library_content_with_search(
         db.save(game);
     }
 
-    if let Some(selected) = selected_mod_id.borrow().as_ref() {
-        if !db.mods.iter().any(|m| &m.id == selected) {
+    if let Some(selected) = selected_mod_id.borrow().as_ref()
+        && !db.mods.iter().any(|m| &m.id == selected) {
             *selected_mod_id.borrow_mut() = None;
         }
-    }
 
     let visible_mods: Vec<_> = db
         .mods
@@ -483,8 +482,8 @@ fn build_mod_row(
         let mod_id_c = mod_entry.id.clone();
         up_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
-            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c) {
-                if pos > 0 {
+            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
+                && pos > 0 {
                     db.mods.swap(pos, pos - 1);
                     db.save(&game_c);
                     refresh_library_content_with_search(
@@ -497,7 +496,6 @@ fn build_mod_row(
                         false,
                     );
                 }
-            }
         });
     }
 
@@ -511,8 +509,8 @@ fn build_mod_row(
         down_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
             let len = db.mods.len();
-            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c) {
-                if pos + 1 < len {
+            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
+                && pos + 1 < len {
                     db.mods.swap(pos, pos + 1);
                     db.save(&game_c);
                     refresh_library_content_with_search(
@@ -525,7 +523,6 @@ fn build_mod_row(
                         false,
                     );
                 }
-            }
         });
     }
 
@@ -870,8 +867,8 @@ fn build_mod_row(
             let mod_id_move = mod_id_rclick.clone();
             move_item.connect_clicked(move |_| {
                 popover_move.popdown();
-                if let Some(root) = row_move.root() {
-                    if let Ok(window) = root.downcast::<gtk4::Window>() {
+                if let Some(root) = row_move.root()
+                    && let Ok(window) = root.downcast::<gtk4::Window>() {
                         show_move_to_position_dialog_for_mod(
                             &window,
                             mod_id_move.clone(),
@@ -882,7 +879,6 @@ fn build_mod_row(
                             Rc::clone(&selected_move),
                         );
                     }
-                }
             });
 
             let popover_enable = popover.clone();
@@ -1001,8 +997,8 @@ fn show_move_to_position_dialog_for_mod(
         let target_idx = target_pos_1indexed.saturating_sub(1);
 
         let mut db = ModDatabase::load(&game);
-        if let Some(src_pos) = db.mods.iter().position(|m| m.id == mod_id) {
-            if target_idx < db.mods.len() {
+        if let Some(src_pos) = db.mods.iter().position(|m| m.id == mod_id)
+            && target_idx < db.mods.len() {
                 let m = db.mods.remove(src_pos);
                 let insert_pos = adjusted_insert_pos(src_pos, target_idx);
                 db.mods.insert(insert_pos, m);
@@ -1017,7 +1013,6 @@ fn show_move_to_position_dialog_for_mod(
                     false,
                 );
             }
-        }
     });
 
     dialog.present(Some(parent));
@@ -1181,11 +1176,10 @@ fn collect_mod_target_files(mod_entry: &Mod) -> BTreeSet<String> {
                 }
                 if path.is_dir() {
                     collect_files_recursive(&path, root, "root", &mut files);
-                } else if path.is_file() {
-                    if let Ok(rel) = path.strip_prefix(root) {
+                } else if path.is_file()
+                    && let Ok(rel) = path.strip_prefix(root) {
                         files.insert(normalize_relative_path("root", rel));
                     }
-                }
             }
         }
     } else {
@@ -1204,11 +1198,10 @@ fn collect_files_recursive(base: &Path, root: &Path, prefix: &str, files: &mut B
         let path = entry.path();
         if path.is_dir() {
             collect_files_recursive(&path, root, prefix, files);
-        } else if path.is_file() {
-            if let Ok(rel) = path.strip_prefix(root) {
+        } else if path.is_file()
+            && let Ok(rel) = path.strip_prefix(root) {
                 files.insert(normalize_relative_path(prefix, rel));
             }
-        }
     }
 }
 
