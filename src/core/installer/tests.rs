@@ -789,11 +789,11 @@ fn install_fomod_files_normalizes_uppercase_dirs_to_lowercase() {
             .join("slidersets")
             .join("cbbe.osp")
             .exists(),
-        "CalienteTools directory should be normalised to calientetools"
+        "CalienteTools directory should be normalized to calientetools"
     );
     assert!(
         !dest.join("CalienteTools").exists(),
-        "original CalienteTools dir should be gone after normalisation"
+        "original CalienteTools dir should be gone after normalization"
     );
     assert!(
         dest.join("textures")
@@ -801,11 +801,11 @@ fn install_fomod_files_normalizes_uppercase_dirs_to_lowercase() {
             .join("character")
             .join("cbbe.dds")
             .exists(),
-        "TEXTURES directory should be normalised to textures"
+        "TEXTURES directory should be normalized to textures"
     );
     assert!(
         !dest.join("TEXTURES").exists(),
-        "original TEXTURES dir should be gone after normalisation"
+        "original TEXTURES dir should be gone after normalization"
     );
 }
 
