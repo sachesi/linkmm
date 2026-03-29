@@ -253,6 +253,139 @@ pub fn launch_game(game: &crate::core::games::Game) -> Result<(), String> {
         .map_err(|e| format!("Failed to open steam://run/{app_id}: {e}"))
 }
 
+/// Find the Proton runtime path for a given game's App ID.
+///
+/// Returns the path to the Proton directory (e.g., `~/.steam/steam/steamapps/common/Proton 8.0`)
+/// and the `compatdata` directory for the game.
+pub fn find_proton_for_game(app_id: u32) -> Result<(PathBuf, PathBuf), String> {
+    // Find the compatdata path first
+    let compatdata_path = find_compatdata_path(app_id)
+        .ok_or_else(|| format!("Could not find compatdata for App ID {}", app_id))?;
+
+    // Check for a toolmanifest.vdf inside compatdata to determine which Proton version is used
+    let tool_manifest = compatdata_path.join("version");
+    let proton_version = if tool_manifest.exists() {
+        std::fs::read_to_string(&tool_manifest)
+            .ok()
+            .and_then(|content| {
+                // The version file typically contains a line like "8.0-3c" or similar
+                content.lines().next().map(|s| s.trim().to_string())
+            })
+    } else {
+        None
+    };
+
+    // Try to find Proton in common directories
+    let libraries = find_steam_libraries();
+    for lib in &libraries {
+        let common_path = lib.path.parent()
+            .map(|p| p.join("common"))
+            .unwrap_or_else(|| lib.path.join("common"));
+
+        if !common_path.is_dir() {
+            continue;
+        }
+
+        // If we have a specific version from compatdata, look for it
+        if let Some(ref version) = proton_version {
+            // Try exact match first (e.g., "Proton 8.0")
+            let proton_path = common_path.join(format!("Proton {}", version));
+            if proton_path.join("proton").exists() {
+                return Ok((proton_path, compatdata_path));
+            }
+        }
+
+        // Fallback: find any Proton installation
+        if let Ok(entries) = std::fs::read_dir(&common_path) {
+            let mut proton_dirs: Vec<_> = entries
+                .flatten()
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("Proton") && e.path().join("proton").exists()
+                })
+                .collect();
+
+            // Sort to prefer newer versions (reverse alphabetical often works)
+            proton_dirs.sort_by(|a, b| {
+                b.file_name()
+                    .to_string_lossy()
+                    .cmp(&a.file_name().to_string_lossy())
+            });
+
+            if let Some(proton_dir) = proton_dirs.first() {
+                return Ok((proton_dir.path(), compatdata_path));
+            }
+        }
+    }
+
+    Err("Could not find any Proton installation".to_string())
+}
+
+/// Launch an external tool using Proton.
+///
+/// This sets up the appropriate environment variables and executes the tool
+/// through Proton's runtime, similar to how Steam launches Windows games.
+pub fn launch_tool_with_proton(
+    exe_path: &PathBuf,
+    arguments: &str,
+    app_id: u32,
+) -> Result<std::process::Child, String> {
+    let (proton_path, compatdata_path) = find_proton_for_game(app_id)?;
+    let proton_script = proton_path.join("proton");
+
+    if !proton_script.exists() {
+        return Err(format!(
+            "Proton script not found at {}",
+            proton_script.display()
+        ));
+    }
+
+    if !exe_path.exists() {
+        return Err(format!("Executable not found at {}", exe_path.display()));
+    }
+
+    let steam_root = find_steam_root()
+        .ok_or_else(|| "Could not find Steam installation".to_string())?;
+
+    log::info!(
+        "Launching tool {} with Proton from {}",
+        exe_path.display(),
+        proton_path.display()
+    );
+    log::debug!("Using compatdata: {}", compatdata_path.display());
+
+    let mut command = std::process::Command::new(&proton_script);
+
+    // Set up Proton environment variables
+    command.env("STEAM_COMPAT_DATA_PATH", &compatdata_path);
+    command.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &steam_root);
+    command.env("SteamAppId", app_id.to_string());
+    command.env("SteamGameId", app_id.to_string());
+
+    // Add the "run" command
+    command.arg("run");
+
+    // Add the executable path
+    command.arg(exe_path);
+
+    // Add any additional arguments
+    if !arguments.is_empty() {
+        for arg in arguments.split_whitespace() {
+            command.arg(arg);
+        }
+    }
+
+    // Capture stdout and stderr for logging
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    log::debug!("Executing: {:?}", command);
+
+    command
+        .spawn()
+        .map_err(|e| format!("Failed to spawn Proton process: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

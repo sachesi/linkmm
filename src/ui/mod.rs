@@ -18,6 +18,7 @@ pub mod logs;
 pub mod mod_list;
 pub mod settings;
 pub mod setup_wizard;
+pub mod tools;
 
 pub fn build_ui(app: &libadwaita::Application) {
     let config = Rc::new(RefCell::new(AppConfig::load_or_default()));
@@ -36,7 +37,8 @@ pub fn build_ui(app: &libadwaita::Application) {
 const NAV_LIBRARY: i32 = 0;
 const NAV_LOAD_ORDER: i32 = 1;
 const NAV_DOWNLOADS: i32 = 2;
-const NAV_PREFERENCES: i32 = 3;
+const NAV_TOOLS: i32 = 3;
+const NAV_PREFERENCES: i32 = 4;
 
 // ── Main window ────────────────────────────────────────────────────────────
 
@@ -152,6 +154,7 @@ fn build_main_window(
         ("Library", "applications-games-symbolic"),
         ("Load Order", "format-justify-left-symbolic"),
         ("Downloads", "folder-download-symbolic"),
+        ("Tools", "applications-utilities-symbolic"),
         ("Preferences", "preferences-system-symbolic"),
     ] {
         let row = adw::ActionRow::builder()
@@ -247,6 +250,10 @@ fn build_main_window(
         downloads::build_downloads_page(current_game.as_ref(), Rc::clone(&config));
     content_stack.add_named(&downloads_widget, Some("downloads"));
 
+    // Tools
+    let tools_widget = tools::build_tools_page(current_game.as_ref(), Rc::clone(&config));
+    content_stack.add_named(&tools_widget, Some("tools"));
+
     // Preferences
     let preferences_widget =
         settings::build_settings_page(Rc::clone(&config), window.upcast_ref::<gtk4::Window>());
@@ -322,6 +329,16 @@ fn build_main_window(
                     content_page_c.set_title("Downloads");
                     content_stack_c.set_visible_child_name("downloads");
                 }
+                NAV_TOOLS => {
+                    let new_tools =
+                        tools::build_tools_page(game_info.as_ref(), Rc::clone(&config_c));
+                    if let Some(old) = content_stack_c.child_by_name("tools") {
+                        content_stack_c.remove(&old);
+                    }
+                    content_stack_c.add_named(&new_tools, Some("tools"));
+                    content_page_c.set_title("Tools");
+                    content_stack_c.set_visible_child_name("tools");
+                }
                 NAV_PREFERENCES => {
                     content_page_c.set_title("Preferences");
                     content_stack_c.set_visible_child_name("preferences");
@@ -388,6 +405,13 @@ fn build_main_window(
             content_stack_r.remove(&old);
         }
         content_stack_r.add_named(&new_downloads, Some("downloads"));
+
+        // Rebuild Tools page
+        let new_tools = tools::build_tools_page(game_info.as_ref(), Rc::clone(&config_r));
+        if let Some(old) = content_stack_r.child_by_name("tools") {
+            content_stack_r.remove(&old);
+        }
+        content_stack_r.add_named(&new_tools, Some("tools"));
 
         // Switch to Library
         content_page_r.set_title("Library");
