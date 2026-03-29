@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gio;
+use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -597,8 +598,8 @@ fn show_install_dialog(
     // Show the status bar immediately so the user sees activity.  For non-zip
     // archives (7z / rar) strategy detection and FOMOD XML parsing require
     // spawning 7z subprocesses which can take seconds on large archives.  We
-    // do all of that work on a background thread so the GTK event loop keeps
-    // running.
+    // use glib::spawn_future_local + gio::spawn_blocking so the GTK event
+    // loop keeps running without a polling timer.
     set_downloads_busy(status_ctx, true);
     status_ctx.revealer.set_reveal_child(true);
     status_ctx.label.set_text("Reading archive…");
@@ -607,58 +608,18 @@ fn show_install_dialog(
         .progress
         .set_text(Some("Detecting install type…"));
 
-    // Clone Send-able data for the background thread (no Rc / GTK widget).
+    // Clone Send-able data for the blocking task (no Rc / GTK widget).
     let ap = archive_path.to_path_buf();
 
-    // Channel carries the result back to the GTK main thread.
-    #[allow(clippy::type_complexity)]
-    let (tx, rx) = std::sync::mpsc::channel::<
-        Result<
-            (
-                InstallStrategy,
-                Option<FomodConfig>,
-                HashMap<String, Vec<u8>>,
-            ),
-            String,
-        >,
-    >();
-
-    std::thread::spawn(move || {
-        #[allow(clippy::type_complexity)]
-        let result = (|| -> Result<(InstallStrategy, Option<FomodConfig>, HashMap<String, Vec<u8>>), String> {
-            let strategy = detect_strategy(&ap)?;
-            let mut images_data = HashMap::new();
-            let fomod_config = if let InstallStrategy::Fomod(_) = &strategy {
-                match parse_fomod_from_archive(&ap) {
-                    Ok(cfg) => {
-                        let mut image_paths = Vec::new();
-                        for step in &cfg.steps {
-                            for group in &step.groups {
-                                for plugin in &group.plugins {
-                                    if let Some(ref img) = plugin.image_path {
-                                        image_paths.push(img.as_str());
-                                    }
-                                }
-                            }
-                        }
-                        if !image_paths.is_empty()
-                            && let Ok(data) = read_archive_files_bytes(&ap, &image_paths) {
-                                images_data = data;
-                            }
-                        Some(cfg)
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to parse FOMOD config, falling back: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            Ok((strategy, fomod_config, images_data))
-        })();
-        let _ = tx.send(result);
-    });
+    // Pulse the progress bar while the blocking task runs.
+    let progress_pulse = status_ctx.progress.clone();
+    let pulse_id = gtk4::glib::timeout_add_local(
+        std::time::Duration::from_millis(100),
+        move || {
+            progress_pulse.pulse();
+            gtk4::glib::ControlFlow::Continue
+        },
+    );
 
     // Clone GTK-side handles for the completion closure (main-thread-only).
     let anchor_c = anchor.clone();
@@ -671,9 +632,52 @@ fn show_install_dialog(
     let search_query_s = search_query.to_string();
     let status_ctx_c = status_ctx.clone();
 
-    // Poll the channel every 50 ms; pulse the progress bar while waiting.
-    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-        match rx.try_recv() {
+    glib::spawn_future_local(async move {
+        #[allow(clippy::type_complexity)]
+        let result = gio::spawn_blocking(
+            move || -> Result<
+                (InstallStrategy, Option<FomodConfig>, HashMap<String, Vec<u8>>),
+                String,
+            > {
+                let strategy = detect_strategy(&ap)?;
+                let mut images_data = HashMap::new();
+                let fomod_config = if let InstallStrategy::Fomod(_) = &strategy {
+                    match parse_fomod_from_archive(&ap) {
+                        Ok(cfg) => {
+                            let mut image_paths = Vec::new();
+                            for step in &cfg.steps {
+                                for group in &step.groups {
+                                    for plugin in &group.plugins {
+                                        if let Some(ref img) = plugin.image_path {
+                                            image_paths.push(img.as_str());
+                                        }
+                                    }
+                                }
+                            }
+                            if !image_paths.is_empty()
+                                && let Ok(data) = read_archive_files_bytes(&ap, &image_paths)
+                            {
+                                images_data = data;
+                            }
+                            Some(cfg)
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse FOMOD config, falling back: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok((strategy, fomod_config, images_data))
+            },
+        )
+        .await;
+
+        // Stop pulsing the progress bar.
+        pulse_id.remove();
+
+        match result {
             Ok(Ok((strategy, fomod_config_opt, images_data))) => {
                 set_downloads_busy(&status_ctx_c, false);
                 status_ctx_c.revealer.set_reveal_child(false);
@@ -714,7 +718,6 @@ fn show_install_dialog(
                         &status_ctx_c,
                     );
                 }
-                gtk4::glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
                 log::error!("Failed to detect install strategy: {e}");
@@ -724,19 +727,12 @@ fn show_install_dialog(
                     status_ctx_c.list_container.upcast_ref(),
                     &format!("Error: {e}"),
                 );
-                gtk4::glib::ControlFlow::Break
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // Still detecting — pulse the bar to show activity.
-                status_ctx_c.progress.pulse();
-                gtk4::glib::ControlFlow::Continue
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // Background thread panicked.
-                log::error!("Strategy detection thread terminated unexpectedly");
+            Err(_) => {
+                // Blocking task panicked.
+                log::error!("Strategy detection task terminated unexpectedly");
                 set_downloads_busy(&status_ctx_c, false);
                 hide_status_popup_later(status_ctx_c.revealer.clone());
-                gtk4::glib::ControlFlow::Break
             }
         }
     });
@@ -970,13 +966,6 @@ fn on_install_complete(
 
 /// Selected plugin indices by `[step_index][group_index][plugin_indices]`.
 type FomodSelections = Vec<Vec<Vec<usize>>>;
-const GROUP_OPTIONS_MIN_WIDTH: i32 = 360;
-const GROUP_PREVIEW_PANE_WIDTH: i32 = 300;
-const GROUP_PREVIEW_IMAGE_WIDTH: i32 = 268;
-const GROUP_PREVIEW_IMAGE_HEIGHT: i32 = 268;
-const GROUP_PREVIEW_NAME_WIDTH_CHARS: i32 = 28;
-const GROUP_PREVIEW_NAME_MAX_WIDTH_CHARS: i32 = 32;
-const FOMOD_CARD_EDGE_MARGIN: i32 = 8;
 
 fn collect_active_flags(
     fomod: &FomodConfig,
@@ -1156,13 +1145,6 @@ fn resolve_fomod_files(fomod: &FomodConfig, selections: &FomodSelections) -> Vec
     files
 }
 
-fn load_fomod_option_image(
-    image_path: &str,
-    cache: &Rc<RefCell<HashMap<String, gtk4::gdk::Texture>>>,
-) -> Option<gtk4::gdk::Texture> {
-    cache.borrow().get(image_path).cloned()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn show_fomod_wizard(
     parent: Option<&gtk4::Window>,
@@ -1183,6 +1165,7 @@ fn show_fomod_wizard(
         .clone()
         .unwrap_or_else(|| archive_name.to_string());
 
+    // No interactive steps — install required files immediately.
     if fomod.steps.is_empty() {
         let strategy = InstallStrategy::Fomod(fomod.required_files.clone());
         do_install(
@@ -1200,25 +1183,7 @@ fn show_fomod_wizard(
         return;
     }
 
-    let dialog = adw::Window::builder()
-        .title(format!("Install: {mod_display_name}"))
-        .modal(true)
-        .default_width(900)
-        .default_height(620)
-        .build();
-    if let Some(p) = parent {
-        dialog.set_transient_for(Some(p));
-    }
-
-    let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&adw::HeaderBar::new());
-
-    let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
-    main_box.set_margin_start(24);
-    main_box.set_margin_end(24);
-    main_box.set_margin_top(12);
-    main_box.set_margin_bottom(12);
-
+    // Initialise per-step, per-group selections with defaults.
     let selections: Rc<RefCell<FomodSelections>> = Rc::new(RefCell::new(Vec::new()));
     {
         let mut sel = selections.borrow_mut();
@@ -1252,27 +1217,9 @@ fn show_fomod_wizard(
         }
     }
 
-    let step_index = Rc::new(RefCell::new(0usize));
-    let step_content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    step_content.set_vexpand(true);
-
-    let nav_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    nav_box.set_halign(gtk4::Align::End);
-    nav_box.set_margin_top(12);
-    let back_btn = gtk4::Button::with_label("Back");
-    let next_btn = gtk4::Button::with_label("Next");
-    next_btn.add_css_class("suggested-action");
-    let install_btn = gtk4::Button::with_label("Install");
-    install_btn.add_css_class("suggested-action");
-    nav_box.append(&back_btn);
-    nav_box.append(&next_btn);
-    nav_box.append(&install_btn);
-
-    let fomod_rc = Rc::new(fomod.clone());
-    let step_count = fomod.steps.len();
+    // Convert raw image bytes into GPU textures once, up-front.
     let image_cache: Rc<RefCell<HashMap<String, gtk4::gdk::Texture>>> =
         Rc::new(RefCell::new(HashMap::new()));
-
     {
         let mut cache = image_cache.borrow_mut();
         for (path, bytes) in images_data {
@@ -1284,151 +1231,331 @@ fn show_fomod_wizard(
         }
     }
 
-    let render_step = {
-        let sc = step_content.clone();
-        let fc = Rc::clone(&fomod_rc);
-        let sel_c = Rc::clone(&selections);
-        let img_cache = Rc::clone(&image_cache);
-        let bb = back_btn.clone();
-        let nb = next_btn.clone();
-        let ib = install_btn.clone();
-        Rc::new(move |idx: usize| {
-            while let Some(child) = sc.first_child() {
-                sc.remove(&child);
+    // ── adw::Dialog ──────────────────────────────────────────────────────────
+    let dialog = adw::Dialog::builder()
+        .title(format!("Install: {mod_display_name}"))
+        .content_width(700)
+        .content_height(560)
+        .build();
+
+    let nav_view = adw::NavigationView::new();
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&nav_view));
+    dialog.set_child(Some(&toast_overlay));
+
+    // ── Shared install callback ───────────────────────────────────────────────
+    let ap = archive_path.to_path_buf();
+    let an = archive_name.to_string();
+    let gc = game.clone();
+    let cc = Rc::clone(config);
+    let cont = container.clone();
+    let hide = hide_installed;
+    let search = search_query.to_string();
+    let grc = Rc::clone(game_rc);
+    let ctx = status_ctx.cloned();
+    let dlg = dialog.clone();
+    let fomod_rc = Rc::new(fomod.clone());
+    let sc_install = Rc::clone(&selections);
+    let fc_install = Rc::clone(&fomod_rc);
+    let on_install: Rc<dyn Fn()> = Rc::new(move || {
+        let files = {
+            let sel = sc_install.borrow();
+            resolve_fomod_files(&fc_install, &sel)
+        };
+        dlg.close();
+        do_install(
+            &ap,
+            &an,
+            &gc,
+            &cc,
+            &cont,
+            hide,
+            &search,
+            &InstallStrategy::Fomod(files),
+            &grc,
+            ctx.as_ref(),
+        );
+    });
+
+    // Build and push the first visible step page.
+    let initial_flags = HashMap::new();
+    if let Some(first_idx) = (0..fomod_rc.steps.len())
+        .find(|&i| step_is_visible_with_flags(&fomod_rc.steps[i], &initial_flags))
+    {
+        let page = build_fomod_nav_page(
+            first_idx,
+            Rc::clone(&fomod_rc),
+            Rc::clone(&selections),
+            Rc::clone(&image_cache),
+            nav_view.clone(),
+            Rc::clone(&on_install),
+        );
+        nav_view.push(&page);
+    }
+
+    dialog.present(parent);
+}
+
+/// Build one `adw::NavigationPage` for `step_idx` in `fomod`, following the
+/// GNOME HIG:
+///
+/// * `adw::ToolbarView` with `adw::HeaderBar` (provides the back button).
+/// * Plugin groups rendered as `adw::PreferencesGroup` + `gtk4::ListBox` with
+///   `boxed-list` class and `adw::ActionRow` per plugin.
+/// * Small image thumbnails as row prefixes; a full-size preview card at the
+///   top of the step updates on hover.
+/// * Next / Install pill button in the `ToolbarView` bottom bar.
+/// * Next is insensitive until every required group has a valid selection.
+fn build_fomod_nav_page(
+    step_idx: usize,
+    fomod: Rc<FomodConfig>,
+    selections: Rc<RefCell<FomodSelections>>,
+    image_cache: Rc<RefCell<HashMap<String, gtk4::gdk::Texture>>>,
+    nav_view: adw::NavigationView,
+    on_install: Rc<dyn Fn()>,
+) -> adw::NavigationPage {
+    // Ensure selections for this step are consistent with its constraints.
+    {
+        let mut sel = selections.borrow_mut();
+        sanitize_step_selection(&fomod, &mut sel, step_idx);
+    }
+
+    let step = &fomod.steps[step_idx];
+
+    // Flags set by all steps that precede this one (used for plugin-level
+    // visibility within the current step).
+    let prev_flags = {
+        let sel = selections.borrow();
+        if step_idx > 0 {
+            collect_active_flags(&fomod, &sel, step_idx - 1)
+        } else {
+            HashMap::new()
+        }
+    };
+
+    // Does any plugin in this step have a preview image?
+    let has_any_image = step.groups.iter().flat_map(|g| &g.plugins).any(|p| {
+        p.image_path
+            .as_ref()
+            .is_some_and(|ip| image_cache.borrow().contains_key(ip))
+    });
+
+    // ── NavigationPage ───────────────────────────────────────────────────────
+    // Title comes from NavigationPage — no manual title-1 label needed.
+    let page = adw::NavigationPage::builder()
+        .title(&step.name)
+        .build();
+
+    let toolbar_view = adw::ToolbarView::new();
+    // HeaderBar is added as a top bar; NavigationView injects the back button
+    // automatically — we must NOT add one manually.
+    toolbar_view.add_top_bar(&adw::HeaderBar::new());
+
+    // ── Full-size preview panel (shown at top when images are available) ─────
+    let preview_picture = gtk4::Picture::new();
+    preview_picture.set_content_fit(gtk4::ContentFit::Contain);
+    preview_picture.set_can_shrink(true);
+    preview_picture.set_halign(gtk4::Align::Center);
+    preview_picture.set_size_request(400, 200);
+
+    let preview_name = gtk4::Label::new(None);
+    preview_name.add_css_class("dim-label");
+    preview_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    preview_name.set_halign(gtk4::Align::Center);
+
+    let preview_card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    preview_card.add_css_class("card");
+    preview_card.set_margin_bottom(4);
+    preview_card.append(&preview_picture);
+    preview_card.append(&preview_name);
+
+    // ── Content box (Clamp + ScrolledWindow) ─────────────────────────────────
+    let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    content_box.set_margin_top(18);
+    content_box.set_margin_bottom(18);
+    content_box.set_margin_start(18);
+    content_box.set_margin_end(18);
+
+    if has_any_image {
+        content_box.append(&preview_card);
+    }
+
+    // ── Forward button (Next / Install) ──────────────────────────────────────
+    // Determine whether there is a next visible step with the current
+    // selections so we can label the button correctly at creation time.  The
+    // connect_toggled handler keeps the label in sync if selections change.
+    let is_last_initially = {
+        let sel = selections.borrow();
+        let flags = collect_active_flags(&fomod, &sel, step_idx);
+        (step_idx + 1..fomod.steps.len())
+            .find(|&i| step_is_visible_with_flags(&fomod.steps[i], &flags))
+            .is_none()
+    };
+
+    let fwd_btn = gtk4::Button::with_label(if is_last_initially {
+        "Install"
+    } else {
+        "Next"
+    });
+    fwd_btn.add_css_class("suggested-action");
+    fwd_btn.add_css_class("pill");
+    fwd_btn.set_halign(gtk4::Align::Center);
+    fwd_btn.set_margin_top(12);
+    fwd_btn.set_margin_bottom(12);
+
+    // Disable until every required group has at least one selection.
+    fwd_btn.set_sensitive(step_selection_is_valid(
+        &fomod,
+        step_idx,
+        &selections.borrow(),
+    ));
+    let fwd_btn_ref = fwd_btn.clone();
+
+    // Track the first available image to show as the default preview.
+    let mut default_preview: Option<(gtk4::gdk::Texture, String)> = None;
+
+    // ── Plugin groups ────────────────────────────────────────────────────────
+    for (gi, group) in step.groups.iter().enumerate() {
+        // Only include plugins that pass dependency-flag visibility check.
+        let visible_plugins: Vec<usize> = group
+            .plugins
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, plugin)| {
+                if plugin_is_visible(plugin, &prev_flags) {
+                    Some(pi)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if visible_plugins.is_empty() {
+            continue;
+        }
+
+        // Section title comes from PreferencesGroup — no separate Label needed.
+        let type_desc = match group.group_type {
+            FomodGroupType::SelectExactlyOne => " (select one)",
+            FomodGroupType::SelectAtMostOne => " (select at most one)",
+            FomodGroupType::SelectAtLeastOne => " (select at least one)",
+            FomodGroupType::SelectAll => " (all included)",
+            FomodGroupType::SelectAny => " (select any)",
+        };
+
+        let pref_group = adw::PreferencesGroup::builder()
+            .title(format!("{}{}", group.name, type_desc))
+            .build();
+
+        let list = gtk4::ListBox::new();
+        list.add_css_class("boxed-list");
+        list.set_selection_mode(gtk4::SelectionMode::None);
+        list.set_hexpand(true);
+
+        let use_radio = matches!(
+            group.group_type,
+            FomodGroupType::SelectExactlyOne | FomodGroupType::SelectAtMostOne
+        );
+        let mut radio_leader: Option<gtk4::CheckButton> = None;
+
+        for &pi in &visible_plugins {
+            let plugin = &group.plugins[pi];
+            let row = adw::ActionRow::builder().title(&plugin.name).build();
+
+            // Description as subtitle (trimmed, skipped when empty).
+            if let Some(ref d) = plugin.description {
+                let trimmed = d.trim();
+                if !trimmed.is_empty() {
+                    row.set_subtitle(trimmed);
+                }
             }
-            bb.set_sensitive(idx > 0);
-            nb.set_visible(idx + 1 < step_count);
-            ib.set_visible(idx + 1 >= step_count);
-            if idx >= fc.steps.len() {
-                return;
-            }
-            {
-                let mut sel = sel_c.borrow_mut();
-                sanitize_step_selection(&fc, &mut sel, idx);
-            }
-            let active_flags = {
-                let sel = sel_c.borrow();
-                collect_active_flags(&fc, &sel, idx)
-            };
-            let step = &fc.steps[idx];
-            let title = gtk4::Label::new(Some(&step.name));
-            title.add_css_class("title-2");
-            title.set_halign(gtk4::Align::Start);
-            title.set_margin_bottom(4);
-            sc.append(&title);
-            let step_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
-            step_row.set_hexpand(true);
-            step_row.set_vexpand(true);
-            let scrolled = gtk4::ScrolledWindow::new();
-            scrolled.set_vexpand(true);
-            scrolled.set_hexpand(true);
-            scrolled.set_size_request(GROUP_OPTIONS_MIN_WIDTH, -1);
-            scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-            scrolled.add_css_class("card");
-            let groups_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-            groups_box.set_margin_start(12);
-            groups_box.set_margin_end(12);
-            groups_box.set_margin_top(12);
-            groups_box.set_margin_bottom(12);
-            let preview_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-            preview_box.add_css_class("card");
-            preview_box.set_halign(gtk4::Align::Start);
-            preview_box.set_valign(gtk4::Align::Start);
-            preview_box.set_vexpand(false);
-            preview_box.set_size_request(GROUP_PREVIEW_PANE_WIDTH, -1);
-            preview_box.set_margin_top(FOMOD_CARD_EDGE_MARGIN);
-            preview_box.set_margin_bottom(FOMOD_CARD_EDGE_MARGIN);
-            preview_box.set_margin_start(FOMOD_CARD_EDGE_MARGIN);
-            preview_box.set_margin_end(FOMOD_CARD_EDGE_MARGIN);
-            let preview_label = gtk4::Label::new(Some("Preview"));
-            preview_label.add_css_class("dim-label");
-            preview_label.add_css_class("caption");
-            preview_label.set_halign(gtk4::Align::Start);
-            preview_label.set_margin_start(12);
-            preview_label.set_margin_top(12);
-            let preview_name = gtk4::Label::new(Some(""));
-            preview_name.set_wrap(false);
-            preview_name.set_single_line_mode(true);
-            preview_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            preview_name.set_halign(gtk4::Align::Start);
-            preview_name.set_width_chars(GROUP_PREVIEW_NAME_WIDTH_CHARS);
-            preview_name.set_max_width_chars(GROUP_PREVIEW_NAME_MAX_WIDTH_CHARS);
-            preview_name.set_margin_start(12);
-            preview_name.set_margin_end(12);
-            preview_name.set_margin_bottom(12);
-            let preview_picture = gtk4::Picture::new();
-            preview_picture.set_content_fit(gtk4::ContentFit::Contain);
-            preview_picture.set_can_shrink(true);
-            preview_picture.set_hexpand(false);
-            preview_picture.set_vexpand(false);
-            preview_picture.set_halign(gtk4::Align::Center);
-            let preview_picture_frame = gtk4::Frame::new(None);
-            preview_picture_frame
-                .set_size_request(GROUP_PREVIEW_IMAGE_WIDTH, GROUP_PREVIEW_IMAGE_HEIGHT);
-            preview_picture_frame.set_halign(gtk4::Align::Center);
-            preview_picture_frame.set_margin_start(12);
-            preview_picture_frame.set_margin_end(12);
-            preview_picture_frame.set_margin_bottom(8);
-            preview_picture_frame.set_child(Some(&preview_picture));
-            preview_box.append(&preview_label);
-            preview_box.append(&preview_picture_frame);
-            preview_box.append(&preview_name);
-            let mut has_step_preview = false;
-            let mut default_preview: Option<(gtk4::gdk::Texture, String)> = None;
-            for (gi, group) in step.groups.iter().enumerate() {
-                let type_desc = match group.group_type {
-                    FomodGroupType::SelectExactlyOne => "select one",
-                    FomodGroupType::SelectAtMostOne => "select at most one",
-                    FomodGroupType::SelectAtLeastOne => "select at least one",
-                    FomodGroupType::SelectAll => "all required",
-                    FomodGroupType::SelectAny => "select any",
-                };
-                let frame = gtk4::Frame::new(Some(&format!("{} ({type_desc})", group.name)));
-                frame.add_css_class("card");
-                frame.set_margin_top(FOMOD_CARD_EDGE_MARGIN);
-                frame.set_margin_bottom(FOMOD_CARD_EDGE_MARGIN);
-                let lb = gtk4::ListBox::new();
-                lb.add_css_class("boxed-list");
-                lb.set_selection_mode(gtk4::SelectionMode::None);
-                lb.set_hexpand(true);
-                let use_radio = matches!(
-                    group.group_type,
-                    FomodGroupType::SelectExactlyOne | FomodGroupType::SelectAtMostOne
-                );
-                let mut first_radio_button: Option<gtk4::CheckButton> = None;
-                for (pi, plugin) in group.plugins.iter().enumerate() {
-                    if !plugin_is_visible(plugin, &active_flags) {
-                        continue;
+
+            // Small thumbnail prefix (80×60, cover crop).
+            if let Some(ref ip) = plugin.image_path {
+                if let Some(texture) = image_cache.borrow().get(ip).cloned() {
+                    let thumb = gtk4::Picture::new();
+                    thumb.set_size_request(80, 60);
+                    thumb.set_paintable(Some(&texture));
+                    thumb.set_content_fit(gtk4::ContentFit::Cover);
+                    thumb.set_valign(gtk4::Align::Center);
+                    let thumb_frame = gtk4::Frame::new(None);
+                    thumb_frame.set_valign(gtk4::Align::Center);
+                    thumb_frame.set_child(Some(&thumb));
+                    row.add_prefix(&thumb_frame);
+
+                    if default_preview.is_none() {
+                        default_preview = Some((texture.clone(), plugin.name.clone()));
                     }
-                    let row = adw::ActionRow::builder().title(&plugin.name).build();
-                    if let Some(ref d) = plugin.description
-                        && !d.is_empty() {
-                            row.set_subtitle(d);
-                        }
+
+                    // Update the full-size preview panel on row hover.
+                    let hover_pic = preview_picture.clone();
+                    let hover_name = preview_name.clone();
+                    let hover_tex = texture.clone();
+                    let hover_plugin_name = plugin.name.clone();
+                    let motion = gtk4::EventControllerMotion::new();
+                    motion.connect_enter(move |_, _, _| {
+                        hover_pic.set_paintable(Some(&hover_tex));
+                        hover_name.set_label(&hover_plugin_name);
+                    });
+                    row.add_controller(motion);
+                }
+            }
+
+            match group.group_type {
+                FomodGroupType::SelectAll => {
+                    // All plugins are auto-selected; show a read-only badge
+                    // instead of an interactive checkbox.
+                    row.set_sensitive(false);
+                    row.set_activatable(false);
+                    let badge = gtk4::Label::new(Some("Included"));
+                    badge.add_css_class("dim-label");
+                    badge.add_css_class("caption");
+                    badge.set_valign(gtk4::Align::Center);
+                    row.add_suffix(&badge);
+                }
+                _ => {
                     let check = gtk4::CheckButton::new();
+                    check.set_valign(gtk4::Align::Center);
+
+                    // Use GTK radio-group semantics — no manual uncheck loops.
                     if use_radio {
-                        if let Some(ref first) = first_radio_button {
-                            check.set_group(Some(first));
+                        if let Some(ref leader) = radio_leader {
+                            check.set_group(Some(leader));
                         } else {
-                            first_radio_button = Some(check.clone());
+                            radio_leader = Some(check.clone());
                         }
                     }
+
+                    // Restore persisted selection state.
                     {
-                        let sel = sel_c.borrow();
-                        if let Some(gs) = sel.get(idx).and_then(|s| s.get(gi)) {
+                        let sel = selections.borrow();
+                        if let Some(gs) = sel.get(step_idx).and_then(|s| s.get(gi)) {
                             check.set_active(gs.contains(&pi));
                         }
                     }
-                    if group.group_type == FomodGroupType::SelectAll {
+
+                    // Required plugins: pre-checked and locked.
+                    if plugin.type_descriptor == FomodPluginType::Required {
                         check.set_active(true);
                         check.set_sensitive(false);
                     }
-                    let sel_cc = Rc::clone(&sel_c);
+
+                    // NotUsable plugins: greyed out with an explanatory tooltip.
+                    if plugin.type_descriptor == FomodPluginType::NotUsable {
+                        row.set_sensitive(false);
+                        row.set_tooltip_text(Some("Not available for your current setup"));
+                    }
+
+                    // Update selections and button state on every toggle.
+                    let sel_c = Rc::clone(&selections);
+                    let fomod_c = Rc::clone(&fomod);
+                    let nb = fwd_btn_ref.clone();
                     let is_radio = use_radio;
-                    let si = idx;
                     check.connect_toggled(move |btn| {
-                        let mut sel = sel_cc.borrow_mut();
-                        if let Some(gs) = sel.get_mut(si).and_then(|s| s.get_mut(gi)) {
+                        let mut sel = sel_c.borrow_mut();
+                        if let Some(gs) =
+                            sel.get_mut(step_idx).and_then(|s| s.get_mut(gi))
+                        {
                             if btn.is_active() {
                                 if is_radio {
                                     gs.clear();
@@ -1440,38 +1567,21 @@ fn show_fomod_wizard(
                                 gs.retain(|&x| x != pi);
                             }
                         }
+                        // Sensitivity: re-validate required groups.
+                        let valid = step_selection_is_valid(&fomod_c, step_idx, &sel);
+                        nb.set_sensitive(valid);
+                        // Label: re-evaluate step visibility so Install/Next
+                        // stays accurate when selections affect later steps.
+                        let cur_flags = collect_active_flags(&fomod_c, &sel, step_idx);
+                        let still_last = (step_idx + 1..fomod_c.steps.len())
+                            .find(|&i| {
+                                step_is_visible_with_flags(&fomod_c.steps[i], &cur_flags)
+                            })
+                            .is_none();
+                        nb.set_label(if still_last { "Install" } else { "Next" });
                     });
-                    check.set_valign(gtk4::Align::Center);
-                    row.add_prefix(&check);
-                    row.set_activatable_widget(Some(&check));
-                    if let Some(ref image_path) = plugin.image_path
-                        && let Some(texture) = load_fomod_option_image(image_path, &img_cache) {
-                            has_step_preview = true;
-                            if check.is_active() || default_preview.is_none() {
-                                default_preview = Some((texture.clone(), plugin.name.clone()));
-                            }
-                            let hover_pic = preview_picture.clone();
-                            let hover_name = preview_name.clone();
-                            let hover_texture = texture.clone();
-                            let hover_plugin_name = plugin.name.clone();
-                            let row_motion = gtk4::EventControllerMotion::new();
-                            row_motion.connect_enter(move |_, _, _| {
-                                hover_pic.set_paintable(Some(&hover_texture));
-                                hover_name.set_label(&hover_plugin_name);
-                            });
-                            row.add_controller(row_motion);
 
-                            let radio_pic = preview_picture.clone();
-                            let radio_name = preview_name.clone();
-                            let radio_texture = texture.clone();
-                            let radio_plugin_name = plugin.name.clone();
-                            let check_motion = gtk4::EventControllerMotion::new();
-                            check_motion.connect_enter(move |_, _, _| {
-                                radio_pic.set_paintable(Some(&radio_texture));
-                                radio_name.set_label(&radio_plugin_name);
-                            });
-                            check.add_controller(check_motion);
-                        }
+                    // Type badge (Required / Recommended / Not Usable).
                     let tl = match plugin.type_descriptor {
                         FomodPluginType::Required => Some("Required"),
                         FomodPluginType::Recommended => Some("Recommended"),
@@ -1485,92 +1595,113 @@ fn show_fomod_wizard(
                         badge.set_valign(gtk4::Align::Center);
                         row.add_suffix(&badge);
                     }
-                    lb.append(&row);
+
+                    row.add_suffix(&check);
+                    row.set_activatable_widget(Some(&check));
                 }
-                frame.set_child(Some(&lb));
-                groups_box.append(&frame);
             }
-            scrolled.set_child(Some(&groups_box));
-            step_row.append(&scrolled);
-            if has_step_preview {
-                if let Some((texture, plugin_name)) = default_preview {
-                    preview_picture.set_paintable(Some(&texture));
-                    preview_name.set_label(&plugin_name);
-                }
-            } else {
-                preview_picture.set_paintable(None::<&gtk4::gdk::Texture>);
-                preview_name.set_label("No preview available");
-            }
-            step_row.append(&preview_box);
-            sc.append(&step_row);
-        })
-    };
-    render_step(0);
-    {
-        let si = Rc::clone(&step_index);
-        let rs = Rc::clone(&render_step);
-        back_btn.connect_clicked(move |_| {
-            let mut i = si.borrow_mut();
-            if *i > 0 {
-                *i -= 1;
-                rs(*i);
-            }
-        });
+
+            list.append(&row);
+        }
+
+        pref_group.add(&list);
+        content_box.append(&pref_group);
     }
-    {
-        let si = Rc::clone(&step_index);
-        let rs = Rc::clone(&render_step);
-        next_btn.connect_clicked(move |_| {
-            let mut i = si.borrow_mut();
-            if *i + 1 < step_count {
-                *i += 1;
-                rs(*i);
-            }
-        });
+
+    // Populate the full-size preview with the first available image.
+    if has_any_image {
+        if let Some((texture, name)) = default_preview {
+            preview_picture.set_paintable(Some(&texture));
+            preview_name.set_label(&name);
+        }
     }
+
+    // ── Scroll + Clamp (max 700 px, GNOME HIG standard) ─────────────────────
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    let clamp = adw::Clamp::builder()
+        .maximum_size(700)
+        .child(&content_box)
+        .build();
+    scroll.set_child(Some(&clamp));
+    toolbar_view.set_content(Some(&scroll));
+
+    // ── Bottom action bar — Next / Install pill button ────────────────────────
+    // Placed in the ToolbarView bottom bar (not inline in the content) so it
+    // respects safe-area insets and stays in the correct HIG position.
+    let action_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    action_bar.set_halign(gtk4::Align::Center);
+    action_bar.append(&fwd_btn);
+    toolbar_view.add_bottom_bar(&action_bar);
+
+    page.set_child(Some(&toolbar_view));
+
+    // ── Forward-navigation handler ───────────────────────────────────────────
+    // A single handler always re-evaluates step visibility so the correct
+    // action (push next page vs. install) is taken even if selections changed.
     {
-        let sel_c = Rc::clone(&selections);
-        let fc = Rc::clone(&fomod_rc);
-        let ap = archive_path.to_path_buf();
-        let an = archive_name.to_string();
-        let gc = game.clone();
-        let cc = Rc::clone(config);
-        let cont = container.clone();
-        let dlg = dialog.clone();
-        let hide = hide_installed;
-        let search = search_query.to_string();
-        let grc = Rc::clone(game_rc);
-        let ctx = status_ctx.cloned();
-        install_btn.connect_clicked(move |_| {
-            let files = {
-                let sel = sel_c.borrow();
-                resolve_fomod_files(&fc, &sel)
+        let fc = Rc::clone(&fomod);
+        let sc = Rc::clone(&selections);
+        let ic = Rc::clone(&image_cache);
+        let nv = nav_view.clone();
+        let oi = Rc::clone(&on_install);
+        fwd_btn.connect_clicked(move |_| {
+            let next_flags = {
+                let sel = sc.borrow();
+                collect_active_flags(&fc, &sel, step_idx)
             };
-            // Close the wizard first so the Downloads page is visible when
-            // the install progress popup appears.
-            dlg.destroy();
-            do_install(
-                &ap,
-                &an,
-                &gc,
-                &cc,
-                &cont,
-                hide,
-                &search,
-                &InstallStrategy::Fomod(files),
-                &grc,
-                ctx.as_ref(),
-            );
+            let next_idx = (step_idx + 1..fc.steps.len())
+                .find(|&i| step_is_visible_with_flags(&fc.steps[i], &next_flags));
+            if let Some(next_idx) = next_idx {
+                let next_page = build_fomod_nav_page(
+                    next_idx,
+                    Rc::clone(&fc),
+                    Rc::clone(&sc),
+                    Rc::clone(&ic),
+                    nv.clone(),
+                    Rc::clone(&oi),
+                );
+                nv.push(&next_page);
+            } else {
+                // No more visible steps — run the install callback.
+                oi();
+            }
         });
     }
-    main_box.append(&step_content);
-    main_box.append(&nav_box);
-    toolbar_view.set_content(Some(&main_box));
-    dialog.set_content(Some(&toolbar_view));
-    dialog.present();
+
+    page
 }
 
-/// Public entry point for the FOMOD wizard, callable from the Library page.
+/// Returns `true` when every group in `step_idx` that mandates a selection
+/// (SelectExactlyOne, SelectAtLeastOne) has at least one plugin chosen.
+fn step_selection_is_valid(
+    fomod: &FomodConfig,
+    step_idx: usize,
+    selections: &FomodSelections,
+) -> bool {
+    let Some(step) = fomod.steps.get(step_idx) else {
+        return true;
+    };
+    for (gi, group) in step.groups.iter().enumerate() {
+        let count = selections
+            .get(step_idx)
+            .and_then(|s| s.get(gi))
+            .map(|gs| gs.len())
+            .unwrap_or(0);
+        match group.group_type {
+            FomodGroupType::SelectExactlyOne | FomodGroupType::SelectAtLeastOne => {
+                if count == 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn show_fomod_wizard_from_library(
     parent: Option<&gtk4::Window>,
