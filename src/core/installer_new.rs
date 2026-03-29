@@ -544,7 +544,7 @@ pub fn resolve_file_conflicts(mut files: Vec<FomodFile>) -> Vec<FomodFile> {
         let is_new = seen.insert(dest_norm.clone());
         if !is_new {
             log::debug!(
-                "[Conflict] Overriding duplicate destination | dest={}, winner_source={}, priority={}",
+                "[Conflict] Duplicate destination skipped | dest={}, source={}, priority={}",
                 dest_norm,
                 f.source,
                 f.priority
