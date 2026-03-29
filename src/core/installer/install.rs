@@ -5,12 +5,12 @@ use crate::core::games::Game;
 use crate::core::logger;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 
-use super::archive::{find_common_prefix, list_archive_entries_with_7z};
+use super::archive::list_archive_entries_with_7z;
 use super::extract::{
     create_temp_extract_dir, extract_archive_with_7z, extract_non_zip_to, extract_zip_to,
     normalize_paths_to_lowercase,
 };
-use super::heuristics::{build_data_archive_plan, find_common_prefix_from_paths};
+use super::heuristics::{build_data_archive_plan, find_data_root_in_paths};
 use super::paths::{
     has_rar_extension, has_zip_extension, installer_log_activity, installer_log_warning,
     is_safe_relative_path, normalize_path, strip_data_prefix,
@@ -336,11 +336,13 @@ pub(super) fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[Fomod
         list_archive_entries_with_7z(archive_path)?
     };
 
-    let archive_prefix = if let Some(zip) = &mut zip_archive {
-        normalize_path(&find_common_prefix(zip))
-    } else {
+    let archive_prefix = {
         let entry_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
-        find_common_prefix_from_paths(&entry_refs)
+        // Use FOMOD-aware detection: finds the directory containing fomod/ModuleConfig.xml,
+        // which is exactly what FOMOD source paths are relative to.
+        // Falls back to find_common_prefix_from_paths for archives without a fomod/ dir.
+        let root = find_data_root_in_paths(&entry_refs);
+        normalize_path(&root)
     };
     let entry_map: Vec<(String, String, usize)> = entries
         .iter()
@@ -410,6 +412,19 @@ pub(super) fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[Fomod
             (result_source, result_entries)
         };
 
+        if matching_entries.is_empty() {
+            log::warn!(
+                "[FOMOD] No archive entries matched source '{}' | archive_prefix='{}' | total_entries={}",
+                fomod_file.source,
+                archive_prefix,
+                entry_map.len()
+            );
+            // Log a sample of actual entry keys so the mismatch can be diagnosed.
+            for (nl, _, _) in entry_map.iter().take(10) {
+                log::debug!("[FOMOD] entry_map sample: '{nl}'");
+            }
+        }
+
         let matched_source_lower = matched_source.to_lowercase();
         let source_prefix_lower = (!matched_source_lower.is_empty())
             .then(|| format!("{matched_source_lower}/"));
@@ -456,7 +471,13 @@ pub(super) fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[Fomod
         files_to_extract.len()
     ));
     if let Some(zip) = &mut zip_archive {
-        for (_, out_path, entry_idx) in files_to_extract {
+        for (raw_name, out_path, entry_idx) in files_to_extract {
+            let rel_lower = normalize_path(&raw_name).to_lowercase();
+            // Skip known macOS / metadata entries that should never be extracted.
+            let top = rel_lower.split('/').next().unwrap_or("");
+            if JUNK_TOPLEVEL_ENTRIES.contains(&top) {
+                continue;
+            }
             let mut entry = zip
                 .by_index(entry_idx)
                 .map_err(|e| format!("Cannot read entry at index {entry_idx}: {e}"))?;

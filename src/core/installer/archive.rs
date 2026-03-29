@@ -2,7 +2,7 @@ use std::io::Read;
 use std::path::Path;
 
 use super::paths::{has_rar_extension, has_zip_extension, normalize_path};
-use super::types::{FOMOD_DIR_PREFIX, SINGLE_FILE_READ_CAP};
+use super::types::{FOMOD_DIR_PREFIX, JUNK_TOPLEVEL_ENTRIES, SINGLE_FILE_READ_CAP};
 
 /// Open a 7z archive and return an `ArchiveReader` ready for reading.
 pub(super) fn open_7z_reader(
@@ -285,6 +285,11 @@ fn read_archive_file_bytes_non_zip(
 }
 
 /// Detect common top-level prefix shared by all zip entries.
+///
+/// Entries whose top-level component is in `JUNK_TOPLEVEL_DIRS` (e.g.
+/// `__MACOSX/`) are ignored so that macOS resource-fork entries don't prevent
+/// wrapper-directory detection.  Comparison is case-insensitive so minor
+/// casing differences in repeated wrapper-dir names don't break detection.
 pub(super) fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String {
     if zip.is_empty() {
         return String::new();
@@ -298,9 +303,12 @@ pub(super) fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String
         if top.is_empty() {
             continue;
         }
+        if JUNK_TOPLEVEL_ENTRIES.contains(&top.to_lowercase().as_str()) {
+            continue;
+        }
         match &first_top {
             None => first_top = Some(top.to_string()),
-            Some(ft) if ft != top => {
+            Some(ft) if ft.to_lowercase() != top.to_lowercase() => {
                 all_same = false;
                 break;
             }
