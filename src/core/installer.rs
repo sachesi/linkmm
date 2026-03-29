@@ -3260,6 +3260,34 @@ mod tests {
     }
 
     #[test]
+    fn install_fomod_files_data_root_fallback_preserves_original_filename_case() {
+        let tmp = tempdir();
+        let archive = create_test_zip(
+            &tmp,
+            &[
+                ("fomod/", b""),
+                ("fomod/ModuleConfig.xml", b"<config/>"),
+                ("FileName.ESP", b"esp_data"),
+            ],
+        );
+        let dest = tmp.join("mod_data");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        install_fomod_files(
+            &archive,
+            &dest,
+            &[FomodFile {
+                source: "Data".to_string(),
+                destination: "Data".to_string(),
+                priority: 0,
+            }],
+        )
+        .unwrap();
+
+        assert!(dest.join("FileName.ESP").exists());
+    }
+
+    #[test]
     fn install_fomod_files_skips_empty_directory_entries() {
         let tmp = tempdir();
         let archive = create_test_zip(
