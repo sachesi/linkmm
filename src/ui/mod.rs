@@ -129,11 +129,10 @@ fn build_main_window(
         let config_c = Rc::clone(&config);
         play_btn.connect_clicked(move |_| {
             let game = config_c.borrow().current_game().cloned();
-            if let Some(g) = game {
-                if let Err(e) = crate::core::steam::launch_game(&g) {
+            if let Some(g) = game
+                && let Err(e) = crate::core::steam::launch_game(&g) {
                     log::warn!("Could not launch {}: {e}", g.name);
                 }
-            }
         });
     }
 
@@ -161,7 +160,7 @@ fn build_main_window(
             .title(*name)
             .activatable(true)
             .build();
-        let img = gtk4::Image::from_icon_name(*icon);
+        let img = gtk4::Image::from_icon_name(icon);
         row.add_prefix(&img);
         nav_list.append(&row);
     }
@@ -878,13 +877,12 @@ fn start_nxm_download(
 
             let dest_path = downloads_dir.join(&file_name);
             if dest_path.exists() {
-                if let Some(ref game) = download_target {
-                    if let Err(e) =
+                if let Some(ref game) = download_target
+                    && let Err(e) =
                         game.write_nxm_mod_id(&file_name, &nxm.game_domain, nxm.mod_id as u32)
                     {
                         log::warn!("Failed to update NXM metadata for {}: {e}", file_name);
                     }
-                }
                 return Ok(format!("{file_name} (already downloaded)"));
             }
 
@@ -913,13 +911,12 @@ fn start_nxm_download(
             download_state::clear_active(download_id);
             download_result?;
 
-            if let Some(ref game) = download_target {
-                if let Err(e) =
+            if let Some(ref game) = download_target
+                && let Err(e) =
                     game.write_nxm_mod_id(&file_name, &nxm.game_domain, nxm.mod_id as u32)
                 {
                     log::warn!("Failed to write NXM metadata for {}: {e}", file_name);
                 }
-            }
 
             Ok(file_name)
         })();

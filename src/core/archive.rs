@@ -12,6 +12,10 @@
 //   - Lazy Extraction: actual file bytes are only read when explicitly
 //     requested by path.
 
+// All public items here are used by tests. Production code routes through
+// installer.rs which builds on the same underlying archive libraries.
+#![allow(dead_code)]
+
 use std::path::Path;
 
 use crate::core::logger;

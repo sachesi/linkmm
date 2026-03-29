@@ -10,18 +10,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::core::games::Game;
-use crate::core::mods::{Mod, ModDatabase};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Buffer size for file extraction operations (256 KB)
+#[allow(dead_code)]
 const EXTRACT_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Progress callback interval in milliseconds (50ms = ~20 Hz)
+#[allow(dead_code)]
 const EXTRACTION_TICK_INTERVAL_MS: u64 = 50;
 
 /// Known Data/ subdirectories for detection heuristics
@@ -101,6 +100,7 @@ pub fn normalize_path_lowercase(path: &str) -> String {
 /// - Strips leading slashes
 /// - Trims trailing slashes
 /// - Does NOT lowercase (use normalize_path_lowercase for that)
+#[allow(dead_code)]
 pub fn normalize_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let normalized = normalized.trim_start_matches('/');
@@ -111,6 +111,7 @@ pub fn normalize_path(path: &str) -> String {
 ///
 /// Returns the path without the prefix if present, otherwise returns the
 /// original path unchanged.
+#[allow(dead_code)]
 pub fn strip_data_prefix(path: &str) -> String {
     let normalized = normalize_path(path);
     let lower = normalized.to_lowercase();
@@ -131,6 +132,7 @@ pub fn strip_data_prefix(path: &str) -> String {
 /// - Absolute paths
 ///
 /// This is critical zip-slip protection.
+#[allow(dead_code)]
 pub fn is_safe_relative_path(path: &Path) -> bool {
     if path.is_absolute() {
         return false;
@@ -354,6 +356,7 @@ pub fn detect_data_root(paths: &[String]) -> Option<String> {
 
 /// How a mod archive should be installed
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum InstallStrategy {
     /// Simple Data/ mod - extract and deploy
     SimpleData {
@@ -370,6 +373,7 @@ pub enum InstallStrategy {
 // ── FOMOD Types ───────────────────────────────────────────────────────────────
 
 /// A single file mapping in FOMOD
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FomodFile {
     /// Source path in archive (case-insensitive match)
@@ -384,6 +388,8 @@ pub struct FomodFile {
 
 /// FOMOD group selection type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+#[allow(clippy::enum_variant_names)]
 pub enum FomodGroupType {
     SelectAll,        // All mandatory
     SelectAny,        // Zero or more
@@ -394,6 +400,7 @@ pub enum FomodGroupType {
 
 /// FOMOD plugin type descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum FomodPluginType {
     Required,
     Optional,
@@ -409,6 +416,7 @@ pub struct FlagDependency {
 }
 
 /// Dependency operator
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyOperator {
     And,
@@ -416,6 +424,7 @@ pub enum DependencyOperator {
 }
 
 /// Dependencies for plugin visibility
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PluginDependencies {
     pub operator: DependencyOperator,
@@ -424,6 +433,7 @@ pub struct PluginDependencies {
 
 impl PluginDependencies {
     /// Check if dependencies are satisfied given current flags
+    #[allow(dead_code)]
     pub fn evaluate(&self, active_flags: &HashMap<String, String>) -> bool {
         let result = match self.operator {
             DependencyOperator::And => {
@@ -467,6 +477,7 @@ impl PluginDependencies {
 
 /// Condition flag set by plugin selection
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ConditionFlag {
     pub name: String,
     pub value: String,
@@ -474,6 +485,7 @@ pub struct ConditionFlag {
 
 /// A selectable plugin in a FOMOD group
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FomodPlugin {
     pub name: String,
     pub description: Option<String>,
@@ -486,6 +498,7 @@ pub struct FomodPlugin {
 
 /// A group of plugins in a FOMOD install step
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FomodPluginGroup {
     pub name: String,
     pub group_type: FomodGroupType,
@@ -494,6 +507,7 @@ pub struct FomodPluginGroup {
 
 /// A single page/step in the FOMOD installer wizard
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FomodInstallStep {
     pub name: String,
     pub visible: Option<PluginDependencies>,
@@ -502,6 +516,7 @@ pub struct FomodInstallStep {
 
 /// Conditional files activated by flag patterns
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConditionalFileInstall {
     pub dependencies: PluginDependencies,
     pub files: Vec<FomodFile>,
@@ -509,6 +524,7 @@ pub struct ConditionalFileInstall {
 
 /// Complete parsed FOMOD configuration
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FomodConfig {
     pub mod_name: Option<String>,
     pub required_files: Vec<FomodFile>,
@@ -525,6 +541,7 @@ pub struct FomodConfig {
 /// 2. Higher priority wins
 /// 3. Later doc_order wins (tie-breaker)
 /// 4. Keep only the winner for each destination
+#[allow(dead_code)]
 pub fn resolve_file_conflicts(mut files: Vec<FomodFile>) -> Vec<FomodFile> {
     if files.is_empty() {
         return files;

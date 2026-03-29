@@ -109,6 +109,7 @@ fn build_welcome_page() -> gtk4::Box {
     page
 }
 
+#[allow(clippy::type_complexity)]
 fn build_game_select_page(
     stack: &gtk4::Stack,
     detected_games: Vec<(GameKind, std::path::PathBuf)>,
@@ -295,11 +296,10 @@ fn show_add_game_dialog(
                 parent_window_clone.as_ref(),
                 None::<&gio::Cancellable>,
                 move |result| {
-                    if let Ok(file) = result {
-                        if let Some(path) = file.path() {
+                    if let Ok(file) = result
+                        && let Some(path) = file.path() {
                             row_clone.set_text(&path.to_string_lossy());
                         }
-                    }
                 },
             );
         });
@@ -374,7 +374,7 @@ fn build_app_dir_page(
 
     // Default suggestion: ~/Documents/Linkmm
     let default_dir = dirs::document_dir()
-        .or_else(|| dirs::home_dir())
+        .or_else(dirs::home_dir)
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("Linkmm");
 
@@ -425,12 +425,11 @@ fn build_app_dir_page(
                 parent.as_ref(),
                 None::<&gio::Cancellable>,
                 move |result| {
-                    if let Ok(file) = result {
-                        if let Some(path) = file.path() {
+                    if let Ok(file) = result
+                        && let Some(path) = file.path() {
                             row_c.set_text(&path.to_string_lossy());
                             *app_dir_cc.borrow_mut() = Some(path);
                         }
-                    }
                 },
             );
         });

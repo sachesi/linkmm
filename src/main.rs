@@ -15,7 +15,6 @@ mod core {
 }
 pub mod ui;
 
-use gio;
 use gio::prelude::FileExt;
 use gtk4::prelude::{ApplicationExt, ApplicationExtManual, GtkApplicationExt};
 
