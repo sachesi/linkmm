@@ -1974,12 +1974,16 @@ fn extract_single_7z_file(
     file_path_in_archive: &str,
     dest_dir: &Path,
 ) -> Result<(), String> {
+    let target_norm = normalise_path(file_path_in_archive);
+    let target_lower = target_norm.to_lowercase();
     let mut data = None;
     sevenz_rust2::decompress_file_with_extract_fn(
         archive_path,
         dest_dir,
         |entry, reader, _default_dest| {
-            if entry.name() == file_path_in_archive && !entry.is_directory() {
+            let entry_norm = normalise_path(entry.name());
+            let entry_lower = entry_norm.to_lowercase();
+            if entry_lower == target_lower && !entry.is_directory() {
                 let mut buf = Vec::with_capacity(entry.size() as usize);
                 if reader.read_to_end(&mut buf).is_ok() {
                     data = Some(buf);
@@ -1997,7 +2001,7 @@ fn extract_single_7z_file(
         )
     })?;
 
-    let out_path = dest_dir.join(Path::new(&normalise_path(file_path_in_archive)));
+    let out_path = dest_dir.join(Path::new(&target_norm));
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create parent directory: {e}"))?;
@@ -3015,6 +3019,30 @@ mod tests {
             return;
         };
         let cfg = parse_fomod_from_archive(&archive).unwrap();
+        assert!(!cfg.required_files.is_empty());
+    }
+
+    #[test]
+    fn parse_fomod_from_archive_reads_non_zip_mixed_case_fomod_path() {
+        let tmp = tempdir();
+        let archive_path = tmp.join("mod_case.7z");
+        let staging = tmp.join("staging_case");
+        std::fs::create_dir_all(staging.join("FOMod")).unwrap();
+        std::fs::create_dir_all(staging.join("Data/textures")).unwrap();
+        std::fs::write(
+            staging.join("FOMod/ModuleConfig.xml"),
+            r#"<config>
+  <requiredInstallFiles>
+    <file source="Data/textures/sky.dds" destination="Data/textures/sky.dds" />
+  </requiredInstallFiles>
+</config>"#,
+        )
+        .unwrap();
+        std::fs::write(staging.join("Data/textures/sky.dds"), b"dds").unwrap();
+        let out_file = std::fs::File::create(&archive_path).unwrap();
+        sevenz_rust2::compress(staging.as_path(), out_file).unwrap();
+
+        let cfg = parse_fomod_from_archive(&archive_path).unwrap();
         assert!(!cfg.required_files.is_empty());
     }
 
