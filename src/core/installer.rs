@@ -703,47 +703,57 @@ pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, Stri
         .unwrap_or_default();
     let _span = logger::span("parse_fomod", &format!("archive={archive_name}"));
 
-    if has_zip_extension(archive_path) {
-        return parse_fomod_from_zip(archive_path);
+    let mut config = if has_zip_extension(archive_path) {
+        parse_fomod_from_zip(archive_path)?
+    } else if has_rar_extension(archive_path) {
+        parse_fomod_from_rar(archive_path)?
+    } else {
+        // For 7z archives: open the ArchiveReader once, find the FOMOD entry
+        // by name, and read its bytes directly.  This avoids decompressing the
+        // entire archive through `decompress_file_with_extract_fn` which was
+        // unreliable for solid archives.
+        let mut reader = open_7z_reader(archive_path)?;
+
+        // Find the FOMOD config entry name (case-insensitive search).
+        let fomod_entry = reader
+            .archive()
+            .files
+            .iter()
+            .find(|f| {
+                let lower = f.name().to_lowercase().replace('\\', "/");
+                lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
+            })
+            .map(|f| f.name().to_string())
+            .ok_or_else(|| "No fomod/ModuleConfig.xml found in archive".to_string())?;
+
+        log::debug!(
+            "[FOMOD] Found config entry in 7z | exact_name={}",
+            fomod_entry
+        );
+
+        // Read the XML bytes directly from the archive using the exact stored name.
+        let xml_bytes = reader.read_file(&fomod_entry).map_err(|e| {
+            format!(
+                "Failed to read '{}' from {}: {e}",
+                fomod_entry,
+                archive_path.display()
+            )
+        })?;
+
+        parse_fomod_xml(&xml_bytes)?
+    };
+
+    // Fall back to the archive filename (without extension) when the FOMOD
+    // config does not supply a <moduleName>.
+    if config.mod_name.is_none() && !archive_name.is_empty() {
+        let stem = std::path::Path::new(&archive_name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or(archive_name);
+        config.mod_name = Some(stem);
     }
 
-    if has_rar_extension(archive_path) {
-        return parse_fomod_from_rar(archive_path);
-    }
-
-    // For 7z archives: open the ArchiveReader once, find the FOMOD entry
-    // by name, and read its bytes directly.  This avoids decompressing the
-    // entire archive through `decompress_file_with_extract_fn` which was
-    // unreliable for solid archives.
-    let mut reader = open_7z_reader(archive_path)?;
-
-    // Find the FOMOD config entry name (case-insensitive search).
-    let fomod_entry = reader
-        .archive()
-        .files
-        .iter()
-        .find(|f| {
-            let lower = f.name().to_lowercase().replace('\\', "/");
-            lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
-        })
-        .map(|f| f.name().to_string())
-        .ok_or_else(|| "No fomod/ModuleConfig.xml found in archive".to_string())?;
-
-    log::debug!(
-        "[FOMOD] Found config entry in 7z | exact_name={}",
-        fomod_entry
-    );
-
-    // Read the XML bytes directly from the archive using the exact stored name.
-    let xml_bytes = reader.read_file(&fomod_entry).map_err(|e| {
-        format!(
-            "Failed to read '{}' from {}: {e}",
-            fomod_entry,
-            archive_path.display()
-        )
-    })?;
-
-    parse_fomod_xml(&xml_bytes)
+    Ok(config)
 }
 
 /// Parse a FOMOD `ModuleConfig.xml` from inside a RAR archive.
@@ -1202,11 +1212,36 @@ fn collect_matching_fs_entries(entry_map: &[(String, String)], source_lower: &st
         .collect()
 }
 
+/// Decode raw `ModuleConfig.xml` bytes to a UTF-8 `String`,
+/// handling UTF-16 LE/BE BOMs and an optional UTF-8 BOM.
+fn decode_fomod_xml(raw: &[u8]) -> Result<String, String> {
+    // UTF-16 LE: BOM = FF FE
+    if raw.starts_with(&[0xFF, 0xFE]) {
+        let utf16: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        return String::from_utf16(&utf16).map_err(|e| format!("UTF-16 LE decode error: {e}"));
+    }
+    // UTF-16 BE: BOM = FE FF
+    if raw.starts_with(&[0xFE, 0xFF]) {
+        let utf16: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+            .collect();
+        return String::from_utf16(&utf16).map_err(|e| format!("UTF-16 BE decode error: {e}"));
+    }
+    // UTF-8 BOM: EF BB BF (strip it, then parse normally)
+    let bytes = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
+    String::from_utf8(bytes.to_vec()).map_err(|e| format!("UTF-8 decode error: {e}"))
+}
+
 fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
-    let mut reader = Reader::from_reader(xml_bytes);
+    let xml_str = decode_fomod_xml(xml_bytes)?;
+    let mut reader = Reader::from_str(&xml_str);
     reader.config_mut().trim_text(true);
 
     let mut config = FomodConfig {
@@ -1614,6 +1649,13 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
         config.required_files.len(),
         config.conditional_file_installs.len()
     );
+
+    if config.steps.is_empty() && config.required_files.is_empty() {
+        log::warn!(
+            "[FOMOD] Parsed config has no steps and no required files. \
+             Check if the XML was decoded correctly (possible encoding issue)."
+        );
+    }
 
     Ok(config)
 }
@@ -4293,6 +4335,133 @@ mod tests {
         assert!(
             !dest.join("CBBE 2K").exists(),
             "CBBE 2K folder should not be present (not selected)"
+        );
+    }
+
+    // ── Encoding detection tests ──────────────────────────────────────────────
+
+    /// Helper: encode a UTF-8 string as UTF-16 LE with BOM.
+    fn to_utf16_le_with_bom(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE]; // BOM
+        for ch in s.encode_utf16() {
+            out.extend_from_slice(&ch.to_le_bytes());
+        }
+        out
+    }
+
+    /// Helper: encode a UTF-8 string as UTF-16 BE with BOM.
+    fn to_utf16_be_with_bom(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFE, 0xFF]; // BOM
+        for ch in s.encode_utf16() {
+            out.extend_from_slice(&ch.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn decode_fomod_xml_handles_utf16_le_bom() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-16"?>
+<config>
+  <moduleName>My Mod</moduleName>
+</config>"#;
+        let encoded = to_utf16_le_with_bom(xml);
+        let result = decode_fomod_xml(&encoded).unwrap();
+        assert!(result.contains("My Mod"));
+    }
+
+    #[test]
+    fn decode_fomod_xml_handles_utf16_be_bom() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-16"?>
+<config>
+  <moduleName>My Mod BE</moduleName>
+</config>"#;
+        let encoded = to_utf16_be_with_bom(xml);
+        let result = decode_fomod_xml(&encoded).unwrap();
+        assert!(result.contains("My Mod BE"));
+    }
+
+    #[test]
+    fn decode_fomod_xml_strips_utf8_bom() {
+        let xml = "<config><moduleName>Plain</moduleName></config>";
+        let mut bytes = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+        bytes.extend_from_slice(xml.as_bytes());
+        let result = decode_fomod_xml(&bytes).unwrap();
+        assert!(result.contains("Plain"));
+        assert!(!result.starts_with('\u{FEFF}'));
+    }
+
+    #[test]
+    fn decode_fomod_xml_handles_plain_utf8() {
+        let xml = "<config><moduleName>Plain UTF-8</moduleName></config>";
+        let result = decode_fomod_xml(xml.as_bytes()).unwrap();
+        assert_eq!(result, xml);
+    }
+
+    #[test]
+    fn parse_fomod_xml_accepts_utf16_le_encoded_bytes() {
+        let xml = r#"<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <moduleName>Diamond Mod</moduleName>
+  <installSteps>
+    <installStep name="Step1">
+      <optionalFileGroups>
+        <group name="Options" type="SelectAll">
+          <plugins>
+            <plugin name="Option A">
+              <description>Option A description</description>
+              <files>
+                <file source="optionA/file.esp" destination="Data/file.esp"/>
+              </files>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let encoded = to_utf16_le_with_bom(xml);
+        let config = parse_fomod_xml(&encoded).unwrap();
+        assert_eq!(config.mod_name.as_deref(), Some("Diamond Mod"));
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(config.steps[0].groups[0].plugins.len(), 1);
+    }
+
+    #[test]
+    fn parse_fomod_from_archive_uses_archive_name_as_fallback_for_empty_mod_name() {
+        // Create a zip with a ModuleConfig.xml that has an empty <moduleName>.
+        let tmp = tempdir();
+        let xml = br#"<config>
+  <moduleName></moduleName>
+  <installSteps>
+    <installStep name="Step1">
+      <optionalFileGroups>
+        <group name="G" type="SelectAny">
+          <plugins>
+            <plugin name="P">
+              <description>D</description>
+              <files><file source="f.esp" destination=""/></files>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"#;
+        let archive_path = tmp.join("MyGreatMod.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip_writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip_writer
+            .start_file("fomod/ModuleConfig.xml", options)
+            .unwrap();
+        zip_writer.write_all(xml).unwrap();
+        zip_writer.finish().unwrap();
+
+        let config = parse_fomod_from_archive(&archive_path).unwrap();
+        assert_eq!(
+            config.mod_name.as_deref(),
+            Some("MyGreatMod"),
+            "should fall back to archive stem when moduleName is empty"
         );
     }
 }
