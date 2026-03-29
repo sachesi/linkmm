@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::Path;
 
-use super::installer_new::{determine_link_type, LinkKind};
+use super::installer::{determine_link_type, LinkKind};
 use crate::core::games::Game;
 use crate::core::mods::Mod;
 
