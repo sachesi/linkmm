@@ -2,8 +2,8 @@ use std::io::{BufWriter, Read};
 use std::path::{Path, PathBuf};
 
 use crate::core::games::Game;
-use crate::core::mods::{Mod, ModDatabase, ModManager};
 use crate::core::installer_new;
+use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -21,11 +21,36 @@ const EXTRACTION_TICK_INTERVAL_MS: u64 = 50;
 /// `Data/` folder.  Used by the scoring heuristic to identify which directory
 /// in an archive corresponds to the game data root.
 const KNOWN_DATA_SUBDIRS: &[&str] = &[
-    "meshes", "textures", "scripts", "sound", "music", "shaders",
-    "lodsettings", "seq", "interface", "skse", "f4se", "nvse", "obse",
-    "fose", "mwse", "xnvse", "strings", "video", "facegen", "grass",
-    "shadersfx", "terrain", "dialogueviews", "vis", "lightingtemplate",
-    "distantlod", "lod", "trees", "fxmaster", "sky",
+    "meshes",
+    "textures",
+    "scripts",
+    "sound",
+    "music",
+    "shaders",
+    "lodsettings",
+    "seq",
+    "interface",
+    "skse",
+    "f4se",
+    "nvse",
+    "obse",
+    "fose",
+    "mwse",
+    "xnvse",
+    "strings",
+    "video",
+    "facegen",
+    "grass",
+    "shadersfx",
+    "terrain",
+    "dialogueviews",
+    "vis",
+    "lightingtemplate",
+    "distantlod",
+    "lod",
+    "trees",
+    "fxmaster",
+    "sky",
 ];
 
 /// Plugin file extensions that strongly indicate a game data root.
@@ -165,7 +190,11 @@ fn score_as_data_root(prefix: &str, paths: &[&str]) -> i32 {
 
     // +20 if the directory is itself named "data".
     let prefix_norm = prefix.to_lowercase().replace('\\', "/");
-    let dir_name = prefix_norm.trim_end_matches('/').split('/').next_back().unwrap_or("");
+    let dir_name = prefix_norm
+        .trim_end_matches('/')
+        .split('/')
+        .next_back()
+        .unwrap_or("");
     if dir_name == "data" {
         score += 20;
     }
@@ -603,7 +632,10 @@ fn find_fomod_config_in_dir(root: &Path) -> Option<std::path::PathBuf> {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                log::warn!("Failed to read extracted archive directory {}: {e}", dir.display());
+                log::warn!(
+                    "Failed to read extracted archive directory {}: {e}",
+                    dir.display()
+                );
                 continue;
             }
         };
@@ -644,6 +676,62 @@ fn find_fomod_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String, 
         }
     }
     Err("No fomod/ModuleConfig.xml found in archive".to_string())
+}
+
+/// Load multiple files from an archive by path in a single pass.
+/// Optimized for solid 7z archives to prevent multiple full sequential scans.
+pub fn read_archive_files_bytes(
+    archive_path: &Path,
+    relative_paths: &[&str],
+) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+    let mut results = std::collections::HashMap::new();
+
+    if relative_paths.is_empty() {
+        return Ok(results);
+    }
+
+    if !has_zip_extension(archive_path) {
+        return read_archive_files_bytes_non_zip(archive_path, relative_paths);
+    }
+
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
+
+    for rel_path in relative_paths {
+        let target = normalise_path(rel_path);
+        let target_lower = target.to_lowercase();
+        if target_lower.is_empty() {
+            continue;
+        }
+        let fomod_target = format!("{FOMOD_DIR_PREFIX}{target_lower}");
+
+        for i in 0..zip.len() {
+            let mut entry = match zip.by_index(i) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.is_dir() {
+                continue;
+            }
+            let name_norm = normalise_path(entry.name());
+            let name_lower = name_norm.to_lowercase();
+            let matches = name_lower == target_lower
+                || name_lower.ends_with(&format!("/{target_lower}"))
+                || name_lower == fomod_target
+                || name_lower.ends_with(&format!("/{fomod_target}"));
+            if matches {
+                let mut bytes = Vec::new();
+                if entry.read_to_end(&mut bytes).is_ok() {
+                    results.insert(rel_path.to_string(), bytes);
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Load a file from an archive by path, using case-insensitive matching and
@@ -703,6 +791,80 @@ pub fn read_archive_file_bytes(
 /// Instead of fully extracting the archive, this function first lists the
 /// archive's contents to find the exact stored path, then extracts only that
 /// single file.  This is orders of magnitude faster for large archives.
+fn read_archive_files_bytes_non_zip(
+    archive_path: &Path,
+    relative_paths: &[&str],
+) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+    let entries = list_archive_entries_with_7z(archive_path)?;
+    let mut target_to_req = std::collections::HashMap::new();
+
+    for rel_path in relative_paths {
+        let target = normalise_path(rel_path);
+        let target_lower = target.to_lowercase();
+        if target_lower.is_empty() {
+            continue;
+        }
+        let fomod_target = format!("{FOMOD_DIR_PREFIX}{target_lower}");
+
+        let matching_entry = entries.iter().find(|p| {
+            let norm = normalise_path(p);
+            let lower = norm.to_lowercase();
+            lower == target_lower
+                || lower.ends_with(&format!("/{target_lower}"))
+                || lower == fomod_target
+                || lower.ends_with(&format!("/{fomod_target}"))
+        });
+
+        if let Some(entry_path) = matching_entry {
+            target_to_req.insert(entry_path.clone(), rel_path.to_string());
+        }
+    }
+
+    if target_to_req.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut results = std::collections::HashMap::new();
+
+    if has_rar_extension(archive_path) {
+        let tmp = create_temp_extract_dir()?;
+        for (entry_path, rel_path) in target_to_req {
+            if extract_single_rar_file(archive_path, &entry_path, &tmp).is_ok() {
+                let extracted_path = tmp.join(Path::new(&normalise_path(&entry_path)));
+                if let Ok(bytes) = std::fs::read(&extracted_path) {
+                    results.insert(rel_path, bytes);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    } else {
+        // 7z single sequential pass
+        let _ = sevenz_rust2::decompress_file_with_extract_fn(
+            archive_path,
+            std::env::temp_dir(),
+            |entry, reader, _default_dest| {
+                if let Some(rel_path) = target_to_req.get(entry.name()) {
+                    if !entry.is_directory() {
+                        let mut bytes = Vec::with_capacity(entry.size() as usize);
+                        if reader.read_to_end(&mut bytes).is_ok() {
+                            results.insert(rel_path.clone(), bytes);
+                        }
+                    }
+                }
+                Ok(true)
+            },
+        );
+    }
+
+    Ok(results)
+}
+
+/// Read a file from a non-zip archive (7z, rar, etc.) using the same
+/// case-insensitive / `fomod/`-relative matching logic as the zip variant.
+///
+/// Instead of fully extracting the archive, this function first lists the
+/// archive's contents to find the exact stored path, then extracts only that
+/// single file.  This is orders of magnitude faster for large archives.
 fn read_archive_file_bytes_non_zip(
     archive_path: &Path,
     relative_path: &str,
@@ -738,8 +900,12 @@ fn read_archive_file_bytes_non_zip(
         // The file was extracted preserving directory structure.  Locate it.
         let normalised = normalise_path(entry_path);
         let extracted_path = tmp.join(Path::new(&normalised));
-        std::fs::read(&extracted_path)
-            .map_err(|e| format!("Failed to read extracted file {}: {e}", extracted_path.display()))
+        std::fs::read(&extracted_path).map_err(|e| {
+            format!(
+                "Failed to read extracted file {}: {e}",
+                extracted_path.display()
+            )
+        })
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     result
@@ -747,11 +913,7 @@ fn read_archive_file_bytes_non_zip(
 
 /// Recursively collect all regular files under `dir`, returning tuples of
 /// `(lowercase_relative_path, full_path)` relative to `root`.
-fn collect_fs_files(
-    root: &Path,
-    dir: &Path,
-    result: &mut Vec<(String, std::path::PathBuf)>,
-) {
+fn collect_fs_files(root: &Path, dir: &Path, result: &mut Vec<(String, std::path::PathBuf)>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
@@ -771,11 +933,7 @@ fn collect_fs_files(
 /// Recursively collect all entries (files and directories) under `dir`,
 /// returning tuples of `(lowercase_relative_path, original_relative_path)`
 /// relative to `root`.
-fn collect_fs_entries(
-    root: &Path,
-    dir: &Path,
-    result: &mut Vec<(String, String)>,
-) {
+fn collect_fs_entries(root: &Path, dir: &Path, result: &mut Vec<(String, String)>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
@@ -836,10 +994,7 @@ fn find_fs_common_prefix(entry_map: &[(String, String)]) -> (String, String) {
 /// Filter `entry_map` to entries whose lowercase relative path equals
 /// `source_lower` or starts with `source_lower/`, returning the original
 /// relative paths.
-fn collect_matching_fs_entries(
-    entry_map: &[(String, String)],
-    source_lower: &str,
-) -> Vec<String> {
+fn collect_matching_fs_entries(entry_map: &[(String, String)], source_lower: &str) -> Vec<String> {
     entry_map
         .iter()
         .filter(|(nl, _)| {
@@ -1238,12 +1393,13 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         }
                     }
                     "pattern" => {
-                        let dependencies = current_pattern_dependencies.take().unwrap_or(
-                            PluginDependencies {
-                                operator: DependencyOperator::And,
-                                flags: Vec::new(),
-                            },
-                        );
+                        let dependencies =
+                            current_pattern_dependencies
+                                .take()
+                                .unwrap_or(PluginDependencies {
+                                    operator: DependencyOperator::And,
+                                    flags: Vec::new(),
+                                });
                         if !current_pattern_files.is_empty() {
                             config
                                 .conditional_file_installs
@@ -1295,7 +1451,14 @@ pub fn install_mod_from_archive(
     mod_name: &str,
     strategy: &InstallStrategy,
 ) -> Result<Mod, String> {
-    install_mod_from_archive_with_nexus_ticking(archive_path, game, mod_name, strategy, None, &|| {})
+    install_mod_from_archive_with_nexus_ticking(
+        archive_path,
+        game,
+        mod_name,
+        strategy,
+        None,
+        &|| {},
+    )
 }
 
 pub fn install_mod_from_archive_with_nexus(
@@ -1305,7 +1468,14 @@ pub fn install_mod_from_archive_with_nexus(
     strategy: &InstallStrategy,
     nexus_id: Option<u32>,
 ) -> Result<Mod, String> {
-    install_mod_from_archive_with_nexus_ticking(archive_path, game, mod_name, strategy, nexus_id, &|| {})
+    install_mod_from_archive_with_nexus_ticking(
+        archive_path,
+        game,
+        mod_name,
+        strategy,
+        nexus_id,
+        &|| {},
+    )
 }
 
 /// Like [`install_mod_from_archive_with_nexus`] but calls `tick()` periodically
@@ -1352,14 +1522,18 @@ pub fn install_mod_from_archive_with_nexus_ticking(
 
             // Verify that files were actually installed. If the Data/ directory
             // is empty (all file matching failed), clean up and return error.
-            let has_files = data_dir.read_dir()
+            let has_files = data_dir
+                .read_dir()
                 .ok()
                 .and_then(|mut entries| entries.next())
                 .is_some();
             if !has_files {
                 // Clean up the mod directory
                 let _ = std::fs::remove_dir_all(&mod_dir);
-                return Err("No files were installed. FOMOD file paths may not match archive contents.".to_string());
+                return Err(
+                    "No files were installed. FOMOD file paths may not match archive contents."
+                        .to_string(),
+                );
             }
 
             // Normalise directory/file names to lowercase so that FOMOD mods
@@ -1372,6 +1546,9 @@ pub fn install_mod_from_archive_with_nexus_ticking(
     let mut mod_entry = Mod::new(mod_name, mod_dir);
     mod_entry.installed_from_nexus = nexus_id.is_some();
     mod_entry.nexus_id = nexus_id;
+    mod_entry.archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
 
     // Register in the mod database
     let mut db = ModDatabase::load(game);
@@ -1510,8 +1687,12 @@ fn extract_archive_with_7z(archive_path: &Path, dest_dir: &Path) -> Result<(), S
 
 /// Extract a `.7z` archive to `dest_dir` using `sevenz_rust2`.
 fn extract_7z_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
-    sevenz_rust2::decompress_file(archive_path, dest_dir)
-        .map_err(|e| format!("Failed to extract 7z archive {}: {e}", archive_path.display()))
+    sevenz_rust2::decompress_file(archive_path, dest_dir).map_err(|e| {
+        format!(
+            "Failed to extract 7z archive {}: {e}",
+            archive_path.display()
+        )
+    })
 }
 
 /// Stream-extract a `.7z` archive directly to `dest_dir`, stripping
@@ -1601,7 +1782,12 @@ fn extract_7z_archive_to(
             Ok(true)
         },
     )
-    .map_err(|e| format!("Failed to extract 7z archive {}: {e}", archive_path.display()))
+    .map_err(|e| {
+        format!(
+            "Failed to extract 7z archive {}: {e}",
+            archive_path.display()
+        )
+    })
 }
 
 /// Extract a `.rar` archive to `dest_dir` with prefix stripping.
@@ -1686,9 +1872,9 @@ fn extract_rar_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Strin
             Err(e) => return Err(format!("Failed to read RAR header: {e}")),
             Ok(None) => break,
             Ok(Some(header)) => {
-                archive = header.extract_with_base(dest_dir).map_err(|e| {
-                    format!("Failed to extract RAR entry: {e}")
-                })?;
+                archive = header
+                    .extract_with_base(dest_dir)
+                    .map_err(|e| format!("Failed to extract RAR entry: {e}"))?;
             }
         }
     }
@@ -1769,16 +1955,29 @@ fn extract_single_7z_file(
     file_path_in_archive: &str,
     dest_dir: &Path,
 ) -> Result<(), String> {
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
-    let mut reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
-        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
-    let data = reader.read_file(file_path_in_archive).map_err(|e| {
+    let mut data = None;
+    sevenz_rust2::decompress_file_with_extract_fn(
+        archive_path,
+        dest_dir,
+        |entry, reader, _default_dest| {
+            if entry.name() == file_path_in_archive && !entry.is_directory() {
+                let mut buf = Vec::with_capacity(entry.size() as usize);
+                if reader.read_to_end(&mut buf).is_ok() {
+                    data = Some(buf);
+                }
+            }
+            Ok(true)
+        },
+    )
+    .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
+
+    let data = data.ok_or_else(|| {
         format!(
-            "Failed to read '{file_path_in_archive}' from {}: {e}",
+            "Failed to read '{file_path_in_archive}' from {}",
             archive_path.display()
         )
     })?;
+
     let out_path = dest_dir.join(Path::new(&normalise_path(file_path_in_archive)));
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1806,14 +2005,14 @@ fn extract_single_rar_file(
                 let entry_name = header.entry().filename.to_string_lossy().to_string();
                 let entry_lower = entry_name.to_lowercase().replace('\\', "/");
                 if entry_lower == target_lower {
-                    archive = header.extract_with_base(dest_dir).map_err(|e| {
-                        format!("Failed to extract RAR entry '{entry_name}': {e}")
-                    })?;
+                    archive = header
+                        .extract_with_base(dest_dir)
+                        .map_err(|e| format!("Failed to extract RAR entry '{entry_name}': {e}"))?;
                     return Ok(());
                 }
-                archive = header.skip().map_err(|e| {
-                    format!("Failed to skip RAR entry '{entry_name}': {e}")
-                })?;
+                archive = header
+                    .skip()
+                    .map_err(|e| format!("Failed to skip RAR entry '{entry_name}': {e}"))?;
             }
         }
     }
@@ -1835,12 +2034,15 @@ fn extract_single_rar_file(
 ///    ([`link_items_alongside_data`]) will link these files to the game root.
 /// 3. **Normal data mod** – content is extracted with the detected prefix
 ///    stripped directly into `mod_dir/Data/`.
-fn install_zip_data_mod(archive_path: &Path, mod_dir: &Path, tick: &dyn Fn()) -> Result<(), String> {
+fn install_zip_data_mod(
+    archive_path: &Path,
+    mod_dir: &Path,
+    tick: &dyn Fn(),
+) -> Result<(), String> {
     // Collect all file names from the central directory (no decompression).
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
-    let zip =
-        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
+    let zip = zip::ZipArchive::new(file).map_err(|e| format!("Cannot read zip archive: {e}"))?;
     let all_paths: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
     drop(zip); // release the file handle before extraction
     let path_refs: Vec<&str> = all_paths.iter().map(|s| s.as_str()).collect();
@@ -2038,8 +2240,8 @@ fn create_temp_extract_dir_in(parent: &Path) -> Result<std::path::PathBuf, Strin
 fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst)
         .map_err(|e| format!("Failed to create destination {}: {e}", dst.display()))?;
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| format!("Failed to read {}: {e}", src.display()))?
+    for entry in
+        std::fs::read_dir(src).map_err(|e| format!("Failed to read {}: {e}", src.display()))?
     {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
         let from = entry.path();
@@ -2067,7 +2269,9 @@ fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst)
         .map_err(|e| format!("Failed to create destination {}: {e}", dst.display()))?;
-    for entry in std::fs::read_dir(src).map_err(|e| format!("Failed to read {}: {e}", src.display()))? {
+    for entry in
+        std::fs::read_dir(src).map_err(|e| format!("Failed to read {}: {e}", src.display()))?
+    {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
@@ -2075,8 +2279,9 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
             copy_dir_contents(&from, &to)?;
         } else if from.is_file() {
             if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create parent dir {}: {e}", parent.display()))?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("Failed to create parent dir {}: {e}", parent.display())
+                })?;
             }
             std::fs::copy(&from, &to).map_err(|e| {
                 format!(
@@ -2105,7 +2310,10 @@ fn normalize_paths_to_lowercase(dir: &Path) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) => {
-            log::warn!("normalize_paths_to_lowercase: cannot read {}: {err}", dir.display());
+            log::warn!(
+                "normalize_paths_to_lowercase: cannot read {}: {err}",
+                dir.display()
+            );
             return;
         }
     };
@@ -2292,7 +2500,8 @@ fn install_fomod_files(
                     matched_source = stripped_source;
                 } else if !archive_prefix_lower.is_empty() {
                     let wrapped_stripped_lower = format!("{archive_prefix_lower}/{stripped_lower}");
-                    matching_indices = collect_matching_entries(&entry_map, &wrapped_stripped_lower);
+                    matching_indices =
+                        collect_matching_entries(&entry_map, &wrapped_stripped_lower);
                     if !matching_indices.is_empty() {
                         matched_source = format!("{archive_prefix}/{stripped_source}");
                     }
@@ -2373,10 +2582,11 @@ fn install_fomod_files(
                     .map_err(|e| format!("Failed to create parent dir: {e}"))?;
             }
 
-            let out_file =
-                std::fs::File::create(&out_path).map_err(|e| format!("Failed to create file: {e}"))?;
+            let out_file = std::fs::File::create(&out_path)
+                .map_err(|e| format!("Failed to create file: {e}"))?;
             let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
-            std::io::copy(&mut entry, &mut buffered).map_err(|e| format!("Failed to extract: {e}"))?;
+            std::io::copy(&mut entry, &mut buffered)
+                .map_err(|e| format!("Failed to extract: {e}"))?;
         }
     }
 
@@ -2456,9 +2666,7 @@ fn install_fomod_files_non_zip(
                 matching_entries = entry_map
                     .iter()
                     .filter(|(nl, _, _)| {
-                        !(nl == "fomod"
-                            || nl.starts_with("fomod/")
-                            || nl.contains("/fomod/"))
+                        !(nl == "fomod" || nl.starts_with("fomod/") || nl.contains("/fomod/"))
                     })
                     .map(|(_, orig, idx)| (orig.clone(), *idx))
                     .collect();
@@ -2488,7 +2696,9 @@ fn install_fomod_files_non_zip(
             let entry_lower = orig_entry.to_lowercase();
             let rel = if entry_lower == matched_source_lower {
                 destination.clone()
-            } else if let Some(suffix) = entry_lower.strip_prefix(&format!("{}/", matched_source_lower)) {
+            } else if let Some(suffix) =
+                entry_lower.strip_prefix(&format!("{}/", matched_source_lower))
+            {
                 if destination.is_empty() {
                     suffix.to_string()
                 } else {
@@ -2508,7 +2718,10 @@ fn install_fomod_files_non_zip(
     }
 
     // Now extract only the required files
-    log::info!("Extracting {} files from FOMOD archive", files_to_extract.len());
+    log::info!(
+        "Extracting {} files from FOMOD archive",
+        files_to_extract.len()
+    );
 
     if has_rar_extension(archive_path) {
         // For RAR, we need to fall back to full extraction as unrar doesn't
@@ -2531,26 +2744,56 @@ fn install_fomod_files_non_zip(
         return result;
     }
 
-    // For 7z, use efficient selective extraction
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("Cannot open archive: {e}"))?;
-    let mut reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
-        .map_err(|e| format!("Failed to read 7z archive: {e}"))?;
+    // For 7z, use a single sequential pass over the archive.
+    // Random access (ArchiveReader::read_file) is extremely slow for solid 7z
+    // archives because it has to decompress from the beginning of the solid block
+    // for every file. Sequential extraction fixes this 3-5 minute hang.
+    sevenz_rust2::decompress_file_with_extract_fn(
+        archive_path,
+        dest_dir,
+        |entry, reader, _default_dest| {
+            let entry_name = entry.name();
 
-    for (archive_file_path, dest_path) in &files_to_extract {
-        // Read file from archive
-        let data = reader.read_file(archive_file_path).map_err(|e| {
-            format!("Failed to read '{}' from archive: {e}", archive_file_path)
-        })?;
+            // Find all destinations for this archive entry
+            let mut destinations = Vec::new();
+            for (src, dest) in &files_to_extract {
+                if src == entry_name {
+                    destinations.push(dest.clone());
+                }
+            }
 
-        // Write to destination
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create parent directory: {e}"))?;
-        }
-        std::fs::write(dest_path, &data)
-            .map_err(|e| format!("Failed to write file {}: {e}", dest_path.display()))?;
-    }
+            if !destinations.is_empty() && !entry.is_directory() {
+                if destinations.len() == 1 {
+                    let dest_path = &destinations[0];
+                    if let Some(parent) = dest_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Ok(out_file) = std::fs::File::create(dest_path) {
+                        let mut buffered = BufWriter::with_capacity(EXTRACT_BUFFER_SIZE, out_file);
+                        let _ = std::io::copy(reader, &mut buffered);
+                    }
+                } else {
+                    let mut data = Vec::with_capacity(entry.size() as usize);
+                    if reader.read_to_end(&mut data).is_ok() {
+                        for dest_path in destinations {
+                            if let Some(parent) = dest_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::write(&dest_path, &data);
+                        }
+                    }
+                }
+            }
+
+            Ok(true)
+        },
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to extract 7z archive {}: {e}",
+            archive_path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -2607,9 +2850,7 @@ fn install_fomod_files_from_dir(
                 matching_rels = entry_map
                     .iter()
                     .filter(|(nl, _)| {
-                        !(nl == "fomod"
-                            || nl.starts_with("fomod/")
-                            || nl.contains("/fomod/"))
+                        !(nl == "fomod" || nl.starts_with("fomod/") || nl.contains("/fomod/"))
                     })
                     .map(|(_, orig)| orig.clone())
                     .collect();
@@ -2774,14 +3015,21 @@ mod tests {
             return;
         };
         let entries = list_archive_entries_with_7z(&archive).unwrap();
-        let lower: Vec<String> = entries.iter().map(|p| p.to_lowercase().replace('\\', "/")).collect();
-        assert!(lower.iter().any(|p| p.ends_with("fomod/moduleconfig.xml")),
-            "expected fomod/moduleconfig.xml in listing, got: {lower:?}");
-        assert!(lower.iter().any(|p| p.ends_with("data/textures/sky.dds")),
-            "expected Data/textures/sky.dds in listing, got: {lower:?}");
+        let lower: Vec<String> = entries
+            .iter()
+            .map(|p| p.to_lowercase().replace('\\', "/"))
+            .collect();
+        assert!(
+            lower.iter().any(|p| p.ends_with("fomod/moduleconfig.xml")),
+            "expected fomod/moduleconfig.xml in listing, got: {lower:?}"
+        );
+        assert!(
+            lower.iter().any(|p| p.ends_with("data/textures/sky.dds")),
+            "expected Data/textures/sky.dds in listing, got: {lower:?}"
+        );
     }
 
-        /// Create a simple zip archive in `dir` containing the given entries.
+    /// Create a simple zip archive in `dir` containing the given entries.
     /// Each entry is (name, content).  Names ending with `/` are directories.
     fn create_test_zip(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
         let archive_path = dir.join("test_mod.zip");
@@ -3332,7 +3580,10 @@ mod tests {
             }
         );
         assert_eq!(cfg.conditional_file_installs[0].files.len(), 1);
-        assert_eq!(cfg.conditional_file_installs[0].files[0].source, "22 Underwear Dark Purple");
+        assert_eq!(
+            cfg.conditional_file_installs[0].files[0].source,
+            "22 Underwear Dark Purple"
+        );
     }
 
     #[test]
@@ -3513,9 +3764,18 @@ mod tests {
 
         normalize_paths_to_lowercase(&tmp);
 
-        assert!(tmp.join("textures").is_dir(), "directory should be lowercased");
-        assert!(tmp.join("textures/sky.dds").exists(), "file inside renamed dir should exist");
-        assert!(!tmp.join("TEXTURES").exists(), "original uppercase dir should be gone");
+        assert!(
+            tmp.join("textures").is_dir(),
+            "directory should be lowercased"
+        );
+        assert!(
+            tmp.join("textures/sky.dds").exists(),
+            "file inside renamed dir should exist"
+        );
+        assert!(
+            !tmp.join("TEXTURES").exists(),
+            "original uppercase dir should be gone"
+        );
     }
 
     #[test]
@@ -3530,9 +3790,18 @@ mod tests {
         normalize_paths_to_lowercase(&tmp);
 
         // Both files should end up in textures/.
-        assert!(tmp.join("textures/sky.dds").exists(), "sky.dds from TEXTURES should be merged");
-        assert!(tmp.join("textures/ground.dds").exists(), "ground.dds from textures should remain");
-        assert!(!tmp.join("TEXTURES").exists(), "uppercase variant should be removed");
+        assert!(
+            tmp.join("textures/sky.dds").exists(),
+            "sky.dds from TEXTURES should be merged"
+        );
+        assert!(
+            tmp.join("textures/ground.dds").exists(),
+            "ground.dds from textures should remain"
+        );
+        assert!(
+            !tmp.join("TEXTURES").exists(),
+            "uppercase variant should be removed"
+        );
     }
 
     #[test]
@@ -3634,10 +3903,7 @@ mod tests {
     #[test]
     fn find_data_root_fomod_at_archive_root_returns_empty() {
         // fomod/ lives directly at the archive root → data root is ""
-        let paths = &[
-            "fomod/ModuleConfig.xml",
-            "Option A/textures/body.dds",
-        ];
+        let paths = &["fomod/ModuleConfig.xml", "Option A/textures/body.dds"];
         let root = find_data_root_in_paths(paths);
         assert_eq!(
             root, "",
@@ -3787,7 +4053,10 @@ mod tests {
         let config = parse_fomod_from_zip(&archive).unwrap();
 
         assert_eq!(config.mod_name.as_deref(), Some("Diamond Skin"));
-        assert!(config.required_files.is_empty(), "no required files expected");
+        assert!(
+            config.required_files.is_empty(),
+            "no required files expected"
+        );
         assert_eq!(config.steps.len(), 1);
 
         let step = &config.steps[0];
@@ -3799,7 +4068,10 @@ mod tests {
         // CBBE plugin should have conditionFlag, no direct files
         let cbbe = &body_group.plugins[0];
         assert_eq!(cbbe.name, "CBBE");
-        assert!(cbbe.files.is_empty(), "CBBE plugin should have no direct files");
+        assert!(
+            cbbe.files.is_empty(),
+            "CBBE plugin should have no direct files"
+        );
         assert_eq!(cbbe.condition_flags.len(), 1);
         assert_eq!(cbbe.condition_flags[0].name, "isCBBE");
         assert_eq!(cbbe.condition_flags[0].value, "selected");
@@ -3836,7 +4108,8 @@ mod tests {
         install_fomod_files(&archive, &dest, &files).unwrap();
 
         assert!(
-            dest.join("textures/actors/character/female/femalebody_1.dds").exists(),
+            dest.join("textures/actors/character/female/femalebody_1.dds")
+                .exists(),
             "CBBE 4K texture should be installed under textures/"
         );
         assert!(

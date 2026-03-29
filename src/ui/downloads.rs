@@ -14,10 +14,8 @@ use crate::core::games::Game;
 use crate::core::installer::{
     DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodPlugin, GroupType,
     InstallStep, InstallStrategy, PluginDependencies, PluginType, detect_strategy,
-    install_mod_from_archive_with_nexus, parse_fomod_from_archive,
-    read_archive_file_bytes,
+    install_mod_from_archive_with_nexus, parse_fomod_from_archive, read_archive_files_bytes,
 };
-use crate::core::mods::ModDatabase;
 
 // ── Archive extensions ────────────────────────────────────────────────────────
 
@@ -188,7 +186,15 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         let game_c = Rc::clone(&game_rc);
         let ctx_c = status_ctx.clone();
         clean_btn.connect_clicked(move |btn| {
-            show_clean_cache_dialog(btn, &config_c, &container_c, &hide_c, &search_c, &game_c, &ctx_c);
+            show_clean_cache_dialog(
+                btn,
+                &config_c,
+                &container_c,
+                &hide_c,
+                &search_c,
+                &game_c,
+                &ctx_c,
+            );
         });
     }
 
@@ -257,6 +263,14 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
                         "{id}:{}:{}:{}|",
                         entry.file_name, entry.downloaded, entry.total
                     ));
+                }
+                if let Some(g) = game_c.as_ref().as_ref() {
+                    let cfg = config_c.borrow();
+                    if let Some(gs) = cfg.game_settings.get(&g.id) {
+                        for arc in &gs.installed_archives {
+                            identity_key.push_str(&format!("inst:{}|", arc));
+                        }
+                    }
                 }
                 if *identity_fingerprint_c.borrow() != identity_key {
                     // A download started or finished → full rebuild of both sections.
@@ -340,21 +354,13 @@ fn refresh_content_with_search(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    let installed_mod_names: Vec<String> = match game.as_ref() {
-        Some(g) => ModDatabase::load(g)
-            .mods
-            .into_iter()
-            .map(|m| m.name.to_lowercase())
-            .collect(),
-        None => Vec::new(),
-    };
     let entries = scan_downloads(&downloads_dir);
     let active_downloads = download_state::all_active();
 
     let visible: Vec<&DownloadEntry> = entries
         .iter()
         .filter(|e| {
-            (!hide_installed || !entry_is_installed(e, &installed_archives, &installed_mod_names))
+            (!hide_installed || !installed_archives.contains(&e.name))
                 && matches_query(&e.name, search_query)
         })
         .collect();
@@ -400,7 +406,6 @@ fn refresh_content_with_search(
         let row = build_entry_row(
             entry,
             &installed_archives,
-            &installed_mod_names,
             config,
             container,
             hide_installed,
@@ -468,7 +473,6 @@ fn build_active_download_row(
 fn build_entry_row(
     entry: &DownloadEntry,
     installed_archives: &[String],
-    installed_mod_names: &[String],
     config: &Rc<RefCell<AppConfig>>,
     container: &gtk4::Box,
     hide_installed: bool,
@@ -476,7 +480,7 @@ fn build_entry_row(
     game: &Rc<Option<Game>>,
     status_ctx: &InstallStatusCtx,
 ) -> adw::ActionRow {
-    let is_installed = entry_is_installed(entry, installed_archives, installed_mod_names);
+    let is_installed = installed_archives.contains(&entry.name);
     let row = adw::ActionRow::builder()
         .title(&entry.name)
         .subtitle(&format_size(entry.size_bytes))
@@ -597,21 +601,49 @@ fn show_install_dialog(
     status_ctx.revealer.set_reveal_child(true);
     status_ctx.label.set_text("Reading archive…");
     status_ctx.progress.set_fraction(0.0);
-    status_ctx.progress.set_text(Some("Detecting install type…"));
+    status_ctx
+        .progress
+        .set_text(Some("Detecting install type…"));
 
     // Clone Send-able data for the background thread (no Rc / GTK widget).
     let ap = archive_path.to_path_buf();
 
     // Channel carries the result back to the GTK main thread.
-    let (tx, rx) =
-        std::sync::mpsc::channel::<Result<(InstallStrategy, Option<FomodConfig>), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<
+        Result<
+            (
+                InstallStrategy,
+                Option<FomodConfig>,
+                HashMap<String, Vec<u8>>,
+            ),
+            String,
+        >,
+    >();
 
     std::thread::spawn(move || {
-        let result = (|| -> Result<(InstallStrategy, Option<FomodConfig>), String> {
+        let result = (|| -> Result<(InstallStrategy, Option<FomodConfig>, HashMap<String, Vec<u8>>), String> {
             let strategy = detect_strategy(&ap)?;
+            let mut images_data = HashMap::new();
             let fomod_config = if let InstallStrategy::Fomod(_) = &strategy {
                 match parse_fomod_from_archive(&ap) {
-                    Ok(cfg) => Some(cfg),
+                    Ok(cfg) => {
+                        let mut image_paths = Vec::new();
+                        for step in &cfg.steps {
+                            for group in &step.groups {
+                                for plugin in &group.plugins {
+                                    if let Some(ref img) = plugin.image_path {
+                                        image_paths.push(img.as_str());
+                                    }
+                                }
+                            }
+                        }
+                        if !image_paths.is_empty() {
+                            if let Ok(data) = read_archive_files_bytes(&ap, &image_paths) {
+                                images_data = data;
+                            }
+                        }
+                        Some(cfg)
+                    }
                     Err(e) => {
                         log::warn!("Failed to parse FOMOD config, falling back: {e}");
                         None
@@ -620,7 +652,7 @@ fn show_install_dialog(
             } else {
                 None
             };
-            Ok((strategy, fomod_config))
+            Ok((strategy, fomod_config, images_data))
         })();
         let _ = tx.send(result);
     });
@@ -637,76 +669,74 @@ fn show_install_dialog(
     let status_ctx_c = status_ctx.clone();
 
     // Poll the channel every 50 ms; pulse the progress bar while waiting.
-    gtk4::glib::timeout_add_local(
-        std::time::Duration::from_millis(50),
-        move || {
-            match rx.try_recv() {
-                Ok(Ok((strategy, fomod_config_opt))) => {
-                    set_downloads_busy(&status_ctx_c, false);
-                    status_ctx_c.revealer.set_reveal_child(false);
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        match rx.try_recv() {
+            Ok(Ok((strategy, fomod_config_opt, images_data))) => {
+                set_downloads_busy(&status_ctx_c, false);
+                status_ctx_c.revealer.set_reveal_child(false);
 
-                    if let Some(fomod_config) = fomod_config_opt {
-                        let parent = anchor_c
-                            .root()
-                            .and_then(|r| r.downcast::<gtk4::Window>().ok());
-                        show_fomod_wizard(
-                            parent.as_ref(),
-                            &archive_path_c,
-                            &archive_name_s,
-                            &game_c,
-                            &config_c,
-                            &container_c,
-                            hide_installed,
-                            &search_query_s,
-                            &fomod_config,
-                            &game_rc_c,
-                            Some(&status_ctx_c),
-                        );
-                    } else {
-                        let parent = anchor_c
-                            .root()
-                            .and_then(|r| r.downcast::<gtk4::Window>().ok());
-                        show_strategy_picker(
-                            parent.as_ref(),
-                            &archive_path_c,
-                            &archive_name_s,
-                            &game_c,
-                            &config_c,
-                            &container_c,
-                            hide_installed,
-                            &search_query_s,
-                            &strategy,
-                            &game_rc_c,
-                            &status_ctx_c,
-                        );
-                    }
-                    gtk4::glib::ControlFlow::Break
-                }
-                Ok(Err(e)) => {
-                    log::error!("Failed to detect install strategy: {e}");
-                    set_downloads_busy(&status_ctx_c, false);
-                    hide_status_popup_later(status_ctx_c.revealer.clone());
-                    show_toast(
-                        status_ctx_c.list_container.upcast_ref(),
-                        &format!("Error: {e}"),
+                if let Some(fomod_config) = fomod_config_opt {
+                    let parent = anchor_c
+                        .root()
+                        .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                    show_fomod_wizard(
+                        parent.as_ref(),
+                        &archive_path_c,
+                        &archive_name_s,
+                        &game_c,
+                        &config_c,
+                        &container_c,
+                        hide_installed,
+                        &search_query_s,
+                        &fomod_config,
+                        &game_rc_c,
+                        Some(&status_ctx_c),
+                        images_data,
                     );
-                    gtk4::glib::ControlFlow::Break
+                } else {
+                    let parent = anchor_c
+                        .root()
+                        .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                    show_strategy_picker(
+                        parent.as_ref(),
+                        &archive_path_c,
+                        &archive_name_s,
+                        &game_c,
+                        &config_c,
+                        &container_c,
+                        hide_installed,
+                        &search_query_s,
+                        &strategy,
+                        &game_rc_c,
+                        &status_ctx_c,
+                    );
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Still detecting — pulse the bar to show activity.
-                    status_ctx_c.progress.pulse();
-                    gtk4::glib::ControlFlow::Continue
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Background thread panicked.
-                    log::error!("Strategy detection thread terminated unexpectedly");
-                    set_downloads_busy(&status_ctx_c, false);
-                    hide_status_popup_later(status_ctx_c.revealer.clone());
-                    gtk4::glib::ControlFlow::Break
-                }
+                gtk4::glib::ControlFlow::Break
             }
-        },
-    );
+            Ok(Err(e)) => {
+                log::error!("Failed to detect install strategy: {e}");
+                set_downloads_busy(&status_ctx_c, false);
+                hide_status_popup_later(status_ctx_c.revealer.clone());
+                show_toast(
+                    status_ctx_c.list_container.upcast_ref(),
+                    &format!("Error: {e}"),
+                );
+                gtk4::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Still detecting — pulse the bar to show activity.
+                status_ctx_c.progress.pulse();
+                gtk4::glib::ControlFlow::Continue
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Background thread panicked.
+                log::error!("Strategy detection thread terminated unexpectedly");
+                set_downloads_busy(&status_ctx_c, false);
+                hide_status_popup_later(status_ctx_c.revealer.clone());
+                gtk4::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn show_strategy_picker(
@@ -825,50 +855,47 @@ fn do_install(
     // Poll the channel from the GTK main thread.  While the background thread
     // is running, pulse the progress bar so the user sees activity.  When the
     // thread finishes, handle success / error and restore the UI.
-    gtk4::glib::timeout_add_local(
-        std::time::Duration::from_millis(50),
-        move || {
-            match rx.try_recv() {
-                Ok(result) => {
-                    on_install_complete(
-                        result,
-                        &archive_name_s,
-                        &mod_name_s,
-                        &config_c,
-                        hide_installed,
-                        &search_query_s,
-                        &game_rc_c,
-                        status_ctx_clone.as_ref(),
-                        &container_c,
-                    );
-                    gtk4::glib::ControlFlow::Break
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Still extracting — pulse so the user sees activity.
-                    if let Some(ctx) = &status_ctx_clone {
-                        ctx.progress.pulse();
-                    }
-                    gtk4::glib::ControlFlow::Continue
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Thread terminated without sending a result (panic etc.).
-                    log::error!("Install thread terminated unexpectedly for \"{mod_name_s}\"");
-                    on_install_complete(
-                        Err("Install thread terminated unexpectedly".to_string()),
-                        &archive_name_s,
-                        &mod_name_s,
-                        &config_c,
-                        hide_installed,
-                        &search_query_s,
-                        &game_rc_c,
-                        status_ctx_clone.as_ref(),
-                        &container_c,
-                    );
-                    gtk4::glib::ControlFlow::Break
-                }
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        match rx.try_recv() {
+            Ok(result) => {
+                on_install_complete(
+                    result,
+                    &archive_name_s,
+                    &mod_name_s,
+                    &config_c,
+                    hide_installed,
+                    &search_query_s,
+                    &game_rc_c,
+                    status_ctx_clone.as_ref(),
+                    &container_c,
+                );
+                gtk4::glib::ControlFlow::Break
             }
-        },
-    );
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Still extracting — pulse so the user sees activity.
+                if let Some(ctx) = &status_ctx_clone {
+                    ctx.progress.pulse();
+                }
+                gtk4::glib::ControlFlow::Continue
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Thread terminated without sending a result (panic etc.).
+                log::error!("Install thread terminated unexpectedly for \"{mod_name_s}\"");
+                on_install_complete(
+                    Err("Install thread terminated unexpectedly".to_string()),
+                    &archive_name_s,
+                    &mod_name_s,
+                    &config_c,
+                    hide_installed,
+                    &search_query_s,
+                    &game_rc_c,
+                    status_ctx_clone.as_ref(),
+                    &container_c,
+                );
+                gtk4::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 /// Handle the install result on the GTK main thread once the background thread
@@ -932,7 +959,6 @@ fn on_install_complete(
         }
     }
 }
-
 
 // ── FOMOD wizard ──────────────────────────────────────────────────────────────
 
@@ -1127,19 +1153,10 @@ fn resolve_fomod_files(fomod: &FomodConfig, selections: &FomodSelections) -> Vec
 }
 
 fn load_fomod_option_image(
-    archive_path: &Path,
     image_path: &str,
     cache: &Rc<RefCell<HashMap<String, gtk4::gdk::Texture>>>,
 ) -> Option<gtk4::gdk::Texture> {
-    if let Some(texture) = cache.borrow().get(image_path).cloned() {
-        return Some(texture);
-    }
-    let bytes = read_archive_file_bytes(archive_path, image_path).ok()?;
-    let texture = gtk4::gdk::Texture::from_bytes(&gtk4::glib::Bytes::from_owned(bytes)).ok()?;
-    cache
-        .borrow_mut()
-        .insert(image_path.to_string(), texture.clone());
-    Some(texture)
+    cache.borrow().get(image_path).cloned()
 }
 
 fn show_fomod_wizard(
@@ -1154,6 +1171,7 @@ fn show_fomod_wizard(
     fomod: &FomodConfig,
     game_rc: &Rc<Option<Game>>,
     status_ctx: Option<&InstallStatusCtx>,
+    images_data: HashMap<String, Vec<u8>>,
 ) {
     let mod_display_name = fomod
         .mod_name
@@ -1250,12 +1268,22 @@ fn show_fomod_wizard(
     let image_cache: Rc<RefCell<HashMap<String, gtk4::gdk::Texture>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
+    {
+        let mut cache = image_cache.borrow_mut();
+        for (path, bytes) in images_data {
+            if let Ok(texture) =
+                gtk4::gdk::Texture::from_bytes(&gtk4::glib::Bytes::from_owned(bytes))
+            {
+                cache.insert(path, texture);
+            }
+        }
+    }
+
     let render_step = {
         let sc = step_content.clone();
         let fc = Rc::clone(&fomod_rc);
         let sel_c = Rc::clone(&selections);
         let img_cache = Rc::clone(&image_cache);
-        let ap = archive_path.to_path_buf();
         let bb = back_btn.clone();
         let nb = next_btn.clone();
         let ib = install_btn.clone();
@@ -1413,8 +1441,7 @@ fn show_fomod_wizard(
                     row.add_prefix(&check);
                     row.set_activatable_widget(Some(&check));
                     if let Some(ref image_path) = plugin.image_path {
-                        if let Some(texture) = load_fomod_option_image(&ap, image_path, &img_cache)
-                        {
+                        if let Some(texture) = load_fomod_option_image(image_path, &img_cache) {
                             has_step_preview = true;
                             if check.is_active() || default_preview.is_none() {
                                 default_preview = Some((texture.clone(), plugin.name.clone()));
@@ -1563,6 +1590,7 @@ pub fn show_fomod_wizard_from_library(
         fomod,
         game_rc,
         None,
+        HashMap::new(),
     );
 }
 
@@ -1672,21 +1700,6 @@ fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
-}
-
-fn entry_is_installed(
-    entry: &DownloadEntry,
-    installed_archives: &[String],
-    installed_mod_names: &[String],
-) -> bool {
-    if installed_archives.contains(&entry.name) {
-        return true;
-    }
-    let mod_name = Path::new(&entry.name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    !mod_name.is_empty() && installed_mod_names.iter().any(|m| m == &mod_name)
 }
 
 fn matches_query(value: &str, query: &str) -> bool {
@@ -1814,7 +1827,8 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CTR: AtomicU32 = AtomicU32::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("linkmm_downloads_test_{}_{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("linkmm_downloads_test_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2171,7 +2185,10 @@ mod tests {
         .unwrap();
 
         let game = Game::new(GameKind::SkyrimSE, tmp.join("game_root"));
-        assert_eq!(read_nxm_mod_id_for_archive(&archive_path, &game), Some(173949));
+        assert_eq!(
+            read_nxm_mod_id_for_archive(&archive_path, &game),
+            Some(173949)
+        );
     }
 
     #[test]
@@ -2180,11 +2197,7 @@ mod tests {
         let archive_path = tmp.join("SomeMod.zip");
         std::fs::write(&archive_path, b"zip").unwrap();
         let metadata_path = nxm_metadata_path_for_archive(&archive_path);
-        std::fs::write(
-            &metadata_path,
-            r#"{"game_domain":"fallout4","mod_id":999}"#,
-        )
-        .unwrap();
+        std::fs::write(&metadata_path, r#"{"game_domain":"fallout4","mod_id":999}"#).unwrap();
 
         // Sidecar says fallout4 but game is SkyrimSE → mismatch → None
         let game = Game::new(GameKind::SkyrimSE, tmp.join("game_root"));

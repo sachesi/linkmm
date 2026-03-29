@@ -1,5 +1,5 @@
-use crate::core::games::Game;
 use crate::core::deployment;
+use crate::core::games::Game;
 use libloot::{Game as LootGame, GameType as LootGameType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -92,6 +92,9 @@ pub struct Mod {
     /// True when this mod was downloaded through the Downloads page via the Nexus API.
     #[serde(default)]
     pub installed_from_nexus: bool,
+    /// The name of the archive file this mod was installed from.
+    #[serde(default)]
+    pub archive_name: Option<String>,
 }
 
 impl Mod {
@@ -107,6 +110,7 @@ impl Mod {
             nexus_id: None,
             source_path,
             installed_from_nexus: false,
+            archive_name: None,
         }
     }
 }
@@ -159,14 +163,12 @@ impl ModDatabase {
             .map(|plugin| game.data_path.join(&plugin.name))
             .collect();
         let plugin_path_refs: Vec<&Path> = plugin_paths.iter().map(PathBuf::as_path).collect();
-        loot_game
-            .load_plugins(&plugin_path_refs)
-            .map_err(|e| {
-                format!(
-                    "Failed to load plugins for libloot sorting from {}: {e}",
-                    game.data_path.display()
-                )
-            })?;
+        loot_game.load_plugins(&plugin_path_refs).map_err(|e| {
+            format!(
+                "Failed to load plugins for libloot sorting from {}: {e}",
+                game.data_path.display()
+            )
+        })?;
 
         let plugin_names: Vec<&str> = plugins.iter().map(|plugin| plugin.name.as_str()).collect();
         loot_game
@@ -287,8 +289,7 @@ impl ModDatabase {
 
         // Partition into vanilla masters and the rest
         let vanilla_order = game.kind.vanilla_masters();
-        let (mut vanilla, rest): (Vec<_>, Vec<_>) =
-            plugins.into_iter().partition(|p| p.is_vanilla);
+        let (mut vanilla, rest): (Vec<_>, Vec<_>) = plugins.into_iter().partition(|p| p.is_vanilla);
 
         // Sort vanilla masters in their canonical order
         vanilla.sort_by_key(|p| {
@@ -403,8 +404,9 @@ impl ModDatabase {
                 .map_err(|e| format!("Failed to create plugins directory: {e}"))?;
         }
         let plugins = self.get_ordered_plugins(game);
-        let mut content =
-            String::from("# This file is used by the game to determine which plugins are active.\n");
+        let mut content = String::from(
+            "# This file is used by the game to determine which plugins are active.\n",
+        );
         for plugin in &plugins {
             if plugin.enabled {
                 content.push('*');
@@ -524,17 +526,16 @@ impl ModManager {
         // Log but do not abort on undeploy failure – we still want to clean up
         // the files and database record.
         if let Err(e) = Self::disable_mod(game, mod_entry) {
-            log::warn!("Undeploy warning during uninstall of '{}': {e}", mod_entry.name);
+            log::warn!(
+                "Undeploy warning during uninstall of '{}': {e}",
+                mod_entry.name
+            );
         }
 
         // Delete the mod's managed directory from disk.
         if mod_entry.source_path.exists() {
-            std::fs::remove_dir_all(&mod_entry.source_path).map_err(|e| {
-                format!(
-                    "Failed to delete mod files for '{}': {e}",
-                    mod_entry.name
-                )
-            })?;
+            std::fs::remove_dir_all(&mod_entry.source_path)
+                .map_err(|e| format!("Failed to delete mod files for '{}': {e}", mod_entry.name))?;
         }
 
         // Remove the mod entry from the database.
@@ -657,8 +658,8 @@ fn link_items_alongside_data(source_root: &Path, dest: &Path) -> Result<(), Stri
     if !source_root.is_dir() {
         return Ok(());
     }
-    let entries = std::fs::read_dir(source_root)
-        .map_err(|e| format!("Failed to read mod directory: {e}"))?;
+    let entries =
+        std::fs::read_dir(source_root).map_err(|e| format!("Failed to read mod directory: {e}"))?;
 
     for entry in entries.flatten() {
         let file_name = entry.file_name();
@@ -709,8 +710,8 @@ fn unlink_items_alongside_data(source_root: &Path, dest: &Path) -> Result<(), St
     if !source_root.is_dir() || !dest.is_dir() {
         return Ok(());
     }
-    let entries = std::fs::read_dir(source_root)
-        .map_err(|e| format!("Failed to read mod directory: {e}"))?;
+    let entries =
+        std::fs::read_dir(source_root).map_err(|e| format!("Failed to read mod directory: {e}"))?;
 
     for entry in entries.flatten() {
         let file_name = entry.file_name();
@@ -874,7 +875,6 @@ fn purge_symlinks(dir: &Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
-
 mod tests {
     use super::*;
 
@@ -892,7 +892,11 @@ mod tests {
     fn uuid_format_looks_like_uuid() {
         let id = generate_mod_uuid();
         let parts: Vec<&str> = id.split('-').collect();
-        assert_eq!(parts.len(), 5, "UUID should have 5 dash-separated parts: {id}");
+        assert_eq!(
+            parts.len(),
+            5,
+            "UUID should have 5 dash-separated parts: {id}"
+        );
         assert_eq!(parts[0].len(), 8);
         assert_eq!(parts[1].len(), 4);
         assert_eq!(parts[2].len(), 4);
@@ -921,8 +925,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CTR: AtomicU32 = AtomicU32::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("linkmm_mods_test_{}_{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("linkmm_mods_test_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1028,10 +1031,12 @@ mod tests {
         link_items_alongside_data(&mod_root, &game_root).unwrap();
 
         // enbseries/ directory alongside Data/ is linked recursively into game root.
-        assert!(game_root
-            .join("enbseries")
-            .join("enbseries.ini")
-            .is_symlink());
+        assert!(
+            game_root
+                .join("enbseries")
+                .join("enbseries.ini")
+                .is_symlink()
+        );
         assert!(!game_root.join("Data").exists());
     }
 
@@ -1116,7 +1121,11 @@ mod tests {
 
         // mod_dir/Data/Data/textures/sky.dds  ← double-nested
         std::fs::create_dir_all(mod_data.join("Data").join("textures")).unwrap();
-        std::fs::write(mod_data.join("Data").join("textures").join("sky.dds"), b"dds").unwrap();
+        std::fs::write(
+            mod_data.join("Data").join("textures").join("sky.dds"),
+            b"dds",
+        )
+        .unwrap();
         // mod_dir/Data/plugin.esp  ← single-level (should also be deployed)
         std::fs::write(mod_data.join("plugin.esp"), b"esp").unwrap();
         std::fs::create_dir_all(&game_data).unwrap();
@@ -1124,14 +1133,20 @@ mod tests {
         link_mod_data(&mod_data, &game_data).unwrap();
 
         // Inner Data/ contents flattened to game_data/textures/sky.dds
-        assert!(game_data.join("textures").join("sky.dds").is_symlink(),
-            "double-nested file should be flattened to game_dir/Data/textures/");
+        assert!(
+            game_data.join("textures").join("sky.dds").is_symlink(),
+            "double-nested file should be flattened to game_dir/Data/textures/"
+        );
         // Normal file linked correctly
-        assert!(game_data.join("plugin.esp").is_symlink(),
-            "top-level plugin.esp should be linked to game_dir/Data/");
+        assert!(
+            game_data.join("plugin.esp").is_symlink(),
+            "top-level plugin.esp should be linked to game_dir/Data/"
+        );
         // NO game_dir/Data/Data/ nesting
-        assert!(!game_data.join("Data").exists(),
-            "game_dir/Data/Data/ must not be created");
+        assert!(
+            !game_data.join("Data").exists(),
+            "game_dir/Data/Data/ must not be created"
+        );
     }
 
     #[cfg(unix)]
@@ -1154,7 +1169,10 @@ mod tests {
         // purge_symlinks should remove everything.
         purge_symlinks(&nested_data);
 
-        assert!(!nested_data.exists(), "purge_symlinks should remove the directory entirely");
+        assert!(
+            !nested_data.exists(),
+            "purge_symlinks should remove the directory entirely"
+        );
     }
 
     #[cfg(unix)]
