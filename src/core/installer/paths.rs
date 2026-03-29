@@ -43,8 +43,8 @@ pub(super) fn strip_data_prefix(s: &str) -> String {
 /// Rejects paths containing `..` components that would escape the destination.
 pub(super) fn is_safe_relative_path(path: &str) -> bool {
     use std::path::Component;
-    let normalised = path.replace('\\', "/");
-    let p = Path::new(&normalised);
+    let normalized = path.replace('\\', "/");
+    let p = Path::new(&normalized);
     let mut depth: i32 = 0;
     for component in p.components() {
         match component {

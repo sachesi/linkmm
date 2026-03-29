@@ -305,7 +305,7 @@ fn extract_single_7z_file(
             match reader.read_file(&target_norm) {
                 Ok(bytes) => {
                     log::debug!(
-                        "[Extract7z] read_file normalised match succeeded | path={}",
+                        "[Extract7z] read_file normalized match succeeded | path={}",
                         target_norm
                     );
                     bytes
