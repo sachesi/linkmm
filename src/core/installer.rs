@@ -2260,7 +2260,7 @@ fn extract_single_rar_file(
                 let entry_name = header.entry().filename.to_string_lossy().to_string();
                 let entry_lower = entry_name.to_lowercase().replace('\\', "/");
                 if entry_lower == target_lower {
-                    archive = header
+                    header
                         .extract_with_base(dest_dir)
                         .map_err(|e| format!("Failed to extract RAR entry '{entry_name}': {e}"))?;
                     return Ok(());
