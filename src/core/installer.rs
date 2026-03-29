@@ -712,10 +712,7 @@ pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, Stri
     // by name, and read its bytes directly.  This avoids decompressing the
     // entire archive through `decompress_file_with_extract_fn` which was
     // unreliable for solid archives.
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
-    let mut reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
-        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
+    let mut reader = open_7z_reader(archive_path)?;
 
     // Find the FOMOD config entry name (case-insensitive search).
     let fomod_entry = reader
@@ -1011,16 +1008,7 @@ fn read_archive_files_bytes_non_zip(
         let _ = std::fs::remove_dir_all(&tmp);
     } else {
         // 7z: read each file directly via ArchiveReader for reliability.
-        let file = std::fs::File::open(archive_path)
-            .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
-        let mut reader =
-            sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
-                .map_err(|e| {
-                    format!(
-                        "Failed to read 7z archive {}: {e}",
-                        archive_path.display()
-                    )
-                })?;
+        let mut reader = open_7z_reader(archive_path)?;
         for (entry_path, rel_path) in &target_to_req {
             match reader.read_file(entry_path) {
                 Ok(bytes) => {
@@ -1091,16 +1079,7 @@ fn read_archive_file_bytes_non_zip(
         result
     } else {
         // 7z: read file bytes directly from the archive via ArchiveReader.
-        let file = std::fs::File::open(archive_path)
-            .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
-        let mut reader =
-            sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
-                .map_err(|e| {
-                    format!(
-                        "Failed to read 7z archive {}: {e}",
-                        archive_path.display()
-                    )
-                })?;
+        let mut reader = open_7z_reader(archive_path)?;
         reader.read_file(entry_path).map_err(|e| {
             format!(
                 "Failed to read '{}' from {}: {e}",
@@ -2118,10 +2097,7 @@ fn list_archive_entries_with_7z(archive_path: &Path) -> Result<Vec<String>, Stri
 
 /// List entries in a `.7z` archive.
 fn list_7z_entries(archive_path: &Path) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
-    let reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
-        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
+    let reader = open_7z_reader(archive_path)?;
     let paths = reader
         .archive()
         .files
@@ -2129,6 +2105,19 @@ fn list_7z_entries(archive_path: &Path) -> Result<Vec<String>, String> {
         .map(|f| f.name().to_string())
         .collect();
     Ok(paths)
+}
+
+/// Open a 7z archive and return an `ArchiveReader` ready for reading.
+///
+/// Centralises the open + error-handling pattern used throughout the
+/// installer so that every call site gets consistent diagnostics.
+fn open_7z_reader(
+    archive_path: &Path,
+) -> Result<sevenz_rust2::ArchiveReader<std::fs::File>, String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
+    sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
+        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))
 }
 
 /// List entries in a `.rar` archive.
@@ -2182,10 +2171,7 @@ fn extract_single_7z_file(
     let target_norm = normalise_path(file_path_in_archive);
     let target_lower = target_norm.to_lowercase();
 
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
-    let mut reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
-        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
+    let mut reader = open_7z_reader(archive_path)?;
 
     // Fast path: try exact name lookup via the archive index.
     // This is much faster for non-solid archives and avoids decompressing
@@ -2225,7 +2211,7 @@ fn extract_single_7z_file(
                                 let mut buf = Vec::with_capacity(entry.size() as usize);
                                 if entry_reader.read_to_end(&mut buf).is_ok() {
                                     found = Some(buf);
-                                    return Ok(false); // stop iterating
+                                    return Ok(false); // target file found and read; stop iterating
                                 }
                             }
                             Ok(true)
