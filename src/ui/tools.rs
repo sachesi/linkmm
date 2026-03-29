@@ -263,12 +263,11 @@ fn show_tool_dialog(
                 gtk4::Window::NONE,
                 gio::Cancellable::NONE,
                 move |result| {
-                    if let Ok(file) = result {
-                        if let Some(path) = file.path() {
+                    if let Ok(file) = result
+                        && let Some(path) = file.path() {
                             exe_label_c2.set_label(&path.to_string_lossy());
                             *exe_path_ref_c2.borrow_mut() = Some(path);
                         }
-                    }
                 },
             );
         });
@@ -302,14 +301,13 @@ fn show_tool_dialog(
     // If editing, populate fields
     if let Some(tool_id) = tool_id {
         let cfg = config.borrow();
-        if let Some(game_settings) = cfg.game_settings.get(game_id) {
-            if let Some(tool) = game_settings.tools.iter().find(|t| t.id == tool_id) {
+        if let Some(game_settings) = cfg.game_settings.get(game_id)
+            && let Some(tool) = game_settings.tools.iter().find(|t| t.id == tool_id) {
                 name_row.set_text(&tool.name);
                 args_row.set_text(&tool.arguments);
                 exe_label.set_label(&tool.exe_path.to_string_lossy());
                 *exe_path_ref.borrow_mut() = Some(tool.exe_path.clone());
             }
-        }
     }
 
     // Buttons
@@ -431,14 +429,14 @@ fn launch_tool(tool: &ToolConfig, btn: &gtk4::Button, toast_overlay: &adw::Toast
                 // Capture and log stdout/stderr
                 if let Some(stdout) = child.stdout.take() {
                     let reader = BufReader::new(stdout);
-                    for line in reader.lines().flatten() {
+                    for line in reader.lines().map_while(Result::ok) {
                         log::info!("[{}] {}", tool_clone.name, line);
                     }
                 }
 
                 if let Some(stderr) = child.stderr.take() {
                     let reader = BufReader::new(stderr);
-                    for line in reader.lines().flatten() {
+                    for line in reader.lines().map_while(Result::ok) {
                         log::warn!("[{}] {}", tool_clone.name, line);
                     }
                 }
