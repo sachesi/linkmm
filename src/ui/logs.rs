@@ -16,7 +16,7 @@ const LOG_REFRESH_INTERVAL_MS: u64 = 500;
 /// Open a read-only log viewer window.
 ///
 /// The window auto-refreshes every 500 ms and filters entries according to
-/// the three logging toggles stored in `config`.
+/// the logging toggles stored in `config`.
 pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
     let win = adw::Window::builder()
         .title("Application Logs")
@@ -119,9 +119,9 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
             }
             let new_entries = &entries[new_start..];
 
-            let (show_errors, show_warnings, show_activity) = {
+            let (show_errors, show_warnings, show_activity, show_info, show_debug) = {
                 let cfg = config_c.borrow();
-                (cfg.log_errors, cfg.log_warnings, cfg.log_activity)
+                (cfg.log_errors, cfg.log_warnings, cfg.log_activity, cfg.log_info, cfg.log_debug)
             };
 
             let mut end_iter = text_buffer_c.end_iter();
@@ -130,9 +130,8 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
                 let show = match entry.level {
                     Level::Error => show_errors,
                     Level::Warn => show_warnings,
-                    Level::Info => show_activity,
-                    // Debug / Trace — treat as activity
-                    _ => show_activity,
+                    Level::Info => show_activity || show_info,
+                    Level::Debug | Level::Trace => show_debug,
                 };
                 if !show {
                     continue;
