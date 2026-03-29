@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::games::Game;
 use crate::core::installer_new;
+use crate::core::logger;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -11,6 +12,10 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 /// 256 KB buffer reduces the number of `write` syscalls for archives that
 /// contain many small files.
 const EXTRACT_BUFFER_SIZE: usize = 256 * 1024;
+
+/// Maximum initial allocation when reading a single file from a 7z archive.
+/// Prevents DoS from archives with inflated size metadata.
+const SINGLE_FILE_READ_CAP: usize = 64 * 1024 * 1024;
 
 /// How often the zip extraction loop calls the progress `tick` callback.
 /// At 50 ms the progress bar pulses at ~20 Hz, which looks smooth enough
@@ -272,6 +277,10 @@ fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
         let norm = path.to_lowercase().replace('\\', "/");
         let norm = norm.trim_start_matches('/');
         if norm == "fomod/moduleconfig.xml" {
+            log::debug!(
+                "[FOMOD] ModuleConfig.xml discovered at archive root | virtual_path={}",
+                path
+            );
             return Some(String::new());
         }
         if norm.ends_with("/fomod/moduleconfig.xml") {
@@ -281,6 +290,11 @@ fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
             let orig = path.replace('\\', "/");
             let orig = orig.trim_start_matches('/');
             let parent = orig.split('/').next().unwrap_or("").to_string();
+            log::debug!(
+                "[FOMOD] ModuleConfig.xml discovered under wrapper | virtual_path={}, parent_dir={}",
+                path,
+                parent
+            );
             return Some(parent);
         }
     }
@@ -302,11 +316,17 @@ pub fn find_data_root_in_paths(paths: &[&str]) -> String {
     // If the archive contains a FOMOD config file, the directory that holds
     // the `fomod/` subdirectory is the wrapper root.
     if let Some(fomod_parent) = find_fomod_parent_dir(paths) {
-        return if fomod_parent.is_empty() {
+        let result = if fomod_parent.is_empty() {
             String::new()
         } else {
             format!("{fomod_parent}/")
         };
+        log::debug!(
+            "[DataRoot] FOMOD detected, using fomod parent as root | fomod_parent='{}', resolved_root='{}'",
+            fomod_parent,
+            result
+        );
+        return result;
     }
 
     // Convert &[&str] to Vec<String> for new module
@@ -315,17 +335,28 @@ pub fn find_data_root_in_paths(paths: &[&str]) -> String {
     // Use new improved detection
     match installer_new::detect_data_root(&paths_owned) {
         Some(prefix) => {
-            if prefix.is_empty() {
+            let result = if prefix.is_empty() {
                 String::new()
             } else {
                 format!("{}/", prefix)
-            }
+            };
+            log::debug!(
+                "[DataRoot] Resolved via scoring heuristic | detected_prefix='{}', strip_prefix='{}'",
+                prefix,
+                result
+            );
+            result
         }
         None => {
             // Fallback to old simple prefix detection if new detection fails.
             // This handles edge cases where the new scoring system can't
             // confidently identify the Data/ root.
-            find_common_prefix_from_paths(paths)
+            let fallback = find_common_prefix_from_paths(paths);
+            log::debug!(
+                "[DataRoot] Scoring heuristic inconclusive, fallback to common prefix | strip_prefix='{}'",
+                fallback
+            );
+            fallback
         }
     }
 }
@@ -392,11 +423,19 @@ fn looks_like_root_level_mod(paths: &[&str]) -> bool {
             continue;
         }
         if ROOT_DIRS.contains(&first) {
+            log::debug!(
+                "[DataRoot] Root-level mod detected via directory marker | dir={}",
+                first
+            );
             return true;
         }
         if first.contains('.') {
             let ext = first.rsplit('.').next().unwrap_or("");
             if ROOT_EXTS.contains(&ext) {
+                log::debug!(
+                    "[DataRoot] Root-level mod detected via binary extension | file={}",
+                    first
+                );
                 return true;
             }
         }
@@ -587,13 +626,26 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         return Err(format!("Cannot open archive: {}", archive_path.display()));
     }
 
+    let archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
     // Return Fomod with empty file list – the caller will run the wizard and
     // parse the full XML separately (via parse_fomod_from_archive).  This
     // avoids propagating an XML-parse error from inside strategy *detection*,
     // which should be a best-effort, non-fatal operation.
     if is_fomod_archive(archive_path) {
+        log::debug!(
+            "[Strategy] FOMOD installer detected | archive={}",
+            archive_name
+        );
         Ok(InstallStrategy::Fomod(vec![]))
     } else {
+        log::debug!(
+            "[Strategy] Standard data mod detected | archive={}",
+            archive_name
+        );
         Ok(InstallStrategy::Data)
     }
 }
@@ -646,14 +698,58 @@ fn archive_has_data_folder(archive_path: &Path) -> bool {
 
 /// Parse a FOMOD `ModuleConfig.xml` from a supported archive.
 pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, String> {
+    let archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let _span = logger::span("parse_fomod", &format!("archive={archive_name}"));
+
     if has_zip_extension(archive_path) {
         return parse_fomod_from_zip(archive_path);
     }
 
-    // For non-zip archives: list entries to find the FOMOD XML path, then
-    // extract only that single file.  This is much faster than a full
-    // extraction for large archives.
-    let entries = list_archive_entries_with_7z(archive_path)?;
+    if has_rar_extension(archive_path) {
+        return parse_fomod_from_rar(archive_path);
+    }
+
+    // For 7z archives: open the ArchiveReader once, find the FOMOD entry
+    // by name, and read its bytes directly.  This avoids decompressing the
+    // entire archive through `decompress_file_with_extract_fn` which was
+    // unreliable for solid archives.
+    let mut reader = open_7z_reader(archive_path)?;
+
+    // Find the FOMOD config entry name (case-insensitive search).
+    let fomod_entry = reader
+        .archive()
+        .files
+        .iter()
+        .find(|f| {
+            let lower = f.name().to_lowercase().replace('\\', "/");
+            lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
+        })
+        .map(|f| f.name().to_string())
+        .ok_or_else(|| "No fomod/ModuleConfig.xml found in archive".to_string())?;
+
+    log::debug!(
+        "[FOMOD] Found config entry in 7z | exact_name={}",
+        fomod_entry
+    );
+
+    // Read the XML bytes directly from the archive using the exact stored name.
+    let xml_bytes = reader.read_file(&fomod_entry).map_err(|e| {
+        format!(
+            "Failed to read '{}' from {}: {e}",
+            fomod_entry,
+            archive_path.display()
+        )
+    })?;
+
+    parse_fomod_xml(&xml_bytes)
+}
+
+/// Parse a FOMOD `ModuleConfig.xml` from inside a RAR archive.
+fn parse_fomod_from_rar(archive_path: &Path) -> Result<FomodConfig, String> {
+    let entries = list_rar_entries(archive_path)?;
     let fomod_entry = entries
         .iter()
         .find(|p| {
@@ -664,7 +760,7 @@ pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, Stri
 
     let tmp_extract = create_temp_extract_dir()?;
     let result = (|| {
-        extract_single_file_with_7z(archive_path, fomod_entry, &tmp_extract)?;
+        extract_single_rar_file(archive_path, fomod_entry, &tmp_extract)?;
         let config_path = find_fomod_config_in_dir(&tmp_extract)
             .ok_or_else(|| "fomod/ModuleConfig.xml not found after extraction".to_string())?;
         let xml_bytes = std::fs::read(&config_path)
@@ -915,22 +1011,35 @@ fn read_archive_files_bytes_non_zip(
         }
         let _ = std::fs::remove_dir_all(&tmp);
     } else {
-        // 7z single sequential pass
-        let _ = sevenz_rust2::decompress_file_with_extract_fn(
-            archive_path,
-            std::env::temp_dir(),
-            |entry, reader, _default_dest| {
-                if let Some(rel_path) = target_to_req.get(entry.name()) {
+        // 7z: single-pass streaming extraction.
+        // For solid 7z archives, `read_file()` per entry would decompress the
+        // entire solid block from scratch for *each* file.  Instead, iterate
+        // all entries once and collect the ones we need.
+        let target_set: std::collections::HashMap<String, String> = target_to_req
+            .iter()
+            .map(|(entry, rel)| (normalise_path(entry).to_lowercase(), rel.clone()))
+            .collect();
+        let mut reader = open_7z_reader(archive_path)?;
+        reader
+            .for_each_entries(|entry, entry_reader| {
+                let entry_lower = normalise_path(entry.name()).to_lowercase();
+                if let Some(rel_path) = target_set.get(&entry_lower) {
                     if !entry.is_directory() {
-                        let mut bytes = Vec::with_capacity(entry.size() as usize);
-                        if reader.read_to_end(&mut bytes).is_ok() {
-                            results.insert(rel_path.clone(), bytes);
+                        let cap = std::cmp::min(entry.size() as usize, SINGLE_FILE_READ_CAP);
+                        let mut buf = Vec::with_capacity(cap);
+                        if entry_reader.read_to_end(&mut buf).is_ok() {
+                            results.insert(rel_path.clone(), buf);
                         }
                     }
                 }
                 Ok(true)
-            },
-        );
+            })
+            .map_err(|e| {
+                format!(
+                    "Failed to read 7z archive {}: {e}",
+                    archive_path.display()
+                )
+            })?;
     }
 
     Ok(results)
@@ -970,22 +1079,33 @@ fn read_archive_file_bytes_non_zip(
         return Err(format!("Archive file not found: {relative_path}"));
     };
 
-    // Extract only that single file.
-    let tmp = create_temp_extract_dir()?;
-    let result = (|| {
-        extract_single_file_with_7z(archive_path, entry_path, &tmp)?;
-        // The file was extracted preserving directory structure.  Locate it.
-        let normalised = normalise_path(entry_path);
-        let extracted_path = tmp.join(Path::new(&normalised));
-        std::fs::read(&extracted_path).map_err(|e| {
+    if has_rar_extension(archive_path) {
+        // RAR: extract single file to temp dir and read.
+        let tmp = create_temp_extract_dir()?;
+        let result = (|| {
+            extract_single_rar_file(archive_path, entry_path, &tmp)?;
+            let normalised = normalise_path(entry_path);
+            let extracted_path = tmp.join(Path::new(&normalised));
+            std::fs::read(&extracted_path).map_err(|e| {
+                format!(
+                    "Failed to read extracted file {}: {e}",
+                    extracted_path.display()
+                )
+            })
+        })();
+        let _ = std::fs::remove_dir_all(&tmp);
+        result
+    } else {
+        // 7z: read file bytes directly from the archive via ArchiveReader.
+        let mut reader = open_7z_reader(archive_path)?;
+        reader.read_file(entry_path).map_err(|e| {
             format!(
-                "Failed to read extracted file {}: {e}",
-                extracted_path.display()
+                "Failed to read '{}' from {}: {e}",
+                entry_path,
+                archive_path.display()
             )
         })
-    })();
-    let _ = std::fs::remove_dir_all(&tmp);
-    result
+    }
 }
 
 /// Recursively collect all regular files under `dir`, returning tuples of
@@ -1502,6 +1622,14 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
         buf.clear();
     }
 
+    log::debug!(
+        "[FOMOD] XML parsed | mod_name={}, steps={}, required_files={}, conditional_patterns={}",
+        config.mod_name.as_deref().unwrap_or("<unnamed>"),
+        config.steps.len(),
+        config.required_files.len(),
+        config.conditional_file_installs.len()
+    );
+
     Ok(config)
 }
 
@@ -1571,6 +1699,15 @@ pub fn install_mod_from_archive_with_nexus_ticking(
     nexus_id: Option<u32>,
     tick: &dyn Fn(),
 ) -> Result<Mod, String> {
+    let archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let _span = logger::span(
+        "install_mod",
+        &format!("archive={archive_name}, mod={mod_name}"),
+    );
+
     let mod_dir = ModManager::create_mod_directory(game)?;
 
     match strategy {
@@ -1710,6 +1847,7 @@ fn extract_zip_to(
             std::fs::create_dir_all(&out_path)
                 .map_err(|e| format!("Failed to create directory {}: {e}", out_path.display()))?;
         } else {
+            log::trace!("[Extract] zip entry | path={}", rel_name);
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create parent dir: {e}"))?;
@@ -1848,6 +1986,7 @@ fn extract_7z_archive_to(
             if entry.is_directory() {
                 std::fs::create_dir_all(&out_path)?;
             } else {
+                log::trace!("[Extract] 7z entry | path={}", rel_name);
                 if let Some(parent) = out_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -1976,10 +2115,7 @@ fn list_archive_entries_with_7z(archive_path: &Path) -> Result<Vec<String>, Stri
 
 /// List entries in a `.7z` archive.
 fn list_7z_entries(archive_path: &Path) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
-    let reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
-        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
+    let reader = open_7z_reader(archive_path)?;
     let paths = reader
         .archive()
         .files
@@ -1987,6 +2123,19 @@ fn list_7z_entries(archive_path: &Path) -> Result<Vec<String>, String> {
         .map(|f| f.name().to_string())
         .collect();
     Ok(paths)
+}
+
+/// Open a 7z archive and return an `ArchiveReader` ready for reading.
+///
+/// Centralises the open + error-handling pattern used throughout the
+/// installer so that every call site gets consistent diagnostics.
+fn open_7z_reader(
+    archive_path: &Path,
+) -> Result<sevenz_rust2::ArchiveReader<std::fs::File>, String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("Cannot open archive {}: {e}", archive_path.display()))?;
+    sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
+        .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))
 }
 
 /// List entries in a `.rar` archive.
@@ -2027,6 +2176,11 @@ fn extract_single_file_with_7z(
 }
 
 /// Extract a single file from a `.7z` archive using `sevenz_rust2`.
+///
+/// Uses `ArchiveReader` directly instead of `decompress_file_with_extract_fn`
+/// so that we can first try the efficient `read_file()` path (which uses the
+/// archive's built-in file index) and only fall back to a full sequential scan
+/// with case-insensitive matching if the exact-name lookup fails.
 fn extract_single_7z_file(
     archive_path: &Path,
     file_path_in_archive: &str,
@@ -2034,30 +2188,71 @@ fn extract_single_7z_file(
 ) -> Result<(), String> {
     let target_norm = normalise_path(file_path_in_archive);
     let target_lower = target_norm.to_lowercase();
-    let mut data = None;
-    sevenz_rust2::decompress_file_with_extract_fn(
-        archive_path,
-        dest_dir,
-        |entry, reader, _default_dest| {
-            let entry_norm = normalise_path(entry.name());
-            let entry_lower = entry_norm.to_lowercase();
-            if entry_lower == target_lower && !entry.is_directory() {
-                let mut buf = Vec::with_capacity(entry.size() as usize);
-                if reader.read_to_end(&mut buf).is_ok() {
-                    data = Some(buf);
+
+    let mut reader = open_7z_reader(archive_path)?;
+
+    // Fast path: try exact name lookup via the archive index.
+    // This is much faster for non-solid archives and avoids decompressing
+    // all preceding entries in solid archives.
+    let data = match reader.read_file(file_path_in_archive) {
+        Ok(bytes) => {
+            log::debug!(
+                "[Extract7z] read_file exact match succeeded | path={}",
+                file_path_in_archive
+            );
+            bytes
+        }
+        Err(_) => {
+            // Also try the normalised form (backslash→slash, no leading/trailing slash).
+            match reader.read_file(&target_norm) {
+                Ok(bytes) => {
+                    log::debug!(
+                        "[Extract7z] read_file normalised match succeeded | path={}",
+                        target_norm
+                    );
+                    bytes
+                }
+                Err(_) => {
+                    // Slow path: iterate all entries with case-insensitive matching.
+                    // This handles archives where the stored name differs in casing
+                    // from what list_7z_entries reported.
+                    log::debug!(
+                        "[Extract7z] read_file failed, falling back to sequential scan | target={}",
+                        target_lower
+                    );
+                    let mut found = None;
+                    reader
+                        .for_each_entries(|entry, entry_reader| {
+                            let entry_norm = normalise_path(entry.name());
+                            let entry_lower = entry_norm.to_lowercase();
+                            if entry_lower == target_lower && !entry.is_directory() {
+                                // Cap initial allocation to prevent DoS from
+                                // archives with inflated size metadata.
+                                let cap = std::cmp::min(entry.size() as usize, SINGLE_FILE_READ_CAP);
+                                let mut buf = Vec::with_capacity(cap);
+                                if entry_reader.read_to_end(&mut buf).is_ok() {
+                                    found = Some(buf);
+                                    return Ok(false); // target file found and read; stop iterating
+                                }
+                            }
+                            Ok(true)
+                        })
+                        .map_err(|e| {
+                            format!(
+                                "Failed to read 7z archive {}: {e}",
+                                archive_path.display()
+                            )
+                        })?;
+                    found.ok_or_else(|| {
+                        format!(
+                            "Failed to read '{file_path_in_archive}' from {}",
+                            archive_path.display()
+                        )
+                    })?
                 }
             }
-            Ok(true)
-        },
-    )
-    .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
-
-    let data = data.ok_or_else(|| {
-        format!(
-            "Failed to read '{file_path_in_archive}' from {}",
-            archive_path.display()
-        )
-    })?;
+        }
+    };
 
     let out_path = dest_dir.join(Path::new(&target_norm));
     if let Some(parent) = out_path.parent() {
@@ -2458,6 +2653,15 @@ fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String {
 /// efficiently. It resolves file paths based on the FOMOD configuration and
 /// extracts only the necessary files.
 fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> Result<(), String> {
+    let archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let _span = logger::span(
+        "install_fomod",
+        &format!("archive={archive_name}, file_mappings={}", files.len()),
+    );
+
     // 1. Get entries and create entry_map
     let is_zip = has_zip_extension(archive_path);
     let mut zip_archive = if is_zip {
@@ -3568,6 +3772,29 @@ mod tests {
         };
         let bytes = read_archive_file_bytes(&archive, "images/preview.png").unwrap();
         assert_eq!(bytes, b"pngdata");
+    }
+
+    #[test]
+    fn read_archive_files_bytes_non_zip_batch_single_pass() {
+        // Verify batch reading from 7z gathers multiple files in one pass.
+        let tmp = tempdir();
+        let staging = tmp.join("staging_batch");
+        std::fs::create_dir_all(staging.join("fomod/images")).unwrap();
+        std::fs::create_dir_all(staging.join("Data/textures")).unwrap();
+        std::fs::write(staging.join("fomod/images/a.png"), b"aaa").unwrap();
+        std::fs::write(staging.join("fomod/images/b.png"), b"bbb").unwrap();
+        std::fs::write(staging.join("Data/textures/sky.dds"), b"dds").unwrap();
+        let archive_path = tmp.join("batch.7z");
+        let out_file = std::fs::File::create(&archive_path).unwrap();
+        if sevenz_rust2::compress(staging.as_path(), out_file).is_err() {
+            return; // 7z compression not available
+        }
+
+        let result =
+            read_archive_files_bytes(&archive_path, &["images/a.png", "images/b.png"]).unwrap();
+        assert_eq!(result.len(), 2, "expected both images to be read");
+        assert_eq!(result.get("images/a.png").unwrap(), b"aaa");
+        assert_eq!(result.get("images/b.png").unwrap(), b"bbb");
     }
 
     #[test]
