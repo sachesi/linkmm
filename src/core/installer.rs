@@ -2208,7 +2208,10 @@ fn extract_single_7z_file(
                             let entry_norm = normalise_path(entry.name());
                             let entry_lower = entry_norm.to_lowercase();
                             if entry_lower == target_lower && !entry.is_directory() {
-                                let mut buf = Vec::with_capacity(entry.size() as usize);
+                                // Cap initial allocation to prevent DoS from
+                                // archives with inflated size metadata.
+                                let cap = std::cmp::min(entry.size() as usize, 64 * 1024 * 1024);
+                                let mut buf = Vec::with_capacity(cap);
                                 if entry_reader.read_to_end(&mut buf).is_ok() {
                                     found = Some(buf);
                                     return Ok(false); // target file found and read; stop iterating
