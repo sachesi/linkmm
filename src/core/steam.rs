@@ -401,6 +401,15 @@ pub fn is_steam_flatpak() -> bool {
     }
 }
 
+/// Detect if a path is within the Flatpak Steam directory.
+///
+/// This is more reliable than checking steam_root alone, since Proton or compatdata
+/// may be installed in the Flatpak directory even if steam_root points to a symlink.
+pub fn is_path_in_flatpak(path: &PathBuf) -> bool {
+    let path_str = path.to_string_lossy();
+    path_str.contains("/.var/app/com.valvesoftware.Steam/")
+}
+
 /// Return the Proton compatdata directory for `app_id`.
 ///
 /// Searches the Steam library that contains the game's `appmanifest_<app_id>.acf`
@@ -574,10 +583,11 @@ pub fn launch_tool_with_proton(
     );
     log::debug!("Using compatdata: {}", compatdata_path.display());
 
-    let is_flatpak = is_steam_flatpak();
+    // Check if either Proton or compatdata is in the Flatpak directory
+    let is_flatpak = is_path_in_flatpak(&proton_path) || is_path_in_flatpak(&compatdata_path);
 
     if is_flatpak {
-        log::info!("Detected Flatpak Steam, using flatpak wrapper");
+        log::info!("Detected Flatpak Steam (Proton or compatdata in Flatpak directory), using flatpak wrapper");
         launch_tool_with_flatpak(
             &proton_script,
             exe_path,
@@ -723,6 +733,25 @@ mod tests {
         let result = is_steam_flatpak();
         // In CI, this will be false since Steam isn't installed
         assert!(!result || result); // Always passes, just exercises the code
+    }
+
+    #[test]
+    fn is_path_in_flatpak_detects_flatpak_paths() {
+        use std::path::PathBuf;
+
+        // Flatpak paths should be detected
+        let flatpak_path = PathBuf::from("/home/user/.var/app/com.valvesoftware.Steam/.steam/steam/compatibilitytools.d/GE-Proton10-34");
+        assert!(is_path_in_flatpak(&flatpak_path));
+
+        let flatpak_compatdata = PathBuf::from("/home/user/.var/app/com.valvesoftware.Steam/data/steamapps/compatdata/489830");
+        assert!(is_path_in_flatpak(&flatpak_compatdata));
+
+        // Native paths should not be detected as Flatpak
+        let native_path = PathBuf::from("/home/user/.local/share/Steam/steamapps/common/Proton 8.0");
+        assert!(!is_path_in_flatpak(&native_path));
+
+        let external_lib = PathBuf::from("/mnt/data0/.steamlib/steamapps/compatdata/489830");
+        assert!(!is_path_in_flatpak(&external_lib));
     }
 
     #[test]
