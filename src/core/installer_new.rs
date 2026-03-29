@@ -431,10 +431,11 @@ impl PluginDependencies {
                     let matched = active_flags.get(&dep.flag.to_lowercase())
                         == Some(&dep.value.to_lowercase());
                     log::debug!(
-                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator=And",
+                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
                         dep.flag,
                         dep.value,
-                        matched
+                        matched,
+                        self.operator
                     );
                     matched
                 })
@@ -444,10 +445,11 @@ impl PluginDependencies {
                     let matched = active_flags.get(&dep.flag.to_lowercase())
                         == Some(&dep.value.to_lowercase());
                     log::debug!(
-                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator=Or",
+                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
                         dep.flag,
                         dep.value,
-                        matched
+                        matched,
+                        self.operator
                     );
                     matched
                 })
