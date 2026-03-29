@@ -121,15 +121,21 @@ pub struct AppConfig {
     pub game_settings: HashMap<String, GameSettings>,
 
     // ── Logging preferences ───────────────────────────────────────────────
-    /// Show error-level log entries in the log viewer.
+    /// Show mod activity (Info-level) log entries in the log viewer.
     #[serde(default = "default_true")]
-    pub log_errors: bool,
+    pub log_activity: bool,
     /// Show warning-level log entries in the log viewer.
     #[serde(default = "default_true")]
     pub log_warnings: bool,
-    /// Show info-level (download / installation process) entries in the log viewer.
+    /// Show error-level log entries in the log viewer.
     #[serde(default = "default_true")]
-    pub log_activity: bool,
+    pub log_errors: bool,
+    /// Show info-level log entries in the log viewer.
+    #[serde(default = "default_true")]
+    pub log_info: bool,
+    /// Show debug-level log entries in the log viewer.
+    #[serde(default = "default_true")]
+    pub log_debug: bool,
 
     // ── Legacy global fields – kept for migration only, never re-serialized ──
     /// Migrated into `game_settings[*].app_data_dir`.
@@ -155,9 +161,11 @@ impl Default for AppConfig {
             nexus_api_key: None,
             games: Vec::new(),
             game_settings: HashMap::new(),
-            log_errors: true,
-            log_warnings: true,
             log_activity: true,
+            log_warnings: true,
+            log_errors: true,
+            log_info: true,
+            log_debug: true,
             // Legacy fields – only meaningful during migration
             app_data_dir: None,
             installed_archives: Vec::new(),
