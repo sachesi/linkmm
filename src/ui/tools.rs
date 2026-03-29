@@ -429,14 +429,14 @@ fn launch_tool(tool: &ToolConfig, btn: &gtk4::Button, toast_overlay: &adw::Toast
                 // Capture and log stdout/stderr
                 if let Some(stdout) = child.stdout.take() {
                     let reader = BufReader::new(stdout);
-                    for line in reader.lines().flatten() {
+                    for line in reader.lines().map_while(Result::ok) {
                         log::info!("[{}] {}", tool_clone.name, line);
                     }
                 }
 
                 if let Some(stderr) = child.stderr.take() {
                     let reader = BufReader::new(stderr);
-                    for line in reader.lines().flatten() {
+                    for line in reader.lines().map_while(Result::ok) {
                         log::warn!("[{}] {}", tool_clone.name, line);
                     }
                 }
