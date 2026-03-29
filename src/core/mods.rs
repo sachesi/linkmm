@@ -76,7 +76,7 @@ fn generate_mod_uuid() -> String {
     let b = (nanos >> 16) as u16;
     let c = nanos as u16;
     let d = (pid as u16) ^ (seq as u16);
-    let e = (((secs >> 32) as u64) << 32) | ((pid as u64) << 16) | (seq as u64);
+    let e = ((secs >> 32) << 32) | ((pid as u64) << 16) | (seq as u64);
     format!("{a:08x}-{b:04x}-{c:04x}-{d:04x}-{e:012x}")
 }
 
@@ -620,15 +620,13 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
             #[cfg(unix)]
             {
                 // Only remove the symlink if it points to our source file
-                if dest_path.is_symlink() {
-                    if let Ok(target) = std::fs::read_link(&dest_path) {
-                        if target == src_path {
+                if dest_path.is_symlink()
+                    && let Ok(target) = std::fs::read_link(&dest_path)
+                        && target == src_path {
                             std::fs::remove_file(&dest_path).map_err(|e| {
                                 format!("Failed to remove symlink {:?}: {e}", dest_path)
                             })?;
                         }
-                    }
-                }
             }
         }
     }
@@ -637,13 +635,12 @@ fn unlink_directory_contents(source: &Path, dest: &Path) -> Result<(), String> {
     // "not found" result is fully expected (the dir has vanilla files, other
     // mods' symlinks, or was already gone) and is silently ignored.  Any other
     // OS error is logged at debug level to aid diagnosing unexpected failures.
-    if let Err(e) = std::fs::remove_dir(dest) {
-        if e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    if let Err(e) = std::fs::remove_dir(dest)
+        && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
             && e.kind() != std::io::ErrorKind::NotFound
         {
             log::debug!("Could not remove directory {}: {e}", dest.display());
         }
-    }
 
     Ok(())
 }
@@ -726,15 +723,13 @@ fn unlink_items_alongside_data(source_root: &Path, dest: &Path) -> Result<(), St
         } else {
             #[cfg(unix)]
             {
-                if dest_path.is_symlink() {
-                    if let Ok(target) = std::fs::read_link(&dest_path) {
-                        if target == src_path {
+                if dest_path.is_symlink()
+                    && let Ok(target) = std::fs::read_link(&dest_path)
+                        && target == src_path {
                             std::fs::remove_file(&dest_path).map_err(|e| {
                                 format!("Failed to remove symlink {:?}: {e}", dest_path)
                             })?;
                         }
-                    }
-                }
             }
         }
     }
@@ -838,15 +833,13 @@ fn unlink_mod_data(source: &Path, dest: &Path) -> Result<(), String> {
         } else {
             #[cfg(unix)]
             {
-                if dest_path.is_symlink() {
-                    if let Ok(target) = std::fs::read_link(&dest_path) {
-                        if target == src_path {
+                if dest_path.is_symlink()
+                    && let Ok(target) = std::fs::read_link(&dest_path)
+                        && target == src_path {
                             std::fs::remove_file(&dest_path).map_err(|e| {
                                 format!("Failed to remove symlink {:?}: {e}", dest_path)
                             })?;
                         }
-                    }
-                }
             }
         }
     }

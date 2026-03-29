@@ -391,13 +391,11 @@ fn find_common_prefix_from_paths(paths: &[&str]) -> String {
         }
     }
 
-    if all_same {
-        if let Some(ft) = first_top {
-            if paths.len() > 1 {
+    if all_same
+        && let Some(ft) = first_top
+            && paths.len() > 1 {
                 return format!("{ft}/");
             }
-        }
-    }
     String::new()
 }
 
@@ -503,11 +501,10 @@ pub fn is_bain_archive(paths: &[&str]) -> bool {
     for path in paths {
         let p = path.replace('\\', "/");
         let p = p.trim_start_matches('/').to_string();
-        if let Some(first) = p.split('/').next() {
-            if !first.is_empty() {
+        if let Some(first) = p.split('/').next()
+            && !first.is_empty() {
                 top_dirs.insert(first.to_lowercase());
             }
-        }
     }
 
     if top_dirs.len() < 2 {
@@ -531,8 +528,8 @@ fn collect_bain_top_dirs(paths: &[&str]) -> Vec<String> {
     for path in paths {
         let p = path.replace('\\', "/");
         let p_lower = p.trim_start_matches('/').to_lowercase();
-        if let Some(first) = p_lower.split('/').next() {
-            if !first.is_empty()
+        if let Some(first) = p_lower.split('/').next()
+            && !first.is_empty()
                 && first.len() >= 3
                 && first.chars().take(2).all(|c| c.is_ascii_digit())
                 && matches!(first.chars().nth(2), Some(' ') | Some('_'))
@@ -544,7 +541,6 @@ fn collect_bain_top_dirs(paths: &[&str]) -> Vec<String> {
                     dirs.insert(orig_first.to_string());
                 }
             }
-        }
     }
     dirs.into_iter().collect()
 }
@@ -1023,15 +1019,14 @@ fn read_archive_files_bytes_non_zip(
         reader
             .for_each_entries(|entry, entry_reader| {
                 let entry_lower = normalise_path(entry.name()).to_lowercase();
-                if let Some(rel_path) = target_set.get(&entry_lower) {
-                    if !entry.is_directory() {
+                if let Some(rel_path) = target_set.get(&entry_lower)
+                    && !entry.is_directory() {
                         let cap = std::cmp::min(entry.size() as usize, SINGLE_FILE_READ_CAP);
                         let mut buf = Vec::with_capacity(cap);
                         if entry_reader.read_to_end(&mut buf).is_ok() {
                             results.insert(rel_path.clone(), buf);
                         }
                     }
-                }
                 Ok(true)
             })
             .map_err(|e| {
@@ -1118,12 +1113,11 @@ fn collect_fs_files(root: &Path, dir: &Path, result: &mut Vec<(String, std::path
         let path = entry.path();
         if path.is_dir() {
             collect_fs_files(root, &path, result);
-        } else if path.is_file() {
-            if let Ok(rel) = path.strip_prefix(root) {
+        } else if path.is_file()
+            && let Ok(rel) = path.strip_prefix(root) {
                 let rel_str = normalise_path(&rel.to_string_lossy());
                 result.push((rel_str.to_lowercase(), path));
             }
-        }
     }
 }
 
@@ -1180,11 +1174,10 @@ fn find_fs_common_prefix(entry_map: &[(String, String)]) -> (String, String) {
             _ => {}
         }
     }
-    if all_same {
-        if let (Some(tl), Some(to)) = (first_lower, first_orig) {
+    if all_same
+        && let (Some(tl), Some(to)) = (first_lower, first_orig) {
             return (format!("{to}/"), format!("{tl}/"));
         }
-    }
     (String::new(), String::new())
 }
 
@@ -1376,11 +1369,10 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                                         deps.flags.push(FlagDependency { flag, value });
                                     }
                                 }
-                            } else if let Some(ref mut plugin) = current_plugin {
-                                if let Some(ref mut deps) = plugin.dependencies {
+                            } else if let Some(ref mut plugin) = current_plugin
+                                && let Some(ref mut deps) = plugin.dependencies {
                                     deps.flags.push(FlagDependency { flag, value });
                                 }
-                            }
                         }
                     }
                     "flag" => {
@@ -1457,15 +1449,14 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                     }
                     "flag" => {
                         let in_condition_flags = path_stack.iter().any(|p| p == "conditionflags");
-                        if in_condition_flags {
-                            if let Some(ref mut plugin) = current_plugin {
+                        if in_condition_flags
+                            && let Some(ref mut plugin) = current_plugin {
                                 let name = get_attr(e, "name").unwrap_or_default();
                                 let value = get_attr(e, "value").unwrap_or_default();
                                 if !name.is_empty() && !value.is_empty() {
                                     plugin.condition_flags.push(ConditionFlag { name, value });
                                 }
                             }
-                        }
                     }
                     "flagdependency" => {
                         let flag = get_attr(e, "flag").unwrap_or_default();
@@ -1493,11 +1484,10 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                                         deps.flags.push(FlagDependency { flag, value });
                                     }
                                 }
-                            } else if let Some(ref mut plugin) = current_plugin {
-                                if let Some(ref mut deps) = plugin.dependencies {
+                            } else if let Some(ref mut plugin) = current_plugin
+                                && let Some(ref mut deps) = plugin.dependencies {
                                     deps.flags.push(FlagDependency { flag, value });
                                 }
-                            }
                         }
                     }
                     _ => {}
@@ -1520,69 +1510,58 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                         in_required = false;
                     }
                     "description" => {
-                        if let Some(ref mut plugin) = current_plugin {
-                            if !current_text.is_empty() {
+                        if let Some(ref mut plugin) = current_plugin
+                            && !current_text.is_empty() {
                                 plugin.description = Some(current_text.clone());
                             }
-                        }
                     }
                     "flag" => {
                         let in_condition_flags = path_stack
                             .last()
                             .map(|p| p == "conditionflags")
                             .unwrap_or(false);
-                        if in_condition_flags {
-                            if let Some(name) = current_condition_flag_name.take() {
-                                if let Some(ref mut plugin) = current_plugin {
-                                    if !current_text.is_empty() {
+                        if in_condition_flags
+                            && let Some(name) = current_condition_flag_name.take()
+                                && let Some(ref mut plugin) = current_plugin
+                                    && !current_text.is_empty() {
                                         plugin.condition_flags.push(ConditionFlag {
                                             name,
                                             value: current_text.clone(),
                                         });
                                     }
-                                }
-                            }
-                        }
                     }
                     "dependencies" => {
                         if in_pattern {
-                            if let Some(ref deps) = current_pattern_dependencies {
-                                if deps.flags.is_empty() {
+                            if let Some(ref deps) = current_pattern_dependencies
+                                && deps.flags.is_empty() {
                                     current_pattern_dependencies = None;
                                 }
-                            }
                         } else if in_visible {
-                            if let Some(ref mut step) = current_step {
-                                if let Some(ref deps) = step.visible {
-                                    if deps.flags.is_empty() {
+                            if let Some(ref mut step) = current_step
+                                && let Some(ref deps) = step.visible
+                                    && deps.flags.is_empty() {
                                         step.visible = None;
                                     }
-                                }
-                            }
-                        } else if let Some(ref mut plugin) = current_plugin {
-                            if let Some(ref deps) = plugin.dependencies {
-                                if deps.flags.is_empty() {
+                        } else if let Some(ref mut plugin) = current_plugin
+                            && let Some(ref deps) = plugin.dependencies
+                                && deps.flags.is_empty() {
                                     plugin.dependencies = None;
                                 }
-                            }
-                        }
                     }
                     "visible" => {
                         in_visible = false;
                     }
                     "plugin" => {
-                        if let Some(plugin) = current_plugin.take() {
-                            if let Some(ref mut group) = current_group {
+                        if let Some(plugin) = current_plugin.take()
+                            && let Some(ref mut group) = current_group {
                                 group.plugins.push(plugin);
                             }
-                        }
                     }
                     "group" => {
-                        if let Some(group) = current_group.take() {
-                            if let Some(ref mut step) = current_step {
+                        if let Some(group) = current_group.take()
+                            && let Some(ref mut step) = current_step {
                                 step.groups.push(group);
                             }
-                        }
                     }
                     "installstep" => {
                         if let Some(step) = current_step.take() {
@@ -2474,7 +2453,7 @@ fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
         let from = entry.path();
         let to = dst.join(entry.file_name());
         // Try a fast rename first; fall back to copy+delete on cross-device error.
-        if let Err(_) = std::fs::rename(&from, &to) {
+        if std::fs::rename(&from, &to).is_err() {
             if from.is_dir() {
                 copy_dir_contents(&from, &to)?;
                 let _ = std::fs::remove_dir_all(&from);
@@ -2636,14 +2615,13 @@ fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String {
         }
     }
 
-    if all_same {
-        if let Some(ft) = first_top {
+    if all_same
+        && let Some(ft) = first_top {
             // Only strip if there are entries *inside* the folder (not just the folder itself)
             if zip.len() > 1 {
                 return format!("{ft}/");
             }
         }
-    }
     String::new()
 }
 

@@ -224,12 +224,11 @@ impl AppConfig {
 
     pub fn save(&self) {
         let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent) {
                 log::error!("Failed to create config directory: {e}");
                 return;
             }
-        }
         match toml::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {
