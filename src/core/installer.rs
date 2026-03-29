@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::games::Game;
 use crate::core::installer_new;
+use crate::core::logger;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -272,6 +273,10 @@ fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
         let norm = path.to_lowercase().replace('\\', "/");
         let norm = norm.trim_start_matches('/');
         if norm == "fomod/moduleconfig.xml" {
+            log::debug!(
+                "[FOMOD] ModuleConfig.xml discovered at archive root | virtual_path={}",
+                path
+            );
             return Some(String::new());
         }
         if norm.ends_with("/fomod/moduleconfig.xml") {
@@ -281,6 +286,11 @@ fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
             let orig = path.replace('\\', "/");
             let orig = orig.trim_start_matches('/');
             let parent = orig.split('/').next().unwrap_or("").to_string();
+            log::debug!(
+                "[FOMOD] ModuleConfig.xml discovered under wrapper | virtual_path={}, parent_dir={}",
+                path,
+                parent
+            );
             return Some(parent);
         }
     }
@@ -302,11 +312,17 @@ pub fn find_data_root_in_paths(paths: &[&str]) -> String {
     // If the archive contains a FOMOD config file, the directory that holds
     // the `fomod/` subdirectory is the wrapper root.
     if let Some(fomod_parent) = find_fomod_parent_dir(paths) {
-        return if fomod_parent.is_empty() {
+        let result = if fomod_parent.is_empty() {
             String::new()
         } else {
             format!("{fomod_parent}/")
         };
+        log::debug!(
+            "[DataRoot] FOMOD detected, using fomod parent as root | fomod_parent='{}', resolved_root='{}'",
+            fomod_parent,
+            result
+        );
+        return result;
     }
 
     // Convert &[&str] to Vec<String> for new module
@@ -315,17 +331,28 @@ pub fn find_data_root_in_paths(paths: &[&str]) -> String {
     // Use new improved detection
     match installer_new::detect_data_root(&paths_owned) {
         Some(prefix) => {
-            if prefix.is_empty() {
+            let result = if prefix.is_empty() {
                 String::new()
             } else {
                 format!("{}/", prefix)
-            }
+            };
+            log::debug!(
+                "[DataRoot] Resolved via scoring heuristic | detected_prefix='{}', strip_prefix='{}'",
+                prefix,
+                result
+            );
+            result
         }
         None => {
             // Fallback to old simple prefix detection if new detection fails.
             // This handles edge cases where the new scoring system can't
             // confidently identify the Data/ root.
-            find_common_prefix_from_paths(paths)
+            let fallback = find_common_prefix_from_paths(paths);
+            log::debug!(
+                "[DataRoot] Scoring heuristic inconclusive, fallback to common prefix | strip_prefix='{}'",
+                fallback
+            );
+            fallback
         }
     }
 }
@@ -392,11 +419,19 @@ fn looks_like_root_level_mod(paths: &[&str]) -> bool {
             continue;
         }
         if ROOT_DIRS.contains(&first) {
+            log::debug!(
+                "[DataRoot] Root-level mod detected via directory marker | dir={}",
+                first
+            );
             return true;
         }
         if first.contains('.') {
             let ext = first.rsplit('.').next().unwrap_or("");
             if ROOT_EXTS.contains(&ext) {
+                log::debug!(
+                    "[DataRoot] Root-level mod detected via binary extension | file={}",
+                    first
+                );
                 return true;
             }
         }
@@ -587,13 +622,26 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
         return Err(format!("Cannot open archive: {}", archive_path.display()));
     }
 
+    let archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
     // Return Fomod with empty file list – the caller will run the wizard and
     // parse the full XML separately (via parse_fomod_from_archive).  This
     // avoids propagating an XML-parse error from inside strategy *detection*,
     // which should be a best-effort, non-fatal operation.
     if is_fomod_archive(archive_path) {
+        log::debug!(
+            "[Strategy] FOMOD installer detected | archive={}",
+            archive_name
+        );
         Ok(InstallStrategy::Fomod(vec![]))
     } else {
+        log::debug!(
+            "[Strategy] Standard data mod detected | archive={}",
+            archive_name
+        );
         Ok(InstallStrategy::Data)
     }
 }
@@ -646,6 +694,12 @@ fn archive_has_data_folder(archive_path: &Path) -> bool {
 
 /// Parse a FOMOD `ModuleConfig.xml` from a supported archive.
 pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, String> {
+    let archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let _span = logger::span("parse_fomod", &format!("archive={archive_name}"));
+
     if has_zip_extension(archive_path) {
         return parse_fomod_from_zip(archive_path);
     }
@@ -1502,6 +1556,14 @@ fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
         buf.clear();
     }
 
+    log::debug!(
+        "[FOMOD] XML parsed | mod_name={}, steps={}, required_files={}, conditional_patterns={}",
+        config.mod_name.as_deref().unwrap_or("<unnamed>"),
+        config.steps.len(),
+        config.required_files.len(),
+        config.conditional_file_installs.len()
+    );
+
     Ok(config)
 }
 
@@ -1571,6 +1633,15 @@ pub fn install_mod_from_archive_with_nexus_ticking(
     nexus_id: Option<u32>,
     tick: &dyn Fn(),
 ) -> Result<Mod, String> {
+    let archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let _span = logger::span(
+        "install_mod",
+        &format!("archive={archive_name}, mod={mod_name}"),
+    );
+
     let mod_dir = ModManager::create_mod_directory(game)?;
 
     match strategy {
@@ -1710,6 +1781,7 @@ fn extract_zip_to(
             std::fs::create_dir_all(&out_path)
                 .map_err(|e| format!("Failed to create directory {}: {e}", out_path.display()))?;
         } else {
+            log::trace!("[Extract] zip entry | path={}", rel_name);
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create parent dir: {e}"))?;
@@ -1848,6 +1920,7 @@ fn extract_7z_archive_to(
             if entry.is_directory() {
                 std::fs::create_dir_all(&out_path)?;
             } else {
+                log::trace!("[Extract] 7z entry | path={}", rel_name);
                 if let Some(parent) = out_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -2458,6 +2531,15 @@ fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String {
 /// efficiently. It resolves file paths based on the FOMOD configuration and
 /// extracts only the necessary files.
 fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> Result<(), String> {
+    let archive_name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let _span = logger::span(
+        "install_fomod",
+        &format!("archive={archive_name}, file_mappings={}", files.len()),
+    );
+
     // 1. Get entries and create entry_map
     let is_zip = has_zip_extension(archive_path);
     let mut zip_archive = if is_zip {
