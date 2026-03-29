@@ -1217,7 +1217,14 @@ fn collect_matching_fs_entries(entry_map: &[(String, String)], source_lower: &st
 fn decode_fomod_xml(raw: &[u8]) -> Result<String, String> {
     // UTF-16 LE: BOM = FF FE
     if raw.starts_with(&[0xFF, 0xFE]) {
-        let utf16: Vec<u16> = raw[2..]
+        let payload = &raw[2..];
+        if payload.len() % 2 != 0 {
+            return Err(format!(
+                "UTF-16 LE data has odd byte count ({} bytes after BOM)",
+                payload.len()
+            ));
+        }
+        let utf16: Vec<u16> = payload
             .chunks_exact(2)
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
@@ -1225,7 +1232,14 @@ fn decode_fomod_xml(raw: &[u8]) -> Result<String, String> {
     }
     // UTF-16 BE: BOM = FE FF
     if raw.starts_with(&[0xFE, 0xFF]) {
-        let utf16: Vec<u16> = raw[2..]
+        let payload = &raw[2..];
+        if payload.len() % 2 != 0 {
+            return Err(format!(
+                "UTF-16 BE data has odd byte count ({} bytes after BOM)",
+                payload.len()
+            ));
+        }
+        let utf16: Vec<u16> = payload
             .chunks_exact(2)
             .map(|b| u16::from_be_bytes([b[0], b[1]]))
             .collect();
@@ -4462,6 +4476,28 @@ mod tests {
             config.mod_name.as_deref(),
             Some("MyGreatMod"),
             "should fall back to archive stem when moduleName is empty"
+        );
+    }
+
+    #[test]
+    fn decode_fomod_xml_rejects_odd_length_utf16_le() {
+        // BOM + 3 bytes → odd payload length
+        let bad: Vec<u8> = vec![0xFF, 0xFE, 0x41, 0x00, 0x42];
+        let result = decode_fomod_xml(&bad);
+        assert!(
+            result.is_err(),
+            "odd-length UTF-16 LE payload should return an error"
+        );
+    }
+
+    #[test]
+    fn decode_fomod_xml_rejects_odd_length_utf16_be() {
+        // BOM + 3 bytes → odd payload length
+        let bad: Vec<u8> = vec![0xFE, 0xFF, 0x00, 0x41, 0x00];
+        let result = decode_fomod_xml(&bad);
+        assert!(
+            result.is_err(),
+            "odd-length UTF-16 BE payload should return an error"
         );
     }
 }
