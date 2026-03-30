@@ -1030,7 +1030,25 @@ fn build_fomod_info_pane(
     let img_btn = gtk4::Button::new();
     img_btn.set_child(Some(&picture));
     img_btn.add_css_class("flat");
+    img_btn.add_css_class("fomod-preview-btn");
+    img_btn.set_margin_top(12);
+    img_btn.set_margin_start(12);
+    img_btn.set_margin_end(12);
     img_btn.set_cursor(gtk4::gdk::Cursor::from_name("zoom-in", None).as_ref());
+
+    // Rounded corners on the image: inject CSS once when the widget gets a
+    // display (i.e. after it is realized inside a window).
+    let css_provider = gtk4::CssProvider::new();
+    css_provider.load_from_string(
+        ".fomod-preview-btn picture { border-radius: 12px; }",
+    );
+    picture.connect_realize(move |widget| {
+        gtk4::style_context_add_provider_for_display(
+            &widget.display(),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
 
     let picture_clone = picture.clone();
     img_btn.connect_clicked(move |btn| {
@@ -1112,7 +1130,7 @@ fn attach_hover_controller(
     plugin_name: &str,
     description: Option<&str>,
 ) {
-    let panel_pic = texture.map(|_| info_pane.picture.clone());
+    let panel_pic = info_pane.picture.clone();
     let panel_name = info_pane.name_label.clone();
     let panel_desc = info_pane.desc_label.clone();
     let hover_tex = texture.cloned();
@@ -1121,8 +1139,8 @@ fn attach_hover_controller(
 
     let motion = gtk4::EventControllerMotion::new();
     motion.connect_enter(move |_, _, _| {
-        if let (Some(pic), Some(tex)) = (&panel_pic, &hover_tex) {
-            pic.set_paintable(Some(tex));
+        if let Some(tex) = &hover_tex {
+            panel_pic.set_paintable(Some(tex));
         }
         panel_name.set_label(&name_owned);
         let cleaned = normalize_line_endings(&desc_owned);
@@ -1169,7 +1187,7 @@ fn show_fullscreen_image_dialog(
 /// * Right pane: scrollable options list with plugin groups as
 ///   `adw::PreferencesGroup` + `gtk4::ListBox` with `boxed-list` class and
 ///   `adw::ActionRow` per plugin.
-/// * Small image thumbnails (96×72) as row prefixes.
+/// * Hovering a row updates the left-pane preview; no inline row thumbnails.
 /// * Next / Install pill button in the `ToolbarView` bottom bar.
 /// * Next is insensitive until every required group has a valid selection.
 fn build_fomod_nav_page(
@@ -1381,39 +1399,19 @@ fn build_fomod_nav_page(
                 }
             }
 
-            // §4b: Small thumbnail prefix (96×72, cover crop).
-            if let Some(ref ip) = plugin.image_path {
-                if let Some(texture) = image_cache.borrow().get(ip).cloned() {
-                    let thumb = gtk4::Picture::new();
-                    thumb.set_size_request(96, 72);
-                    thumb.set_paintable(Some(&texture));
-                    thumb.set_content_fit(gtk4::ContentFit::Cover);
-                    thumb.set_valign(gtk4::Align::Center);
-                    let thumb_frame = gtk4::Frame::new(None);
-                    thumb_frame.set_valign(gtk4::Align::Center);
-                    thumb_frame.set_child(Some(&thumb));
-                    row.add_prefix(&thumb_frame);
-
-                    // Hover → update left panel image, name, and description.
-                    attach_hover_controller(
-                        &row,
-                        &info_pane,
-                        Some(&texture),
-                        &plugin.name,
-                        plugin.description.as_deref(),
-                    );
-                }
-            } else {
-                // No image — still update name and description on hover,
-                // but keep the last displayed image (MO2 behaviour).
-                attach_hover_controller(
-                    &row,
-                    &info_pane,
-                    None,
-                    &plugin.name,
-                    plugin.description.as_deref(),
-                );
-            }
+            // Hover → update left panel image, name, and description.
+            // Thumbnails are no longer shown inline; the left pane handles preview.
+            let hover_texture = plugin
+                .image_path
+                .as_ref()
+                .and_then(|ip| image_cache.borrow().get(ip).cloned());
+            attach_hover_controller(
+                &row,
+                &info_pane,
+                hover_texture.as_ref(),
+                &plugin.name,
+                plugin.description.as_deref(),
+            );
 
             match group.group_type {
                 FomodGroupType::SelectAll => {
