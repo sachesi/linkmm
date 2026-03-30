@@ -4,7 +4,7 @@ use super::extract::{extract_zip_to, normalize_paths_to_lowercase};
 use super::fomod::{decode_fomod_xml, parse_fomod_xml};
 use super::heuristics::{
     archive_has_data_folder, build_data_archive_plan, detect_data_root,
-    find_data_root_in_paths, score_as_data_root, score_as_data_root_owned,
+    find_data_root_in_paths, find_fomod_parent_dir, score_as_data_root, score_as_data_root_owned,
 };
 use super::install::install_fomod_files;
 use super::paths::{
@@ -1560,4 +1560,99 @@ fn install_fomod_diamond_style_wrapper_dir() {
         dest.join("textures").join("body_smooth.dds").exists(),
         "body_n/smooth map/textures content should be installed"
     );
+}
+
+// ── find_fomod_parent_dir / two-level wrapper regression tests ────────────────
+
+/// Real-world Diamond archive layout: two-level nesting where the outer dir
+/// is the zip filename and the inner dir is the actual content wrapper.
+/// Previously failed because find_fomod_parent_dir only returned the outer dir.
+#[test]
+fn install_fomod_two_level_wrapper_dir() {
+    let tmp = tempdir();
+    let archive = create_test_zip(
+        &tmp,
+        &[
+            // outer: zip-name directory
+            ("Diamond 3BA puffy pussy-45718/", b""),
+            // inner: actual content wrapper (different name from outer)
+            ("Diamond 3BA puffy pussy-45718/Diamond 3BA Puffy Pussy normal maps/", b""),
+            (
+                "Diamond 3BA puffy pussy-45718/Diamond 3BA Puffy Pussy normal maps/fomod/ModuleConfig.xml",
+                b"<config/>",
+            ),
+            (
+                "Diamond 3BA puffy pussy-45718/Diamond 3BA Puffy Pussy normal maps/00main/textures/body.dds",
+                b"dds1",
+            ),
+            (
+                "Diamond 3BA puffy pussy-45718/Diamond 3BA Puffy Pussy normal maps/body_n/smooth map/textures/body_smooth.dds",
+                b"dds2",
+            ),
+        ],
+    );
+
+    let dest = tmp.join("mod_data");
+    std::fs::create_dir_all(&dest).unwrap();
+
+    install_fomod_files(
+        &archive,
+        &dest,
+        &[
+            FomodFile {
+                source: "00main\\textures".to_string(),
+                destination: "textures".to_string(),
+                priority: 0,
+            },
+            FomodFile {
+                source: "body_n\\smooth map\\textures".to_string(),
+                destination: "textures".to_string(),
+                priority: 1,
+            },
+        ],
+    )
+    .unwrap();
+
+    assert!(
+        dest.join("textures").join("body.dds").exists(),
+        "00main/textures content should be installed from two-level wrapper archive"
+    );
+    assert!(
+        dest.join("textures").join("body_smooth.dds").exists(),
+        "body_n/ content should be installed from two-level wrapper archive"
+    );
+}
+
+/// `find_fomod_parent_dir` must return the full multi-component path for
+/// archives with two levels of nesting.
+#[test]
+fn find_fomod_parent_dir_two_level_returns_full_path() {
+    let paths = &[
+        "outer/inner/fomod/ModuleConfig.xml",
+        "outer/inner/00main/textures/body.dds",
+    ];
+    let parent = find_fomod_parent_dir(paths).unwrap();
+    assert_eq!(
+        parent, "outer/inner",
+        "should return the full two-level parent, got '{parent}'"
+    );
+}
+
+/// Single-level nesting must still work after the fix.
+#[test]
+fn find_fomod_parent_dir_single_level_still_works() {
+    let paths = &[
+        "MyMod/fomod/ModuleConfig.xml",
+        "MyMod/00main/textures/body.dds",
+    ];
+    let parent = find_fomod_parent_dir(paths).unwrap();
+    assert_eq!(parent, "MyMod");
+}
+
+/// Archive root (no wrapper) must still return empty string.
+#[test]
+fn find_fomod_parent_dir_at_root_returns_empty() {
+    let paths = &["fomod/ModuleConfig.xml", "00main/textures/body.dds"];
+    let parent = find_fomod_parent_dir(paths).unwrap();
+    assert_eq!(parent, "");
 }
