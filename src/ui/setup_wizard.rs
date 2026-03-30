@@ -938,8 +938,8 @@ pub(crate) fn show_fomod_wizard(
     // ── adw::Dialog ──────────────────────────────────────────────────────────
     let dialog = adw::Dialog::builder()
         .title(format!("Install: {mod_display_name}"))
-        .content_width(700)
-        .content_height(560)
+        .content_width(920)
+        .content_height(640)
         .build();
 
     let nav_view = adw::NavigationView::new();
@@ -981,12 +981,160 @@ pub(crate) fn show_fomod_wizard(
     dialog.present(parent);
 }
 
+/// State exposed by the left info pane so rows can update it on hover.
+struct FomodInfoPane {
+    /// The root widget to set as the paned start child.
+    root: gtk4::Box,
+    /// The image display — update `set_paintable` on hover.
+    picture: gtk4::Picture,
+    /// Plugin name label below the image — update `set_label` on hover.
+    name_label: gtk4::Label,
+    /// Description label — update `set_label` on hover.
+    desc_label: gtk4::Label,
+}
+
+fn build_fomod_info_pane(
+    fomod: &FomodConfig,
+    step_idx: usize,
+    image_cache: &Rc<RefCell<HashMap<String, gtk4::gdk::Texture>>>,
+) -> FomodInfoPane {
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    root.set_width_request(300);
+    root.add_css_class("sidebar");
+
+    // ── Image panel ──────────────────────────────────────────────────────────
+    let picture = gtk4::Picture::new();
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    picture.set_can_shrink(true);
+    picture.set_size_request(300, 220);
+    picture.set_halign(gtk4::Align::Fill);
+    picture.set_valign(gtk4::Align::Start);
+
+    // Pre-fill with the first image found in this step, if any.
+    if let Some(first_image) = fomod
+        .steps
+        .get(step_idx)
+        .and_then(|s| {
+            s.groups
+                .iter()
+                .flat_map(|g| &g.plugins)
+                .find_map(|p| p.image_path.as_ref())
+        })
+    {
+        if let Some(tex) = image_cache.borrow().get(first_image).cloned() {
+            picture.set_paintable(Some(&tex));
+        }
+    }
+
+    // ── Click-to-fullscreen ───────────────────────────────────────────────────
+    let img_btn = gtk4::Button::new();
+    img_btn.set_child(Some(&picture));
+    img_btn.add_css_class("flat");
+    img_btn.set_cursor(gtk4::gdk::Cursor::from_name("zoom-in", None).as_ref());
+
+    let picture_clone = picture.clone();
+    img_btn.connect_clicked(move |btn| {
+        if let Some(paintable) = picture_clone.paintable() {
+            let parent_widget: Option<gtk4::Widget> =
+                btn.root().map(|r| r.upcast::<gtk4::Widget>());
+            show_fullscreen_image_dialog(&paintable, parent_widget.as_ref());
+        }
+    });
+
+    root.append(&img_btn);
+
+    // ── Plugin name below the image ───────────────────────────────────────────
+    let name_label = gtk4::Label::new(None);
+    name_label.add_css_class("dim-label");
+    name_label.add_css_class("caption");
+    name_label.set_halign(gtk4::Align::Center);
+    name_label.set_margin_top(4);
+    name_label.set_margin_bottom(8);
+    name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    root.append(&name_label);
+
+    // ── Separator ─────────────────────────────────────────────────────────────
+    root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    // ── Description text (scrollable, read-only) ─────────────────────────────
+    let desc_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vexpand(true)
+        .build();
+
+    let initial_desc = fomod
+        .steps
+        .get(step_idx)
+        .and_then(|s| {
+            s.groups
+                .iter()
+                .flat_map(|g| &g.plugins)
+                .find_map(|p| p.description.as_ref())
+        })
+        .map(|d| d.replace("\r\n", "\n").replace('\r', "\n"))
+        .unwrap_or_default();
+
+    let desc_label = gtk4::Label::new(Some(initial_desc.trim()));
+    desc_label.set_wrap(true);
+    desc_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    desc_label.set_xalign(0.0);
+    desc_label.set_valign(gtk4::Align::Start);
+    desc_label.set_selectable(true);
+    desc_label.set_margin_top(12);
+    desc_label.set_margin_bottom(12);
+    desc_label.set_margin_start(12);
+    desc_label.set_margin_end(12);
+
+    desc_scroll.set_child(Some(&desc_label));
+    root.append(&desc_scroll);
+
+    FomodInfoPane {
+        root,
+        picture,
+        name_label,
+        desc_label,
+    }
+}
+
+/// Open a full-size image in a modal adw::Dialog.
+fn show_fullscreen_image_dialog(
+    paintable: &impl gtk4::gdk::prelude::IsA<gtk4::gdk::Paintable>,
+    parent: Option<&gtk4::Widget>,
+) {
+    let dialog = adw::Dialog::builder()
+        .title("Preview")
+        .content_width(900)
+        .content_height(700)
+        .build();
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&adw::HeaderBar::new());
+
+    let picture = gtk4::Picture::new();
+    picture.set_paintable(Some(paintable));
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    picture.set_can_shrink(true);
+    picture.set_vexpand(true);
+    picture.set_hexpand(true);
+    picture.set_margin_top(12);
+    picture.set_margin_bottom(12);
+    picture.set_margin_start(12);
+    picture.set_margin_end(12);
+
+    toolbar_view.set_content(Some(&picture));
+    dialog.set_child(Some(&toolbar_view));
+    dialog.present(parent);
+}
+
 /// Build one `adw::NavigationPage` for `step_idx` in `fomod`, following the
-/// GNOME HIG:
+/// GNOME HIG with an MO2-style two-pane layout:
 ///
 /// * `adw::ToolbarView` with `adw::HeaderBar` (provides the back button).
-/// * Plugin groups rendered as `adw::PreferencesGroup` + `gtk4::ListBox` with
-///   `boxed-list` class and `adw::ActionRow` per plugin.
+/// * Left pane (300 px): image preview, plugin name, and description.
+/// * Right pane: scrollable options list with plugin groups as
+///   `adw::PreferencesGroup` + `gtk4::ListBox` with `boxed-list` class and
+///   `adw::ActionRow` per plugin.
 /// * Small image thumbnails (96×72) as row prefixes.
 /// * Next / Install pill button in the `ToolbarView` bottom bar.
 /// * Next is insensitive until every required group has a valid selection.
@@ -1103,19 +1251,39 @@ fn build_fomod_nav_page(
         return page;
     }
 
-    // ── Content box (Clamp + ScrolledWindow) ─────────────────────────────────
-    let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
-    content_box.set_margin_top(18);
-    content_box.set_margin_bottom(18);
-    content_box.set_margin_start(18);
-    content_box.set_margin_end(18);
+    // ── Horizontal paned: left=info, right=options ────────────────────────────
+    let paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+    paned.set_vexpand(true);
+    paned.set_hexpand(true);
+    paned.set_shrink_start_child(false);
+    paned.set_shrink_end_child(false);
+    paned.set_resize_start_child(false);
+    paned.set_resize_end_child(true);
+    paned.set_position(300);
+
+    // ── LEFT PANE ─────────────────────────────────────────────────────────────
+    let info_pane = build_fomod_info_pane(&fomod, step_idx, &image_cache);
+    paned.set_start_child(Some(&info_pane.root));
+
+    // ── RIGHT PANE ────────────────────────────────────────────────────────────
+    let right_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+
+    let right_box = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    right_box.set_margin_top(18);
+    right_box.set_margin_bottom(18);
+    right_box.set_margin_start(12);
+    right_box.set_margin_end(18);
 
     // ── Validation banner (§4e) ───────────────────────────────────────────────
     let validation_banner = adw::Banner::builder()
         .title("Please make a selection in all required groups to continue")
         .revealed(!step_selection_is_valid(&fomod, step_idx, &selections.borrow()))
         .build();
-    content_box.append(&validation_banner);
+    right_box.append(&validation_banner);
 
     let fwd_btn_ref = fwd_btn.clone();
     let validation_banner_ref = validation_banner.clone();
@@ -1191,7 +1359,39 @@ fn build_fomod_nav_page(
                     thumb_frame.set_valign(gtk4::Align::Center);
                     thumb_frame.set_child(Some(&thumb));
                     row.add_prefix(&thumb_frame);
+
+                    // Hover → update left panel image, name, and description.
+                    let panel_pic = info_pane.picture.clone();
+                    let panel_name = info_pane.name_label.clone();
+                    let panel_desc = info_pane.desc_label.clone();
+                    let hover_tex = texture.clone();
+                    let plugin_name = plugin.name.clone();
+                    let desc_text = plugin.description.clone().unwrap_or_default();
+
+                    let motion = gtk4::EventControllerMotion::new();
+                    motion.connect_enter(move |_, _, _| {
+                        panel_pic.set_paintable(Some(&hover_tex));
+                        panel_name.set_label(&plugin_name);
+                        let cleaned = desc_text.replace("\r\n", "\n").replace('\r', "\n");
+                        panel_desc.set_label(cleaned.trim());
+                    });
+                    row.add_controller(motion);
                 }
+            } else {
+                // No image — still update name and description on hover,
+                // but keep the last displayed image (MO2 behaviour).
+                let panel_name = info_pane.name_label.clone();
+                let panel_desc = info_pane.desc_label.clone();
+                let plugin_name = plugin.name.clone();
+                let desc_text = plugin.description.clone().unwrap_or_default();
+
+                let motion = gtk4::EventControllerMotion::new();
+                motion.connect_enter(move |_, _, _| {
+                    panel_name.set_label(&plugin_name);
+                    let cleaned = desc_text.replace("\r\n", "\n").replace('\r', "\n");
+                    panel_desc.set_label(cleaned.trim());
+                });
+                row.add_controller(motion);
             }
 
             match group.group_type {
@@ -1300,20 +1500,13 @@ fn build_fomod_nav_page(
         }
 
         pref_group.add(&list);
-        content_box.append(&pref_group);
+        right_box.append(&pref_group);
     }
 
-    // ── Scroll + Clamp (max 700 px, GNOME HIG standard) ─────────────────────
-    let scroll = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vexpand(true)
-        .build();
-    let clamp = adw::Clamp::builder()
-        .maximum_size(700)
-        .child(&content_box)
-        .build();
-    scroll.set_child(Some(&clamp));
-    toolbar_view.set_content(Some(&scroll));
+    // ── Assemble paned layout ───────────────────────────────────────────────
+    right_scroll.set_child(Some(&right_box));
+    paned.set_end_child(Some(&right_scroll));
+    toolbar_view.set_content(Some(&paned));
 
     // ── Bottom action bar — Next / Install pill button ────────────────────────
     let action_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
