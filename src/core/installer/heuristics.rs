@@ -8,7 +8,7 @@ use super::paths::{
 };
 use super::types::{
     DataArchivePlan, InstallStrategy,
-    KNOWN_DATA_SUBDIRS, KNOWN_PLUGIN_EXTS, KNOWN_ARCHIVE_EXTS,
+    KNOWN_DATA_SUBDIRS, KNOWN_PLUGIN_EXTS, KNOWN_ARCHIVE_EXTS, JUNK_TOPLEVEL_ENTRIES,
 };
 
 /// Score a path prefix as a candidate game Data-root directory.
@@ -151,7 +151,13 @@ pub(super) fn score_as_data_root_owned(prefix: &str, paths: &[String]) -> i32 {
 }
 
 /// Find the directory that directly contains the `fomod/` subdirectory.
-pub(super) fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
+///
+/// Returns the **full** relative path to the parent directory, regardless of
+/// nesting depth.  For example:
+/// - `"fomod/ModuleConfig.xml"` → `Some("")` (archive root)
+/// - `"MyMod/fomod/ModuleConfig.xml"` → `Some("MyMod")`
+/// - `"outer/inner/fomod/ModuleConfig.xml"` → `Some("outer/inner")`
+pub(crate) fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
     for path in paths {
         let norm = path.to_lowercase().replace('\\', "/");
         let norm = norm.trim_start_matches('/');
@@ -165,7 +171,11 @@ pub(super) fn find_fomod_parent_dir(paths: &[&str]) -> Option<String> {
         if norm.ends_with("/fomod/moduleconfig.xml") {
             let orig = path.replace('\\', "/");
             let orig = orig.trim_start_matches('/');
-            let parent = orig.split('/').next().unwrap_or("").to_string();
+            // Strip "/fomod/moduleconfig.xml" from the end of the original path
+            // (same byte length as the lowercase suffix we matched on).
+            // This gives the FULL parent path regardless of nesting depth.
+            let suffix_len = "/fomod/moduleconfig.xml".len();
+            let parent = orig[..orig.len() - suffix_len].to_string();
             log::debug!(
                 "[FOMOD] ModuleConfig.xml discovered under wrapper | virtual_path={}, parent_dir={}",
                 path,
@@ -221,6 +231,10 @@ pub fn find_data_root_in_paths(paths: &[&str]) -> String {
 }
 
 /// Compute the common single-level top-directory prefix.
+///
+/// Entries whose top-level component is in `JUNK_TOPLEVEL_DIRS` (e.g.
+/// `__MACOSX/`) are ignored.  Comparison is case-insensitive to handle minor
+/// casing differences in the wrapper-dir name across entries.
 pub(super) fn find_common_prefix_from_paths(paths: &[&str]) -> String {
     if paths.is_empty() {
         return String::new();
@@ -235,9 +249,12 @@ pub(super) fn find_common_prefix_from_paths(paths: &[&str]) -> String {
         if top.is_empty() {
             continue;
         }
+        if JUNK_TOPLEVEL_ENTRIES.contains(&top.to_lowercase().as_str()) {
+            continue;
+        }
         match &first_top {
             None => first_top = Some(top.to_string()),
-            Some(ft) if ft.as_str() != top => {
+            Some(ft) if ft.to_lowercase() != top.to_lowercase() => {
                 all_same = false;
                 break;
             }

@@ -54,6 +54,18 @@ pub(super) const KNOWN_PLUGIN_EXTS: &[&str] = &["esp", "esm", "esl"];
 /// Known archive extensions.
 pub(super) const KNOWN_ARCHIVE_EXTS: &[&str] = &["bsa", "ba2"];
 
+/// Top-level entries (directories or files) that are never actual mod content.
+///
+/// These are injected by macOS tools (`__MACOSX`), Python (`__pycache__`),
+/// or Windows thumbnail caches (`thumbs.db`).  They must be excluded when
+/// detecting the common wrapper prefix so they don't poison the all-same check.
+pub(super) const JUNK_TOPLEVEL_ENTRIES: &[&str] = &[
+    "__macosx",
+    "__pycache__",
+    ".ds_store",
+    "thumbs.db",
+];
+
 // ── Install strategy ──────────────────────────────────────────────────────────
 
 /// How a mod archive should be installed.
