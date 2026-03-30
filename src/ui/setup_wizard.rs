@@ -1072,7 +1072,7 @@ fn build_fomod_info_pane(
                 .flat_map(|g| &g.plugins)
                 .find_map(|p| p.description.as_ref())
         })
-        .map(|d| d.replace("\r\n", "\n").replace('\r', "\n"))
+        .map(|d| normalize_line_endings(d))
         .unwrap_or_default();
 
     let desc_label = gtk4::Label::new(Some(initial_desc.trim()));
@@ -1095,6 +1095,40 @@ fn build_fomod_info_pane(
         name_label,
         desc_label,
     }
+}
+
+/// Normalize CRLF / CR line endings to LF.
+fn normalize_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Attach an `EventControllerMotion` to `row` that updates the left info pane
+/// on hover. If `texture` is `Some`, the panel image is updated too; otherwise
+/// the last displayed image is kept (MO2 behaviour).
+fn attach_hover_controller(
+    row: &adw::ActionRow,
+    info_pane: &FomodInfoPane,
+    texture: Option<&gtk4::gdk::Texture>,
+    plugin_name: &str,
+    description: Option<&str>,
+) {
+    let panel_pic = texture.map(|_| info_pane.picture.clone());
+    let panel_name = info_pane.name_label.clone();
+    let panel_desc = info_pane.desc_label.clone();
+    let hover_tex = texture.cloned();
+    let name_owned = plugin_name.to_string();
+    let desc_owned = description.unwrap_or_default().to_string();
+
+    let motion = gtk4::EventControllerMotion::new();
+    motion.connect_enter(move |_, _, _| {
+        if let (Some(pic), Some(tex)) = (&panel_pic, &hover_tex) {
+            pic.set_paintable(Some(tex));
+        }
+        panel_name.set_label(&name_owned);
+        let cleaned = normalize_line_endings(&desc_owned);
+        panel_desc.set_label(cleaned.trim());
+    });
+    row.add_controller(motion);
 }
 
 /// Open a full-size image in a modal adw::Dialog.
@@ -1361,37 +1395,24 @@ fn build_fomod_nav_page(
                     row.add_prefix(&thumb_frame);
 
                     // Hover → update left panel image, name, and description.
-                    let panel_pic = info_pane.picture.clone();
-                    let panel_name = info_pane.name_label.clone();
-                    let panel_desc = info_pane.desc_label.clone();
-                    let hover_tex = texture.clone();
-                    let plugin_name = plugin.name.clone();
-                    let desc_text = plugin.description.clone().unwrap_or_default();
-
-                    let motion = gtk4::EventControllerMotion::new();
-                    motion.connect_enter(move |_, _, _| {
-                        panel_pic.set_paintable(Some(&hover_tex));
-                        panel_name.set_label(&plugin_name);
-                        let cleaned = desc_text.replace("\r\n", "\n").replace('\r', "\n");
-                        panel_desc.set_label(cleaned.trim());
-                    });
-                    row.add_controller(motion);
+                    attach_hover_controller(
+                        &row,
+                        &info_pane,
+                        Some(&texture),
+                        &plugin.name,
+                        plugin.description.as_deref(),
+                    );
                 }
             } else {
                 // No image — still update name and description on hover,
                 // but keep the last displayed image (MO2 behaviour).
-                let panel_name = info_pane.name_label.clone();
-                let panel_desc = info_pane.desc_label.clone();
-                let plugin_name = plugin.name.clone();
-                let desc_text = plugin.description.clone().unwrap_or_default();
-
-                let motion = gtk4::EventControllerMotion::new();
-                motion.connect_enter(move |_, _, _| {
-                    panel_name.set_label(&plugin_name);
-                    let cleaned = desc_text.replace("\r\n", "\n").replace('\r', "\n");
-                    panel_desc.set_label(cleaned.trim());
-                });
-                row.add_controller(motion);
+                attach_hover_controller(
+                    &row,
+                    &info_pane,
+                    None,
+                    &plugin.name,
+                    plugin.description.as_deref(),
+                );
             }
 
             match group.group_type {
