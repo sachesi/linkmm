@@ -1666,3 +1666,68 @@ fn find_fomod_parent_dir_at_root_returns_empty() {
     let parent = find_fomod_parent_dir(paths).unwrap();
     assert_eq!(parent, "");
 }
+
+/// Extracted-dir equivalent of `install_fomod_two_level_wrapper_dir`:
+/// ensures `install_fomod_files_from_dir` handles two levels of directory
+/// nesting by using FOMOD-aware prefix detection.
+#[test]
+fn install_fomod_files_from_dir_two_level_wrapper() {
+    let tmp = tempdir();
+
+    // Build an extracted tree with two levels of nesting around the fomod/ dir.
+    let extracted = tmp.join("extracted");
+    let inner = extracted.join("Diamond 3BA puffy pussy-45718/Diamond 3BA Puffy Pussy normal maps");
+    std::fs::create_dir_all(inner.join("fomod")).unwrap();
+    std::fs::write(inner.join("fomod/ModuleConfig.xml"), b"<config/>").unwrap();
+    std::fs::create_dir_all(inner.join("00main/textures")).unwrap();
+    std::fs::write(inner.join("00main/textures/body.dds"), b"dds1").unwrap();
+    std::fs::create_dir_all(inner.join("body_n/smooth map/textures")).unwrap();
+    std::fs::write(
+        inner.join("body_n/smooth map/textures/body_smooth.dds"),
+        b"dds2",
+    )
+    .unwrap();
+
+    let dest = tmp.join("dest_dir");
+    std::fs::create_dir_all(&dest).unwrap();
+
+    super::install::install_fomod_files_from_dir(
+        &extracted,
+        &dest,
+        &[
+            FomodFile {
+                source: "00main\\textures".to_string(),
+                destination: "textures".to_string(),
+                priority: 0,
+            },
+            FomodFile {
+                source: "body_n\\smooth map\\textures".to_string(),
+                destination: "textures".to_string(),
+                priority: 1,
+            },
+        ],
+    )
+    .unwrap();
+
+    assert!(
+        dest.join("textures").join("body.dds").exists(),
+        "00main/textures content should be installed from two-level extracted dir"
+    );
+    assert!(
+        dest.join("textures").join("body_smooth.dds").exists(),
+        "body_n/ content should be installed from two-level extracted dir"
+    );
+}
+
+/// Verify that `decode_fomod_xml` falls back to Windows-1252 decoding when
+/// the bytes are not valid UTF-8.
+#[test]
+fn decode_fomod_xml_handles_windows_1252_encoding() {
+    // "Möd Nàme" in Windows-1252: ö = 0xF6, à = 0xE0
+    let bytes: &[u8] = b"<?xml version=\"1.0\"?>\n<config>M\xF6d N\xE0me</config>";
+    let decoded = super::fomod::decode_fomod_xml(bytes).unwrap();
+    assert!(
+        decoded.contains("Möd Nàme"),
+        "Windows-1252 characters should be decoded correctly, got: {decoded}"
+    );
+}

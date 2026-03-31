@@ -57,38 +57,6 @@ fn collect_fs_entries(root: &Path, dir: &Path, result: &mut Vec<(String, String)
     }
 }
 
-/// Determine the common top-level prefix from filesystem entries.
-fn find_fs_common_prefix(entry_map: &[(String, String)]) -> (String, String) {
-    if entry_map.len() <= 1 {
-        return (String::new(), String::new());
-    }
-    let mut first_lower: Option<String> = None;
-    let mut first_orig: Option<String> = None;
-    let mut all_same = true;
-    for (lower, orig) in entry_map {
-        let tl = lower.split('/').next().unwrap_or("");
-        let to = orig.split('/').next().unwrap_or("");
-        if tl.is_empty() {
-            continue;
-        }
-        match &first_lower {
-            None => {
-                first_lower = Some(tl.to_string());
-                first_orig = Some(to.to_string());
-            }
-            Some(ft) if ft.as_str() != tl => {
-                all_same = false;
-                break;
-            }
-            _ => {}
-        }
-    }
-    if all_same && let (Some(tl), Some(to)) = (first_lower, first_orig) {
-        return (format!("{to}/"), format!("{tl}/"));
-    }
-    (String::new(), String::new())
-}
-
 /// Filter `entry_map` to entries matching `source_lower`.
 fn collect_matching_fs_entries(entry_map: &[(String, String)], source_lower: &str) -> Vec<String> {
     entry_map
@@ -593,7 +561,24 @@ pub(super) fn install_fomod_files_from_dir(
     let mut entry_map: Vec<(String, String)> = Vec::new();
     collect_fs_entries(extracted_dir, extracted_dir, &mut entry_map);
 
-    let (archive_prefix, archive_prefix_lower) = find_fs_common_prefix(&entry_map);
+    // FOMOD-aware prefix detection: finds the directory containing
+    // fomod/ModuleConfig.xml, correctly handling multi-level nesting
+    // (e.g. outer-dir/inner-dir/fomod/...).  This matches the logic
+    // used by the archive-based install_fomod().
+    let entry_strs: Vec<&str> = entry_map.iter().map(|(_, orig)| orig.as_str()).collect();
+    let root = find_data_root_in_paths(&entry_strs);
+    let root = root.replace('\\', "/");
+    let (archive_prefix, archive_prefix_lower) = if root.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let p = if root.ends_with('/') {
+            root
+        } else {
+            format!("{root}/")
+        };
+        let pl = p.to_lowercase();
+        (p, pl)
+    };
 
     let mut sorted_files = files.to_vec();
     sorted_files.sort_by(|a, b| a.priority.cmp(&b.priority));

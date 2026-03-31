@@ -241,7 +241,53 @@ pub(super) fn decode_fomod_xml(raw: &[u8]) -> Result<String, String> {
         return String::from_utf16(&utf16).map_err(|e| format!("UTF-16 BE decode error: {e}"));
     }
     let bytes = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
-    String::from_utf8(bytes.to_vec()).map_err(|e| format!("UTF-8 decode error: {e}"))
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            // Many older FOMOD configs (especially from Windows tools) use
+            // Windows-1252 or ISO-8859-1 encoding without a BOM.  Fall back
+            // to Windows-1252 decoding so these archives can still install.
+            log::info!(
+                "[FOMOD] UTF-8 decode failed, falling back to Windows-1252 decoding ({} bytes)",
+                bytes.len()
+            );
+            Ok(decode_windows_1252(bytes))
+        }
+    }
+}
+
+/// Decode a byte slice as Windows-1252 (superset of ISO-8859-1).
+///
+/// Windows-1252 is the most common legacy encoding for FOMOD XML files
+/// created by older Windows modding tools.  Bytes 0x00–0x7F and 0xA0–0xFF
+/// map to the same Unicode code points; bytes 0x80–0x9F map to various
+/// typographic characters.
+fn decode_windows_1252(bytes: &[u8]) -> String {
+    /// Mapping for the 0x80–0x9F range in Windows-1252.
+    /// Entries marked `\0` are undefined in the spec and mapped to the
+    /// Unicode replacement character by the caller.
+    const WIN1252_80_9F: [char; 32] = [
+        '\u{20AC}', '\0', '\u{201A}', '\u{0192}', // 80–83
+        '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}', // 84–87
+        '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', // 88–8B
+        '\u{0152}', '\0', '\u{017D}', '\0', // 8C–8F
+        '\0', '\u{2018}', '\u{2019}', '\u{201C}', // 90–93
+        '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}', // 94–97
+        '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', // 98–9B
+        '\u{0153}', '\0', '\u{017E}', '\u{0178}', // 9C–9F
+    ];
+
+    bytes
+        .iter()
+        .map(|&b| {
+            if b < 0x80 || b >= 0xA0 {
+                b as char
+            } else {
+                let ch = WIN1252_80_9F[(b - 0x80) as usize];
+                if ch == '\0' { '\u{FFFD}' } else { ch }
+            }
+        })
+        .collect()
 }
 
 pub(super) fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
