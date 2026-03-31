@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gio;
 use glib;
@@ -13,9 +15,9 @@ use crate::core::config::AppConfig;
 use crate::core::download_state;
 use crate::core::games::Game;
 use crate::core::installer::{
-    FomodConfig, InstallStrategy,
-    detect_strategy, install_mod_from_archive_with_nexus, parse_fomod_from_archive,
-    read_archive_files_bytes,
+    ExtractedArchive, FomodConfig, InstallStrategy, detect_strategy_from_extracted,
+    install_mod_from_archive_with_nexus, install_mod_from_extracted, parse_fomod_from_extracted,
+    read_images_from_extracted,
 };
 
 // ── Archive extensions ────────────────────────────────────────────────────────
@@ -50,6 +52,14 @@ pub(crate) struct InstallStatusCtx {
     /// Populated on every full refresh so the poll timer can update bars
     /// in-place without rebuilding the whole list on every progress tick.
     active_progress_bars: Rc<RefCell<HashMap<u64, gtk4::ProgressBar>>>,
+    /// Shared cancellation flag.  Set to `true` by the cancel button; read
+    /// by the extraction progress callback to abort the blocking task.
+    /// Reset to `false` at the start of every new install session.
+    cancel_flag: Arc<AtomicBool>,
+    /// The "Cancel" button shown inside the status popup during extraction.
+    cancel_btn: gtk4::Button,
+    /// Callback that locks/unlocks the sidebar navigation.
+    nav_lock: Rc<dyn Fn(bool)>,
 }
 
 // ── Public entry-point ────────────────────────────────────────────────────────
@@ -60,7 +70,11 @@ pub(crate) struct InstallStatusCtx {
 /// Archives arrive here either by manual placement or via NXM link handling
 /// from the browser.  Provides actions to install, hide already-installed
 /// archives, and clean the cache.
-pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
+pub fn build_downloads_page(
+    game: Option<&Game>,
+    config: Rc<RefCell<AppConfig>>,
+    nav_lock: Rc<dyn Fn(bool)>,
+) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
@@ -117,8 +131,18 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
     status_progress.set_margin_end(8);
     status_progress.set_margin_bottom(8);
 
+    let cancel_btn = gtk4::Button::builder()
+        .label("Cancel")
+        .halign(gtk4::Align::End)
+        .build();
+    cancel_btn.add_css_class("destructive-action");
+    cancel_btn.set_margin_end(8);
+    cancel_btn.set_margin_bottom(8);
+    cancel_btn.set_visible(false); // only shown during extraction
+
     status_card.append(&status_label);
     status_card.append(&status_progress);
+    status_card.append(&cancel_btn);
     status_revealer.set_child(Some(&status_card));
     content.append(&status_revealer);
     // ─────────────────────────────────────────────────────────────────────────
@@ -127,6 +151,16 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
     list_container.set_vexpand(true);
 
     content.append(&list_container);
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    // Wire the cancel button to set the shared flag.
+    {
+        let flag = Arc::clone(&cancel_flag);
+        cancel_btn.connect_clicked(move |_| {
+            flag.store(true, Ordering::Relaxed);
+        });
+    }
 
     let status_ctx = InstallStatusCtx {
         revealer: status_revealer,
@@ -139,6 +173,9 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         list_container: list_container.clone(),
         is_installing: Rc::new(RefCell::new(false)),
         active_progress_bars: Rc::new(RefCell::new(HashMap::new())),
+        cancel_flag: Arc::clone(&cancel_flag),
+        cancel_btn: cancel_btn.clone(),
+        nav_lock,
     };
 
     let hide_installed = Rc::new(RefCell::new(false));
@@ -497,47 +534,46 @@ fn build_entry_row(
     }
 
     // Install button (when a game is selected)
-    if !is_installed
-        && let Some(ref g) = **game {
-            let ext = entry
-                .path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_lowercase())
-                .unwrap_or_default();
-            if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
-                return row;
-            }
-            let install_btn = gtk4::Button::with_label("Install");
-            install_btn.set_tooltip_text(Some("Install mod"));
-            install_btn.set_valign(gtk4::Align::Center);
-            install_btn.add_css_class("suggested-action");
-
-            let path_c = entry.path.clone();
-            let name_c = entry.name.clone();
-            let game_c = g.clone();
-            let config_c = Rc::clone(config);
-            let container_c = container.clone();
-            let game_rc_c = Rc::clone(game);
-            let hide_installed_c = hide_installed;
-            let search_query_c = search_query.to_string();
-            let ctx_c = status_ctx.clone();
-            install_btn.connect_clicked(move |btn| {
-                show_install_dialog(
-                    btn,
-                    &path_c,
-                    &name_c,
-                    &game_c,
-                    &config_c,
-                    &container_c,
-                    hide_installed_c,
-                    &search_query_c,
-                    &game_rc_c,
-                    &ctx_c,
-                );
-            });
-            row.add_suffix(&install_btn);
+    if !is_installed && let Some(ref g) = **game {
+        let ext = entry
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        if !INSTALLABLE_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+            return row;
         }
+        let install_btn = gtk4::Button::with_label("Install");
+        install_btn.set_tooltip_text(Some("Install mod"));
+        install_btn.set_valign(gtk4::Align::Center);
+        install_btn.add_css_class("suggested-action");
+
+        let path_c = entry.path.clone();
+        let name_c = entry.name.clone();
+        let game_c = g.clone();
+        let config_c = Rc::clone(config);
+        let container_c = container.clone();
+        let game_rc_c = Rc::clone(game);
+        let hide_installed_c = hide_installed;
+        let search_query_c = search_query.to_string();
+        let ctx_c = status_ctx.clone();
+        install_btn.connect_clicked(move |btn| {
+            show_install_dialog(
+                btn,
+                &path_c,
+                &name_c,
+                &game_c,
+                &config_c,
+                &container_c,
+                hide_installed_c,
+                &search_query_c,
+                &game_rc_c,
+                &ctx_c,
+            );
+        });
+        row.add_suffix(&install_btn);
+    }
 
     let delete_btn = gtk4::Button::new();
     delete_btn.set_icon_name("user-trash-symbolic");
@@ -594,31 +630,60 @@ fn show_install_dialog(
     game_rc: &Rc<Option<Game>>,
     status_ctx: &InstallStatusCtx,
 ) {
-    // Show the status bar immediately so the user sees activity.  For non-zip
-    // archives (7z / rar) strategy detection and FOMOD XML parsing require
-    // spawning 7z subprocesses which can take seconds on large archives.  We
-    // use glib::spawn_future_local + gio::spawn_blocking so the GTK event
-    // loop keeps running without a polling timer.
+    // Show the status bar immediately.  The archive is fully extracted ONCE
+    // into a hidden temporary folder inside the game's mods directory (same
+    // filesystem as the final mod destination).  All subsequent analysis
+    // (strategy detection, FOMOD XML parsing, image loading) runs instantly
+    // from the filesystem.  At install time the extracted files are *moved*
+    // (renamed) rather than copied, so large archives install instantly.
     set_downloads_busy(status_ctx, true);
     status_ctx.revealer.set_reveal_child(true);
-    status_ctx.label.set_text("Reading archive…");
-    status_ctx.progress.set_fraction(0.0);
     status_ctx
-        .progress
-        .set_text(Some("Detecting install type…"));
+        .label
+        .set_text("Extracting archive to mods directory…");
+    status_ctx.progress.set_fraction(0.0);
+    status_ctx.progress.set_text(Some("Extracting…"));
+
+    // Reset the cancel flag and show the cancel button for the extraction phase.
+    status_ctx.cancel_flag.store(false, Ordering::Relaxed);
+    status_ctx.cancel_btn.set_visible(true);
 
     // Clone Send-able data for the blocking task (no Rc / GTK widget).
     let ap = archive_path.to_path_buf();
+    let archive_name_bg = archive_name.to_string();
+    // Resolve the mods directory now (on the main thread) so the blocking
+    // task can pass it to `from_archive_in` without touching `game` across
+    // the thread boundary.
+    let mods_dir_bg = game.mods_dir();
 
-    // Pulse the progress bar while the blocking task runs.
-    let progress_pulse = status_ctx.progress.clone();
-    let pulse_id = gtk4::glib::timeout_add_local(
-        std::time::Duration::from_millis(100),
-        move || {
-            progress_pulse.pulse();
+    // Shared progress counters written by the extraction thread and read by
+    // the GTK timer on the main thread.  Both use `Relaxed` ordering — we
+    // only need eventual visibility, not strict synchronisation.
+    let extract_bytes_done = Arc::new(AtomicU64::new(0));
+    let extract_bytes_total = Arc::new(AtomicU64::new(0));
+    let extract_bytes_done_bg = Arc::clone(&extract_bytes_done);
+    let extract_bytes_total_bg = Arc::clone(&extract_bytes_total);
+    let cancel_for_progress = Arc::clone(&status_ctx.cancel_flag);
+
+    // Drive the progress bar from the main thread at ~10 Hz.
+    let progress_bar = status_ctx.progress.clone();
+    let bytes_done_ui = Arc::clone(&extract_bytes_done);
+    let bytes_total_ui = Arc::clone(&extract_bytes_total);
+    let pulse_id =
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            let done = bytes_done_ui.load(Ordering::Relaxed);
+            let total = bytes_total_ui.load(Ordering::Relaxed);
+            if total > 0 {
+                let fraction = (done as f64 / total as f64).min(1.0);
+                progress_bar.set_fraction(fraction);
+                let done_mb = done as f64 / 1_048_576.0;
+                let total_mb = total as f64 / 1_048_576.0;
+                progress_bar.set_text(Some(&format!("{done_mb:.0} / {total_mb:.0} MB")));
+            } else {
+                progress_bar.pulse();
+            }
             gtk4::glib::ControlFlow::Continue
-        },
-    );
+        });
 
     // Clone GTK-side handles for the completion closure (main-thread-only).
     let anchor_c = anchor.clone();
@@ -635,28 +700,47 @@ fn show_install_dialog(
         #[allow(clippy::type_complexity)]
         let result = gio::spawn_blocking(
             move || -> Result<
-                (InstallStrategy, Option<FomodConfig>, HashMap<String, Vec<u8>>),
+                (
+                    Arc<ExtractedArchive>,
+                    InstallStrategy,
+                    Option<FomodConfig>,
+                    HashMap<String, Vec<u8>>,
+                ),
                 String,
             > {
-                let strategy = detect_strategy(&ap)?;
+                // ── Single-pass extraction (on-disk, same filesystem) ─────
+                // Extract the entire archive once into a hidden temp folder
+                // inside the game's mods directory.  Because the temp dir and
+                // the final mod directory share the same filesystem, the
+                // install step can *move* (rename) files instead of copying
+                // them — making even multi-gigabyte archives install instantly.
+                let extracted = Arc::new(
+                    ExtractedArchive::from_archive_in(&ap, &mods_dir_bg, &|done, total| {
+                        extract_bytes_done_bg.store(done, Ordering::Relaxed);
+                        extract_bytes_total_bg.store(total, Ordering::Relaxed);
+                        // Return false to abort extraction when user cancels.
+                        !cancel_for_progress.load(Ordering::Relaxed)
+                    })?
+                );
+
+                // ── Strategy detection (instant — filesystem only) ────────
+                let strategy = detect_strategy_from_extracted(&extracted);
+
+                // ── FOMOD parsing + image loading (instant) ───────────────
                 let mut images_data = HashMap::new();
                 let fomod_config = if let InstallStrategy::Fomod(_) = &strategy {
-                    match parse_fomod_from_archive(&ap) {
+                    match parse_fomod_from_extracted(&extracted, &archive_name_bg) {
                         Ok(cfg) => {
-                            let mut image_paths = Vec::new();
-                            for step in &cfg.steps {
-                                for group in &step.groups {
-                                    for plugin in &group.plugins {
-                                        if let Some(ref img) = plugin.image_path {
-                                            image_paths.push(img.as_str());
-                                        }
-                                    }
-                                }
-                            }
-                            if !image_paths.is_empty()
-                                && let Ok(data) = read_archive_files_bytes(&ap, &image_paths)
-                            {
-                                images_data = data;
+                            let image_paths: Vec<&str> = cfg
+                                .steps
+                                .iter()
+                                .flat_map(|s| &s.groups)
+                                .flat_map(|g| &g.plugins)
+                                .filter_map(|p| p.image_path.as_deref())
+                                .collect();
+                            if !image_paths.is_empty() {
+                                images_data =
+                                    read_images_from_extracted(&extracted, &image_paths);
                             }
                             Some(cfg)
                         }
@@ -668,7 +752,8 @@ fn show_install_dialog(
                 } else {
                     None
                 };
-                Ok((strategy, fomod_config, images_data))
+
+                Ok((extracted, strategy, fomod_config, images_data))
             },
         )
         .await;
@@ -677,7 +762,8 @@ fn show_install_dialog(
         pulse_id.remove();
 
         match result {
-            Ok(Ok((strategy, fomod_config_opt, images_data))) => {
+            Ok(Ok((extracted, _strategy, fomod_config_opt, images_data))) => {
+                status_ctx_c.cancel_btn.set_visible(false);
                 set_downloads_busy(&status_ctx_c, false);
                 status_ctx_c.revealer.set_reveal_child(false);
 
@@ -685,6 +771,7 @@ fn show_install_dialog(
                     let parent = anchor_c
                         .root()
                         .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                    let extracted_c = Arc::clone(&extracted);
                     let ap = archive_path_c.clone();
                     let an = archive_name_s.clone();
                     let gc = game_c.clone();
@@ -700,8 +787,17 @@ fn show_install_dialog(
                         &fomod_config,
                         images_data,
                         move |strategy| {
-                            do_install(
-                                &ap, &an, &gc, &cc, &cont, hide, &search, &strategy, &grc,
+                            do_install_from_extracted(
+                                Arc::clone(&extracted_c),
+                                &ap,
+                                &an,
+                                &gc,
+                                &cc,
+                                &cont,
+                                hide,
+                                &search,
+                                &strategy,
+                                &grc,
                                 ctx.as_ref(),
                             );
                         },
@@ -712,6 +808,7 @@ fn show_install_dialog(
                         .and_then(|r| r.downcast::<gtk4::Window>().ok());
                     show_strategy_picker(
                         parent.as_ref(),
+                        extracted,
                         &archive_path_c,
                         &archive_name_s,
                         &game_c,
@@ -719,14 +816,20 @@ fn show_install_dialog(
                         &container_c,
                         hide_installed,
                         &search_query_s,
-                        &strategy,
                         &game_rc_c,
                         &status_ctx_c,
                     );
                 }
             }
+            Ok(Err(ref e)) if e == "Cancelled by user" => {
+                log::info!("Archive extraction cancelled by user");
+                status_ctx_c.cancel_btn.set_visible(false);
+                set_downloads_busy(&status_ctx_c, false);
+                status_ctx_c.revealer.set_reveal_child(false);
+            }
             Ok(Err(e)) => {
-                log::error!("Failed to detect install strategy: {e}");
+                log::error!("Failed to extract archive: {e}");
+                status_ctx_c.cancel_btn.set_visible(false);
                 set_downloads_busy(&status_ctx_c, false);
                 hide_status_popup_later(status_ctx_c.revealer.clone());
                 show_toast(
@@ -736,7 +839,8 @@ fn show_install_dialog(
             }
             Err(_) => {
                 // Blocking task panicked.
-                log::error!("Strategy detection task terminated unexpectedly");
+                log::error!("Archive extraction task terminated unexpectedly");
+                status_ctx_c.cancel_btn.set_visible(false);
                 set_downloads_busy(&status_ctx_c, false);
                 hide_status_popup_later(status_ctx_c.revealer.clone());
             }
@@ -747,6 +851,7 @@ fn show_install_dialog(
 #[allow(clippy::too_many_arguments)]
 fn show_strategy_picker(
     parent: Option<&gtk4::Window>,
+    extracted: Arc<ExtractedArchive>,
     archive_path: &Path,
     archive_name: &str,
     game: &Game,
@@ -754,7 +859,6 @@ fn show_strategy_picker(
     container: &gtk4::Box,
     hide_installed: bool,
     search_query: &str,
-    _detected: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
     status_ctx: &InstallStatusCtx,
 ) {
@@ -781,7 +885,8 @@ fn show_strategy_picker(
     let ctx = status_ctx.clone();
     dialog.connect_response(None, move |_, response| {
         if response == "data" {
-            do_install(
+            do_install_from_extracted(
+                Arc::clone(&extracted),
                 &ap,
                 &an,
                 &gc,
@@ -798,6 +903,121 @@ fn show_strategy_picker(
     dialog.present(parent);
 }
 
+/// Install a mod from a pre-extracted archive.
+///
+/// The `ExtractedArchive` temp directory already contains all files; the
+/// background thread only needs to copy them into the game's mod folder,
+/// avoiding any re-decompression of the original archive.
+#[allow(clippy::too_many_arguments)]
+fn do_install_from_extracted(
+    extracted: Arc<ExtractedArchive>,
+    archive_path: &Path,
+    archive_name: &str,
+    game: &Game,
+    config: &Rc<RefCell<AppConfig>>,
+    container: &gtk4::Box,
+    hide_installed: bool,
+    search_query: &str,
+    strategy: &InstallStrategy,
+    game_rc: &Rc<Option<Game>>,
+    status_ctx: Option<&InstallStatusCtx>,
+) {
+    let mod_name = Path::new(archive_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| archive_name.to_string());
+
+    if let Some(ctx) = status_ctx {
+        set_downloads_busy(ctx, true);
+        // Install phase is essentially instant (file moves/renames);
+        // hide the cancel button immediately so it is not shown.
+        ctx.cancel_btn.set_visible(false);
+        ctx.revealer.set_reveal_child(true);
+        ctx.label.set_text(&format!("Installing \"{}\"…", mod_name));
+        ctx.progress.set_fraction(0.0);
+        ctx.progress.set_text(Some("Installing…"));
+    }
+
+    let nexus_id = read_nxm_mod_id_for_archive(archive_path, game);
+
+    // Clone all Send data needed by the background thread.
+    let game_clone = game.clone();
+    let mod_name_bg = mod_name.clone();
+    let strategy_clone = strategy.clone();
+    let archive_name_bg = archive_name.to_string();
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<crate::core::mods::Mod, String>>();
+
+    // The Arc<ExtractedArchive> is moved into the thread; the temp directory
+    // persists until this thread (and any other Arc clones) are dropped.
+    std::thread::spawn(move || {
+        let result = install_mod_from_extracted(
+            &extracted,
+            &game_clone,
+            &mod_name_bg,
+            &strategy_clone,
+            nexus_id,
+            Some(&archive_name_bg),
+            &|| {},
+        );
+        let _ = tx.send(result);
+        // `extracted` (Arc) is dropped here — if this is the last clone the
+        // temp directory is cleaned up automatically.
+    });
+
+    let config_c = Rc::clone(config);
+    let container_c = container.clone();
+    let game_rc_c = Rc::clone(game_rc);
+    let archive_name_s = archive_name.to_string();
+    let mod_name_s = mod_name.clone();
+    let search_query_s = search_query.to_string();
+    let status_ctx_clone = status_ctx.cloned();
+
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        match rx.try_recv() {
+            Ok(result) => {
+                on_install_complete(
+                    result,
+                    &archive_name_s,
+                    &mod_name_s,
+                    &config_c,
+                    hide_installed,
+                    &search_query_s,
+                    &game_rc_c,
+                    status_ctx_clone.as_ref(),
+                    &container_c,
+                );
+                gtk4::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if let Some(ctx) = &status_ctx_clone {
+                    ctx.progress.pulse();
+                }
+                gtk4::glib::ControlFlow::Continue
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::error!("Install thread terminated unexpectedly for \"{mod_name_s}\"");
+                on_install_complete(
+                    Err("Install thread terminated unexpectedly".to_string()),
+                    &archive_name_s,
+                    &mod_name_s,
+                    &config_c,
+                    hide_installed,
+                    &search_query_s,
+                    &game_rc_c,
+                    status_ctx_clone.as_ref(),
+                    &container_c,
+                );
+                gtk4::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+/// Legacy install path: re-reads the archive from disk.
+///
+/// Still used by NXM link handler and the library reinstall flow which do not
+/// go through the extract-first pipeline (yet).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn do_install(
     archive_path: &Path,
@@ -826,19 +1046,13 @@ pub(crate) fn do_install(
 
     let nexus_id = read_nxm_mod_id_for_archive(archive_path, game);
 
-    // Clone all Send data needed by the background thread.  GTK types (Rc,
-    // widgets) must NOT be passed to the thread; they are captured by the
-    // glib::timeout_add_local closure that runs on the main thread.
     let ap = archive_path.to_path_buf();
     let game_clone = game.clone();
     let mod_name_bg = mod_name.clone();
     let strategy_clone = strategy.clone();
 
-    // Channel used to pass the install result back to the GTK main thread.
     let (tx, rx) = std::sync::mpsc::channel::<Result<crate::core::mods::Mod, String>>();
 
-    // Run the blocking extraction on a dedicated thread so the GTK event loop
-    // is never blocked, regardless of archive size or compression ratio.
     std::thread::spawn(move || {
         let result = install_mod_from_archive_with_nexus(
             &ap,
@@ -850,7 +1064,6 @@ pub(crate) fn do_install(
         let _ = tx.send(result);
     });
 
-    // Clone UI handles needed by the completion closure (all 'static + main-thread-only).
     let config_c = Rc::clone(config);
     let container_c = container.clone();
     let game_rc_c = Rc::clone(game_rc);
@@ -859,9 +1072,6 @@ pub(crate) fn do_install(
     let search_query_s = search_query.to_string();
     let status_ctx_clone = status_ctx.cloned();
 
-    // Poll the channel from the GTK main thread.  While the background thread
-    // is running, pulse the progress bar so the user sees activity.  When the
-    // thread finishes, handle success / error and restore the UI.
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
         match rx.try_recv() {
             Ok(result) => {
@@ -879,14 +1089,12 @@ pub(crate) fn do_install(
                 gtk4::glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // Still extracting — pulse so the user sees activity.
                 if let Some(ctx) = &status_ctx_clone {
                     ctx.progress.pulse();
                 }
                 gtk4::glib::ControlFlow::Continue
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // Thread terminated without sending a result (panic etc.).
                 log::error!("Install thread terminated unexpectedly for \"{mod_name_s}\"");
                 on_install_complete(
                     Err("Install thread terminated unexpectedly".to_string()),
@@ -967,7 +1175,6 @@ fn on_install_complete(
         }
     }
 }
-
 
 // ── Clean cache dialog ────────────────────────────────────────────────────────
 
@@ -1107,9 +1314,10 @@ fn nxm_metadata_path_for_archive(archive_path: &Path) -> PathBuf {
 fn read_nxm_mod_id_for_archive(archive_path: &Path, game: &Game) -> Option<u32> {
     // Try new consolidated format first (~/.config/linkmm/<game_id>/nxm_metadata.json)
     if let Some(file_name) = archive_path.file_name().and_then(|n| n.to_str())
-        && let Some(id) = game.read_nxm_mod_id(file_name) {
-            return Some(id);
-        }
+        && let Some(id) = game.read_nxm_mod_id(file_name)
+    {
+        return Some(id);
+    }
     // Fallback: try old per-archive sidecar file (.nxm.json alongside archive)
     let metadata_path = nxm_metadata_path_for_archive(archive_path);
     let contents = std::fs::read_to_string(metadata_path).ok()?;
@@ -1154,6 +1362,9 @@ fn set_downloads_busy(ctx: &InstallStatusCtx, busy: bool) {
     ctx.clean_btn.set_sensitive(sensitive);
     ctx.refresh_btn.set_sensitive(sensitive);
     ctx.list_container.set_sensitive(sensitive);
+    // Lock/unlock sidebar navigation.
+    (ctx.nav_lock)(busy);
+    // Cancel button is managed separately (shown only during extraction).
 }
 
 /// Schedule the status popup to slide back up after a short delay.
