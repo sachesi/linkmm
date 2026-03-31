@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gio;
 use glib;
@@ -52,6 +52,14 @@ pub(crate) struct InstallStatusCtx {
     /// Populated on every full refresh so the poll timer can update bars
     /// in-place without rebuilding the whole list on every progress tick.
     active_progress_bars: Rc<RefCell<HashMap<u64, gtk4::ProgressBar>>>,
+    /// Shared cancellation flag.  Set to `true` by the cancel button; read
+    /// by the extraction progress callback to abort the blocking task.
+    /// Reset to `false` at the start of every new install session.
+    cancel_flag: Arc<AtomicBool>,
+    /// The "Cancel" button shown inside the status popup during extraction.
+    cancel_btn: gtk4::Button,
+    /// Callback that locks/unlocks the sidebar navigation.
+    nav_lock: Rc<dyn Fn(bool)>,
 }
 
 // ── Public entry-point ────────────────────────────────────────────────────────
@@ -62,7 +70,11 @@ pub(crate) struct InstallStatusCtx {
 /// Archives arrive here either by manual placement or via NXM link handling
 /// from the browser.  Provides actions to install, hide already-installed
 /// archives, and clean the cache.
-pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
+pub fn build_downloads_page(
+    game: Option<&Game>,
+    config: Rc<RefCell<AppConfig>>,
+    nav_lock: Rc<dyn Fn(bool)>,
+) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
@@ -119,8 +131,18 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
     status_progress.set_margin_end(8);
     status_progress.set_margin_bottom(8);
 
+    let cancel_btn = gtk4::Button::builder()
+        .label("Cancel")
+        .halign(gtk4::Align::End)
+        .build();
+    cancel_btn.add_css_class("destructive-action");
+    cancel_btn.set_margin_end(8);
+    cancel_btn.set_margin_bottom(8);
+    cancel_btn.set_visible(false); // only shown during extraction
+
     status_card.append(&status_label);
     status_card.append(&status_progress);
+    status_card.append(&cancel_btn);
     status_revealer.set_child(Some(&status_card));
     content.append(&status_revealer);
     // ─────────────────────────────────────────────────────────────────────────
@@ -129,6 +151,16 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
     list_container.set_vexpand(true);
 
     content.append(&list_container);
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    // Wire the cancel button to set the shared flag.
+    {
+        let flag = Arc::clone(&cancel_flag);
+        cancel_btn.connect_clicked(move |_| {
+            flag.store(true, Ordering::Relaxed);
+        });
+    }
 
     let status_ctx = InstallStatusCtx {
         revealer: status_revealer,
@@ -141,6 +173,9 @@ pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>)
         list_container: list_container.clone(),
         is_installing: Rc::new(RefCell::new(false)),
         active_progress_bars: Rc::new(RefCell::new(HashMap::new())),
+        cancel_flag: Arc::clone(&cancel_flag),
+        cancel_btn: cancel_btn.clone(),
+        nav_lock,
     };
 
     let hide_installed = Rc::new(RefCell::new(false));
@@ -609,6 +644,10 @@ fn show_install_dialog(
     status_ctx.progress.set_fraction(0.0);
     status_ctx.progress.set_text(Some("Extracting…"));
 
+    // Reset the cancel flag and show the cancel button for the extraction phase.
+    status_ctx.cancel_flag.store(false, Ordering::Relaxed);
+    status_ctx.cancel_btn.set_visible(true);
+
     // Clone Send-able data for the blocking task (no Rc / GTK widget).
     let ap = archive_path.to_path_buf();
     let archive_name_bg = archive_name.to_string();
@@ -624,6 +663,7 @@ fn show_install_dialog(
     let extract_bytes_total = Arc::new(AtomicU64::new(0));
     let extract_bytes_done_bg = Arc::clone(&extract_bytes_done);
     let extract_bytes_total_bg = Arc::clone(&extract_bytes_total);
+    let cancel_for_progress = Arc::clone(&status_ctx.cancel_flag);
 
     // Drive the progress bar from the main thread at ~10 Hz.
     let progress_bar = status_ctx.progress.clone();
@@ -678,6 +718,8 @@ fn show_install_dialog(
                     ExtractedArchive::from_archive_in(&ap, &mods_dir_bg, &|done, total| {
                         extract_bytes_done_bg.store(done, Ordering::Relaxed);
                         extract_bytes_total_bg.store(total, Ordering::Relaxed);
+                        // Return false to abort extraction when user cancels.
+                        !cancel_for_progress.load(Ordering::Relaxed)
                     })?
                 );
 
@@ -721,6 +763,7 @@ fn show_install_dialog(
 
         match result {
             Ok(Ok((extracted, _strategy, fomod_config_opt, images_data))) => {
+                status_ctx_c.cancel_btn.set_visible(false);
                 set_downloads_busy(&status_ctx_c, false);
                 status_ctx_c.revealer.set_reveal_child(false);
 
@@ -778,8 +821,15 @@ fn show_install_dialog(
                     );
                 }
             }
+            Ok(Err(ref e)) if e == "Cancelled by user" => {
+                log::info!("Archive extraction cancelled by user");
+                status_ctx_c.cancel_btn.set_visible(false);
+                set_downloads_busy(&status_ctx_c, false);
+                status_ctx_c.revealer.set_reveal_child(false);
+            }
             Ok(Err(e)) => {
                 log::error!("Failed to extract archive: {e}");
+                status_ctx_c.cancel_btn.set_visible(false);
                 set_downloads_busy(&status_ctx_c, false);
                 hide_status_popup_later(status_ctx_c.revealer.clone());
                 show_toast(
@@ -790,6 +840,7 @@ fn show_install_dialog(
             Err(_) => {
                 // Blocking task panicked.
                 log::error!("Archive extraction task terminated unexpectedly");
+                status_ctx_c.cancel_btn.set_visible(false);
                 set_downloads_busy(&status_ctx_c, false);
                 hide_status_popup_later(status_ctx_c.revealer.clone());
             }
@@ -878,6 +929,9 @@ fn do_install_from_extracted(
 
     if let Some(ctx) = status_ctx {
         set_downloads_busy(ctx, true);
+        // Install phase is essentially instant (file moves/renames);
+        // hide the cancel button immediately so it is not shown.
+        ctx.cancel_btn.set_visible(false);
         ctx.revealer.set_reveal_child(true);
         ctx.label.set_text(&format!("Installing \"{}\"…", mod_name));
         ctx.progress.set_fraction(0.0);
@@ -1308,6 +1362,9 @@ fn set_downloads_busy(ctx: &InstallStatusCtx, busy: bool) {
     ctx.clean_btn.set_sensitive(sensitive);
     ctx.refresh_btn.set_sensitive(sensitive);
     ctx.list_container.set_sensitive(sensitive);
+    // Lock/unlock sidebar navigation.
+    (ctx.nav_lock)(busy);
+    // Cancel button is managed separately (shown only during extraction).
 }
 
 /// Schedule the status popup to slide back up after a short delay.

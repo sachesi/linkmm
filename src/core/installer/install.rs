@@ -252,16 +252,25 @@ fn install_zip_data_mod(
         DataArchivePlan::Bain { top_dirs } => {
             for bain_dir in top_dirs {
                 let bain_prefix = format!("{bain_dir}/");
-                extract_zip_to(archive_path, &data_dir, &bain_prefix, &|_, _| tick())?;
+                extract_zip_to(archive_path, &data_dir, &bain_prefix, &|_, _| {
+                    tick();
+                    true
+                })?;
             }
             normalize_paths_to_lowercase(&data_dir);
         }
         DataArchivePlan::ExtractToData { strip_prefix } => {
-            extract_zip_to(archive_path, &data_dir, &strip_prefix, &|_, _| tick())?;
+            extract_zip_to(archive_path, &data_dir, &strip_prefix, &|_, _| {
+                tick();
+                true
+            })?;
             normalize_paths_to_lowercase(&data_dir);
         }
         DataArchivePlan::ExtractToModRoot { strip_prefix } => {
-            extract_zip_to(archive_path, mod_dir, &strip_prefix, &|_, _| tick())?;
+            extract_zip_to(archive_path, mod_dir, &strip_prefix, &|_, _| {
+                tick();
+                true
+            })?;
         }
     }
 
@@ -291,15 +300,24 @@ fn install_data_archive_non_zip(
         DataArchivePlan::Bain { top_dirs } => {
             for bain_dir in top_dirs {
                 let bain_prefix = format!("{bain_dir}/");
-                extract_non_zip_to(archive_path, &data_dir, &bain_prefix, &|_, _| tick())?;
+                extract_non_zip_to(archive_path, &data_dir, &bain_prefix, &|_, _| {
+                    tick();
+                    true
+                })?;
             }
             Ok(())
         }
         DataArchivePlan::ExtractToData { strip_prefix } => {
-            extract_non_zip_to(archive_path, &data_dir, &strip_prefix, &|_, _| tick())
+            extract_non_zip_to(archive_path, &data_dir, &strip_prefix, &|_, _| {
+                tick();
+                true
+            })
         }
         DataArchivePlan::ExtractToModRoot { strip_prefix } => {
-            extract_non_zip_to(archive_path, mod_dir, &strip_prefix, &|_, _| tick())
+            extract_non_zip_to(archive_path, mod_dir, &strip_prefix, &|_, _| {
+                tick();
+                true
+            })
         }
     };
 

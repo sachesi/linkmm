@@ -21,7 +21,7 @@ pub(super) fn extract_zip_to(
     archive_path: &Path,
     dest_dir: &Path,
     strip_prefix: &str,
-    progress: &dyn Fn(u64, u64),
+    progress: &dyn Fn(u64, u64) -> bool,
 ) -> Result<(), String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
@@ -43,7 +43,9 @@ pub(super) fn extract_zip_to(
     for i in 0..zip.len() {
         let now = std::time::Instant::now();
         if now.duration_since(last_tick).as_millis() as u64 >= EXTRACTION_TICK_INTERVAL_MS {
-            progress(bytes_done, total_bytes);
+            if !progress(bytes_done, total_bytes) {
+                return Err("Cancelled by user".to_string());
+            }
             last_tick = now;
         }
 
@@ -105,7 +107,8 @@ pub(super) fn extract_zip_to(
     }
 
     // Emit a final progress event at 100 % so the UI can settle.
-    progress(bytes_done, total_bytes);
+    // Return value is intentionally ignored — extraction is already complete.
+    let _ = progress(bytes_done, total_bytes);
 
     Ok(())
 }
@@ -146,7 +149,7 @@ pub(super) fn extract_7z_archive_to(
     archive_path: &Path,
     dest_dir: &Path,
     strip_prefix: &str,
-    progress: &dyn Fn(u64, u64),
+    progress: &dyn Fn(u64, u64) -> bool,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| {
         format!(
@@ -173,7 +176,11 @@ pub(super) fn extract_7z_archive_to(
         |entry, reader, _default_dest| {
             let now = std::time::Instant::now();
             if now.duration_since(last_tick).as_millis() as u64 >= EXTRACTION_TICK_INTERVAL_MS {
-                progress(bytes_done, total_bytes);
+                if !progress(bytes_done, total_bytes) {
+                    return Err(sevenz_rust2::Error::Other(std::borrow::Cow::Borrowed(
+                        "Cancelled by user",
+                    )));
+                }
                 last_tick = now;
             }
 
@@ -223,14 +230,20 @@ pub(super) fn extract_7z_archive_to(
         },
     )
     .map_err(|e| {
-        format!(
-            "Failed to extract 7z archive {}: {e}",
-            archive_path.display()
-        )
+        let s = e.to_string();
+        if s.contains("Cancelled by user") {
+            "Cancelled by user".to_string()
+        } else {
+            format!(
+                "Failed to extract 7z archive {}: {e}",
+                archive_path.display()
+            )
+        }
     })?;
 
     // Emit a final progress event at 100 % so the UI can settle.
-    progress(bytes_done, total_bytes);
+    // Return value is intentionally ignored — extraction is already complete.
+    let _ = progress(bytes_done, total_bytes);
 
     Ok(())
 }
@@ -293,7 +306,7 @@ pub(super) fn extract_non_zip_to(
     archive_path: &Path,
     dest_dir: &Path,
     strip_prefix: &str,
-    progress: &dyn Fn(u64, u64),
+    progress: &dyn Fn(u64, u64) -> bool,
 ) -> Result<(), String> {
     if has_rar_extension(archive_path) {
         extract_rar_archive_to(archive_path, dest_dir, strip_prefix)
@@ -700,7 +713,7 @@ impl ExtractedArchive {
     pub fn from_archive_in(
         archive_path: &Path,
         parent_dir: &Path,
-        progress: &dyn Fn(u64, u64),
+        progress: &dyn Fn(u64, u64) -> bool,
     ) -> Result<Self, String> {
         let archive_name = archive_path
             .file_name()
@@ -769,7 +782,10 @@ impl ExtractedArchive {
     /// Supports `.zip`, `.7z`, and `.rar` archives.  The `progress` callback
     /// is invoked periodically with `(bytes_written, total_bytes)`.
     #[allow(dead_code)]
-    pub fn from_archive(archive_path: &Path, progress: &dyn Fn(u64, u64)) -> Result<Self, String> {
+    pub fn from_archive(
+        archive_path: &Path,
+        progress: &dyn Fn(u64, u64) -> bool,
+    ) -> Result<Self, String> {
         let archive_name = archive_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
