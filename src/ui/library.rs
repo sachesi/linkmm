@@ -214,6 +214,11 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 // top (lowest priority) -> bottom (highest priority), we deploy in
                 // reverse visual order to ensure the bottom-most enabled mod wins
                 // conflicts.
+                log::info!(
+                    "[Deploy] Starting priority deployment: {} enabled mod(s) out of {} total",
+                    deploy_total,
+                    db.mods.len()
+                );
                 let mut deployed_count = 0usize;
                 for (idx, m) in db.mods.iter().rev().filter(|m| m.enabled).enumerate() {
                     let now = std::time::Instant::now();
@@ -231,6 +236,12 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                         flush_ui_events();
                         last_ui_update = now;
                     }
+                    log::debug!(
+                        "[Deploy] [{}/{}] Deploying '{}'",
+                        idx + 1,
+                        deploy_total,
+                        m.name
+                    );
                     if let Err(e) = ModManager::enable_mod(&game_c, m) {
                         errors.push(format!("{}: {}", m.name, e));
                     } else {
@@ -239,6 +250,11 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     steps_done += 1;
                 }
                 let _ = db.write_plugins_txt(&game_c);
+                log::info!(
+                    "[Deploy] Deployment complete: {} mod(s) deployed successfully, {} error(s)",
+                    deployed_count,
+                    errors.len()
+                );
                 steps_done += 1;
                 let frac = steps_done as f64 / total_steps as f64;
                 status_progress_c.set_fraction(frac);
@@ -296,9 +312,10 @@ fn refresh_library_content_with_search(
     }
 
     if let Some(selected) = selected_mod_id.borrow().as_ref()
-        && !db.mods.iter().any(|m| &m.id == selected) {
-            *selected_mod_id.borrow_mut() = None;
-        }
+        && !db.mods.iter().any(|m| &m.id == selected)
+    {
+        *selected_mod_id.borrow_mut() = None;
+    }
 
     let visible_mods: Vec<_> = db
         .mods
@@ -361,6 +378,12 @@ fn refresh_library_content_with_search(
         scrolled.set_child(Some(&clamp));
 
         container.append(&scrolled);
+
+        let scrolled_clone = scrolled.clone();
+        gtk4::glib::idle_add_local_once(move || {
+            let adj = scrolled_clone.vadjustment();
+            adj.set_value(adj.upper() - adj.page_size());
+        });
     }
 }
 
@@ -484,19 +507,20 @@ fn build_mod_row(
         up_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
             if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
-                && pos > 0 {
-                    db.mods.swap(pos, pos - 1);
-                    db.save(&game_c);
-                    refresh_library_content_with_search(
-                        &container_c,
-                        &game_c,
-                        Rc::clone(&config_c),
-                        &search_c.borrow(),
-                        Rc::clone(&search_c),
-                        Rc::clone(&selected_c),
-                        false,
-                    );
-                }
+                && pos > 0
+            {
+                db.mods.swap(pos, pos - 1);
+                db.save(&game_c);
+                refresh_library_content_with_search(
+                    &container_c,
+                    &game_c,
+                    Rc::clone(&config_c),
+                    &search_c.borrow(),
+                    Rc::clone(&search_c),
+                    Rc::clone(&selected_c),
+                    false,
+                );
+            }
         });
     }
 
@@ -511,19 +535,20 @@ fn build_mod_row(
             let mut db = ModDatabase::load(&game_c);
             let len = db.mods.len();
             if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
-                && pos + 1 < len {
-                    db.mods.swap(pos, pos + 1);
-                    db.save(&game_c);
-                    refresh_library_content_with_search(
-                        &container_c,
-                        &game_c,
-                        Rc::clone(&config_c),
-                        &search_c.borrow(),
-                        Rc::clone(&search_c),
-                        Rc::clone(&selected_c),
-                        false,
-                    );
-                }
+                && pos + 1 < len
+            {
+                db.mods.swap(pos, pos + 1);
+                db.save(&game_c);
+                refresh_library_content_with_search(
+                    &container_c,
+                    &game_c,
+                    Rc::clone(&config_c),
+                    &search_c.borrow(),
+                    Rc::clone(&search_c),
+                    Rc::clone(&selected_c),
+                    false,
+                );
+            }
         });
     }
 
@@ -869,17 +894,18 @@ fn build_mod_row(
             move_item.connect_clicked(move |_| {
                 popover_move.popdown();
                 if let Some(root) = row_move.root()
-                    && let Ok(window) = root.downcast::<gtk4::Window>() {
-                        show_move_to_position_dialog_for_mod(
-                            &window,
-                            mod_id_move.clone(),
-                            Rc::clone(&game_move),
-                            container_move.clone(),
-                            Rc::clone(&config_move),
-                            Rc::clone(&search_move),
-                            Rc::clone(&selected_move),
-                        );
-                    }
+                    && let Ok(window) = root.downcast::<gtk4::Window>()
+                {
+                    show_move_to_position_dialog_for_mod(
+                        &window,
+                        mod_id_move.clone(),
+                        Rc::clone(&game_move),
+                        container_move.clone(),
+                        Rc::clone(&config_move),
+                        Rc::clone(&search_move),
+                        Rc::clone(&selected_move),
+                    );
+                }
             });
 
             let popover_enable = popover.clone();
@@ -999,21 +1025,22 @@ fn show_move_to_position_dialog_for_mod(
 
         let mut db = ModDatabase::load(&game);
         if let Some(src_pos) = db.mods.iter().position(|m| m.id == mod_id)
-            && target_idx < db.mods.len() {
-                let m = db.mods.remove(src_pos);
-                let insert_pos = adjusted_insert_pos(src_pos, target_idx);
-                db.mods.insert(insert_pos, m);
-                db.save(&game);
-                refresh_library_content_with_search(
-                    &container,
-                    &game,
-                    Rc::clone(&config),
-                    &search_state.borrow(),
-                    Rc::clone(&search_state),
-                    Rc::clone(&selected_mod_id),
-                    false,
-                );
-            }
+            && target_idx < db.mods.len()
+        {
+            let m = db.mods.remove(src_pos);
+            let insert_pos = adjusted_insert_pos(src_pos, target_idx);
+            db.mods.insert(insert_pos, m);
+            db.save(&game);
+            refresh_library_content_with_search(
+                &container,
+                &game,
+                Rc::clone(&config),
+                &search_state.borrow(),
+                Rc::clone(&search_state),
+                Rc::clone(&selected_mod_id),
+                false,
+            );
+        }
     });
 
     dialog.present(Some(parent));
@@ -1178,9 +1205,10 @@ fn collect_mod_target_files(mod_entry: &Mod) -> BTreeSet<String> {
                 if path.is_dir() {
                     collect_files_recursive(&path, root, "root", &mut files);
                 } else if path.is_file()
-                    && let Ok(rel) = path.strip_prefix(root) {
-                        files.insert(normalize_relative_path("root", rel));
-                    }
+                    && let Ok(rel) = path.strip_prefix(root)
+                {
+                    files.insert(normalize_relative_path("root", rel));
+                }
             }
         }
     } else {
@@ -1200,9 +1228,10 @@ fn collect_files_recursive(base: &Path, root: &Path, prefix: &str, files: &mut B
         if path.is_dir() {
             collect_files_recursive(&path, root, prefix, files);
         } else if path.is_file()
-            && let Ok(rel) = path.strip_prefix(root) {
-                files.insert(normalize_relative_path(prefix, rel));
-            }
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            files.insert(normalize_relative_path(prefix, rel));
+        }
     }
 }
 

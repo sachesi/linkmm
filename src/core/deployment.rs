@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::Path;
 
-use super::installer::{determine_link_type, LinkKind};
+use super::installer::{LinkKind, determine_link_type};
 use crate::core::games::Game;
 use crate::core::mods::Mod;
 
@@ -32,8 +32,13 @@ pub fn create_link(src: &Path, dest: &Path) -> Result<LinkKind, String> {
 
     // Create parent directory if needed
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent directory for {}: {}", dest.display(), e))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create parent directory for {}: {}",
+                dest.display(),
+                e
+            )
+        })?;
     }
 
     // Handle existing files at destination
@@ -42,21 +47,29 @@ pub fn create_link(src: &Path, dest: &Path) -> Result<LinkKind, String> {
             // Check if it's a broken symlink
             if !dest.exists() {
                 // Broken symlink - remove it
-                fs::remove_file(dest)
-                    .map_err(|e| format!("Failed to remove broken symlink {}: {}", dest.display(), e))?;
+                fs::remove_file(dest).map_err(|e| {
+                    format!("Failed to remove broken symlink {}: {}", dest.display(), e)
+                })?;
             } else {
                 // Valid symlink or file - check if it points to our source
                 if let Ok(target) = fs::read_link(dest)
-                    && target == src {
-                        // Already linked correctly
-                        return Ok(LinkKind::Symlink);
-                    }
+                    && target == src
+                {
+                    // Already linked correctly
+                    return Ok(LinkKind::Symlink);
+                }
                 // Points elsewhere - skip to avoid overwriting another mod's link
-                return Err(format!("Destination {} already exists (conflict)", dest.display()));
+                return Err(format!(
+                    "Destination {} already linked by higher-priority mod",
+                    dest.display()
+                ));
             }
         } else if dest.is_file() {
             // Real file exists - don't overwrite (might be vanilla game file)
-            return Err(format!("Real file exists at {} (not overwriting)", dest.display()));
+            return Err(format!(
+                "Real file exists at {} (priority conflict: not overwriting real file)",
+                dest.display()
+            ));
         }
     }
 
@@ -67,12 +80,22 @@ pub fn create_link(src: &Path, dest: &Path) -> Result<LinkKind, String> {
     match link_kind {
         LinkKind::Hardlink => {
             fs::hard_link(src, dest).map_err(|e| {
-                format!("Failed to create hardlink {} -> {}: {}", dest.display(), src.display(), e)
+                format!(
+                    "Failed to create hardlink {} -> {}: {}",
+                    dest.display(),
+                    src.display(),
+                    e
+                )
             })?;
         }
         LinkKind::Symlink => {
             symlink(src, dest).map_err(|e| {
-                format!("Failed to create symlink {} -> {}: {}", dest.display(), src.display(), e)
+                format!(
+                    "Failed to create symlink {} -> {}: {}",
+                    dest.display(),
+                    src.display(),
+                    e
+                )
             })?;
         }
     }
@@ -105,11 +128,12 @@ pub fn remove_link_if_matches(src: &Path, dest: &Path) -> Result<bool, String> {
     if dest.is_symlink() {
         // Check if symlink points to our source
         if let Ok(target) = fs::read_link(dest)
-            && target == src {
-                fs::remove_file(dest)
-                    .map_err(|e| format!("Failed to remove symlink {}: {}", dest.display(), e))?;
-                return Ok(true);
-            }
+            && target == src
+        {
+            fs::remove_file(dest)
+                .map_err(|e| format!("Failed to remove symlink {}: {}", dest.display(), e))?;
+            return Ok(true);
+        }
         return Ok(false); // Points elsewhere
     }
 
@@ -117,10 +141,10 @@ pub fn remove_link_if_matches(src: &Path, dest: &Path) -> Result<bool, String> {
     if dest.is_file() && src.is_file() {
         use std::os::unix::fs::MetadataExt;
 
-        let src_meta = fs::metadata(src)
-            .map_err(|e| format!("Failed to read source metadata: {}", e))?;
-        let dest_meta = fs::metadata(dest)
-            .map_err(|e| format!("Failed to read dest metadata: {}", e))?;
+        let src_meta =
+            fs::metadata(src).map_err(|e| format!("Failed to read source metadata: {}", e))?;
+        let dest_meta =
+            fs::metadata(dest).map_err(|e| format!("Failed to read dest metadata: {}", e))?;
 
         // Same inode and device = hardlink to same file
         if src_meta.dev() == dest_meta.dev() && src_meta.ino() == dest_meta.ino() {
@@ -146,14 +170,15 @@ pub fn remove_link_if_matches(_src: &Path, _dest: &Path) -> Result<bool, String>
 /// not directories themselves.
 ///
 /// # Returns
-/// * `Ok(usize)` - Number of links created
+/// * `Ok((linked, skipped))` - Number of links created and skipped (priority conflicts)
 /// * `Err(String)` - Error message
-pub fn link_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usize, String> {
+pub fn link_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<(usize, usize), String> {
     if !src_dir.is_dir() {
         return Err(format!("Source is not a directory: {}", src_dir.display()));
     }
 
     let mut link_count = 0;
+    let mut skip_count = 0;
 
     let entries = fs::read_dir(src_dir)
         .map_err(|e| format!("Failed to read directory {}: {}", src_dir.display(), e))?;
@@ -165,20 +190,23 @@ pub fn link_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usize
 
         if src_path.is_dir() {
             // Recurse into subdirectories
-            link_count += link_directory_recursive(&src_path, &dest_path)?;
+            let (linked, skipped) = link_directory_recursive(&src_path, &dest_path)?;
+            link_count += linked;
+            skip_count += skipped;
         } else if src_path.is_file() {
             // Link files
             match create_link(&src_path, &dest_path) {
                 Ok(_) => link_count += 1,
                 Err(e) => {
-                    // Log conflict but don't abort entire deployment
-                    log::warn!("Failed to link {}: {}", dest_path.display(), e);
+                    // Expected during priority deployment — higher-priority mod already linked
+                    log::debug!("Skipped (conflict): {} — {}", dest_path.display(), e);
+                    skip_count += 1;
                 }
             }
         }
     }
 
-    Ok(link_count)
+    Ok((link_count, skip_count))
 }
 
 /// Recursively remove links from destination that point to files in source.
@@ -224,10 +252,10 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
     // Ignore errors - directory might have other mods' files or vanilla content
     if let Err(e) = fs::remove_dir(dest_dir)
         && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            log::debug!("Could not remove directory {}: {}", dest_dir.display(), e);
-        }
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::debug!("Could not remove directory {}: {}", dest_dir.display(), e);
+    }
 
     Ok(unlink_count)
 }
@@ -242,34 +270,45 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
 ///
 /// Flattens nested Data/Data/ structures to prevent double-nesting.
 pub fn deploy_mod(game: &Game, mod_entry: &Mod) -> Result<DeploymentReport, String> {
-    let _span = crate::core::logger::span(
-        "deploy_mod",
-        &format!("mod={}", mod_entry.name),
-    );
+    let _span = crate::core::logger::span("deploy_mod", &format!("mod={}", mod_entry.name));
     let mut report = DeploymentReport::default();
 
     // Deploy Data/ folder contents
     let data_dir = mod_entry.source_path.join("Data");
     if data_dir.is_dir() {
         // Link Data/ contents with flattening
-        let data_links = link_mod_data_with_flatten(&data_dir, &game.data_path)?;
-        report.data_links_created = data_links;
+        let (data_linked, data_skipped) = link_mod_data_with_flatten(&data_dir, &game.data_path)?;
+        report.data_links_created = data_linked;
+        report.data_links_skipped = data_skipped;
 
         // Link root-level files (DLLs, SKSE, ENB, etc.) to game root
-        let root_links = link_root_files(&mod_entry.source_path, &game.root_path)?;
-        report.root_links_created = root_links;
+        let (root_linked, root_skipped) = link_root_files(&mod_entry.source_path, &game.root_path)?;
+        report.root_links_created = root_linked;
+        report.root_links_skipped = root_skipped;
     } else {
         // Legacy flat layout - link directly from mod root
-        let links = link_directory_recursive(&mod_entry.source_path, &game.data_path)?;
-        report.data_links_created = links;
+        let (linked, skipped) = link_directory_recursive(&mod_entry.source_path, &game.data_path)?;
+        report.data_links_created = linked;
+        report.data_links_skipped = skipped;
     }
 
-    log::info!(
-        "Deployed mod '{}': {} data links, {} root links",
-        mod_entry.name,
-        report.data_links_created,
-        report.root_links_created
-    );
+    let total_skipped = report.data_links_skipped + report.root_links_skipped;
+    if total_skipped > 0 {
+        log::info!(
+            "Deployed mod '{}': {} data links, {} root links ({} skipped due to priority)",
+            mod_entry.name,
+            report.data_links_created,
+            report.root_links_created,
+            total_skipped
+        );
+    } else {
+        log::info!(
+            "Deployed mod '{}': {} data links, {} root links",
+            mod_entry.name,
+            report.data_links_created,
+            report.root_links_created
+        );
+    }
 
     Ok(report)
 }
@@ -279,10 +318,7 @@ pub fn deploy_mod(game: &Game, mod_entry: &Mod) -> Result<DeploymentReport, Stri
 /// Only removes links that point to this mod's files. Preserves vanilla
 /// content and other mods' files.
 pub fn undeploy_mod(game: &Game, mod_entry: &Mod) -> Result<DeploymentReport, String> {
-    let _span = crate::core::logger::span(
-        "undeploy_mod",
-        &format!("mod={}", mod_entry.name),
-    );
+    let _span = crate::core::logger::span("undeploy_mod", &format!("mod={}", mod_entry.name));
     let mut report = DeploymentReport::default();
 
     let data_dir = mod_entry.source_path.join("Data");
@@ -321,15 +357,21 @@ pub fn undeploy_mod(game: &Game, mod_entry: &Mod) -> Result<DeploymentReport, St
 /// If source contains Data/Data/, the nested Data/ is flattened into the
 /// target Data/ directory. This handles FOMOD configs that incorrectly use
 /// destination="Data" relative to game root.
-fn link_mod_data_with_flatten(src_data: &Path, dest_data: &Path) -> Result<usize, String> {
+fn link_mod_data_with_flatten(src_data: &Path, dest_data: &Path) -> Result<(usize, usize), String> {
     if !src_data.is_dir() {
-        return Ok(0);
+        return Ok((0, 0));
     }
 
     let mut link_count = 0;
+    let mut skip_count = 0;
 
-    let entries = fs::read_dir(src_data)
-        .map_err(|e| format!("Failed to read Data directory {}: {}", src_data.display(), e))?;
+    let entries = fs::read_dir(src_data).map_err(|e| {
+        format!(
+            "Failed to read Data directory {}: {}",
+            src_data.display(),
+            e
+        )
+    })?;
 
     for entry in entries.flatten() {
         let src_path = entry.path();
@@ -338,23 +380,30 @@ fn link_mod_data_with_flatten(src_data: &Path, dest_data: &Path) -> Result<usize
         // Check for nested Data/ subdirectory (case-insensitive)
         if src_path.is_dir() && file_name.as_encoded_bytes().eq_ignore_ascii_case(b"data") {
             // Flatten: recurse into nested Data/ at same destination level
-            link_count += link_mod_data_with_flatten(&src_path, dest_data)?;
+            let (linked, skipped) = link_mod_data_with_flatten(&src_path, dest_data)?;
+            link_count += linked;
+            skip_count += skipped;
             continue;
         }
 
         let dest_path = dest_data.join(&file_name);
 
         if src_path.is_dir() {
-            link_count += link_directory_recursive(&src_path, &dest_path)?;
+            let (linked, skipped) = link_directory_recursive(&src_path, &dest_path)?;
+            link_count += linked;
+            skip_count += skipped;
         } else if src_path.is_file() {
             match create_link(&src_path, &dest_path) {
                 Ok(_) => link_count += 1,
-                Err(e) => log::warn!("Failed to link {}: {}", dest_path.display(), e),
+                Err(e) => {
+                    log::debug!("Skipped (conflict): {} — {}", dest_path.display(), e);
+                    skip_count += 1;
+                }
             }
         }
     }
 
-    Ok(link_count)
+    Ok((link_count, skip_count))
 }
 
 /// Unlink mod Data/ folder contents with flattening logic.
@@ -367,8 +416,13 @@ fn unlink_mod_data_with_flatten(src_data: &Path, dest_data: &Path) -> Result<usi
 
     let mut unlink_count = 0;
 
-    let entries = fs::read_dir(src_data)
-        .map_err(|e| format!("Failed to read Data directory {}: {}", src_data.display(), e))?;
+    let entries = fs::read_dir(src_data).map_err(|e| {
+        format!(
+            "Failed to read Data directory {}: {}",
+            src_data.display(),
+            e
+        )
+    })?;
 
     for entry in entries.flatten() {
         let src_path = entry.path();
@@ -402,12 +456,13 @@ fn unlink_mod_data_with_flatten(src_data: &Path, dest_data: &Path) -> Result<usi
 /// Link root-level mod files (DLLs, SKSE, ENB configs) to game root.
 ///
 /// Skips the Data/ subdirectory - that's handled separately.
-fn link_root_files(mod_root: &Path, game_root: &Path) -> Result<usize, String> {
+fn link_root_files(mod_root: &Path, game_root: &Path) -> Result<(usize, usize), String> {
     if !mod_root.is_dir() {
-        return Ok(0);
+        return Ok((0, 0));
     }
 
     let mut link_count = 0;
+    let mut skip_count = 0;
 
     let entries = fs::read_dir(mod_root)
         .map_err(|e| format!("Failed to read mod root {}: {}", mod_root.display(), e))?;
@@ -424,16 +479,21 @@ fn link_root_files(mod_root: &Path, game_root: &Path) -> Result<usize, String> {
         let dest_path = game_root.join(&file_name);
 
         if src_path.is_dir() {
-            link_count += link_directory_recursive(&src_path, &dest_path)?;
+            let (linked, skipped) = link_directory_recursive(&src_path, &dest_path)?;
+            link_count += linked;
+            skip_count += skipped;
         } else if src_path.is_file() {
             match create_link(&src_path, &dest_path) {
                 Ok(_) => link_count += 1,
-                Err(e) => log::warn!("Failed to link root file {}: {}", dest_path.display(), e),
+                Err(e) => {
+                    log::debug!("Skipped (conflict): {} — {}", dest_path.display(), e);
+                    skip_count += 1;
+                }
             }
         }
     }
 
-    Ok(link_count)
+    Ok((link_count, skip_count))
 }
 
 /// Unlink root-level mod files from game root.
@@ -530,6 +590,8 @@ pub struct DeploymentReport {
     pub root_links_created: usize,
     pub data_links_removed: usize,
     pub root_links_removed: usize,
+    pub data_links_skipped: usize,
+    pub root_links_skipped: usize,
 }
 
 #[cfg(test)]
@@ -610,8 +672,9 @@ mod tests {
         File::create(src_dir.join("subdir/file2.txt")).unwrap();
 
         // Link recursively
-        let count = link_directory_recursive(&src_dir, &dest_dir).unwrap();
+        let (count, skipped) = link_directory_recursive(&src_dir, &dest_dir).unwrap();
         assert_eq!(count, 2); // Two files linked
+        assert_eq!(skipped, 0); // No conflicts
 
         // Check links exist (may be symlinks or hardlinks depending on filesystem)
         assert!(dest_dir.join("file1.txt").exists());
