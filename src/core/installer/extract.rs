@@ -138,6 +138,74 @@ fn extract_7z_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), String
     })
 }
 
+/// Attempt extraction using the system `7z` binary for better performance.
+///
+/// Returns `Some(Ok(()))` on success, `Some(Err(…))` on failure or cancel,
+/// or `None` when `7z` is not available and the caller should fall back to
+/// the pure-Rust decompressor.
+fn try_extract_with_system_7z(
+    archive_path: &Path,
+    dest_dir: &Path,
+    progress: &dyn Fn(u64, u64) -> bool,
+) -> Option<Result<(), String>> {
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new("7z")
+        .arg("x")
+        .arg("-y")
+        .arg(format!("-o{}", dest_dir.display()))
+        .arg(archive_path.as_os_str())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            log::debug!("[Extract] System 7z not available, using Rust library");
+            return None;
+        }
+    };
+
+    log::info!("[Extract] Using system 7z for faster extraction");
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    // Final 100 % progress tick.
+                    let _ = progress(1, 1);
+                    return Some(Ok(()));
+                }
+                let stderr = child
+                    .stderr
+                    .take()
+                    .and_then(|mut s| {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
+                        Some(buf)
+                    })
+                    .unwrap_or_default();
+                return Some(Err(format!(
+                    "System 7z extraction failed (exit {status}): {stderr}"
+                )));
+            }
+            Ok(None) => {
+                // Still running — report indeterminate progress and check
+                // for cancellation.
+                if !progress(0, 0) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(Err("Cancelled by user".to_string()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Some(Err(format!("Failed to wait for system 7z process: {e}")));
+            }
+        }
+    }
+}
+
 /// Stream-extract a `.7z` archive directly to `dest_dir`, stripping
 /// `strip_prefix` from every entry name.
 ///
@@ -157,6 +225,15 @@ pub(super) fn extract_7z_archive_to(
             dest_dir.display()
         )
     })?;
+
+    // When no prefix stripping is needed, try the system `7z` binary first.
+    // It is typically 3–10× faster than the pure-Rust decompressor for large
+    // LZMA2 solid archives.
+    if strip_prefix.is_empty() {
+        if let Some(result) = try_extract_with_system_7z(archive_path, dest_dir, progress) {
+            return result;
+        }
+    }
 
     // Reading the archive header is cheap (no decompression) and gives us
     // the total uncompressed byte count for real progress reporting.
