@@ -745,7 +745,7 @@ fn show_install_dialog(
                             Some(cfg)
                         }
                         Err(e) => {
-                            log::warn!("Failed to parse FOMOD config, falling back: {e}");
+                            log::debug!("No FOMOD config in archive, using standard install: {e}");
                             None
                         }
                     }
@@ -1250,6 +1250,7 @@ struct DownloadEntry {
     name: String,
     path: PathBuf,
     size_bytes: u64,
+    modified: std::time::SystemTime,
 }
 
 fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
@@ -1272,15 +1273,20 @@ fn scan_downloads(dir: &Path) -> Vec<DownloadEntry> {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let meta = std::fs::metadata(&path).ok();
+            let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
             entries.push(DownloadEntry {
                 name,
                 path,
                 size_bytes,
+                modified,
             });
         }
     }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
     entries
 }
 
