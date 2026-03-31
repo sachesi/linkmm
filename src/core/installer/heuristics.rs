@@ -2,13 +2,11 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use super::archive::{list_archive_entries_with_7z, read_archive_files_bytes};
-use super::paths::{
-    has_zip_extension, installer_log_warning,
-    normalize_path_lowercase,
-};
+use super::extract::ExtractedArchive;
+use super::paths::{has_zip_extension, installer_log_warning, normalize_path_lowercase};
 use super::types::{
-    DataArchivePlan, InstallStrategy,
-    KNOWN_DATA_SUBDIRS, KNOWN_PLUGIN_EXTS, KNOWN_ARCHIVE_EXTS, JUNK_TOPLEVEL_ENTRIES,
+    DataArchivePlan, InstallStrategy, JUNK_TOPLEVEL_ENTRIES, KNOWN_ARCHIVE_EXTS,
+    KNOWN_DATA_SUBDIRS, KNOWN_PLUGIN_EXTS,
 };
 
 /// Score a path prefix as a candidate game Data-root directory.
@@ -264,9 +262,10 @@ pub(super) fn find_common_prefix_from_paths(paths: &[&str]) -> String {
 
     if all_same
         && let Some(ft) = first_top
-            && paths.len() > 1 {
-                return format!("{ft}/");
-            }
+        && paths.len() > 1
+    {
+        return format!("{ft}/");
+    }
     String::new()
 }
 
@@ -352,9 +351,10 @@ pub fn is_bain_archive(paths: &[&str]) -> bool {
         let p = path.replace('\\', "/");
         let p = p.trim_start_matches('/').to_string();
         if let Some(first) = p.split('/').next()
-            && !first.is_empty() {
-                top_dirs.insert(first.to_lowercase());
-            }
+            && !first.is_empty()
+        {
+            top_dirs.insert(first.to_lowercase());
+        }
     }
 
     if top_dirs.len() < 2 {
@@ -376,20 +376,21 @@ pub(super) fn collect_bain_top_dirs(paths: &[&str]) -> Vec<String> {
         let p_lower = p.trim_start_matches('/').to_lowercase();
         if let Some(first) = p_lower.split('/').next()
             && !first.is_empty()
-                && first.len() >= 3
-                && first.chars().take(2).all(|c| c.is_ascii_digit())
-                && matches!(first.chars().nth(2), Some(' ') | Some('_'))
-            {
-                let orig_p = p.trim_start_matches('/');
-                if let Some(orig_first) = orig_p.split('/').next() {
-                    dirs.insert(orig_first.to_string());
-                }
+            && first.len() >= 3
+            && first.chars().take(2).all(|c| c.is_ascii_digit())
+            && matches!(first.chars().nth(2), Some(' ') | Some('_'))
+        {
+            let orig_p = p.trim_start_matches('/');
+            if let Some(orig_first) = orig_p.split('/').next() {
+                dirs.insert(orig_first.to_string());
             }
+        }
     }
     dirs.into_iter().collect()
 }
 
 /// Determine install strategy for an archive.
+#[allow(dead_code)]
 pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
     if !archive_path.exists() {
         return Err(format!("Cannot open archive: {}", archive_path.display()));
@@ -415,6 +416,46 @@ pub fn detect_strategy(archive_path: &Path) -> Result<InstallStrategy, String> {
     }
 }
 
+/// Determine install strategy from an already-extracted archive.
+///
+/// Works entirely from the filesystem — no archive reads required.
+pub fn detect_strategy_from_extracted(archive: &ExtractedArchive) -> InstallStrategy {
+    let entries = archive.entries();
+
+    // Fast path: explicit fomod/ModuleConfig.xml
+    if entries.iter().any(|e| {
+        let lower = e.to_lowercase().replace('\\', "/");
+        lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
+    }) {
+        log::debug!("[Strategy] FOMOD installer detected (from extracted)");
+        return InstallStrategy::Fomod(vec![]);
+    }
+
+    // Slower path: scan XML files for FOMOD module markers.
+    for entry in entries
+        .iter()
+        .filter(|e| e.to_lowercase().ends_with(".xml"))
+    {
+        let full = archive.dir().join(entry.as_str());
+        if let Ok(content) = std::fs::read_to_string(&full) {
+            let lower = content.to_lowercase();
+            if lower.contains("<modulename>")
+                && (lower.contains("<installsteps>") || lower.contains("<requiredinstallfiles>"))
+            {
+                log::debug!(
+                    "[Strategy] FOMOD installer detected via XML content (from extracted) | file={}",
+                    entry
+                );
+                return InstallStrategy::Fomod(vec![]);
+            }
+        }
+    }
+
+    log::debug!("[Strategy] Standard data mod detected (from extracted)");
+    InstallStrategy::Data
+}
+
+#[allow(dead_code)]
 fn is_fomod_archive(archive_path: &Path) -> bool {
     let entries = if has_zip_extension(archive_path) {
         if let Ok(file) = std::fs::File::open(archive_path) {
