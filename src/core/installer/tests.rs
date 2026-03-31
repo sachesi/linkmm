@@ -239,7 +239,7 @@ fn install_flat_archive_places_files_under_data_subdir() {
     std::fs::create_dir_all(&dest).unwrap();
     let data_dest = dest.join("Data");
     std::fs::create_dir_all(&data_dest).unwrap();
-    extract_zip_to(&archive, &data_dest, "", &|| {}).unwrap();
+    extract_zip_to(&archive, &data_dest, "", &|_, _| {}).unwrap();
 
     assert!(dest.join("Data").join("textures").join("sky.dds").exists());
     assert!(dest.join("Data").join("plugin.esp").exists());
@@ -261,7 +261,7 @@ fn install_data_folder_archive_preserves_data_subdir() {
     assert!(!archive_has_data_folder(&archive));
     let data_dest = dest.join("Data");
     std::fs::create_dir_all(&data_dest).unwrap();
-    extract_zip_to(&archive, &data_dest, "Data/", &|| {}).unwrap();
+    extract_zip_to(&archive, &data_dest, "Data/", &|_, _| {}).unwrap();
 
     assert!(dest.join("Data").join("textures").join("sky.dds").exists());
 }
@@ -280,7 +280,7 @@ fn install_wrapped_data_archive_preserves_data_subdir() {
     let dest = tmp.join("mod_dir");
     std::fs::create_dir_all(&dest).unwrap();
     assert!(archive_has_data_folder(&archive));
-    extract_zip_to(&archive, &dest, "MyMod/", &|| {}).unwrap();
+    extract_zip_to(&archive, &dest, "MyMod/", &|_, _| {}).unwrap();
 
     assert!(dest.join("Data").join("textures").join("sky.dds").exists());
 }
@@ -298,7 +298,7 @@ fn extract_zip_strips_common_prefix() {
     );
     let dest = tmp.join("extracted");
     std::fs::create_dir_all(&dest).unwrap();
-    extract_zip_to(&archive, &dest, "MyMod/", &|| {}).unwrap();
+    extract_zip_to(&archive, &dest, "MyMod/", &|_, _| {}).unwrap();
     assert!(dest.join("textures").join("sky.dds").exists());
     assert!(dest.join("plugin.esp").exists());
 }
@@ -876,7 +876,7 @@ fn install_flat_archive_normalizes_uppercase_folder_names() {
     std::fs::create_dir_all(&dest).unwrap();
     let data_dest = dest.join("Data");
     std::fs::create_dir_all(&data_dest).unwrap();
-    extract_zip_to(&archive, &data_dest, "", &|| {}).unwrap();
+    extract_zip_to(&archive, &data_dest, "", &|_, _| {}).unwrap();
     normalize_paths_to_lowercase(&data_dest);
 
     assert!(data_dest.join("textures").join("sky.dds").exists());
