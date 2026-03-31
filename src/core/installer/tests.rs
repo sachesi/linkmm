@@ -1,15 +1,13 @@
-use super::*;
 use super::archive::find_common_prefix;
 use super::extract::{extract_zip_to, normalize_paths_to_lowercase};
 use super::fomod::{decode_fomod_xml, parse_fomod_xml};
 use super::heuristics::{
-    archive_has_data_folder, build_data_archive_plan, detect_data_root,
-    find_data_root_in_paths, find_fomod_parent_dir, score_as_data_root, score_as_data_root_owned,
+    archive_has_data_folder, build_data_archive_plan, detect_data_root, find_data_root_in_paths,
+    find_fomod_parent_dir, score_as_data_root, score_as_data_root_owned,
 };
 use super::install::install_fomod_files;
-use super::paths::{
-    is_safe_relative_path, normalize_path_lowercase, strip_data_prefix,
-};
+use super::paths::{is_safe_relative_path, normalize_path_lowercase, strip_data_prefix};
+use super::*;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -40,8 +38,8 @@ fn create_test_zip(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
     let archive_path = dir.join("test_mod.zip");
     let file = std::fs::File::create(&archive_path).unwrap();
     let mut zip_writer = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for &(name, content) in entries {
         if name.ends_with('/') {
             zip_writer.add_directory(name, options).unwrap();
@@ -239,7 +237,7 @@ fn install_flat_archive_places_files_under_data_subdir() {
     std::fs::create_dir_all(&dest).unwrap();
     let data_dest = dest.join("Data");
     std::fs::create_dir_all(&data_dest).unwrap();
-    extract_zip_to(&archive, &data_dest, "", &|| {}).unwrap();
+    extract_zip_to(&archive, &data_dest, "", &|_, _| true).unwrap();
 
     assert!(dest.join("Data").join("textures").join("sky.dds").exists());
     assert!(dest.join("Data").join("plugin.esp").exists());
@@ -261,7 +259,7 @@ fn install_data_folder_archive_preserves_data_subdir() {
     assert!(!archive_has_data_folder(&archive));
     let data_dest = dest.join("Data");
     std::fs::create_dir_all(&data_dest).unwrap();
-    extract_zip_to(&archive, &data_dest, "Data/", &|| {}).unwrap();
+    extract_zip_to(&archive, &data_dest, "Data/", &|_, _| true).unwrap();
 
     assert!(dest.join("Data").join("textures").join("sky.dds").exists());
 }
@@ -280,7 +278,7 @@ fn install_wrapped_data_archive_preserves_data_subdir() {
     let dest = tmp.join("mod_dir");
     std::fs::create_dir_all(&dest).unwrap();
     assert!(archive_has_data_folder(&archive));
-    extract_zip_to(&archive, &dest, "MyMod/", &|| {}).unwrap();
+    extract_zip_to(&archive, &dest, "MyMod/", &|_, _| true).unwrap();
 
     assert!(dest.join("Data").join("textures").join("sky.dds").exists());
 }
@@ -298,7 +296,7 @@ fn extract_zip_strips_common_prefix() {
     );
     let dest = tmp.join("extracted");
     std::fs::create_dir_all(&dest).unwrap();
-    extract_zip_to(&archive, &dest, "MyMod/", &|| {}).unwrap();
+    extract_zip_to(&archive, &dest, "MyMod/", &|_, _| true).unwrap();
     assert!(dest.join("textures").join("sky.dds").exists());
     assert!(dest.join("plugin.esp").exists());
 }
@@ -876,7 +874,7 @@ fn install_flat_archive_normalizes_uppercase_folder_names() {
     std::fs::create_dir_all(&dest).unwrap();
     let data_dest = dest.join("Data");
     std::fs::create_dir_all(&data_dest).unwrap();
-    extract_zip_to(&archive, &data_dest, "", &|| {}).unwrap();
+    extract_zip_to(&archive, &data_dest, "", &|_, _| true).unwrap();
     normalize_paths_to_lowercase(&data_dest);
 
     assert!(data_dest.join("textures").join("sky.dds").exists());
@@ -1222,8 +1220,8 @@ fn parse_fomod_from_archive_uses_archive_name_as_fallback_for_empty_mod_name() {
     let archive_path = tmp.join("MyGreatMod.zip");
     let file = std::fs::File::create(&archive_path).unwrap();
     let mut zip_writer = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zip_writer
         .start_file("fomod/ModuleConfig.xml", options)
         .unwrap();
@@ -1269,7 +1267,10 @@ fn test_normalize_path_lowercase() {
 #[test]
 fn test_strip_data_prefix() {
     assert_eq!(strip_data_prefix("Data/meshes/file.nif"), "meshes/file.nif");
-    assert_eq!(strip_data_prefix("data/textures/tex.dds"), "textures/tex.dds");
+    assert_eq!(
+        strip_data_prefix("data/textures/tex.dds"),
+        "textures/tex.dds"
+    );
     assert_eq!(strip_data_prefix("meshes/file.nif"), "meshes/file.nif");
     assert_eq!(strip_data_prefix("Data"), "");
     assert_eq!(strip_data_prefix("data"), "");
@@ -1377,10 +1378,16 @@ fn test_resolve_file_conflicts() {
     let resolved = resolve_file_conflicts(files);
     assert_eq!(resolved.len(), 2);
 
-    let file_txt = resolved.iter().find(|f| f.destination == "file.txt").unwrap();
+    let file_txt = resolved
+        .iter()
+        .find(|f| f.destination == "file.txt")
+        .unwrap();
     assert_eq!(file_txt.source, "b.txt");
 
-    let other_txt = resolved.iter().find(|f| f.destination == "other.txt").unwrap();
+    let other_txt = resolved
+        .iter()
+        .find(|f| f.destination == "other.txt")
+        .unwrap();
     assert_eq!(other_txt.source, "c.txt");
 }
 
@@ -1576,7 +1583,10 @@ fn install_fomod_two_level_wrapper_dir() {
             // outer: zip-name directory
             ("Diamond 3BA puffy pussy-45718/", b""),
             // inner: actual content wrapper (different name from outer)
-            ("Diamond 3BA puffy pussy-45718/Diamond 3BA Puffy Pussy normal maps/", b""),
+            (
+                "Diamond 3BA puffy pussy-45718/Diamond 3BA Puffy Pussy normal maps/",
+                b"",
+            ),
             (
                 "Diamond 3BA puffy pussy-45718/Diamond 3BA Puffy Pussy normal maps/fomod/ModuleConfig.xml",
                 b"<config/>",

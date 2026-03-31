@@ -110,10 +110,7 @@ fn build_main_window(
 
     // ── Play Game button ──────────────────────────────────────────────────
 
-    let play_btn = gtk4::Button::builder()
-        .label("Play")
-        .hexpand(true)
-        .build();
+    let play_btn = gtk4::Button::builder().label("Play").hexpand(true).build();
     play_btn.add_css_class("suggested-action");
     play_btn.set_margin_start(12);
     play_btn.set_margin_end(12);
@@ -122,7 +119,11 @@ fn build_main_window(
     // Show the button only when a game with a known Steam App ID is active.
     {
         let cfg = config.borrow();
-        play_btn.set_visible(cfg.current_game().and_then(|g| g.kind.steam_app_id()).is_some());
+        play_btn.set_visible(
+            cfg.current_game()
+                .and_then(|g| g.kind.steam_app_id())
+                .is_some(),
+        );
     }
 
     {
@@ -130,14 +131,14 @@ fn build_main_window(
         play_btn.connect_clicked(move |_| {
             let game = config_c.borrow().current_game().cloned();
             if let Some(g) = game
-                && let Err(e) = crate::core::steam::launch_game(&g) {
-                    log::warn!("Could not launch {}: {e}", g.name);
-                }
+                && let Err(e) = crate::core::steam::launch_game(&g)
+            {
+                log::warn!("Could not launch {}: {e}", g.name);
+            }
         });
     }
 
     sidebar_box.append(&play_btn);
-
 
     // ── Navigation section ────────────────────────────────────────────────
     sidebar_box.append(&make_section_label("Navigation"));
@@ -218,6 +219,14 @@ fn build_main_window(
         .build();
     split_view.set_sidebar(Some(&sidebar_page));
 
+    // Create the nav-lock callback.  Grays out the entire sidebar content
+    // (navigation, game picker, play button) during mod installation so the
+    // user cannot navigate away while a long archive is being extracted.
+    let sidebar_box_for_lock = sidebar_box.clone();
+    let nav_lock: Rc<dyn Fn(bool)> = Rc::new(move |locked: bool| {
+        sidebar_box_for_lock.set_sensitive(!locked);
+    });
+
     // ── Content area ──────────────────────────────────────────────────────
 
     let content_stack = gtk4::Stack::new();
@@ -245,8 +254,11 @@ fn build_main_window(
     content_stack.add_named(&load_order_widget, Some("load_order"));
 
     // Downloads
-    let downloads_widget =
-        downloads::build_downloads_page(current_game.as_ref(), Rc::clone(&config));
+    let downloads_widget = downloads::build_downloads_page(
+        current_game.as_ref(),
+        Rc::clone(&config),
+        Rc::clone(&nav_lock),
+    );
     content_stack.add_named(&downloads_widget, Some("downloads"));
 
     // Tools
@@ -286,6 +298,7 @@ fn build_main_window(
         let content_stack_c = content_stack.clone();
         let content_page_c = content_page.clone();
         let config_c = Rc::clone(&config);
+        let nav_lock_c = Rc::clone(&nav_lock);
 
         nav_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
@@ -319,8 +332,11 @@ fn build_main_window(
                     content_stack_c.set_visible_child_name("load_order");
                 }
                 NAV_DOWNLOADS => {
-                    let new_downloads =
-                        downloads::build_downloads_page(game_info.as_ref(), Rc::clone(&config_c));
+                    let new_downloads = downloads::build_downloads_page(
+                        game_info.as_ref(),
+                        Rc::clone(&config_c),
+                        Rc::clone(&nav_lock_c),
+                    );
                     if let Some(old) = content_stack_c.child_by_name("downloads") {
                         content_stack_c.remove(&old);
                     }
@@ -356,6 +372,7 @@ fn build_main_window(
     let config_r = Rc::clone(&config);
     let nav_list_r = nav_list.clone();
     let play_btn_r = play_btn.clone();
+    let nav_lock_r = Rc::clone(&nav_lock);
 
     let on_setup_done_rc: Rc<dyn Fn()> = Rc::new(move || {
         let game_info = {
@@ -398,8 +415,11 @@ fn build_main_window(
         content_stack_r.add_named(&new_load_order, Some("load_order"));
 
         // Rebuild Downloads page
-        let new_downloads =
-            downloads::build_downloads_page(game_info.as_ref(), Rc::clone(&config_r));
+        let new_downloads = downloads::build_downloads_page(
+            game_info.as_ref(),
+            Rc::clone(&config_r),
+            Rc::clone(&nav_lock_r),
+        );
         if let Some(old) = content_stack_r.child_by_name("downloads") {
             content_stack_r.remove(&old);
         }
@@ -482,11 +502,7 @@ fn build_no_game_page(title: &str, description: &str) -> gtk4::Widget {
     toolbar_view.upcast()
 }
 
-fn refresh_stats(
-    cfg: &AppConfig,
-    installed: &gtk4::Label,
-    enabled: &gtk4::Label,
-) {
+fn refresh_stats(cfg: &AppConfig, installed: &gtk4::Label, enabled: &gtk4::Label) {
     if let Some(game) = cfg.current_game() {
         let db = ModDatabase::load(game);
         installed.set_text(&db.mods.len().to_string());
@@ -880,9 +896,9 @@ fn start_nxm_download(
                 if let Some(ref game) = download_target
                     && let Err(e) =
                         game.write_nxm_mod_id(&file_name, &nxm.game_domain, nxm.mod_id as u32)
-                    {
-                        log::warn!("Failed to update NXM metadata for {}: {e}", file_name);
-                    }
+                {
+                    log::warn!("Failed to update NXM metadata for {}: {e}", file_name);
+                }
                 return Ok(format!("{file_name} (already downloaded)"));
             }
 
@@ -914,9 +930,9 @@ fn start_nxm_download(
             if let Some(ref game) = download_target
                 && let Err(e) =
                     game.write_nxm_mod_id(&file_name, &nxm.game_domain, nxm.mod_id as u32)
-                {
-                    log::warn!("Failed to write NXM metadata for {}: {e}", file_name);
-                }
+            {
+                log::warn!("Failed to write NXM metadata for {}: {e}", file_name);
+            }
 
             Ok(file_name)
         })();
@@ -972,5 +988,3 @@ fn walk_for_toast_overlay(widget: &gtk4::Widget, message: &str) {
         walk_for_toast_overlay(&child, message);
     }
 }
-
-

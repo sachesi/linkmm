@@ -3,14 +3,14 @@ use std::io::Read;
 use std::path::Path;
 
 use super::archive::open_7z_reader;
-use super::extract::{create_temp_extract_dir, extract_single_rar_file};
+use super::extract::{ExtractedArchive, create_temp_extract_dir, extract_single_rar_file};
 use super::paths::{
-    has_rar_extension, has_zip_extension, installer_log_warning,
-    normalize_path_lowercase,
+    has_rar_extension, has_zip_extension, installer_log_warning, normalize_path_lowercase,
 };
 use super::types::*;
 
 /// Parse a FOMOD `ModuleConfig.xml` from a supported archive.
+#[allow(dead_code)]
 pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, String> {
     let archive_name = archive_path
         .file_name()
@@ -64,6 +64,7 @@ pub fn parse_fomod_from_archive(archive_path: &Path) -> Result<FomodConfig, Stri
 }
 
 /// Parse a FOMOD `ModuleConfig.xml` from inside a RAR archive.
+#[allow(dead_code)]
 fn parse_fomod_from_rar(archive_path: &Path) -> Result<FomodConfig, String> {
     let entries = super::archive::list_rar_entries(archive_path)?;
     let fomod_entry = entries
@@ -95,6 +96,7 @@ fn parse_fomod_from_rar(archive_path: &Path) -> Result<FomodConfig, String> {
 }
 
 /// Parse a FOMOD `ModuleConfig.xml` from inside a zip archive.
+#[allow(dead_code)]
 pub fn parse_fomod_from_zip(archive_path: &Path) -> Result<FomodConfig, String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("Cannot open archive: {e}"))?;
@@ -114,6 +116,48 @@ pub fn parse_fomod_from_zip(archive_path: &Path) -> Result<FomodConfig, String> 
     parse_fomod_xml(&xml_bytes)
 }
 
+/// Parse a FOMOD `ModuleConfig.xml` from an already-extracted archive.
+///
+/// Works entirely from the filesystem — no archive re-reading required.
+pub fn parse_fomod_from_extracted(
+    extracted: &ExtractedArchive,
+    archive_name: &str,
+) -> Result<FomodConfig, String> {
+    let _span =
+        crate::core::logger::span("parse_fomod_extracted", &format!("archive={archive_name}"));
+
+    let config_entry = extracted
+        .entries()
+        .iter()
+        .find(|e| {
+            let lower = e.to_lowercase().replace('\\', "/");
+            lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
+        })
+        .ok_or_else(|| "No fomod/ModuleConfig.xml found in extracted archive".to_string())?;
+
+    let config_path = extracted.dir().join(config_entry.as_str());
+    log::debug!(
+        "[FOMOD] Reading config from extracted dir | path={}",
+        config_path.display()
+    );
+
+    let xml_bytes = std::fs::read(&config_path)
+        .map_err(|e| format!("Failed to read FOMOD config {}: {e}", config_path.display()))?;
+
+    let mut config = parse_fomod_xml(&xml_bytes)?;
+
+    if config.mod_name.is_none() && !archive_name.is_empty() {
+        let stem = std::path::Path::new(archive_name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| archive_name.to_string());
+        config.mod_name = Some(stem);
+    }
+
+    Ok(config)
+}
+
+#[allow(dead_code)]
 fn find_fomod_config_in_dir(root: &Path) -> Option<std::path::PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -152,6 +196,7 @@ fn find_fomod_config_in_dir(root: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
+#[allow(dead_code)]
 fn find_fomod_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String, String> {
     for i in 0..zip.len() {
         let entry = zip
@@ -373,9 +418,10 @@ pub(super) fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                                     }
                                 }
                             } else if let Some(ref mut plugin) = current_plugin
-                                && let Some(ref mut deps) = plugin.dependencies {
-                                    deps.flags.push(FlagDependency { flag, value });
-                                }
+                                && let Some(ref mut deps) = plugin.dependencies
+                            {
+                                deps.flags.push(FlagDependency { flag, value });
+                            }
                         }
                     }
                     "flag" => {
@@ -452,14 +498,13 @@ pub(super) fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                     }
                     "flag" => {
                         let in_condition_flags = path_stack.iter().any(|p| p == "conditionflags");
-                        if in_condition_flags
-                            && let Some(ref mut plugin) = current_plugin {
-                                let name = get_attr(e, "name").unwrap_or_default();
-                                let value = get_attr(e, "value").unwrap_or_default();
-                                if !name.is_empty() && !value.is_empty() {
-                                    plugin.condition_flags.push(ConditionFlag { name, value });
-                                }
+                        if in_condition_flags && let Some(ref mut plugin) = current_plugin {
+                            let name = get_attr(e, "name").unwrap_or_default();
+                            let value = get_attr(e, "value").unwrap_or_default();
+                            if !name.is_empty() && !value.is_empty() {
+                                plugin.condition_flags.push(ConditionFlag { name, value });
                             }
+                        }
                     }
                     "flagdependency" => {
                         let flag = get_attr(e, "flag").unwrap_or_default();
@@ -488,9 +533,10 @@ pub(super) fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                                     }
                                 }
                             } else if let Some(ref mut plugin) = current_plugin
-                                && let Some(ref mut deps) = plugin.dependencies {
-                                    deps.flags.push(FlagDependency { flag, value });
-                                }
+                                && let Some(ref mut deps) = plugin.dependencies
+                            {
+                                deps.flags.push(FlagDependency { flag, value });
+                            }
                         }
                     }
                     _ => {}
@@ -514,9 +560,10 @@ pub(super) fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                     }
                     "description" => {
                         if let Some(ref mut plugin) = current_plugin
-                            && !current_text.is_empty() {
-                                plugin.description = Some(current_text.clone());
-                            }
+                            && !current_text.is_empty()
+                        {
+                            plugin.description = Some(current_text.clone());
+                        }
                     }
                     "flag" => {
                         let in_condition_flags = path_stack
@@ -525,46 +572,52 @@ pub(super) fn parse_fomod_xml(xml_bytes: &[u8]) -> Result<FomodConfig, String> {
                             .unwrap_or(false);
                         if in_condition_flags
                             && let Some(name) = current_condition_flag_name.take()
-                                && let Some(ref mut plugin) = current_plugin
-                                    && !current_text.is_empty() {
-                                        plugin.condition_flags.push(ConditionFlag {
-                                            name,
-                                            value: current_text.clone(),
-                                        });
-                                    }
+                            && let Some(ref mut plugin) = current_plugin
+                            && !current_text.is_empty()
+                        {
+                            plugin.condition_flags.push(ConditionFlag {
+                                name,
+                                value: current_text.clone(),
+                            });
+                        }
                     }
                     "dependencies" => {
                         if in_pattern {
                             if let Some(ref deps) = current_pattern_dependencies
-                                && deps.flags.is_empty() {
-                                    current_pattern_dependencies = None;
-                                }
+                                && deps.flags.is_empty()
+                            {
+                                current_pattern_dependencies = None;
+                            }
                         } else if in_visible {
                             if let Some(ref mut step) = current_step
                                 && let Some(ref deps) = step.visible
-                                    && deps.flags.is_empty() {
-                                        step.visible = None;
-                                    }
+                                && deps.flags.is_empty()
+                            {
+                                step.visible = None;
+                            }
                         } else if let Some(ref mut plugin) = current_plugin
                             && let Some(ref deps) = plugin.dependencies
-                                && deps.flags.is_empty() {
-                                    plugin.dependencies = None;
-                                }
+                            && deps.flags.is_empty()
+                        {
+                            plugin.dependencies = None;
+                        }
                     }
                     "visible" => {
                         in_visible = false;
                     }
                     "plugin" => {
                         if let Some(plugin) = current_plugin.take()
-                            && let Some(ref mut group) = current_group {
-                                group.plugins.push(plugin);
-                            }
+                            && let Some(ref mut group) = current_group
+                        {
+                            group.plugins.push(plugin);
+                        }
                     }
                     "group" => {
                         if let Some(group) = current_group.take()
-                            && let Some(ref mut step) = current_step {
-                                step.groups.push(group);
-                            }
+                            && let Some(ref mut step) = current_step
+                        {
+                            step.groups.push(group);
+                        }
                     }
                     "installstep" => {
                         if let Some(step) = current_step.take() {
