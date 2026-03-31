@@ -7,8 +7,8 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 use super::archive::list_archive_entries_with_7z;
 use super::extract::{
-    create_temp_extract_dir, extract_archive_with_7z, extract_non_zip_to, extract_zip_to,
-    normalize_paths_to_lowercase,
+    ExtractedArchive, create_temp_extract_dir, extract_archive_with_7z, extract_non_zip_to,
+    extract_zip_to, normalize_paths_to_lowercase,
 };
 use super::heuristics::{build_data_archive_plan, find_data_root_in_paths};
 use super::paths::{
@@ -28,10 +28,11 @@ fn collect_fs_files(root: &Path, dir: &Path, result: &mut Vec<(String, PathBuf)>
         if path.is_dir() {
             collect_fs_files(root, &path, result);
         } else if path.is_file()
-            && let Ok(rel) = path.strip_prefix(root) {
-                let rel_str = normalize_path(&rel.to_string_lossy());
-                result.push((rel_str.to_lowercase(), path));
-            }
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            let rel_str = normalize_path(&rel.to_string_lossy());
+            result.push((rel_str.to_lowercase(), path));
+        }
     }
 }
 
@@ -82,10 +83,9 @@ fn find_fs_common_prefix(entry_map: &[(String, String)]) -> (String, String) {
             _ => {}
         }
     }
-    if all_same
-        && let (Some(tl), Some(to)) = (first_lower, first_orig) {
-            return (format!("{to}/"), format!("{tl}/"));
-        }
+    if all_same && let (Some(tl), Some(to)) = (first_lower, first_orig) {
+        return (format!("{to}/"), format!("{tl}/"));
+    }
     (String::new(), String::new())
 }
 
@@ -252,16 +252,25 @@ fn install_zip_data_mod(
         DataArchivePlan::Bain { top_dirs } => {
             for bain_dir in top_dirs {
                 let bain_prefix = format!("{bain_dir}/");
-                extract_zip_to(archive_path, &data_dir, &bain_prefix, tick)?;
+                extract_zip_to(archive_path, &data_dir, &bain_prefix, &|_, _| {
+                    tick();
+                    true
+                })?;
             }
             normalize_paths_to_lowercase(&data_dir);
         }
         DataArchivePlan::ExtractToData { strip_prefix } => {
-            extract_zip_to(archive_path, &data_dir, &strip_prefix, tick)?;
+            extract_zip_to(archive_path, &data_dir, &strip_prefix, &|_, _| {
+                tick();
+                true
+            })?;
             normalize_paths_to_lowercase(&data_dir);
         }
         DataArchivePlan::ExtractToModRoot { strip_prefix } => {
-            extract_zip_to(archive_path, mod_dir, &strip_prefix, tick)?;
+            extract_zip_to(archive_path, mod_dir, &strip_prefix, &|_, _| {
+                tick();
+                true
+            })?;
         }
     }
 
@@ -291,15 +300,24 @@ fn install_data_archive_non_zip(
         DataArchivePlan::Bain { top_dirs } => {
             for bain_dir in top_dirs {
                 let bain_prefix = format!("{bain_dir}/");
-                extract_non_zip_to(archive_path, &data_dir, &bain_prefix, tick)?;
+                extract_non_zip_to(archive_path, &data_dir, &bain_prefix, &|_, _| {
+                    tick();
+                    true
+                })?;
             }
             Ok(())
         }
         DataArchivePlan::ExtractToData { strip_prefix } => {
-            extract_non_zip_to(archive_path, &data_dir, &strip_prefix, tick)
+            extract_non_zip_to(archive_path, &data_dir, &strip_prefix, &|_, _| {
+                tick();
+                true
+            })
         }
         DataArchivePlan::ExtractToModRoot { strip_prefix } => {
-            extract_non_zip_to(archive_path, mod_dir, &strip_prefix, tick)
+            extract_non_zip_to(archive_path, mod_dir, &strip_prefix, &|_, _| {
+                tick();
+                true
+            })
         }
     };
 
@@ -311,7 +329,11 @@ fn install_data_archive_non_zip(
 }
 
 /// Install FOMOD-selected files from an archive.
-pub(super) fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[FomodFile]) -> Result<(), String> {
+pub(super) fn install_fomod(
+    archive_path: &Path,
+    dest_dir: &Path,
+    files: &[FomodFile],
+) -> Result<(), String> {
     let archive_name = archive_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -426,8 +448,8 @@ pub(super) fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[Fomod
         }
 
         let matched_source_lower = matched_source.to_lowercase();
-        let source_prefix_lower = (!matched_source_lower.is_empty())
-            .then(|| format!("{matched_source_lower}/"));
+        let source_prefix_lower =
+            (!matched_source_lower.is_empty()).then(|| format!("{matched_source_lower}/"));
 
         for (orig_entry, idx) in matching_entries {
             let entry_norm = normalize_path(&orig_entry);
@@ -440,10 +462,11 @@ pub(super) fn install_fomod(archive_path: &Path, dest_dir: &Path, files: &[Fomod
                 }
             } else if entry_lower == matched_source_lower {
                 destination.clone()
-            } else if let Some(suffix) = source_prefix_lower
-                .as_deref()
-                .and_then(|prefix| entry_norm.get(prefix.len()..).filter(|_| entry_lower.starts_with(prefix)))
-            {
+            } else if let Some(suffix) = source_prefix_lower.as_deref().and_then(|prefix| {
+                entry_norm
+                    .get(prefix.len()..)
+                    .filter(|_| entry_lower.starts_with(prefix))
+            }) {
                 if destination.is_empty() {
                     suffix.to_string()
                 } else {
@@ -664,9 +687,7 @@ pub(super) fn install_fomod_files_from_dir(
                 std::borrow::Cow::Owned(format!("{destination}/{rel}"))
             };
             if !is_safe_relative_path(combined.as_ref()) {
-                installer_log_warning(format!(
-                    "Skipping fomod entry with unsafe path: {combined}"
-                ));
+                installer_log_warning(format!("Skipping fomod entry with unsafe path: {combined}"));
                 continue;
             }
 
@@ -684,6 +705,195 @@ pub(super) fn install_fomod_files_from_dir(
                     out_path.display()
                 )
             })?;
+        }
+    }
+
+    Ok(())
+}
+
+// ── Install from pre-extracted archive ────────────────────────────────────────
+
+/// Install a mod from a pre-extracted archive.
+///
+/// This is the preferred path for all formats: the archive has already been
+/// decompressed once by [`ExtractedArchive::from_archive`], so installation
+/// is just filesystem copies — no re-reading of compressed data.
+pub fn install_mod_from_extracted(
+    extracted: &ExtractedArchive,
+    game: &Game,
+    mod_name: &str,
+    strategy: &InstallStrategy,
+    nexus_id: Option<u32>,
+    archive_name: Option<&str>,
+    tick: &dyn Fn(),
+) -> Result<Mod, String> {
+    let display_archive = archive_name.unwrap_or("(unknown)");
+    let _span = logger::span(
+        "install_mod_extracted",
+        &format!("archive={display_archive}, mod={mod_name}"),
+    );
+
+    let mod_dir = ModManager::create_mod_directory(game)?;
+
+    let result = match strategy {
+        InstallStrategy::Data => install_data_from_extracted(extracted, &mod_dir, tick),
+        InstallStrategy::Fomod(files) => {
+            if files.is_empty() {
+                let _ = std::fs::remove_dir_all(&mod_dir);
+                return Err(
+                    "No files selected for installation. FOMOD configuration may be \
+                     invalid or no options were selected."
+                        .to_string(),
+                );
+            }
+            let data_dir = mod_dir.join("Data");
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| format!("Failed to create Data directory: {e}"))?;
+
+            install_fomod_files_from_dir(extracted.dir(), &data_dir, files)?;
+
+            let has_files = data_dir
+                .read_dir()
+                .ok()
+                .and_then(|mut entries| entries.next())
+                .is_some();
+            if !has_files {
+                let _ = std::fs::remove_dir_all(&mod_dir);
+                return Err("No files were installed. FOMOD file paths may not match \
+                     archive contents."
+                    .to_string());
+            }
+
+            normalize_paths_to_lowercase(&data_dir);
+            Ok(())
+        }
+    };
+
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&mod_dir);
+        return Err(e);
+    }
+
+    // Files have been moved into `mod_dir` — remove the temp extract dir
+    // immediately so the hidden folder in the mods directory does not linger
+    // until the last Arc<ExtractedArchive> reference (e.g. a still-open
+    // FOMOD wizard) is finally dropped.
+    extracted.cleanup();
+
+    let mut mod_entry = Mod::new(mod_name, mod_dir);
+    mod_entry.installed_from_nexus = nexus_id.is_some();
+    mod_entry.nexus_id = nexus_id;
+    mod_entry.archive_name = archive_name.map(|s| s.to_owned());
+
+    let mut db = ModDatabase::load(game);
+    db.mods.retain(|m| m.name != mod_name);
+    db.mods.push(mod_entry.clone());
+    db.save(game);
+
+    Ok(mod_entry)
+}
+
+/// Install a data mod from a pre-extracted archive.
+fn install_data_from_extracted(
+    extracted: &ExtractedArchive,
+    mod_dir: &Path,
+    tick: &dyn Fn(),
+) -> Result<(), String> {
+    let entries = extracted.entries();
+    let path_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+
+    let data_dir = mod_dir.join("Data");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create Data directory: {e}"))?;
+
+    let plan = build_data_archive_plan(&path_refs);
+    installer_log_activity(format!("Extracted archive install plan: {:?}", plan));
+
+    match plan {
+        DataArchivePlan::Bain { top_dirs } => {
+            for bain_dir in top_dirs {
+                let bain_prefix = format!("{bain_dir}/");
+                move_from_extracted_to(extracted, &data_dir, &bain_prefix, tick)?;
+            }
+        }
+        DataArchivePlan::ExtractToData { strip_prefix } => {
+            move_from_extracted_to(extracted, &data_dir, &strip_prefix, tick)?;
+        }
+        DataArchivePlan::ExtractToModRoot { strip_prefix } => {
+            move_from_extracted_to(extracted, mod_dir, &strip_prefix, tick)?;
+        }
+    }
+
+    if data_dir.is_dir() {
+        normalize_paths_to_lowercase(&data_dir);
+    }
+
+    Ok(())
+}
+
+/// Move files from a pre-extracted archive into `dest_dir`, stripping
+/// `strip_prefix` from each entry path (case-insensitive prefix match).
+///
+/// Files are moved with [`std::fs::rename`] which is atomic and instant when
+/// the source and destination are on the same filesystem (the common case when
+/// the temp dir was created inside the game's mods directory via
+/// [`ExtractedArchive::from_archive_in`]).  If `rename` fails — e.g. because
+/// of a cross-device move — it falls back to copy + delete so the function
+/// always succeeds regardless of filesystem layout.
+fn move_from_extracted_to(
+    extracted: &ExtractedArchive,
+    dest_dir: &Path,
+    strip_prefix: &str,
+    tick: &dyn Fn(),
+) -> Result<(), String> {
+    let prefix_lower = strip_prefix.to_lowercase().replace('\\', "/");
+    let mut last_tick = std::time::Instant::now();
+
+    for entry in extracted.entries() {
+        let now = std::time::Instant::now();
+        if now.duration_since(last_tick).as_millis() as u64 >= EXTRACTION_TICK_INTERVAL_MS {
+            tick();
+            last_tick = now;
+        }
+
+        let entry_lower = entry.to_lowercase().replace('\\', "/");
+        let rel = if prefix_lower.is_empty() {
+            entry.as_str()
+        } else if let Some(rest) = entry_lower.strip_prefix(&prefix_lower) {
+            // Use the original-cased tail from `entry`.
+            &entry[entry.len() - rest.len()..]
+        } else {
+            continue;
+        };
+
+        let rel = rel.trim_start_matches('/');
+        if rel.is_empty() {
+            continue;
+        }
+        if !is_safe_relative_path(rel) {
+            installer_log_warning(format!("Skipping entry with unsafe path: {rel}"));
+            continue;
+        }
+
+        let src = extracted.dir().join(entry.as_str());
+        let dst = dest_dir.join(rel);
+
+        if src.is_dir() {
+            std::fs::create_dir_all(&dst)
+                .map_err(|e| format!("Failed to create directory {}: {e}", dst.display()))?;
+        } else if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dir: {e}"))?;
+            }
+            // Fast path: rename is atomic and instant on the same filesystem.
+            // Slow fallback: cross-device or other rename error → copy + delete.
+            if std::fs::rename(&src, &dst).is_err() {
+                std::fs::copy(&src, &dst).map_err(|e| {
+                    format!("Failed to move {} → {}: {e}", src.display(), dst.display())
+                })?;
+                let _ = std::fs::remove_file(&src);
+            }
         }
     }
 

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
+use super::extract::ExtractedArchive;
 use super::paths::{has_rar_extension, has_zip_extension, normalize_path};
 use super::types::{FOMOD_DIR_PREFIX, JUNK_TOPLEVEL_ENTRIES, SINGLE_FILE_READ_CAP};
 
@@ -50,6 +52,7 @@ pub(super) fn list_rar_entries(archive_path: &Path) -> Result<Vec<String>, Strin
 
 /// Load multiple files from an archive by path in a single pass.
 /// Optimized for solid 7z archives to prevent multiple full sequential scans.
+#[allow(dead_code)]
 pub fn read_archive_files_bytes(
     archive_path: &Path,
     relative_paths: &[&str],
@@ -153,6 +156,7 @@ pub fn read_archive_file_bytes(
 }
 
 /// Read multiple files from a non-zip archive in a single pass.
+#[allow(dead_code)]
 fn read_archive_files_bytes_non_zip(
     archive_path: &Path,
     relative_paths: &[&str],
@@ -209,21 +213,17 @@ fn read_archive_files_bytes_non_zip(
             .for_each_entries(|entry, entry_reader| {
                 let entry_lower = normalize_path(entry.name()).to_lowercase();
                 if let Some(rel_path) = target_set.get(&entry_lower)
-                    && !entry.is_directory() {
-                        let cap = std::cmp::min(entry.size() as usize, SINGLE_FILE_READ_CAP);
-                        let mut buf = Vec::with_capacity(cap);
-                        if entry_reader.read_to_end(&mut buf).is_ok() {
-                            results.insert(rel_path.clone(), buf);
-                        }
+                    && !entry.is_directory()
+                {
+                    let cap = std::cmp::min(entry.size() as usize, SINGLE_FILE_READ_CAP);
+                    let mut buf = Vec::with_capacity(cap);
+                    if entry_reader.read_to_end(&mut buf).is_ok() {
+                        results.insert(rel_path.clone(), buf);
                     }
+                }
                 Ok(true)
             })
-            .map_err(|e| {
-                format!(
-                    "Failed to read 7z archive {}: {e}",
-                    archive_path.display()
-                )
-            })?;
+            .map_err(|e| format!("Failed to read 7z archive {}: {e}", archive_path.display()))?;
     }
 
     Ok(results)
@@ -316,11 +316,63 @@ pub(super) fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String
         }
     }
 
-    if all_same
-        && let Some(ft) = first_top {
-            if zip.len() > 1 {
-                return format!("{ft}/");
-            }
+    if all_same && let Some(ft) = first_top {
+        if zip.len() > 1 {
+            return format!("{ft}/");
         }
+    }
     String::new()
+}
+
+/// Load image files from an already-extracted archive.
+///
+/// For each requested `image_path`, performs a case-insensitive search through
+/// the extracted entries and reads the matching file from the filesystem.
+/// Paths that cannot be found are silently skipped.
+pub fn read_images_from_extracted(
+    extracted: &ExtractedArchive,
+    image_paths: &[&str],
+) -> HashMap<String, Vec<u8>> {
+    let mut result = HashMap::new();
+    for &img_path in image_paths {
+        let norm = normalize_path(img_path).to_lowercase();
+        if norm.is_empty() {
+            continue;
+        }
+        let fomod_norm = format!("{FOMOD_DIR_PREFIX}{norm}");
+
+        let found = extracted.entries().iter().find(|e| {
+            let el = e.to_lowercase().replace('\\', "/");
+            el == norm
+                || el.ends_with(&format!("/{norm}"))
+                || el == fomod_norm
+                || el.ends_with(&format!("/{fomod_norm}"))
+        });
+
+        if let Some(entry) = found {
+            let full = extracted.dir().join(entry.as_str());
+            match std::fs::read(&full) {
+                Ok(bytes) => {
+                    log::trace!(
+                        "[Images] Loaded image from extracted dir | path={}, size={}",
+                        entry,
+                        bytes.len()
+                    );
+                    result.insert(img_path.to_string(), bytes);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[Images] Failed to read extracted image {}: {e}",
+                        full.display()
+                    );
+                }
+            }
+        } else {
+            log::debug!(
+                "[Images] Image not found in extracted archive | requested={}",
+                img_path
+            );
+        }
+    }
+    result
 }
