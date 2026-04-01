@@ -75,7 +75,11 @@ impl Drop for Span {
     fn drop(&mut self) {
         let elapsed = self.start.elapsed();
         if self.context.is_empty() {
-            log::info!("[Span] {} completed in {:.3}s", self.name, elapsed.as_secs_f64());
+            log::info!(
+                "[Span] {} completed in {:.3}s",
+                self.name,
+                elapsed.as_secs_f64()
+            );
         } else {
             log::info!(
                 "[Span] {} completed in {:.3}s | {}",
