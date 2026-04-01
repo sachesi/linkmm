@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -30,6 +31,19 @@ pub fn build_ui(app: &libadwaita::Application) {
     // Ensure this app is registered as the NXM protocol handler so that
     // clicking "Download with NXM" in the browser sends links here.
     register_nxm_handler();
+
+    // If any game is configured via UMU, check for a newer umu-run release in
+    // the background and re-download automatically when the tag has changed.
+    let has_umu_game = config.borrow().games.iter().any(|g| g.umu_config.is_some());
+    if has_umu_game {
+        let installed_version = config.borrow().umu_installed_version.clone();
+        let config_for_update = Rc::clone(&config);
+        crate::core::umu::check_and_update_in_background(installed_version, move |new_tag| {
+            let mut cfg = config_for_update.borrow_mut();
+            cfg.umu_installed_version = Some(new_tag);
+            cfg.save();
+        });
+    }
 }
 
 // ── Navigation constants ───────────────────────────────────────────────────
@@ -116,13 +130,13 @@ fn build_main_window(
     play_btn.set_margin_end(12);
     play_btn.set_margin_bottom(8);
 
-    // Show the button only when a game with a known Steam App ID is active.
+    // Show the button for Steam games (known App ID) and UMU-configured games.
     {
         let cfg = config.borrow();
         play_btn.set_visible(
             cfg.current_game()
-                .and_then(|g| g.kind.steam_app_id())
-                .is_some(),
+                .map(|g| g.kind.steam_app_id().is_some() || g.umu_config.is_some())
+                .unwrap_or(false),
         );
     }
 
@@ -130,10 +144,25 @@ fn build_main_window(
         let config_c = Rc::clone(&config);
         play_btn.connect_clicked(move |_| {
             let game = config_c.borrow().current_game().cloned();
-            if let Some(g) = game
-                && let Err(e) = crate::core::steam::launch_game(&g)
-            {
-                log::warn!("Could not launch {}: {e}", g.name);
+            let Some(g) = game else { return };
+
+            if let Some(ref umu_cfg) = g.umu_config {
+                // UMU-configured (non-Steam) game — launch via umu-run.
+                let app_id = g.kind.steam_app_id().unwrap_or(0);
+                match crate::core::umu::launch_with_umu(
+                    &umu_cfg.exe_path,
+                    app_id,
+                    umu_cfg.prefix_path.as_deref(),
+                    umu_cfg.proton_path.as_deref(),
+                ) {
+                    Ok(_) => log::info!("Launched {} via umu-run", g.name),
+                    Err(e) => log::warn!("Could not launch {} via umu-run: {e}", g.name),
+                }
+            } else {
+                // Steam game — launch via steam://run/<appid>.
+                if let Err(e) = crate::core::steam::launch_game(&g) {
+                    log::warn!("Could not launch {}: {e}", g.name);
+                }
             }
         });
     }
@@ -299,6 +328,7 @@ fn build_main_window(
         let content_page_c = content_page.clone();
         let config_c = Rc::clone(&config);
         let nav_lock_c = Rc::clone(&nav_lock);
+        let window_c = window.clone();
 
         nav_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
@@ -355,6 +385,14 @@ fn build_main_window(
                     content_stack_c.set_visible_child_name("tools");
                 }
                 NAV_PREFERENCES => {
+                    let new_prefs = settings::build_settings_page(
+                        Rc::clone(&config_c),
+                        &window_c.clone().upcast::<gtk4::Window>(),
+                    );
+                    if let Some(old) = content_stack_c.child_by_name("preferences") {
+                        content_stack_c.remove(&old);
+                    }
+                    content_stack_c.add_named(&new_prefs, Some("preferences"));
                     content_page_c.set_title("Preferences");
                     content_stack_c.set_visible_child_name("preferences");
                 }
@@ -373,6 +411,7 @@ fn build_main_window(
     let nav_list_r = nav_list.clone();
     let play_btn_r = play_btn.clone();
     let nav_lock_r = Rc::clone(&nav_lock);
+    let window_r = window.clone();
 
     let on_setup_done_rc: Rc<dyn Fn()> = Rc::new(move || {
         let game_info = {
@@ -386,12 +425,12 @@ fn build_main_window(
             update_active_game_row(&active_game_row_r, None);
         }
 
-        // Show Play button only when the active game has a Steam App ID.
+        // Show Play button for Steam games (has App ID) and UMU-configured games.
         play_btn_r.set_visible(
             game_info
                 .as_ref()
-                .and_then(|g| g.kind.steam_app_id())
-                .is_some(),
+                .map(|g| g.kind.steam_app_id().is_some() || g.umu_config.is_some())
+                .unwrap_or(false),
         );
 
         // Rebuild Library page for the new game
@@ -431,6 +470,16 @@ fn build_main_window(
             content_stack_r.remove(&old);
         }
         content_stack_r.add_named(&new_tools, Some("tools"));
+
+        // Rebuild Preferences page so the UMU section reflects the new game.
+        let new_prefs = settings::build_settings_page(
+            Rc::clone(&config_r),
+            &window_r.clone().upcast::<gtk4::Window>(),
+        );
+        if let Some(old) = content_stack_r.child_by_name("preferences") {
+            content_stack_r.remove(&old);
+        }
+        content_stack_r.add_named(&new_prefs, Some("preferences"));
 
         // Switch to Library
         content_page_r.set_title("Library");

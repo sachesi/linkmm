@@ -121,6 +121,14 @@ pub struct AppConfig {
     pub game_settings: HashMap<String, GameSettings>,
 
     // ── Logging preferences ───────────────────────────────────────────────
+    /// The release tag of the currently installed `umu-run` binary, e.g. `"1.4.0"`.
+    ///
+    /// Persisted in `config.toml` so the app can detect on next launch whether
+    /// a newer release is available and re-download automatically.
+    /// `None` means umu-run has not been downloaded yet.
+    #[serde(default)]
+    pub umu_installed_version: Option<String>,
+
     /// Show mod activity (Info-level) log entries in the log viewer.
     #[serde(default = "default_true")]
     pub log_activity: bool,
@@ -166,6 +174,7 @@ impl Default for AppConfig {
             log_errors: true,
             log_info: true,
             log_debug: true,
+            umu_installed_version: None,
             // Legacy fields – only meaningful during migration
             app_data_dir: None,
             installed_archives: Vec::new(),
@@ -233,10 +242,11 @@ impl AppConfig {
     pub fn save(&self) {
         let path = Self::config_path();
         if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent) {
-                log::error!("Failed to create config directory: {e}");
-                return;
-            }
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            log::error!("Failed to create config directory: {e}");
+            return;
+        }
         match toml::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {
@@ -258,9 +268,7 @@ impl AppConfig {
     /// Mutable access to per-game settings for `game_id`, creating a default
     /// entry if one does not yet exist.
     pub fn game_settings_mut(&mut self, game_id: &str) -> &mut GameSettings {
-        self.game_settings
-            .entry(game_id.to_string())
-            .or_default()
+        self.game_settings.entry(game_id.to_string()).or_default()
     }
 
     /// Set `mods_base_dir` on every game based on the per-game `app_data_dir`.
@@ -272,9 +280,7 @@ impl AppConfig {
             .map(|(id, gs)| (id.clone(), gs.app_data_dir.clone()))
             .collect();
         for game in &mut self.games {
-            game.mods_base_dir = gs_snapshot
-                .get(&game.id)
-                .and_then(|d| d.clone());
+            game.mods_base_dir = gs_snapshot.get(&game.id).and_then(|d| d.clone());
             game.data_path = game.root_path.join(game.kind.default_data_subdir());
         }
     }
