@@ -134,11 +134,15 @@ impl ModDatabase {
     fn loot_game_type(game: &Game) -> LootGameType {
         match game.kind {
             crate::core::games::GameKind::SkyrimSE => LootGameType::SkyrimSE,
+            crate::core::games::GameKind::SkyrimVR => LootGameType::SkyrimVR,
             crate::core::games::GameKind::SkyrimLE => LootGameType::Skyrim,
             crate::core::games::GameKind::Fallout4 => LootGameType::Fallout4,
+            crate::core::games::GameKind::Fallout4VR => LootGameType::Fallout4VR,
             crate::core::games::GameKind::Fallout3 => LootGameType::Fallout3,
             crate::core::games::GameKind::FalloutNV => LootGameType::FalloutNV,
             crate::core::games::GameKind::Oblivion => LootGameType::Oblivion,
+            crate::core::games::GameKind::Morrowind => LootGameType::Morrowind,
+            crate::core::games::GameKind::Starfield => LootGameType::Starfield,
         }
     }
 
@@ -547,7 +551,6 @@ impl ModManager {
     }
 }
 
-
 mod tests {
     use super::*;
 
@@ -625,6 +628,7 @@ mod tests {
             root_path: game_root.clone(),
             data_path: data_dir,
             mods_base_dir: Some(mods_base),
+            umu_config: None,
         };
         let db = ModDatabase {
             plugin_load_order: vec!["z.esp".to_string(), "a.esm".to_string()],
@@ -680,6 +684,7 @@ mod tests {
             root_path: game_root,
             data_path: data_dir,
             mods_base_dir: Some(mods_base),
+            umu_config: None,
         };
 
         let mut db = ModDatabase {
@@ -720,6 +725,7 @@ mod tests {
             root_path: game_root.clone(),
             data_path: game_root.join("Data"),
             mods_base_dir: Some(mods_base.clone()),
+            umu_config: None,
         };
 
         // Create a mod directory with a Data/ subfolder and a file.

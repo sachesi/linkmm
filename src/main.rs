@@ -11,6 +11,7 @@ mod core {
     pub mod nexus;
     pub mod nxm;
     pub mod steam;
+    pub mod umu;
 }
 pub mod ui;
 
