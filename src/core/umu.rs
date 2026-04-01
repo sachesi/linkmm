@@ -49,7 +49,8 @@ const GITHUB_API_LATEST: &str =
     "https://api.github.com/repos/Open-Wine-Components/umu-launcher/releases/latest";
 
 /// Template for the zipapp tarball URL.  `{tag}` is substituted at runtime.
-const ZIPAPP_URL_TEMPLATE: &str = "https://github.com/Open-Wine-Components/umu-launcher/releases/download\
+const ZIPAPP_URL_TEMPLATE: &str =
+    "https://github.com/Open-Wine-Components/umu-launcher/releases/download\
      /{tag}/umu-launcher-{tag}-zipapp.tar";
 
 /// Default Wine prefix used when none is configured.
