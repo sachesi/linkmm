@@ -65,10 +65,7 @@ impl VirtualTree {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| archive_path.display().to_string());
 
-        let _span = logger::span(
-            "VirtualTree::build",
-            &format!("archive={archive_name}"),
-        );
+        let _span = logger::span("VirtualTree::build", &format!("archive={archive_name}"));
 
         let format = detect_format(archive_path)?;
 
@@ -118,8 +115,7 @@ impl VirtualTree {
     pub fn has_fomod_config(&self) -> bool {
         self.entries.iter().any(|p| {
             let lower = p.to_lowercase().replace('\\', "/");
-            lower == "fomod/moduleconfig.xml"
-                || lower.ends_with("/fomod/moduleconfig.xml")
+            lower == "fomod/moduleconfig.xml" || lower.ends_with("/fomod/moduleconfig.xml")
         })
     }
 
@@ -225,10 +221,8 @@ mod tests {
     fn tempdir() -> std::path::PathBuf {
         static CTR: AtomicU32 = AtomicU32::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "linkmm_archive_test_{}_{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("linkmm_archive_test_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -297,19 +291,13 @@ mod tests {
         );
         let tree = VirtualTree::from_archive(&archive).unwrap();
         assert!(tree.has_fomod_config());
-        assert_eq!(
-            tree.find_fomod_parent(),
-            Some("MyMod".to_string())
-        );
+        assert_eq!(tree.find_fomod_parent(), Some("MyMod".to_string()));
     }
 
     #[test]
     fn virtual_tree_no_fomod() {
         let tmp = tempdir();
-        let archive = create_test_zip(
-            &tmp,
-            &[("textures/sky.dds", b"dds")],
-        );
+        let archive = create_test_zip(&tmp, &[("textures/sky.dds", b"dds")]);
         let tree = VirtualTree::from_archive(&archive).unwrap();
         assert!(!tree.has_fomod_config());
         assert_eq!(tree.find_fomod_parent(), None);
