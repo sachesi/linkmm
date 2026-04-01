@@ -128,6 +128,7 @@ struct CacheEntry {
 struct RequestError {
     message: String,
     transient: bool,
+    retry_after: Option<Duration>,
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -209,8 +210,16 @@ impl NexusClient {
                     if !err.transient || attempt == self.max_retries {
                         break;
                     }
-                    let sleep_ms = self.backoff_base_ms * (1_u64 << attempt);
-                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                    let backoff_ms = self.backoff_base_ms * (1_u64 << attempt);
+                    let backoff = Duration::from_millis(backoff_ms);
+                    let sleep_for = err.retry_after.map_or(backoff, |retry_after| {
+                        if retry_after > backoff {
+                            retry_after
+                        } else {
+                            backoff
+                        }
+                    });
+                    std::thread::sleep(sleep_for);
                 }
             }
         }
@@ -237,10 +246,12 @@ impl NexusClient {
             .and_then(|resp| resp.into_string())
             .map_err(|err| match err {
                 ureq::Error::Status(code, resp) => {
+                    let retry_after = parse_retry_after_header(resp.header("Retry-After"));
                     let body = resp.into_string().unwrap_or_default();
                     RequestError {
                         message: format!("Request failed with status {code}: {body}"),
                         transient: code == 408 || code == 429 || (500..=599).contains(&code),
+                        retry_after,
                     }
                 }
                 ureq::Error::Transport(t) => {
@@ -255,6 +266,7 @@ impl NexusClient {
                     RequestError {
                         message: format!("Request failed: {msg}"),
                         transient,
+                        retry_after: None,
                     }
                 }
             })
@@ -383,6 +395,11 @@ impl NexusClient {
     }
 }
 
+fn parse_retry_after_header(retry_after: Option<&str>) -> Option<Duration> {
+    let secs = retry_after?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +442,19 @@ mod tests {
             .expect("should parse cached json");
         assert_eq!(parsed.mod_id, 1);
         assert_eq!(client.telemetry().api_requests_saved_by_cache, 1);
+    }
+
+    #[test]
+    fn parse_retry_after_header_accepts_seconds() {
+        assert_eq!(
+            parse_retry_after_header(Some("3")),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_header_rejects_invalid_values() {
+        assert_eq!(parse_retry_after_header(Some("soon")), None);
+        assert_eq!(parse_retry_after_header(None), None);
     }
 }
