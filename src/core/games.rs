@@ -345,7 +345,11 @@ impl Game {
             .join("AppData")
             .join("Local")
             .join(sub);
-        if path.is_dir() { Some(path) } else { None }
+        if path.is_dir() {
+            Some(path)
+        } else {
+            None
+        }
     }
 
     /// Return the expected path of `plugins.txt`, even if it does not yet exist.

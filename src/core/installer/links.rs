@@ -15,12 +15,8 @@ use super::types::LinkKind;
 pub fn determine_link_type(src: &Path, dest_dir: &Path) -> LinkKind {
     use std::os::unix::fs::MetadataExt;
 
-    let src_dev = std::fs::metadata(src)
-        .map(|m| m.dev())
-        .unwrap_or(0);
-    let dest_dev = std::fs::metadata(dest_dir)
-        .map(|m| m.dev())
-        .unwrap_or(1); // Different default to force symlink on failure
+    let src_dev = std::fs::metadata(src).map(|m| m.dev()).unwrap_or(0);
+    let dest_dev = std::fs::metadata(dest_dir).map(|m| m.dev()).unwrap_or(1); // Different default to force symlink on failure
 
     if src_dev != 0 && src_dev == dest_dev {
         LinkKind::Hardlink

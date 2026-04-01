@@ -502,15 +502,14 @@ fn install_fomod_files_matches_sources_in_wrapped_archives() {
     .unwrap();
 
     assert!(dest.join("AelaStandalone.esp").exists());
-    assert!(
-        dest.join("textures")
-            .join("Actors")
-            .join("Character")
-            .join("Aela")
-            .join("Head")
-            .join("femalehead.dds")
-            .exists()
-    );
+    assert!(dest
+        .join("textures")
+        .join("Actors")
+        .join("Character")
+        .join("Aela")
+        .join("Head")
+        .join("femalehead.dds")
+        .exists());
 }
 
 #[test]
@@ -1104,10 +1103,9 @@ fn install_fomod_files_diamond_skin_conditional_pattern() {
     }];
     install_fomod_files(&archive, &dest, &files).unwrap();
 
-    assert!(
-        dest.join("textures/actors/character/female/femalebody_1.dds")
-            .exists()
-    );
+    assert!(dest
+        .join("textures/actors/character/female/femalebody_1.dds")
+        .exists());
     assert!(!dest.join("CBBE 4K").exists());
     assert!(!dest.join("CBBE 2K").exists());
 }

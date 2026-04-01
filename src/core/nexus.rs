@@ -1,11 +1,14 @@
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
 // These types and methods are part of the Nexus API client which will be used
-// in future download functionality.  Suppress dead-code lints until then.
+// in future download functionality. Suppress dead-code lints until then.
 #[allow(dead_code)]
-
 #[derive(Debug, Clone)]
 pub struct NexusUser {
     pub user_id: u64,
@@ -49,6 +52,13 @@ pub struct NexusModFile {
     pub is_primary: bool,
     pub size_kb: u64,
     pub file_name: String,
+}
+
+/// Non-sensitive counters for Nexus API behavior.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NexusTelemetry {
+    pub api_requests_saved_by_cache: u64,
 }
 
 // ── Private deserialization types ─────────────────────────────────────────────
@@ -108,10 +118,27 @@ struct NexusDownloadLink {
     short_name: String,
 }
 
+#[derive(Debug)]
+struct CacheEntry {
+    body: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct RequestError {
+    message: String,
+    transient: bool,
+}
+
 // ── Client ────────────────────────────────────────────────────────────────────
 
 pub struct NexusClient {
     pub api_key: String,
+    cache_ttl: Duration,
+    max_retries: usize,
+    backoff_base_ms: u64,
+    cache: Mutex<HashMap<String, CacheEntry>>,
+    cache_hits: AtomicU64,
 }
 
 #[allow(dead_code)]
@@ -119,22 +146,123 @@ impl NexusClient {
     pub fn new(api_key: &str) -> Self {
         Self {
             api_key: api_key.to_string(),
+            cache_ttl: Duration::from_secs(60),
+            max_retries: 2,
+            backoff_base_ms: 250,
+            cache: Mutex::new(HashMap::new()),
+            cache_hits: AtomicU64::new(0),
         }
     }
 
-    fn get(&self, url: &str) -> Result<ureq::Response, String> {
-        ureq::get(url)
+    pub fn telemetry(&self) -> NexusTelemetry {
+        NexusTelemetry {
+            api_requests_saved_by_cache: self.cache_hits.load(Ordering::Relaxed),
+        }
+    }
+
+    fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, String> {
+        let body = self.get_body_with_retry(url, None)?;
+        serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))
+    }
+
+    fn get_json_cached<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, String> {
+        let body = self.get_cached_or_fetch(url)?;
+        serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))
+    }
+
+    fn get_cached_or_fetch(&self, url: &str) -> Result<String, String> {
+        if let Ok(cache) = self.cache.lock()
+            && let Some(entry) = cache.get(url)
+            && entry.expires_at > Instant::now()
+        {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(entry.body.clone());
+        }
+
+        let body = self.get_body_with_retry(url, None)?;
+
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(
+                url.to_string(),
+                CacheEntry {
+                    body: body.clone(),
+                    expires_at: Instant::now() + self.cache_ttl,
+                },
+            );
+        }
+
+        Ok(body)
+    }
+
+    fn get_body_with_retry(
+        &self,
+        url: &str,
+        query: Option<&[(&str, &str)]>,
+    ) -> Result<String, String> {
+        let mut last_err = String::new();
+
+        for attempt in 0..=self.max_retries {
+            match self.perform_get(url, query) {
+                Ok(body) => return Ok(body),
+                Err(err) => {
+                    last_err = err.message;
+                    if !err.transient || attempt == self.max_retries {
+                        break;
+                    }
+                    let sleep_ms = self.backoff_base_ms * (1_u64 << attempt);
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                }
+            }
+        }
+
+        Err(last_err)
+    }
+
+    fn perform_get(
+        &self,
+        url: &str,
+        query: Option<&[(&str, &str)]>,
+    ) -> Result<String, RequestError> {
+        let mut req = ureq::get(url)
             .set("apikey", &self.api_key)
-            .set("User-Agent", "Linkmm/0.1.0")
-            .call()
-            .map_err(|e| format!("Request failed: {e}"))
+            .set("User-Agent", "Linkmm/0.1.0");
+
+        if let Some(query) = query {
+            for (key, value) in query {
+                req = req.query(key, value);
+            }
+        }
+
+        req.call()
+            .and_then(|resp| resp.into_string())
+            .map_err(|err| match err {
+                ureq::Error::Status(code, resp) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    RequestError {
+                        message: format!("Request failed with status {code}: {body}"),
+                        transient: code == 408 || code == 429 || (500..=599).contains(&code),
+                    }
+                }
+                ureq::Error::Transport(t) => {
+                    let msg = t.to_string();
+                    let lower = msg.to_lowercase();
+                    let transient = lower.contains("timed out")
+                        || lower.contains("timeout")
+                        || lower.contains("tempor")
+                        || lower.contains("connection reset")
+                        || lower.contains("connection refused")
+                        || lower.contains("dns");
+                    RequestError {
+                        message: format!("Request failed: {msg}"),
+                        transient,
+                    }
+                }
+            })
     }
 
     pub fn validate(&self) -> Result<NexusUser, String> {
-        let response = self.get("https://api.nexusmods.com/v1/users/validate.json")?;
-        let data: NexusUserResponse = response
-            .into_json()
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        let data: NexusUserResponse =
+            self.get_json("https://api.nexusmods.com/v1/users/validate.json")?;
         Ok(NexusUser {
             user_id: data.user_id,
             username: data.name,
@@ -145,13 +273,8 @@ impl NexusClient {
     }
 
     pub fn get_mod(&self, game_domain: &str, mod_id: u32) -> Result<NexusMod, String> {
-        let url = format!(
-            "https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}.json"
-        );
-        let response = self.get(&url)?;
-        let data: NexusModResponse = response
-            .into_json()
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        let url = format!("https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}.json");
+        let data: NexusModResponse = self.get_json_cached(&url)?;
         Ok(NexusMod {
             mod_id: data.mod_id,
             name: data.name,
@@ -176,10 +299,7 @@ impl NexusClient {
     }
 
     fn fetch_mod_list(&self, url: &str) -> Result<Vec<NexusModInfo>, String> {
-        let response = self.get(url)?;
-        let data: Vec<NexusModListItem> = response
-            .into_json()
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        let data: Vec<NexusModListItem> = self.get_json_cached(url)?;
         Ok(data
             .into_iter()
             .map(|m| NexusModInfo {
@@ -200,13 +320,9 @@ impl NexusClient {
         game_domain: &str,
         mod_id: u32,
     ) -> Result<Vec<NexusModFile>, String> {
-        let url = format!(
-            "https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}/files.json"
-        );
-        let response = self.get(&url)?;
-        let data: NexusFilesResponse = response
-            .into_json()
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        let url =
+            format!("https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}/files.json");
+        let data: NexusFilesResponse = self.get_json_cached(&url)?;
         Ok(data
             .files
             .into_iter()
@@ -234,10 +350,7 @@ impl NexusClient {
         let url = format!(
             "https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}/files/{file_id}/download_link.json"
         );
-        let response = self.get(&url)?;
-        let data: Vec<NexusDownloadLink> = response
-            .into_json()
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        let data: Vec<NexusDownloadLink> = self.get_json(&url)?;
         Ok(data.into_iter().map(|l| (l.short_name, l.uri)).collect())
     }
 
@@ -257,22 +370,60 @@ impl NexusClient {
         let url = format!(
             "https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}/files/{file_id}/download_link.json"
         );
-        // Use ureq query parameters to avoid URL injection
-        let response = ureq::get(&url)
-            .set("apikey", &self.api_key)
-            .set("User-Agent", "Linkmm/0.1.0")
-            .query("key", key)
-            .query("expires", expires)
-            .call()
-            .map_err(|e| format!("Request failed: {e}"))?;
-        let data: Vec<NexusDownloadLink> = response
-            .into_json()
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        let query = [("key", key), ("expires", expires)];
+        let body = self.get_body_with_retry(&url, Some(&query))?;
+        let data: Vec<NexusDownloadLink> =
+            serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
         Ok(data.into_iter().map(|l| (l.short_name, l.uri)).collect())
     }
 
     /// Return the public Nexus Mods page URL for the given mod.
     pub fn mod_page_url(game_domain: &str, mod_id: u64) -> String {
         format!("https://www.nexusmods.com/{game_domain}/mods/{mod_id}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_defaults_to_zero() {
+        let client = NexusClient::new("abc");
+        assert_eq!(
+            client.telemetry(),
+            NexusTelemetry {
+                api_requests_saved_by_cache: 0
+            }
+        );
+    }
+
+    #[test]
+    fn mod_page_url_is_stable() {
+        assert_eq!(
+            NexusClient::mod_page_url("skyrimspecialedition", 123),
+            "https://www.nexusmods.com/skyrimspecialedition/mods/123"
+        );
+    }
+
+    #[test]
+    fn cache_can_store_and_hit_without_network() {
+        let client = NexusClient::new("abc");
+        {
+            let mut cache = client.cache.lock().unwrap();
+            cache.insert(
+                "https://example.test/item".to_string(),
+                CacheEntry {
+                    body: "{\"mod_id\":1,\"name\":\"X\",\"summary\":null,\"version\":null,\"author\":null}".to_string(),
+                    expires_at: Instant::now() + Duration::from_secs(10),
+                },
+            );
+        }
+
+        let parsed: NexusModResponse = client
+            .get_json_cached("https://example.test/item")
+            .expect("should parse cached json");
+        assert_eq!(parsed.mod_id, 1);
+        assert_eq!(client.telemetry().api_requests_saved_by_cache, 1);
     }
 }

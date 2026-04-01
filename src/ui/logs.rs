@@ -121,7 +121,13 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
 
             let (show_errors, show_warnings, show_activity, show_info, show_debug) = {
                 let cfg = config_c.borrow();
-                (cfg.log_errors, cfg.log_warnings, cfg.log_activity, cfg.log_info, cfg.log_debug)
+                (
+                    cfg.log_errors,
+                    cfg.log_warnings,
+                    cfg.log_activity,
+                    cfg.log_info,
+                    cfg.log_debug,
+                )
             };
 
             let mut end_iter = text_buffer_c.end_iter();
@@ -139,11 +145,7 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
 
                 // Timestamp in dim grey
                 let time_str = format!("[{}] ", entry.time_str());
-                text_buffer_c.insert_with_tags(
-                    &mut end_iter,
-                    &time_str,
-                    &[&tag_time_c],
-                );
+                text_buffer_c.insert_with_tags(&mut end_iter, &time_str, &[&tag_time_c]);
 
                 // Level tag
                 let level_str = format!("{} ", entry.level_str());
@@ -152,17 +154,10 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
                     Level::Warn => &tag_warn_c,
                     _ => &tag_info_c,
                 };
-                text_buffer_c.insert_with_tags(
-                    &mut end_iter,
-                    &level_str,
-                    &[level_tag],
-                );
+                text_buffer_c.insert_with_tags(&mut end_iter, &level_str, &[level_tag]);
 
                 // Message and newline
-                text_buffer_c.insert(
-                    &mut end_iter,
-                    &format!("{}\n", entry.message),
-                );
+                text_buffer_c.insert(&mut end_iter, &format!("{}\n", entry.message));
             }
 
             *rendered_count_c.borrow_mut() = entries.len();
@@ -181,14 +176,17 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
     let refresh_timeout = Rc::clone(&refresh_rc);
     let win_weak = win.downgrade();
 
-    glib::timeout_add_local(std::time::Duration::from_millis(LOG_REFRESH_INTERVAL_MS), move || {
-        // Stop the timer once the window is closed.
-        if win_weak.upgrade().is_none() {
-            return glib::ControlFlow::Break;
-        }
-        refresh_timeout();
-        glib::ControlFlow::Continue
-    });
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(LOG_REFRESH_INTERVAL_MS),
+        move || {
+            // Stop the timer once the window is closed.
+            if win_weak.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            refresh_timeout();
+            glib::ControlFlow::Continue
+        },
+    );
 
     // ── Clear button handler ───────────────────────────────────────────────
     {
