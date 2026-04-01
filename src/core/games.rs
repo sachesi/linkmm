@@ -4,33 +4,45 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GameKind {
     SkyrimSE,
+    SkyrimVR,
     SkyrimLE,
     Fallout4,
+    Fallout4VR,
     Fallout3,
     FalloutNV,
     Oblivion,
+    Morrowind,
+    Starfield,
 }
 
 impl GameKind {
     pub fn display_name(&self) -> &str {
         match self {
             GameKind::SkyrimSE => "The Elder Scrolls V: Skyrim Special Edition",
+            GameKind::SkyrimVR => "The Elder Scrolls V: Skyrim VR",
             GameKind::SkyrimLE => "The Elder Scrolls V: Skyrim",
             GameKind::Fallout4 => "Fallout 4",
+            GameKind::Fallout4VR => "Fallout 4 VR",
             GameKind::Fallout3 => "Fallout 3",
             GameKind::FalloutNV => "Fallout: New Vegas",
             GameKind::Oblivion => "The Elder Scrolls IV: Oblivion",
+            GameKind::Morrowind => "The Elder Scrolls III: Morrowind",
+            GameKind::Starfield => "Starfield",
         }
     }
 
     pub fn steam_app_id(&self) -> Option<u32> {
         match self {
             GameKind::SkyrimSE => Some(489830),
+            GameKind::SkyrimVR => Some(611670),
             GameKind::SkyrimLE => Some(72850),
             GameKind::Fallout4 => Some(377160),
+            GameKind::Fallout4VR => Some(611660),
             GameKind::Fallout3 => Some(22300),
             GameKind::FalloutNV => Some(22380),
             GameKind::Oblivion => Some(22330),
+            GameKind::Morrowind => Some(22320),
+            GameKind::Starfield => Some(1716740),
         }
     }
 
@@ -41,47 +53,59 @@ impl GameKind {
     pub fn all() -> Vec<GameKind> {
         vec![
             GameKind::SkyrimSE,
+            GameKind::SkyrimVR,
             GameKind::SkyrimLE,
             GameKind::Fallout4,
+            GameKind::Fallout4VR,
             GameKind::Fallout3,
             GameKind::FalloutNV,
             GameKind::Oblivion,
+            GameKind::Morrowind,
+            GameKind::Starfield,
         ]
     }
 
     pub fn id_str(&self) -> &str {
         match self {
             GameKind::SkyrimSE => "skyrim_se",
+            GameKind::SkyrimVR => "skyrim_vr",
             GameKind::SkyrimLE => "skyrim_le",
             GameKind::Fallout4 => "fallout4",
+            GameKind::Fallout4VR => "fallout4_vr",
             GameKind::Fallout3 => "fallout3",
             GameKind::FalloutNV => "fallout_nv",
             GameKind::Oblivion => "oblivion",
+            GameKind::Morrowind => "morrowind",
+            GameKind::Starfield => "starfield",
         }
     }
 
     pub fn nexus_game_id(&self) -> &str {
         match self {
             GameKind::SkyrimSE => "skyrimspecialedition",
+            GameKind::SkyrimVR => "skyrimspecialedition",
             GameKind::SkyrimLE => "skyrim",
             GameKind::Fallout4 => "fallout4",
+            GameKind::Fallout4VR => "fallout4",
             GameKind::Fallout3 => "fallout3",
             GameKind::FalloutNV => "newvegas",
             GameKind::Oblivion => "oblivion",
+            GameKind::Morrowind => "morrowind",
+            GameKind::Starfield => "starfield",
         }
     }
 
     /// Canonical vanilla master plugins for this game, in load-order priority.
     pub fn vanilla_masters(&self) -> &'static [&'static str] {
         match self {
-            GameKind::SkyrimSE | GameKind::SkyrimLE => &[
+            GameKind::SkyrimSE | GameKind::SkyrimVR | GameKind::SkyrimLE => &[
                 "Skyrim.esm",
                 "Update.esm",
                 "Dawnguard.esm",
                 "HearthFires.esm",
                 "Dragonborn.esm",
             ],
-            GameKind::Fallout4 => &[
+            GameKind::Fallout4 | GameKind::Fallout4VR => &[
                 "Fallout4.esm",
                 "DLCRobot.esm",
                 "DLCworkshop01.esm",
@@ -104,6 +128,8 @@ impl GameKind {
                 "TribalPack.esm",
             ],
             GameKind::Oblivion => &["Oblivion.esm"],
+            GameKind::Morrowind => &["Morrowind.esm", "Tribunal.esm", "Bloodmoon.esm"],
+            GameKind::Starfield => &["Starfield.esm"],
         }
     }
 
@@ -112,13 +138,82 @@ impl GameKind {
     pub fn local_app_data_folder(&self) -> &'static str {
         match self {
             GameKind::SkyrimSE => "Skyrim Special Edition",
+            GameKind::SkyrimVR => "Skyrim VR",
             GameKind::SkyrimLE => "Skyrim",
             GameKind::Fallout4 => "Fallout4",
+            GameKind::Fallout4VR => "Fallout4VR",
             GameKind::Fallout3 => "Fallout3",
             GameKind::FalloutNV => "FalloutNV",
             GameKind::Oblivion => "Oblivion",
+            GameKind::Morrowind => "Morrowind",
+            GameKind::Starfield => "Starfield",
         }
     }
+
+    /// Return the `GAMEID` string used by umu-launcher for this game.
+    ///
+    /// The format is `"umu-<steam_app_id>"`, which enables automatic protonfixes
+    /// for the game.  All supported games have a Steam App ID so this always
+    /// returns a valid string.
+    pub fn umu_game_id(&self) -> String {
+        format!(
+            "umu-{}",
+            self.steam_app_id()
+                .expect("all GameKind variants have a Steam App ID")
+        )
+    }
+
+    /// Try to identify a GameKind from a known game executable filename.
+    /// Returns `None` if the executable is not recognized.
+    pub fn from_executable(exe_name: &str) -> Option<GameKind> {
+        match exe_name {
+            // Skyrim SE
+            "SkyrimSE.exe" | "SkyrimSELauncher.exe" | "skse64_loader.exe" => {
+                Some(GameKind::SkyrimSE)
+            }
+            // Skyrim VR
+            "SkyrimVR.exe" | "sksevr_loader.exe" => Some(GameKind::SkyrimVR),
+            // Skyrim LE
+            "TESV.exe" | "SkyrimLauncher.exe" | "skse_loader.exe" => Some(GameKind::SkyrimLE),
+            // Oblivion
+            "Oblivion.exe" | "OblivionLauncher.exe" | "obse_loader.exe" => Some(GameKind::Oblivion),
+            // Morrowind
+            "Morrowind.exe" | "Morrowind Launcher.exe" | "MWSE.exe" => Some(GameKind::Morrowind),
+            // Fallout 4
+            "Fallout4.exe" | "Fallout4Launcher.exe" | "f4se_loader.exe" => Some(GameKind::Fallout4),
+            // Fallout 4 VR
+            "Fallout4VR.exe" | "f4sevr_loader.exe" => Some(GameKind::Fallout4VR),
+            // Fallout NV
+            "FalloutNV.exe" | "FalloutNVLauncher.exe" | "nvse_loader.exe" | "xnvse_loader.exe" => {
+                Some(GameKind::FalloutNV)
+            }
+            // Fallout 3
+            "Fallout3.exe" | "FalloutLauncher.exe" | "fose_loader.exe" => Some(GameKind::Fallout3),
+            // Starfield
+            "Starfield.exe" | "sfse_loader.exe" => Some(GameKind::Starfield),
+            _ => None,
+        }
+    }
+}
+
+/// Configuration for launching a game through umu-launcher (non-Steam).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UmuGameConfig {
+    /// Absolute path to the Windows game executable (.exe).
+    pub exe_path: PathBuf,
+    /// Optional Wine/Proton prefix directory (`WINEPREFIX`).
+    ///
+    /// When `None`, umu uses its built-in default prefix located at
+    /// `~/.local/share/umu/default`, which is created automatically on first
+    /// run.  No manual setup is required.
+    pub prefix_path: Option<PathBuf>,
+    /// Optional explicit path to a Proton installation (`PROTONPATH`).
+    ///
+    /// When `None`, umu receives `PROTONPATH=GE-Proton` (a magic string that
+    /// instructs umu to automatically download the latest GE-Proton release
+    /// into `~/.local/share/Steam/compatibilitytools.d/` on first run).
+    /// Steam itself does **not** need to be installed for this to work.
+    pub proton_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +231,10 @@ pub struct Game {
     /// Populated from `AppConfig::app_data_dir` at load time.
     #[serde(skip)]
     pub mods_base_dir: Option<PathBuf>,
+    /// UMU launcher configuration for non-Steam games. When set, the game
+    /// was configured through the UMU/Custom setup path rather than Steam.
+    #[serde(default)]
+    pub umu_config: Option<UmuGameConfig>,
 }
 
 /// Entry in the per-game NXM metadata file, recording the Nexus mod ID and
@@ -158,6 +257,23 @@ impl Game {
             root_path,
             data_path,
             mods_base_dir: None,
+            umu_config: None,
+        }
+    }
+
+    /// Create a new UMU-based (non-Steam) game from an executable path.
+    pub fn new_umu(kind: GameKind, root_path: PathBuf, umu_cfg: UmuGameConfig) -> Self {
+        let data_path = root_path.join(kind.default_data_subdir());
+        let id = kind.id_str().to_string();
+        let name = kind.display_name().to_string();
+        Self {
+            id,
+            name,
+            kind,
+            root_path,
+            data_path,
+            mods_base_dir: None,
+            umu_config: Some(umu_cfg),
         }
     }
 
@@ -186,9 +302,40 @@ impl Game {
     ///
     /// Returns `None` when no matching directory is found.
     pub fn plugins_txt_dir(&self) -> Option<PathBuf> {
-        let app_id = self.kind.steam_app_id()?;
         let sub = self.kind.local_app_data_folder();
 
+        // UMU-configured game: look inside the configured prefix
+        if let Some(ref umu) = self.umu_config {
+            if let Some(ref prefix) = umu.prefix_path {
+                let path = prefix
+                    .join("pfx")
+                    .join("drive_c")
+                    .join("users")
+                    .join("steamuser")
+                    .join("AppData")
+                    .join("Local")
+                    .join(sub);
+                if path.is_dir() {
+                    return Some(path);
+                }
+                // Also try without the "pfx" subdirectory in case prefix points directly there
+                let path_alt = prefix
+                    .join("drive_c")
+                    .join("users")
+                    .join("steamuser")
+                    .join("AppData")
+                    .join("Local")
+                    .join(sub);
+                if path_alt.is_dir() {
+                    return Some(path_alt);
+                }
+            }
+            // If no prefix, umu uses its default - we can't determine it easily
+            return None;
+        }
+
+        // Steam-configured game: use compatdata
+        let app_id = self.kind.steam_app_id()?;
         let compatdata = crate::core::steam::find_compatdata_path(app_id)?;
         let path = compatdata
             .join("pfx")
@@ -198,11 +345,7 @@ impl Game {
             .join("AppData")
             .join("Local")
             .join(sub);
-        if path.is_dir() {
-            Some(path)
-        } else {
-            None
-        }
+        if path.is_dir() { Some(path) } else { None }
     }
 
     /// Return the expected path of `plugins.txt`, even if it does not yet exist.
@@ -236,8 +379,7 @@ impl Game {
     pub fn read_nxm_mod_id(&self, archive_name: &str) -> Option<u32> {
         let path = self.config_dir().join("nxm_metadata.toml");
         let contents = std::fs::read_to_string(&path).ok()?;
-        let map: std::collections::HashMap<String, NxmEntry> =
-            toml::from_str(&contents).ok()?;
+        let map: std::collections::HashMap<String, NxmEntry> = toml::from_str(&contents).ok()?;
         let entry = map.get(archive_name)?;
         if entry.game_domain != self.kind.nexus_game_id() {
             return None;
@@ -277,8 +419,7 @@ impl Game {
         );
         let body = toml::to_string_pretty(&map)
             .map_err(|e| format!("Failed to serialize NXM metadata: {e}"))?;
-        std::fs::write(&path, body)
-            .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+        std::fs::write(&path, body).map_err(|e| format!("Failed to write {}: {e}", path.display()))
     }
 
     /// Remove the NXM metadata entry for `archive_name` from the consolidated
@@ -291,8 +432,7 @@ impl Game {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             return;
         };
-        let Ok(mut map) =
-            toml::from_str::<std::collections::HashMap<String, NxmEntry>>(&contents)
+        let Ok(mut map) = toml::from_str::<std::collections::HashMap<String, NxmEntry>>(&contents)
         else {
             return;
         };
@@ -304,7 +444,6 @@ impl Game {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

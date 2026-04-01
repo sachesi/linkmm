@@ -10,13 +10,26 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
-use crate::core::games::{Game, GameKind};
+use crate::core::games::{Game, GameKind, UmuGameConfig};
 use crate::core::installer::{
-    DependencyOperator, FlagDependency, FomodConfig,
-    FomodFile, FomodGroupType, FomodInstallStep, FomodPlugin, FomodPluginType, InstallStrategy,
-    PluginDependencies,
+    DependencyOperator, FlagDependency, FomodConfig, FomodFile, FomodGroupType, FomodInstallStep,
+    FomodPlugin, FomodPluginType, InstallStrategy, PluginDependencies,
 };
 use crate::core::steam;
+use crate::core::umu;
+
+/// Represents how the user chose to set up a game in the wizard.
+#[derive(Clone, Debug)]
+enum GameSelection {
+    /// A Steam-detected or manually-added game (no UMU).
+    Steam(GameKind, std::path::PathBuf),
+    /// A game configured via UMU-launcher (non-Steam).
+    Umu {
+        kind: GameKind,
+        root_path: std::path::PathBuf,
+        umu_cfg: UmuGameConfig,
+    },
+}
 
 pub fn show_setup_wizard<F: Fn() + 'static>(
     parent: &adw::ApplicationWindow,
@@ -46,8 +59,7 @@ pub fn show_setup_wizard<F: Fn() + 'static>(
 
     // --- Page 2: Select Game ---
     let detected_games = steam::detect_games();
-    let selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>> =
-        Rc::new(RefCell::new(None));
+    let selected_game: Rc<RefCell<Option<GameSelection>>> = Rc::new(RefCell::new(None));
 
     let (game_page, selected_game_clone) =
         build_game_select_page(&stack, detected_games, Rc::clone(&selected_game));
@@ -120,11 +132,8 @@ fn build_welcome_page() -> gtk4::Box {
 fn build_game_select_page(
     stack: &gtk4::Stack,
     detected_games: Vec<(GameKind, std::path::PathBuf)>,
-    selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
-) -> (
-    gtk4::Box,
-    Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
-) {
+    selected_game: Rc<RefCell<Option<GameSelection>>>,
+) -> (gtk4::Box, Rc<RefCell<Option<GameSelection>>>) {
     let page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     page.set_vexpand(true);
     page.set_margin_start(24);
@@ -143,15 +152,18 @@ fn build_game_select_page(
 
     let inner_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
 
+    // All radio check buttons share a single group so only one can be active
+    let check_buttons: Rc<RefCell<Vec<gtk4::CheckButton>>> = Rc::new(RefCell::new(Vec::new()));
+
     if detected_games.is_empty() {
         let no_games = adw::StatusPage::builder()
-            .title("No Games Found Automatically")
-            .description("No Steam games were detected. Add your game manually.")
+            .title("No Steam Games Found")
+            .description("No Steam games were detected.\nYou can add a game manually or set up a non-Steam game using UMU below.")
             .icon_name("edit-find-symbolic")
             .build();
         inner_box.append(&no_games);
     } else {
-        let section_label = gtk4::Label::new(Some("Auto-Detected Games"));
+        let section_label = gtk4::Label::new(Some("Auto-Detected (Steam)"));
         section_label.add_css_class("heading");
         section_label.set_halign(gtk4::Align::Start);
         inner_box.append(&section_label);
@@ -159,8 +171,6 @@ fn build_game_select_page(
         let game_list = gtk4::ListBox::new();
         game_list.add_css_class("boxed-list");
         game_list.set_selection_mode(gtk4::SelectionMode::None);
-
-        let check_buttons: Rc<RefCell<Vec<gtk4::CheckButton>>> = Rc::new(RefCell::new(Vec::new()));
 
         for (kind, path) in &detected_games {
             let row = adw::ActionRow::builder()
@@ -181,18 +191,19 @@ fn build_game_select_page(
 
             check.connect_toggled(move |this_check| {
                 if this_check.is_active() {
-                    // Uncheck all other buttons
                     for btn in all_checks.borrow().iter() {
                         if btn != this_check {
                             btn.set_active(false);
                         }
                     }
                     *selected_game_clone.borrow_mut() =
-                        Some((kind_clone.clone(), path_clone.clone()));
+                        Some(GameSelection::Steam(kind_clone.clone(), path_clone.clone()));
                 } else {
                     let mut sel = selected_game_clone.borrow_mut();
-                    if sel.as_ref().map(|(k, _)| k == &kind_clone).unwrap_or(false) {
-                        *sel = None;
+                    if let Some(GameSelection::Steam(ref k, _)) = *sel {
+                        if k == &kind_clone {
+                            *sel = None;
+                        }
                     }
                 }
             });
@@ -203,16 +214,276 @@ fn build_game_select_page(
         inner_box.append(&game_list);
     }
 
+    // ── Custom (UMU) section ──────────────────────────────────────────────
+    let umu_section_label = gtk4::Label::new(Some("Custom (Non-Steam)"));
+    umu_section_label.add_css_class("heading");
+    umu_section_label.set_halign(gtk4::Align::Start);
+    umu_section_label.set_margin_top(12);
+    inner_box.append(&umu_section_label);
+
+    let umu_list = gtk4::ListBox::new();
+    umu_list.add_css_class("boxed-list");
+    umu_list.set_selection_mode(gtk4::SelectionMode::None);
+
+    let umu_row = adw::ActionRow::builder()
+        .title("Custom")
+        .subtitle("Setup using UMU (Non-Steam)")
+        .build();
+
+    let umu_check = gtk4::CheckButton::new();
+    umu_row.add_prefix(&umu_check);
+    umu_row.set_activatable_widget(Some(&umu_check));
+
+    check_buttons.borrow_mut().push(umu_check.clone());
+
+    // A revealer that shows the UMU configuration fields when selected
+    let umu_config_revealer = gtk4::Revealer::new();
+    umu_config_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    umu_config_revealer.set_reveal_child(false);
+
+    let umu_config_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    umu_config_box.set_margin_top(8);
+
+    let umu_prefs = adw::PreferencesGroup::builder()
+        .title("UMU Game Configuration")
+        .description(
+            "Select the game executable — the game is detected automatically from its name. \
+             Prefix and Proton are optional: leave them blank to use umu\u{2019}s smart defaults \
+             (prefix: ~/.local/share/umu/default \u{2022} Proton: auto-download latest GE-Proton).",
+        )
+        .build();
+
+    // Executable path
+    let exe_row = adw::EntryRow::builder().title("Game Executable").build();
+    let browse_exe_btn = gtk4::Button::new();
+    browse_exe_btn.set_icon_name("folder-open-symbolic");
+    browse_exe_btn.set_valign(gtk4::Align::Center);
+    exe_row.add_suffix(&browse_exe_btn);
+    umu_prefs.add(&exe_row);
+
+    // Detected game label
+    let detected_kind_label = gtk4::Label::new(Some("No executable selected"));
+    detected_kind_label.set_halign(gtk4::Align::Start);
+    detected_kind_label.add_css_class("dim-label");
+    detected_kind_label.set_margin_start(12);
+
+    // Prefix path (optional) — default: ~/.local/share/umu/default
+    let prefix_row = adw::EntryRow::builder()
+        .title("Wine/Proton Prefix — default: ~/.local/share/umu/default")
+        .build();
+    let browse_prefix_btn = gtk4::Button::new();
+    browse_prefix_btn.set_icon_name("folder-open-symbolic");
+    browse_prefix_btn.set_valign(gtk4::Align::Center);
+    prefix_row.add_suffix(&browse_prefix_btn);
+    umu_prefs.add(&prefix_row);
+
+    // Proton path (optional) — default: auto-download latest GE-Proton
+    let proton_row = adw::EntryRow::builder()
+        .title("Proton Path — default: auto-download latest GE-Proton")
+        .build();
+    let browse_proton_btn = gtk4::Button::new();
+    browse_proton_btn.set_icon_name("folder-open-symbolic");
+    browse_proton_btn.set_valign(gtk4::Align::Center);
+    proton_row.add_suffix(&browse_proton_btn);
+    umu_prefs.add(&proton_row);
+
+    umu_config_box.append(&umu_prefs);
+    umu_config_box.append(&detected_kind_label);
+    umu_config_revealer.set_child(Some(&umu_config_box));
+
+    umu_list.append(&umu_row);
+    inner_box.append(&umu_list);
+    inner_box.append(&umu_config_revealer);
+
+    // Track the detected GameKind from the chosen executable
+    let detected_umu_kind: Rc<RefCell<Option<GameKind>>> = Rc::new(RefCell::new(None));
+
+    // Toggle UMU config visibility
+    {
+        let revealer = umu_config_revealer.clone();
+        let all_checks = Rc::clone(&check_buttons);
+        let selected_game_clone = Rc::clone(&selected_game);
+        umu_check.connect_toggled(move |this_check| {
+            revealer.set_reveal_child(this_check.is_active());
+            if this_check.is_active() {
+                for btn in all_checks.borrow().iter() {
+                    if btn != this_check {
+                        btn.set_active(false);
+                    }
+                }
+                // Selection will be set when user picks an executable
+            } else {
+                let mut sel = selected_game_clone.borrow_mut();
+                if matches!(*sel, Some(GameSelection::Umu { .. })) {
+                    *sel = None;
+                }
+            }
+        });
+    }
+
+    // Update selection whenever exe/prefix/proton fields change
+    let update_umu_selection = {
+        let exe_row_c = exe_row.clone();
+        let prefix_row_c = prefix_row.clone();
+        let proton_row_c = proton_row.clone();
+        let detected_kind_c = Rc::clone(&detected_umu_kind);
+        let selected_game_c = Rc::clone(&selected_game);
+        let kind_label = detected_kind_label.clone();
+        let umu_check_c = umu_check.clone();
+
+        Rc::new(move || {
+            if !umu_check_c.is_active() {
+                return;
+            }
+            let exe_text = exe_row_c.text().to_string();
+            if exe_text.is_empty() {
+                kind_label.set_text("No executable selected");
+                kind_label.remove_css_class("success");
+                kind_label.remove_css_class("error");
+                kind_label.add_css_class("dim-label");
+                *detected_kind_c.borrow_mut() = None;
+                *selected_game_c.borrow_mut() = None;
+                return;
+            }
+            let exe_path = std::path::PathBuf::from(&exe_text);
+            let exe_name = exe_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            match GameKind::from_executable(exe_name) {
+                Some(kind) => {
+                    kind_label.set_text(&format!("Detected: {}", kind.display_name()));
+                    kind_label.remove_css_class("dim-label");
+                    kind_label.remove_css_class("error");
+                    kind_label.add_css_class("success");
+                    *detected_kind_c.borrow_mut() = Some(kind.clone());
+
+                    // Derive root_path as the parent directory of the executable
+                    let root_path = exe_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| exe_path.clone());
+
+                    let prefix_text = prefix_row_c.text().to_string();
+                    let proton_text = proton_row_c.text().to_string();
+
+                    let umu_cfg = UmuGameConfig {
+                        exe_path: exe_path.clone(),
+                        prefix_path: if prefix_text.is_empty() {
+                            None
+                        } else {
+                            Some(std::path::PathBuf::from(prefix_text))
+                        },
+                        proton_path: if proton_text.is_empty() {
+                            None
+                        } else {
+                            Some(std::path::PathBuf::from(proton_text))
+                        },
+                    };
+                    *selected_game_c.borrow_mut() = Some(GameSelection::Umu {
+                        kind,
+                        root_path,
+                        umu_cfg,
+                    });
+                }
+                None => {
+                    kind_label.set_text(&format!(
+                        "Unsupported executable: \u{201c}{}\u{201d}",
+                        exe_name
+                    ));
+                    kind_label.remove_css_class("dim-label");
+                    kind_label.remove_css_class("success");
+                    kind_label.add_css_class("error");
+                    *detected_kind_c.borrow_mut() = None;
+                    *selected_game_c.borrow_mut() = None;
+                }
+            }
+        })
+    };
+
+    // Wire up exe_row changed
+    {
+        let updater = Rc::clone(&update_umu_selection);
+        exe_row.connect_changed(move |_| updater());
+    }
+    // Wire up prefix_row changed
+    {
+        let updater = Rc::clone(&update_umu_selection);
+        prefix_row.connect_changed(move |_| updater());
+    }
+    // Wire up proton_row changed
+    {
+        let updater = Rc::clone(&update_umu_selection);
+        proton_row.connect_changed(move |_| updater());
+    }
+
+    // Browse button for executable
+    {
+        let exe_row_c = exe_row.clone();
+        browse_exe_btn.connect_clicked(move |btn| {
+            let file_dialog = gtk4::FileDialog::new();
+            file_dialog.set_title("Select Game Executable (.exe)");
+            let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+            let row_c = exe_row_c.clone();
+            file_dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    row_c.set_text(&path.to_string_lossy());
+                }
+            });
+        });
+    }
+
+    // Browse button for prefix
+    {
+        let prefix_row_c = prefix_row.clone();
+        browse_prefix_btn.connect_clicked(move |btn| {
+            let file_dialog = gtk4::FileDialog::new();
+            file_dialog.set_title("Select Wine/Proton Prefix Folder");
+            let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+            let row_c = prefix_row_c.clone();
+            file_dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    row_c.set_text(&path.to_string_lossy());
+                }
+            });
+        });
+    }
+
+    // Browse button for proton
+    {
+        let proton_row_c = proton_row.clone();
+        browse_proton_btn.connect_clicked(move |btn| {
+            let file_dialog = gtk4::FileDialog::new();
+            file_dialog.set_title("Select Proton Installation Folder");
+            let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+            let row_c = proton_row_c.clone();
+            file_dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    row_c.set_text(&path.to_string_lossy());
+                }
+            });
+        });
+    }
+
     scrolled.set_child(Some(&inner_box));
     page.append(&scrolled);
 
-    // "Add Game Manually" button
-    let add_manual_btn = gtk4::Button::with_label("Add Game Manually");
+    // "Add Game Manually" button (Steam-style manual add)
+    let add_manual_btn = gtk4::Button::with_label("Add Steam Game Manually");
     add_manual_btn.set_halign(gtk4::Align::Center);
 
     let selected_game_for_manual = Rc::clone(&selected_game);
+    let all_checks_for_manual = Rc::clone(&check_buttons);
     add_manual_btn.connect_clicked(move |btn| {
-        show_add_game_dialog(btn, Rc::clone(&selected_game_for_manual));
+        show_add_game_dialog(
+            btn,
+            Rc::clone(&selected_game_for_manual),
+            Rc::clone(&all_checks_for_manual),
+        );
     });
     page.append(&add_manual_btn);
 
@@ -237,14 +508,15 @@ fn build_game_select_page(
 
 fn show_add_game_dialog(
     parent_widget: &gtk4::Button,
-    selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
+    selected_game: Rc<RefCell<Option<GameSelection>>>,
+    all_checks: Rc<RefCell<Vec<gtk4::CheckButton>>>,
 ) {
     let parent_window = parent_widget
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok());
 
     let dialog = adw::Window::builder()
-        .title("Add Game Manually")
+        .title("Add Steam Game Manually")
         .modal(true)
         .default_width(480)
         .default_height(360)
@@ -304,9 +576,10 @@ fn show_add_game_dialog(
                 None::<&gio::Cancellable>,
                 move |result| {
                     if let Ok(file) = result
-                        && let Some(path) = file.path() {
-                            row_clone.set_text(&path.to_string_lossy());
-                        }
+                        && let Some(path) = file.path()
+                    {
+                        row_clone.set_text(&path.to_string_lossy());
+                    }
                 },
             );
         });
@@ -345,7 +618,11 @@ fn show_add_game_dialog(
         let kind_idx = kind_row_clone.selected() as usize;
         let all_kinds = GameKind::all();
         if let Some(kind) = all_kinds.get(kind_idx) {
-            *selected_game.borrow_mut() = Some((kind.clone(), root_path));
+            // Uncheck all radio buttons from the game select page
+            for btn in all_checks.borrow().iter() {
+                btn.set_active(false);
+            }
+            *selected_game.borrow_mut() = Some(GameSelection::Steam(kind.clone(), root_path));
         }
         dialog_clone2.destroy();
     });
@@ -385,9 +662,7 @@ fn build_app_dir_page(
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("Linkmm");
 
-    let path_group = adw::PreferencesGroup::builder()
-        .title("Directory")
-        .build();
+    let path_group = adw::PreferencesGroup::builder().title("Directory").build();
 
     let dir_row = adw::EntryRow::builder().title("App Directory").build();
     dir_row.set_text(&default_dir.to_string_lossy());
@@ -423,22 +698,17 @@ fn build_app_dir_page(
         browse_btn.connect_clicked(move |btn| {
             let file_dialog = gtk4::FileDialog::new();
             file_dialog.set_title("Select App Directory");
-            let parent = btn
-                .root()
-                .and_then(|r| r.downcast::<gtk4::Window>().ok());
+            let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
             let row_c = dir_row_c.clone();
             let app_dir_cc = Rc::clone(&app_dir_c);
-            file_dialog.select_folder(
-                parent.as_ref(),
-                None::<&gio::Cancellable>,
-                move |result| {
-                    if let Ok(file) = result
-                        && let Some(path) = file.path() {
-                            row_c.set_text(&path.to_string_lossy());
-                            *app_dir_cc.borrow_mut() = Some(path);
-                        }
-                },
-            );
+            file_dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    row_c.set_text(&path.to_string_lossy());
+                    *app_dir_cc.borrow_mut() = Some(path);
+                }
+            });
         });
     }
 
@@ -466,7 +736,7 @@ fn build_app_dir_page(
 fn build_nexus_page(
     wizard_window: &adw::Window,
     config: Rc<RefCell<AppConfig>>,
-    selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
+    selected_game: Rc<RefCell<Option<GameSelection>>>,
     selected_app_dir: Rc<RefCell<Option<std::path::PathBuf>>>,
     on_finish: Rc<dyn Fn()>,
 ) -> gtk4::Box {
@@ -641,7 +911,131 @@ fn build_nexus_page(
 fn finish_wizard(
     wizard_window: &adw::Window,
     config: Rc<RefCell<AppConfig>>,
-    selected_game: Rc<RefCell<Option<(GameKind, std::path::PathBuf)>>>,
+    selected_game: Rc<RefCell<Option<GameSelection>>>,
+    selected_app_dir: Rc<RefCell<Option<std::path::PathBuf>>>,
+    api_key: Option<String>,
+    on_finish: Rc<dyn Fn()>,
+) {
+    let selection = selected_game.borrow().clone();
+    let is_umu = matches!(selection, Some(GameSelection::Umu { .. }));
+
+    // If UMU was selected, always run ensure_umu_available so that:
+    //   • the binary is downloaded on first setup, AND
+    //   • the version tag is persisted even if the binary already exists.
+    // We do this in a background thread with a progress dialog.
+    if is_umu {
+        let progress_dialog = adw::Window::builder()
+            .title("Downloading UMU Launcher")
+            .modal(true)
+            .transient_for(wizard_window)
+            .default_width(400)
+            .default_height(150)
+            .deletable(false)
+            .build();
+
+        let pbox = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        pbox.set_margin_start(24);
+        pbox.set_margin_end(24);
+        pbox.set_margin_top(24);
+        pbox.set_margin_bottom(24);
+        pbox.set_valign(gtk4::Align::Center);
+
+        let plabel = gtk4::Label::new(Some(if umu::is_umu_available() {
+            "Checking for umu-launcher updates\u{2026}"
+        } else {
+            "Downloading umu-launcher\u{2026}"
+        }));
+        let pbar = gtk4::ProgressBar::new();
+        pbar.set_show_text(true);
+
+        pbox.append(&plabel);
+        pbox.append(&pbar);
+        progress_dialog.set_content(Some(&pbox));
+        progress_dialog.present();
+
+        let installed_version = config.borrow().umu_installed_version.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+
+        std::thread::spawn(move || {
+            let result =
+                umu::ensure_umu_available(installed_version.as_deref(), |_downloaded, _total| true);
+            let _ = tx.send(result.map(|(tag, _path)| tag));
+        });
+
+        let wizard_window_c = wizard_window.clone();
+        let config_c = Rc::clone(&config);
+        let selected_game_c = Rc::clone(&selected_game);
+        let selected_app_dir_c = Rc::clone(&selected_app_dir);
+        let on_finish_c = Rc::clone(&on_finish);
+        let progress_dialog_c = progress_dialog.clone();
+        let pbar_c = pbar.clone();
+
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            pbar_c.pulse();
+            match rx.try_recv() {
+                Ok(Ok(new_tag)) => {
+                    progress_dialog_c.destroy();
+                    // Persist the installed version tag before closing the wizard.
+                    config_c.borrow_mut().umu_installed_version = Some(new_tag);
+                    finish_wizard_apply(
+                        &wizard_window_c,
+                        Rc::clone(&config_c),
+                        Rc::clone(&selected_game_c),
+                        Rc::clone(&selected_app_dir_c),
+                        api_key.clone(),
+                        Rc::clone(&on_finish_c),
+                    );
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    progress_dialog_c.destroy();
+                    log::error!("Failed to download umu-launcher: {e}");
+                    // Non-fatal: finish the wizard anyway; the background
+                    // update check on next launch will retry.
+                    finish_wizard_apply(
+                        &wizard_window_c,
+                        Rc::clone(&config_c),
+                        Rc::clone(&selected_game_c),
+                        Rc::clone(&selected_app_dir_c),
+                        api_key.clone(),
+                        Rc::clone(&on_finish_c),
+                    );
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    progress_dialog_c.destroy();
+                    finish_wizard_apply(
+                        &wizard_window_c,
+                        Rc::clone(&config_c),
+                        Rc::clone(&selected_game_c),
+                        Rc::clone(&selected_app_dir_c),
+                        api_key.clone(),
+                        Rc::clone(&on_finish_c),
+                    );
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+
+        return;
+    }
+
+    finish_wizard_apply(
+        wizard_window,
+        config,
+        selected_game,
+        selected_app_dir,
+        api_key,
+        on_finish,
+    );
+}
+
+/// Internal helper that applies the wizard selections to the config and closes the dialog.
+fn finish_wizard_apply(
+    wizard_window: &adw::Window,
+    config: Rc<RefCell<AppConfig>>,
+    selected_game: Rc<RefCell<Option<GameSelection>>>,
     selected_app_dir: Rc<RefCell<Option<std::path::PathBuf>>>,
     api_key: Option<String>,
     on_finish: Rc<dyn Fn()>,
@@ -654,8 +1048,17 @@ fn finish_wizard(
             cfg.nexus_api_key = Some(key);
         }
 
-        if let Some((kind, path)) = selected_game.borrow().clone() {
-            let game = Game::new(kind, path);
+        let game_opt: Option<Game> = match selected_game.borrow().clone() {
+            Some(GameSelection::Steam(kind, path)) => Some(Game::new(kind, path)),
+            Some(GameSelection::Umu {
+                kind,
+                root_path,
+                umu_cfg,
+            }) => Some(Game::new_umu(kind, root_path, umu_cfg)),
+            None => None,
+        };
+
+        if let Some(game) = game_opt {
             let game_id = game.id.clone();
             // Only add the game if it isn't already in the list
             if !cfg.games.iter().any(|g| g.id == game_id) {
@@ -807,15 +1210,17 @@ fn sanitize_step_selection(
                     selected.truncate(1);
                 }
                 if selected.is_empty()
-                    && let Some(first) = visible.first() {
-                        selected.push(*first);
-                    }
+                    && let Some(first) = visible.first()
+                {
+                    selected.push(*first);
+                }
             }
             FomodGroupType::SelectAtLeastOne => {
                 if selected.is_empty()
-                    && let Some(first) = visible.first() {
-                        selected.push(*first);
-                    }
+                    && let Some(first) = visible.first()
+                {
+                    selected.push(*first);
+                }
             }
             FomodGroupType::SelectAtMostOne => {
                 if selected.len() > 1 {
@@ -1011,16 +1416,12 @@ fn build_fomod_info_pane(
     picture.set_valign(gtk4::Align::Start);
 
     // Pre-fill with the first image found in this step, if any.
-    if let Some(first_image) = fomod
-        .steps
-        .get(step_idx)
-        .and_then(|s| {
-            s.groups
-                .iter()
-                .flat_map(|g| &g.plugins)
-                .find_map(|p| p.image_path.as_ref())
-        })
-    {
+    if let Some(first_image) = fomod.steps.get(step_idx).and_then(|s| {
+        s.groups
+            .iter()
+            .flat_map(|g| &g.plugins)
+            .find_map(|p| p.image_path.as_ref())
+    }) {
         if let Some(tex) = image_cache.borrow().get(first_image).cloned() {
             picture.set_paintable(Some(&tex));
         }
@@ -1039,9 +1440,7 @@ fn build_fomod_info_pane(
     // Rounded corners on the image: inject CSS once when the widget gets a
     // display (i.e. after it is realized inside a window).
     let css_provider = gtk4::CssProvider::new();
-    css_provider.load_from_string(
-        ".fomod-preview-btn picture { border-radius: 12px; }",
-    );
+    css_provider.load_from_string(".fomod-preview-btn picture { border-radius: 12px; }");
     picture.connect_realize(move |widget| {
         gtk4::style_context_add_provider_for_display(
             &widget.display(),
@@ -1218,9 +1617,7 @@ fn build_fomod_nav_page(
     };
 
     // ── NavigationPage ───────────────────────────────────────────────────────
-    let page = adw::NavigationPage::builder()
-        .title(&step.name)
-        .build();
+    let page = adw::NavigationPage::builder().title(&step.name).build();
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&adw::HeaderBar::new());
@@ -1234,11 +1631,7 @@ fn build_fomod_nav_page(
             .is_none()
     };
 
-    let fwd_btn = gtk4::Button::with_label(if is_last_initially {
-        "Install"
-    } else {
-        "Next"
-    });
+    let fwd_btn = gtk4::Button::with_label(if is_last_initially { "Install" } else { "Next" });
     fwd_btn.add_css_class("suggested-action");
     fwd_btn.add_css_class("pill");
     fwd_btn.set_halign(gtk4::Align::Center);
@@ -1282,9 +1675,10 @@ fn build_fomod_nav_page(
     }
 
     // ── Empty step guard (§4f) ────────────────────────────────────────────────
-    let all_groups_empty = step.groups.iter().all(|g| {
-        g.plugins.iter().all(|p| !plugin_is_visible(p, &prev_flags))
-    });
+    let all_groups_empty = step
+        .groups
+        .iter()
+        .all(|g| g.plugins.iter().all(|p| !plugin_is_visible(p, &prev_flags)));
 
     if all_groups_empty {
         let empty = adw::StatusPage::builder()
@@ -1333,7 +1727,11 @@ fn build_fomod_nav_page(
     // ── Validation banner (§4e) ───────────────────────────────────────────────
     let validation_banner = adw::Banner::builder()
         .title("Please make a selection in all required groups to continue")
-        .revealed(!step_selection_is_valid(&fomod, step_idx, &selections.borrow()))
+        .revealed(!step_selection_is_valid(
+            &fomod,
+            step_idx,
+            &selections.borrow(),
+        ))
         .build();
     right_box.append(&validation_banner);
 
@@ -1466,9 +1864,7 @@ fn build_fomod_nav_page(
                     let is_radio = use_radio;
                     check.connect_toggled(move |btn| {
                         let mut sel = sel_c.borrow_mut();
-                        if let Some(gs) =
-                            sel.get_mut(step_idx).and_then(|s| s.get_mut(gi))
-                        {
+                        if let Some(gs) = sel.get_mut(step_idx).and_then(|s| s.get_mut(gi)) {
                             if btn.is_active() {
                                 if is_radio {
                                     gs.clear();
@@ -1488,9 +1884,7 @@ fn build_fomod_nav_page(
                         // stays accurate when selections affect later steps.
                         let cur_flags = collect_active_flags(&fomod_c, &sel, step_idx);
                         let still_last = (step_idx + 1..fomod_c.steps.len())
-                            .find(|&i| {
-                                step_is_visible_with_flags(&fomod_c.steps[i], &cur_flags)
-                            })
+                            .find(|&i| step_is_visible_with_flags(&fomod_c.steps[i], &cur_flags))
                             .is_none();
                         nb.set_label(if still_last { "Install" } else { "Next" });
                     });

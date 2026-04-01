@@ -1,14 +1,18 @@
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use gio;
 use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::{AppConfig, Profile};
+use crate::core::games::UmuGameConfig;
 use crate::core::nexus::NexusClient;
+use crate::core::umu;
 
 /// Build the inline Preferences page shown as a tab in the main window.
 pub fn build_settings_page(
@@ -108,9 +112,8 @@ pub fn build_settings_page(
                     }
                     Ok(Err(e)) => {
                         btn_c.set_sensitive(true);
-                        toast_overlay_c2.add_toast(adw::Toast::new(&format!(
-                            "Validation failed: {e}"
-                        )));
+                        toast_overlay_c2
+                            .add_toast(adw::Toast::new(&format!("Validation failed: {e}")));
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -161,12 +164,13 @@ pub fn build_settings_page(
             let (profiles, active_id) = {
                 let cfg = config_c.borrow();
                 if let Some(game_id) = cfg.current_game_id.as_deref() {
-                    let gs = cfg.game_settings_ref(game_id)
-                        .cloned()
-                        .unwrap_or_default();
+                    let gs = cfg.game_settings_ref(game_id).cloned().unwrap_or_default();
                     (gs.profiles, gs.active_profile_id)
                 } else {
-                    (crate::core::config::default_active_profile_id_vec(), "default".to_string())
+                    (
+                        crate::core::config::default_active_profile_id_vec(),
+                        "default".to_string(),
+                    )
                 }
             };
 
@@ -301,6 +305,224 @@ pub fn build_settings_page(
     logging_group.add(&info_row);
     logging_group.add(&debug_row);
     content_box.append(&logging_group);
+
+    // ── UMU Launcher group ────────────────────────────────────────────────
+    // Only shown when the currently active game was set up via UMU (non-Steam).
+    let current_umu_config: Option<(String, UmuGameConfig)> = {
+        let cfg = config.borrow();
+        cfg.current_game()
+            .and_then(|g| g.umu_config.as_ref().map(|u| (g.id.clone(), u.clone())))
+    };
+
+    if let Some((game_id_for_umu, umu_cfg)) = current_umu_config {
+        let installed_version = config.borrow().umu_installed_version.clone();
+        let version_label_text = match &installed_version {
+            Some(v) => format!("Installed version: {v}"),
+            None => "Not installed".to_string(),
+        };
+
+        let umu_group = adw::PreferencesGroup::builder()
+            .title("UMU Launcher")
+            .description(
+                "umu-run launches this non-Steam game through Proton without requiring Steam. \
+                 The latest release is downloaded automatically on startup.",
+            )
+            .build();
+
+        // ── Version row with update button ────────────────────────────────
+        let version_row = adw::ActionRow::builder()
+            .title("umu-run Version")
+            .subtitle(&version_label_text)
+            .build();
+
+        let update_btn = gtk4::Button::with_label("Check for Update");
+        update_btn.set_valign(gtk4::Align::Center);
+        update_btn.add_css_class("flat");
+        version_row.add_suffix(&update_btn);
+
+        {
+            let config_c = Rc::clone(&config);
+            let toast_c = toast_overlay.clone();
+            let version_row_c = version_row.clone();
+            let update_btn_c = update_btn.clone();
+            update_btn.connect_clicked(move |_| {
+                update_btn_c.set_sensitive(false);
+                version_row_c.set_subtitle("Checking…");
+
+                let (tx, rx) = mpsc::channel::<Result<String, String>>();
+
+                std::thread::spawn(move || {
+                    // Force a fresh check by passing None so the tag is
+                    // always re-compared against the GitHub latest.
+                    let result = umu::ensure_umu_available(
+                        None, // ignore stored version → always re-download if tag changed
+                        |_, _| true,
+                    );
+                    let _ = tx.send(result.map(|(tag, _)| tag));
+                });
+
+                let config_cc = Rc::clone(&config_c);
+                let toast_cc = toast_c.clone();
+                let version_row_cc = version_row_c.clone();
+                let update_btn_cc = update_btn_c.clone();
+                glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                    match rx.try_recv() {
+                        Ok(Ok(tag)) => {
+                            let mut cfg = config_cc.borrow_mut();
+                            cfg.umu_installed_version = Some(tag.clone());
+                            cfg.save();
+                            drop(cfg);
+                            version_row_cc.set_subtitle(&format!("Installed version: {tag}"));
+                            update_btn_cc.set_sensitive(true);
+                            toast_cc
+                                .add_toast(adw::Toast::new(&format!("umu-run updated to {tag}.")));
+                            glib::ControlFlow::Break
+                        }
+                        Ok(Err(e)) => {
+                            version_row_cc.set_subtitle("Update failed — see logs.");
+                            update_btn_cc.set_sensitive(true);
+                            toast_cc.add_toast(adw::Toast::new(&format!("Update failed: {e}")));
+                            glib::ControlFlow::Break
+                        }
+                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            update_btn_cc.set_sensitive(true);
+                            glib::ControlFlow::Break
+                        }
+                    }
+                });
+            });
+        }
+
+        umu_group.add(&version_row);
+
+        // ── Wine/Proton Prefix ────────────────────────────────────────────
+        let prefix_row = adw::EntryRow::builder()
+            .title("Wine/Proton Prefix — default: ~/.local/share/umu/default")
+            .show_apply_button(true)
+            .build();
+
+        if let Some(ref p) = umu_cfg.prefix_path {
+            prefix_row.set_text(&p.to_string_lossy());
+        }
+
+        let browse_prefix_btn = gtk4::Button::new();
+        browse_prefix_btn.set_icon_name("folder-open-symbolic");
+        browse_prefix_btn.set_valign(gtk4::Align::Center);
+        browse_prefix_btn.set_tooltip_text(Some("Browse for prefix folder"));
+        prefix_row.add_suffix(&browse_prefix_btn);
+
+        {
+            let prefix_row_c = prefix_row.clone();
+            let parent_c = parent_window.clone();
+            browse_prefix_btn.connect_clicked(move |_| {
+                let fd = gtk4::FileDialog::new();
+                fd.set_title("Select Wine/Proton Prefix Folder");
+                let row_c = prefix_row_c.clone();
+                fd.select_folder(Some(&parent_c), None::<&gio::Cancellable>, move |result| {
+                    if let Ok(file) = result
+                        && let Some(path) = file.path()
+                    {
+                        row_c.set_text(&path.to_string_lossy());
+                    }
+                });
+            });
+        }
+
+        {
+            let config_c = Rc::clone(&config);
+            let game_id_c = game_id_for_umu.clone();
+            let toast_c = toast_overlay.clone();
+            prefix_row.connect_apply(move |row| {
+                let text = row.text().to_string();
+                let new_prefix = if text.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(&text))
+                };
+                let mut cfg = config_c.borrow_mut();
+                if let Some(game) = cfg.games.iter_mut().find(|g| g.id == game_id_c) {
+                    if let Some(ref mut umu) = game.umu_config {
+                        umu.prefix_path = new_prefix;
+                    }
+                }
+                cfg.save();
+                toast_c.add_toast(adw::Toast::new("Prefix saved."));
+            });
+        }
+
+        umu_group.add(&prefix_row);
+
+        // ── Proton Path ───────────────────────────────────────────────────
+        let proton_row = adw::EntryRow::builder()
+            .title("Proton Path — default: auto-download latest GE-Proton")
+            .show_apply_button(true)
+            .build();
+
+        if let Some(ref p) = umu_cfg.proton_path {
+            proton_row.set_text(&p.to_string_lossy());
+        }
+
+        let browse_proton_btn = gtk4::Button::new();
+        browse_proton_btn.set_icon_name("folder-open-symbolic");
+        browse_proton_btn.set_valign(gtk4::Align::Center);
+        browse_proton_btn.set_tooltip_text(Some("Browse for Proton installation folder"));
+        proton_row.add_suffix(&browse_proton_btn);
+
+        {
+            let proton_row_c = proton_row.clone();
+            let parent_c = parent_window.clone();
+            browse_proton_btn.connect_clicked(move |_| {
+                let fd = gtk4::FileDialog::new();
+                fd.set_title("Select Proton Installation Folder");
+                let row_c = proton_row_c.clone();
+                fd.select_folder(Some(&parent_c), None::<&gio::Cancellable>, move |result| {
+                    if let Ok(file) = result
+                        && let Some(path) = file.path()
+                    {
+                        row_c.set_text(&path.to_string_lossy());
+                    }
+                });
+            });
+        }
+
+        {
+            let config_c = Rc::clone(&config);
+            let game_id_c = game_id_for_umu.clone();
+            let toast_c = toast_overlay.clone();
+            proton_row.connect_apply(move |row| {
+                let text = row.text().to_string();
+                let new_proton = if text.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(&text))
+                };
+                let mut cfg = config_c.borrow_mut();
+                if let Some(game) = cfg.games.iter_mut().find(|g| g.id == game_id_c) {
+                    if let Some(ref mut umu) = game.umu_config {
+                        umu.proton_path = new_proton;
+                    }
+                }
+                cfg.save();
+                toast_c.add_toast(adw::Toast::new("Proton path saved."));
+            });
+        }
+
+        umu_group.add(&proton_row);
+
+        // ── Game Executable (read-only info row) ──────────────────────────
+        let exe_row = adw::ActionRow::builder()
+            .title("Game Executable")
+            .subtitle(umu_cfg.exe_path.to_string_lossy().as_ref())
+            .build();
+        exe_row.set_tooltip_text(Some(
+            "The game executable that was set during setup. \
+             To change this, add the game again through the setup wizard.",
+        ));
+        umu_group.add(&exe_row);
+
+        content_box.append(&umu_group);
+    }
 
     clamp.set_child(Some(&content_box));
     scrolled.set_child(Some(&clamp));
