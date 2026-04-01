@@ -59,12 +59,8 @@ pub(super) const KNOWN_ARCHIVE_EXTS: &[&str] = &["bsa", "ba2"];
 /// These are injected by macOS tools (`__MACOSX`), Python (`__pycache__`),
 /// or Windows thumbnail caches (`thumbs.db`).  They must be excluded when
 /// detecting the common wrapper prefix so they don't poison the all-same check.
-pub(super) const JUNK_TOPLEVEL_ENTRIES: &[&str] = &[
-    "__macosx",
-    "__pycache__",
-    ".ds_store",
-    "thumbs.db",
-];
+pub(super) const JUNK_TOPLEVEL_ENTRIES: &[&str] =
+    &["__macosx", "__pycache__", ".ds_store", "thumbs.db"];
 
 // ── Install strategy ──────────────────────────────────────────────────────────
 
@@ -146,34 +142,30 @@ impl PluginDependencies {
     /// Comparison is case-insensitive on both flag names and values.
     pub fn evaluate(&self, active_flags: &HashMap<String, String>) -> bool {
         let result = match self.operator {
-            DependencyOperator::And => {
-                self.flags.iter().all(|dep| {
-                    let matched = active_flags.get(&dep.flag.to_lowercase())
-                        == Some(&dep.value.to_lowercase());
-                    log::debug!(
-                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
-                        dep.flag,
-                        dep.value,
-                        matched,
-                        self.operator
-                    );
-                    matched
-                })
-            }
-            DependencyOperator::Or => {
-                self.flags.iter().any(|dep| {
-                    let matched = active_flags.get(&dep.flag.to_lowercase())
-                        == Some(&dep.value.to_lowercase());
-                    log::debug!(
-                        "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
-                        dep.flag,
-                        dep.value,
-                        matched,
-                        self.operator
-                    );
-                    matched
-                })
-            }
+            DependencyOperator::And => self.flags.iter().all(|dep| {
+                let matched =
+                    active_flags.get(&dep.flag.to_lowercase()) == Some(&dep.value.to_lowercase());
+                log::debug!(
+                    "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
+                    dep.flag,
+                    dep.value,
+                    matched,
+                    self.operator
+                );
+                matched
+            }),
+            DependencyOperator::Or => self.flags.iter().any(|dep| {
+                let matched =
+                    active_flags.get(&dep.flag.to_lowercase()) == Some(&dep.value.to_lowercase());
+                log::debug!(
+                    "[Dependency Evaluated] Condition: {}={} -> Result: {} | operator={:?}",
+                    dep.flag,
+                    dep.value,
+                    matched,
+                    self.operator
+                );
+                matched
+            }),
         };
         log::debug!(
             "[Dependency Group] operator={:?}, flag_count={}, overall_result={}",
