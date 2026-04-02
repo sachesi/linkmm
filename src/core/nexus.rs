@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -392,8 +392,13 @@ impl NexusClient {
 }
 
 fn parse_retry_after_header(retry_after: Option<&str>) -> Option<Duration> {
-    let secs = retry_after?.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(secs))
+    let value = retry_after?.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    retry_at.duration_since(SystemTime::now()).ok()
 }
 
 #[cfg(test)]
@@ -452,5 +457,10 @@ mod tests {
     fn parse_retry_after_header_rejects_invalid_values() {
         assert_eq!(parse_retry_after_header(Some("soon")), None);
         assert_eq!(parse_retry_after_header(None), None);
+    }
+
+    #[test]
+    fn parse_retry_after_header_accepts_http_date() {
+        assert!(parse_retry_after_header(Some("Fri, 31 Dec 9999 23:59:59 GMT")).is_some());
     }
 }
