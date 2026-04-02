@@ -134,15 +134,6 @@ fn is_transient_status(code: u16) -> bool {
     code == 408 || code == 429 || (500..=599).contains(&code)
 }
 
-fn status_message_for(code: u16) -> &'static str {
-    match code {
-        401 => "unauthorized",
-        403 => "forbidden",
-        429 => "rate_limited",
-        _ => "http_error",
-    }
-}
-
 // ── Client ────────────────────────────────────────────────────────────────────
 
 pub struct NexusClient {
@@ -252,10 +243,7 @@ impl NexusClient {
                 ureq::Error::Status(code, resp) => {
                     let body = resp.into_string().unwrap_or_default();
                     RequestError {
-                        message: format!(
-                            "Request failed [{status}] with status {code}: {body}",
-                            status = status_message_for(code)
-                        ),
+                        message: format!("Request failed with status {code}: {body}"),
                         transient: is_transient_status(code),
                     }
                 }
@@ -441,14 +429,6 @@ mod tests {
             .expect("should parse cached json");
         assert_eq!(parsed.mod_id, 1);
         assert_eq!(client.telemetry().api_requests_saved_by_cache, 1);
-    }
-
-    #[test]
-    fn status_classification_is_explicit_for_auth_and_rate_limit() {
-        assert_eq!(status_message_for(401), "unauthorized");
-        assert_eq!(status_message_for(403), "forbidden");
-        assert_eq!(status_message_for(429), "rate_limited");
-        assert_eq!(status_message_for(500), "http_error");
     }
 
     #[test]
