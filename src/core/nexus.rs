@@ -212,13 +212,9 @@ impl NexusClient {
                     }
                     let backoff_ms = self.backoff_base_ms * (1_u64 << attempt);
                     let backoff = Duration::from_millis(backoff_ms);
-                    let sleep_for = err.retry_after.map_or(backoff, |retry_after| {
-                        if retry_after > backoff {
-                            retry_after
-                        } else {
-                            backoff
-                        }
-                    });
+                    let sleep_for = err
+                        .retry_after
+                        .map_or(backoff, |retry_after| backoff.max(retry_after));
                     std::thread::sleep(sleep_for);
                 }
             }
