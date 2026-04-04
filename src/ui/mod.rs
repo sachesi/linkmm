@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 
 use std::rc::Rc;
-use std::sync::mpsc;
 
 use gio;
 use glib;
@@ -12,6 +11,7 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
+use crate::core::runtime::{SessionKind, SessionStatus, SessionStream, global_runtime_manager};
 
 pub mod downloads;
 pub mod library;
@@ -153,32 +153,55 @@ fn build_main_window(
         play_btn.connect_clicked(move |_| {
             let game = config_c.borrow().current_game().cloned();
             let Some(g) = game else { return };
-
-            match g.launcher_source {
-                GameLauncherSource::NonSteamUmu => {
-                    let app_id = g.kind.steam_app_id().unwrap_or(0);
-                    match g.validate_umu_setup().and_then(|umu_cfg| {
-                        crate::core::umu::launch_with_umu(
-                            &umu_cfg.exe_path,
-                            app_id,
-                            umu_cfg.prefix_path.as_deref(),
-                            umu_cfg.proton_path.as_deref(),
-                        )
-                    }) {
-                        Ok(_) => log::info!("Launched {} via umu-run", g.name),
-                        Err(e) => log::warn!("Could not launch {} via umu-run: {e}", g.name),
-                    }
+            let manager = global_runtime_manager();
+            if let Some(session) = manager.current_game_session(&g.id) {
+                if let Err(e) = manager.stop_session(session.id) {
+                    log::error!("Failed stopping game session: {e}");
                 }
-                GameLauncherSource::Steam => {
-                    if let Err(e) = crate::core::steam::launch_game(&g) {
-                        log::warn!("Could not launch {}: {e}", g.name);
-                    }
-                }
+                return;
+            }
+            let profile_id = config_c
+                .borrow()
+                .game_settings
+                .get(&g.id)
+                .map(|gs| gs.active_profile_id.clone());
+            if let Err(e) = manager.start_game_session(g.clone(), profile_id) {
+                log::warn!("Could not launch {}: {e}", g.name);
             }
         });
     }
 
     sidebar_box.append(&play_btn);
+
+    // ── Managed runtime session status ───────────────────────────────────
+    let session_group = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    session_group.set_margin_start(12);
+    session_group.set_margin_end(12);
+    session_group.set_margin_bottom(12);
+    let session_state = gtk4::Label::new(Some("No active managed sessions"));
+    session_state.set_halign(gtk4::Align::Start);
+    session_state.add_css_class("dim-label");
+    let session_meta = gtk4::Label::new(None);
+    session_meta.set_halign(gtk4::Align::Start);
+    session_meta.add_css_class("caption");
+    let lock_reason = gtk4::Label::new(None);
+    lock_reason.set_halign(gtk4::Align::Start);
+    lock_reason.add_css_class("caption");
+    lock_reason.add_css_class("warning");
+    let session_logs = gtk4::TextView::new();
+    session_logs.set_editable(false);
+    session_logs.set_cursor_visible(false);
+    session_logs.set_monospace(true);
+    session_logs.set_vexpand(true);
+    session_logs.set_size_request(-1, 160);
+    let logs_scroll = gtk4::ScrolledWindow::new();
+    logs_scroll.set_min_content_height(140);
+    logs_scroll.set_child(Some(&session_logs));
+    session_group.append(&session_state);
+    session_group.append(&session_meta);
+    session_group.append(&lock_reason);
+    session_group.append(&logs_scroll);
+    sidebar_box.append(&session_group);
 
     // ── Navigation section ────────────────────────────────────────────────
     sidebar_box.append(&make_section_label("Navigation"));
@@ -246,6 +269,85 @@ fn build_main_window(
         });
     }
 
+    {
+        let config_t = Rc::clone(&config);
+        let play_btn_t = play_btn.clone();
+        let active_game_row_t = active_game_row.clone();
+        let nav_list_t = nav_list.clone();
+        let session_state_t = session_state.clone();
+        let session_meta_t = session_meta.clone();
+        let session_logs_t = session_logs.clone();
+        let lock_reason_t = lock_reason.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            let manager = global_runtime_manager();
+            let active_any = manager.any_active();
+            nav_list_t.set_sensitive(!active_any);
+            active_game_row_t.set_sensitive(!active_any);
+            lock_reason_t.set_text(if active_any {
+                "UI is locked while managed process sessions are active. Stop the session to unlock."
+            } else {
+                ""
+            });
+
+            let current_game = config_t.borrow().current_game().cloned();
+            if let Some(game) = current_game {
+                let game_session = manager.current_game_session(&game.id);
+                play_btn_t.set_visible(
+                    game.kind.steam_app_id().is_some()
+                        || game.launcher_source == GameLauncherSource::NonSteamUmu,
+                );
+                play_btn_t.set_label(if game_session.is_some() {
+                    "Stop"
+                } else {
+                    "Play"
+                });
+                play_btn_t.set_sensitive(true);
+            }
+
+            let active_session = manager
+                .sessions()
+                .into_iter()
+                .rev()
+                .find(|s| matches!(s.status, SessionStatus::Starting | SessionStatus::Running));
+            if let Some(s) = active_session {
+                session_state_t.set_text(match s.status {
+                    SessionStatus::Starting => "Session starting…",
+                    SessionStatus::Running => "Session running",
+                    SessionStatus::Exited => "Session exited",
+                    SessionStatus::Failed => "Session failed",
+                    SessionStatus::Killed => "Session stopped",
+                });
+                let launcher = match s.launcher_source {
+                    GameLauncherSource::Steam => "Steam",
+                    GameLauncherSource::NonSteamUmu => "NonSteamUmu",
+                };
+                let kind = match s.kind {
+                    SessionKind::Game => "Game",
+                    SessionKind::Tool => "Tool",
+                };
+                session_meta_t.set_text(&format!(
+                    "{} session · launcher {} · pid {:?}",
+                    kind, launcher, s.pid
+                ));
+                let logs = manager.session_logs(s.id);
+                let text = logs
+                    .iter()
+                    .map(|l| match l.stream {
+                        SessionStream::Stdout => format!("[out] {}", l.message),
+                        SessionStream::Stderr => format!("[err] {}", l.message),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                session_logs_t.buffer().set_text(&text);
+            } else {
+                session_state_t.set_text("No active managed sessions");
+                session_meta_t.set_text("");
+                session_logs_t.buffer().set_text("");
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     let sidebar_scroll = gtk4::ScrolledWindow::new();
     sidebar_scroll.set_vexpand(true);
     sidebar_scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
@@ -259,12 +361,12 @@ fn build_main_window(
         .build();
     split_view.set_sidebar(Some(&sidebar_page));
 
-    // Create the nav-lock callback.  Grays out the entire sidebar content
-    // (navigation, game picker, play button) during mod installation so the
-    // user cannot navigate away while a long archive is being extracted.
-    let sidebar_box_for_lock = sidebar_box.clone();
+    // Lock callback used by long-running tasks (downloads/install).
+    let nav_list_for_lock = nav_list.clone();
+    let active_game_row_for_lock = active_game_row.clone();
     let nav_lock: Rc<dyn Fn(bool)> = Rc::new(move |locked: bool| {
-        sidebar_box_for_lock.set_sensitive(!locked);
+        nav_list_for_lock.set_sensitive(!locked);
+        active_game_row_for_lock.set_sensitive(!locked);
     });
 
     // ── Content area ──────────────────────────────────────────────────────
