@@ -2,14 +2,21 @@ use crate::core::config::{ToolConfig, ToolOutputMode, ToolRunProfile};
 use crate::core::deployment;
 use crate::core::games::Game;
 use crate::core::generated_outputs::{
-    capture_and_register_from_game_data_diff, register_output_directory_package, snapshot_game_data,
-    ToolRunContext,
+    adopt_existing_game_data_files, capture_and_register_from_game_data_diff,
+    register_output_directory_package, snapshot_game_data, ToolRunContext,
 };
 use crate::core::mods::ModDatabase;
+use crate::core::tool_adapters::{adapter_for_tool, OutputClass};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunResult {
     pub package_id: Option<String>,
+    pub adapter: String,
+    pub captured_files: usize,
+    pub plugin_files: usize,
+    pub asset_files: usize,
+    pub preflight_warnings: Vec<String>,
 }
 
 pub fn run_tool_with_managed_outputs<F>(
@@ -22,6 +29,8 @@ pub fn run_tool_with_managed_outputs<F>(
 where
     F: FnOnce(&ToolConfig, &ToolRunProfile) -> Result<std::process::ExitStatus, String>,
 {
+    let adapter = adapter_for_tool(tool);
+    let preflight = adapter.validate(game, tool, profile)?;
     let snapshot = match profile.output_mode {
         ToolOutputMode::SnapshotGameData => Some(snapshot_game_data(game)?),
         ToolOutputMode::DedicatedDirectory => None,
@@ -73,7 +82,60 @@ where
     deployment::rebuild_deployment(game, db)?;
     db.save(game);
 
-    Ok(ToolRunResult { package_id })
+    let package = package_id
+        .as_ref()
+        .and_then(|id| db.generated_outputs.iter().find(|p| &p.id == id));
+    let mut plugin_files = 0usize;
+    let mut asset_files = 0usize;
+    if let Some(pkg) = package {
+        for file in &pkg.owned_files {
+            match adapter.classify_output(&file.relative_path) {
+                OutputClass::Plugin => plugin_files += 1,
+                OutputClass::Asset => asset_files += 1,
+            }
+        }
+    }
+
+    Ok(ToolRunResult {
+        package_id,
+        adapter: adapter.id().to_string(),
+        captured_files: plugin_files + asset_files,
+        plugin_files,
+        asset_files,
+        preflight_warnings: preflight.warnings,
+    })
+}
+
+pub fn detect_unmanaged_outputs(
+    game: &Game,
+    db: &ModDatabase,
+    tool: &ToolConfig,
+    profile: &ToolRunProfile,
+) -> Result<Vec<PathBuf>, String> {
+    let adapter = adapter_for_tool(tool);
+    adapter.detect_unmanaged(game, db, profile)
+}
+
+pub fn adopt_unmanaged_outputs(
+    game: &Game,
+    db: &mut ModDatabase,
+    tool: &ToolConfig,
+    profile: &ToolRunProfile,
+    files: &[PathBuf],
+) -> Result<String, String> {
+    let package_name = if profile.generated_package_name.trim().is_empty() {
+        format!("{} ({})", tool.name, profile.name)
+    } else {
+        profile.generated_package_name.clone()
+    };
+    let run_ctx = ToolRunContext {
+        tool_id: tool.id.clone(),
+        run_profile: profile.id.clone(),
+    };
+    let package_id = adopt_existing_game_data_files(game, db, &run_ctx, files, &package_name)?;
+    deployment::rebuild_deployment(game, db)?;
+    db.save(game);
+    Ok(package_id)
 }
 
 #[cfg(test)]
@@ -126,6 +188,7 @@ mod tests {
             exe_path: PathBuf::from("tool.exe"),
             arguments: String::new(),
             app_id: 489830,
+            preset: crate::core::config::ToolPresetKind::Generic,
             run_profiles: vec![profile],
         }
     }
@@ -147,10 +210,11 @@ mod tests {
         let tool = test_tool(profile.clone());
         let mut db = ModDatabase::default();
 
-        run_tool_with_managed_outputs(&game, &mut db, &tool, &profile, |_tool, _profile| {
+        let run = run_tool_with_managed_outputs(&game, &mut db, &tool, &profile, |_tool, _profile| {
             Ok(std::process::ExitStatus::from_raw(0))
         })
         .unwrap();
+        assert_eq!(run.captured_files, 1);
         assert!(game.data_path.join("meshes/gen.nif").exists());
         assert_eq!(db.generated_outputs.len(), 1);
     }
@@ -174,5 +238,28 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("non-zero"));
         assert!(db.generated_outputs.is_empty());
+    }
+
+    #[test]
+    fn unmanaged_detection_and_adoption_roundtrip() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        std::fs::create_dir_all(game.data_path.join("meshes")).unwrap();
+        std::fs::write(game.data_path.join("meshes/adopt_me.nif"), b"x").unwrap();
+        let profile = ToolRunProfile {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            output_mode: ToolOutputMode::SnapshotGameData,
+            managed_output_dir: None,
+            generated_package_name: "ToolA Output".to_string(),
+        };
+        let tool = test_tool(profile.clone());
+        let mut db = ModDatabase::default();
+        let unmanaged = detect_unmanaged_outputs(&game, &db, &tool, &profile).unwrap();
+        assert_eq!(unmanaged.len(), 1);
+        let package_id = adopt_unmanaged_outputs(&game, &mut db, &tool, &profile, &unmanaged).unwrap();
+        assert!(!package_id.is_empty());
+        assert_eq!(db.generated_outputs.len(), 1);
+        assert!(game.data_path.join("meshes/adopt_me.nif").exists());
     }
 }

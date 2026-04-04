@@ -15,6 +15,18 @@ pub enum ToolOutputMode {
     SnapshotGameData,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolPresetKind {
+    Generic,
+    BodySlide,
+    Pandora,
+    Nemesis,
+}
+
+fn default_tool_preset() -> ToolPresetKind {
+    ToolPresetKind::Generic
+}
+
 fn default_tool_output_mode() -> ToolOutputMode {
     ToolOutputMode::SnapshotGameData
 }
@@ -49,6 +61,8 @@ pub struct ToolConfig {
     pub arguments: String,
     /// Steam App ID to determine which game's Proton prefix to use.
     pub app_id: u32,
+    #[serde(default = "default_tool_preset")]
+    pub preset: ToolPresetKind,
     #[serde(default)]
     pub run_profiles: Vec<ToolRunProfile>,
 }
