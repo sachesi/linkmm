@@ -39,7 +39,9 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ui")]
 use std::rc::Rc;
+#[cfg(feature = "ui")]
 use std::sync::mpsc;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -49,8 +51,7 @@ const GITHUB_API_LATEST: &str =
     "https://api.github.com/repos/Open-Wine-Components/umu-launcher/releases/latest";
 
 /// Template for the zipapp tarball URL.  `{tag}` is substituted at runtime.
-const ZIPAPP_URL_TEMPLATE: &str =
-    "https://github.com/Open-Wine-Components/umu-launcher/releases/download\
+const ZIPAPP_URL_TEMPLATE: &str = "https://github.com/Open-Wine-Components/umu-launcher/releases/download\
      /{tag}/umu-launcher-{tag}-zipapp.tar";
 
 /// Default Wine prefix used when none is configured.
@@ -281,6 +282,7 @@ pub fn ensure_umu_available(
 /// binary remains usable).
 ///
 /// Call this once from `build_ui` after the main window is shown.
+#[cfg(feature = "ui")]
 pub fn check_and_update_in_background(
     installed_version: Option<String>,
     on_updated: impl Fn(String) + 'static,
@@ -318,6 +320,13 @@ pub fn check_and_update_in_background(
             }
         }
     });
+}
+
+#[cfg(not(feature = "ui"))]
+pub fn check_and_update_in_background(
+    _installed_version: Option<String>,
+    _on_updated: impl Fn(String) + 'static,
+) {
 }
 
 // ── Launch ────────────────────────────────────────────────────────────────────

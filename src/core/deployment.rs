@@ -5,12 +5,66 @@
 // This module handles deploying and undeploying mods using symbolic or hard links.
 // Core principle: Game Data/ directory contains ONLY links, never copies of mod files.
 
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::installer::{LinkKind, determine_link_type};
 use crate::core::games::Game;
-use crate::core::mods::Mod;
+use crate::core::mods::{Mod, ModDatabase};
+
+const DEPLOY_STATE_FILE: &str = "deployment_state.toml";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DeploymentState {
+    backups: HashMap<String, String>,
+    deployed: HashMap<String, String>,
+    owners: HashMap<String, String>,
+}
+
+impl DeploymentState {
+    fn path(game: &Game, profile_id: &str) -> PathBuf {
+        game.config_dir()
+            .join("profiles")
+            .join(profile_id)
+            .join(DEPLOY_STATE_FILE)
+    }
+
+    fn load(game: &Game, profile_id: &str) -> Self {
+        let path = Self::path(game, profile_id);
+        let Ok(raw) = fs::read_to_string(path) else {
+            return Self::default();
+        };
+        toml::from_str(&raw).unwrap_or_default()
+    }
+
+    fn save(&self, game: &Game, profile_id: &str) -> Result<(), String> {
+        fs::create_dir_all(game.config_dir().join("profiles").join(profile_id))
+            .map_err(|e| format!("Failed to create config dir for deployment state: {e}"))?;
+        let raw = toml::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize deployment state: {e}"))?;
+        fs::write(Self::path(game, profile_id), raw)
+            .map_err(|e| format!("Failed to write deployment state: {e}"))?;
+        Ok(())
+    }
+}
+
+const ASSETS_DEPLOYER_ID: &str = "assets";
+
+trait Deployer {
+    fn id(&self) -> &'static str;
+    fn rebuild(&self, game: &Game, db: &mut ModDatabase) -> Result<(), String>;
+}
+
+struct AssetsDeployer;
+struct PluginsDeployer;
+
+#[derive(Debug, Clone)]
+struct DesiredDeployment {
+    source: PathBuf,
+    owner_id: String,
+}
 
 // ── Link Creation ─────────────────────────────────────────────────────────────
 
@@ -261,6 +315,246 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
 }
 
 // ── High-Level Deployment ─────────────────────────────────────────────────────
+
+pub fn rebuild_deployment(game: &Game, db: &mut ModDatabase) -> Result<(), String> {
+    let deployers: Vec<Box<dyn Deployer>> =
+        vec![Box::new(AssetsDeployer), Box::new(PluginsDeployer)];
+    for deployer in deployers {
+        log::debug!("[Deployer:{}] Rebuilding", deployer.id());
+        deployer.rebuild(game, db)?;
+    }
+    Ok(())
+}
+
+impl Deployer for AssetsDeployer {
+    fn id(&self) -> &'static str {
+        ASSETS_DEPLOYER_ID
+    }
+
+    fn rebuild(&self, game: &Game, db: &mut ModDatabase) -> Result<(), String> {
+        let desired = build_assets_plan(db, self.id());
+        apply_assets_plan(game, &db.active_profile_id, desired)
+    }
+}
+
+impl Deployer for PluginsDeployer {
+    fn id(&self) -> &'static str {
+        "plugins"
+    }
+
+    fn rebuild(&self, game: &Game, db: &mut ModDatabase) -> Result<(), String> {
+        db.write_plugins_txt(game)
+    }
+}
+
+fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, DesiredDeployment> {
+    let mut desired = HashMap::new();
+    for mod_entry in db
+        .mods
+        .iter()
+        .filter(|m| m.enabled && m.deployer.as_str() == deployer_id)
+    {
+        for (dest, src) in collect_mod_destinations(mod_entry) {
+            desired.insert(
+                dest,
+                DesiredDeployment {
+                    source: src,
+                    owner_id: format!("mod:{}", mod_entry.id),
+                },
+            );
+        }
+    }
+    for output in db.generated_outputs.iter().filter(|o| {
+        o.enabled
+            && o.deployer.as_str() == deployer_id
+            && o.manager_profile_id == db.active_profile_id
+    }) {
+        for (dest, src) in collect_generated_output_destinations(output) {
+            desired.insert(
+                dest,
+                DesiredDeployment {
+                    source: src,
+                    owner_id: format!("generated:{}", output.id),
+                },
+            );
+        }
+    }
+    desired
+}
+
+fn apply_assets_plan(
+    game: &Game,
+    profile_id: &str,
+    desired: HashMap<PathBuf, DesiredDeployment>,
+) -> Result<(), String> {
+    let mut state = DeploymentState::load(game, profile_id);
+    let desired_set: HashSet<PathBuf> = desired.keys().cloned().collect();
+
+    for (dest_rel, src_rel) in state.deployed.clone() {
+        let dest = game.root_path.join(&dest_rel);
+        let src = PathBuf::from(&src_rel);
+        if !desired_set.contains(&PathBuf::from(&dest_rel))
+            || !desired
+                .get(&PathBuf::from(&dest_rel))
+                .is_some_and(|s| s.source == src)
+        {
+            let removed = remove_link_if_matches(&src, &dest).unwrap_or(false);
+            if !removed && (dest.exists() || dest.is_symlink()) {
+                let _ = fs::remove_file(&dest);
+            }
+            state.deployed.remove(&dest_rel);
+            state.owners.remove(&dest_rel);
+        }
+    }
+
+    for (dest_rel, entry) in &desired {
+        let dest = game.root_path.join(dest_rel);
+        ensure_path_ready_for_link(game, &mut state, &dest)?;
+        if remove_link_if_matches(&entry.source, &dest).is_err()
+            && (dest.exists() || dest.is_symlink())
+        {
+            let _ = fs::remove_file(&dest);
+        }
+        let _ = create_link(&entry.source, &dest)?;
+        state.deployed.insert(
+            dest_rel.to_string_lossy().into_owned(),
+            entry.source.to_string_lossy().into_owned(),
+        );
+        state.owners.insert(
+            dest_rel.to_string_lossy().into_owned(),
+            entry.owner_id.clone(),
+        );
+    }
+
+    restore_backups_not_in_desired(game, &mut state, &desired_set)?;
+    state.save(game, profile_id)
+}
+
+fn restore_backups_not_in_desired(
+    game: &Game,
+    state: &mut DeploymentState,
+    desired: &HashSet<PathBuf>,
+) -> Result<(), String> {
+    let backup_keys: Vec<String> = state.backups.keys().cloned().collect();
+    for dest_rel in backup_keys {
+        if desired.contains(&PathBuf::from(&dest_rel)) {
+            continue;
+        }
+        let dest = game.root_path.join(&dest_rel);
+        if dest.exists() || dest.is_symlink() {
+            let _ = fs::remove_file(&dest);
+        }
+        if let Some(backup_rel) = state.backups.remove(&dest_rel) {
+            let backup_path = game.config_dir().join(backup_rel);
+            if backup_path.exists() {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to restore parent directory: {e}"))?;
+                }
+                fs::rename(&backup_path, &dest)
+                    .map_err(|e| format!("Failed to restore backup for {}: {e}", dest.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_path_ready_for_link(
+    game: &Game,
+    state: &mut DeploymentState,
+    dest: &Path,
+) -> Result<(), String> {
+    if dest.is_symlink() {
+        return Ok(());
+    }
+    if !dest.exists() {
+        return Ok(());
+    }
+    if !dest.is_file() {
+        return Err(format!(
+            "Destination exists and is not a file: {}",
+            dest.display()
+        ));
+    }
+
+    let rel = dest
+        .strip_prefix(&game.root_path)
+        .map_err(|_| format!("Destination not inside game root: {}", dest.display()))?
+        .to_path_buf();
+    let rel_s = rel.to_string_lossy().into_owned();
+    if state.backups.contains_key(&rel_s) {
+        fs::remove_file(dest)
+            .map_err(|e| format!("Failed to remove existing file {}: {e}", dest.display()))?;
+        return Ok(());
+    }
+    let backup_rel = PathBuf::from("backups").join(&rel);
+    let backup_path = game.config_dir().join(&backup_rel);
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create backup directory: {e}"))?;
+    }
+    fs::rename(dest, &backup_path)
+        .map_err(|e| format!("Failed to backup existing file {}: {e}", dest.display()))?;
+    state
+        .backups
+        .insert(rel_s, backup_rel.to_string_lossy().into_owned());
+    Ok(())
+}
+
+fn collect_mod_destinations(mod_entry: &Mod) -> HashMap<PathBuf, PathBuf> {
+    let mut map = HashMap::new();
+    let data_dir = mod_entry.source_path.join("Data");
+    if data_dir.is_dir() {
+        collect_data_paths_recursive(&data_dir, Path::new("Data"), &mut map);
+        collect_root_paths_recursive(&mod_entry.source_path, Path::new(""), &mut map);
+    } else {
+        collect_data_paths_recursive(&mod_entry.source_path, Path::new("Data"), &mut map);
+    }
+    map
+}
+
+fn collect_generated_output_destinations(
+    output: &crate::core::mods::GeneratedOutputPackage,
+) -> HashMap<PathBuf, PathBuf> {
+    let mut map = HashMap::new();
+    collect_data_paths_recursive(&output.source_path, Path::new("Data"), &mut map);
+    map
+}
+
+fn collect_data_paths_recursive(src: &Path, dest: &Path, out: &mut HashMap<PathBuf, PathBuf>) {
+    let Ok(entries) = fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let name = entry.file_name();
+        if src_path.is_dir() && name.as_encoded_bytes().eq_ignore_ascii_case(b"data") {
+            collect_data_paths_recursive(&src_path, dest, out);
+        } else if src_path.is_dir() {
+            collect_data_paths_recursive(&src_path, &dest.join(&name), out);
+        } else if src_path.is_file() {
+            out.insert(dest.join(&name), src_path);
+        }
+    }
+}
+
+fn collect_root_paths_recursive(src: &Path, dest: &Path, out: &mut HashMap<PathBuf, PathBuf>) {
+    let Ok(entries) = fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let name = entry.file_name();
+        if name.as_encoded_bytes().eq_ignore_ascii_case(b"data") {
+            continue;
+        }
+        if src_path.is_dir() {
+            collect_root_paths_recursive(&src_path, &dest.join(&name), out);
+        } else if src_path.is_file() {
+            out.insert(dest.join(&name), src_path);
+        }
+    }
+}
 
 /// Deploy a mod by creating links from mod storage to game directory.
 ///
@@ -597,8 +891,12 @@ pub struct DeploymentReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::games::{Game, GameKind, UmuGameConfig};
+    use crate::core::mods::{Mod, ModDatabase};
     use std::fs::File;
     use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -679,5 +977,254 @@ mod tests {
         // Check links exist (may be symlinks or hardlinks depending on filesystem)
         assert!(dest_dir.join("file1.txt").exists());
         assert!(dest_dir.join("subdir/file2.txt").exists());
+    }
+
+    fn test_game(layout: &TempDir) -> Game {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = format!("deploy_test_{}", COUNTER.fetch_add(1, Ordering::Relaxed));
+        let root = layout.path().join("game_root");
+        let data = root.join("Data");
+        let mods_base = layout.path().join("mods_base");
+        let prefix = layout.path().join("umu_prefix");
+        let plugins_dir = prefix
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("AppData")
+            .join("Local")
+            .join(GameKind::SkyrimSE.local_app_data_folder());
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(mods_base.join("mods").join(&id)).unwrap();
+        fs::create_dir_all(&plugins_dir).unwrap();
+
+        Game {
+            id,
+            name: "Test".to_string(),
+            kind: GameKind::SkyrimSE,
+            root_path: root,
+            data_path: data,
+            mods_base_dir: Some(mods_base),
+            umu_config: Some(UmuGameConfig {
+                exe_path: PathBuf::from("game.exe"),
+                prefix_path: Some(prefix),
+                proton_path: None,
+            }),
+        }
+    }
+
+    fn add_mod(
+        game: &Game,
+        db: &mut ModDatabase,
+        name: &str,
+        rel: &str,
+        content: &[u8],
+        enabled: bool,
+    ) {
+        let mod_dir = game.mods_dir().join(name);
+        fs::create_dir_all(mod_dir.join("Data")).unwrap();
+        let path = mod_dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content).unwrap();
+        let mut m = Mod::new(name, mod_dir);
+        m.enabled = enabled;
+        db.mods.push(m);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_uses_order_for_conflict_resolution() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "a",
+            "Data/textures/file.txt",
+            b"from-a",
+            true,
+        );
+        add_mod(
+            &game,
+            &mut db,
+            "b",
+            "Data/textures/file.txt",
+            b"from-b",
+            true,
+        );
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let target_first = fs::read(game.data_path.join("textures/file.txt")).unwrap();
+        assert_eq!(target_first, b"from-b");
+
+        db.mods.swap(0, 1);
+        rebuild_deployment(&game, &mut db).unwrap();
+        let target_second = fs::read(game.data_path.join("textures/file.txt")).unwrap();
+        assert_eq!(target_second, b"from-a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_depends_on_current_state_not_toggle_history() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "a", "Data/meshes/conflict.nif", b"a", true);
+        add_mod(&game, &mut db, "b", "Data/meshes/conflict.nif", b"b", false);
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let target = fs::read(game.data_path.join("meshes/conflict.nif")).unwrap();
+        assert_eq!(target, b"a");
+
+        db.mods[1].enabled = true;
+        rebuild_deployment(&game, &mut db).unwrap();
+        db.mods[1].enabled = false;
+        rebuild_deployment(&game, &mut db).unwrap();
+
+        let final_target = fs::read(game.data_path.join("meshes/conflict.nif")).unwrap();
+        assert_eq!(final_target, b"a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_backs_up_and_restores_real_files() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let target = game.data_path.join("textures/original.dds");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"vanilla").unwrap();
+
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "override",
+            "Data/textures/original.dds",
+            b"modded",
+            true,
+        );
+        rebuild_deployment(&game, &mut db).unwrap();
+
+        assert!(target.exists());
+        let backup = game
+            .config_dir()
+            .join("backups")
+            .join("Data")
+            .join("textures")
+            .join("original.dds");
+        assert!(backup.exists());
+
+        db.mods[0].enabled = false;
+        rebuild_deployment(&game, &mut db).unwrap();
+        let restored = fs::read(&target).unwrap();
+        assert_eq!(restored, b"vanilla");
+        assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugins_deployer_writes_plugins_txt_deterministically() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "base", "Data/Base.esm", b"m", true);
+        add_mod(&game, &mut db, "addon", "Data/Addon.esp", b"p", true);
+        db.plugin_load_order = vec!["Addon.esp".to_string(), "Base.esm".to_string()];
+        db.plugin_disabled.insert("Addon.esp".to_string());
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let plugins_txt = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
+        assert!(plugins_txt.contains("*Base.esm"));
+        assert!(plugins_txt.contains("Addon.esp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_outputs_participate_in_conflict_resolution_order() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "base_mod",
+            "Data/textures/shared.dds",
+            b"mod",
+            true,
+        );
+
+        let generated_dir = game.mods_dir().join("generated_outputs").join("bodyslide");
+        fs::create_dir_all(generated_dir.join("textures")).unwrap();
+        fs::write(generated_dir.join("textures/shared.dds"), b"generated").unwrap();
+        let mut package = crate::core::mods::GeneratedOutputPackage::new(
+            "BodySlide Output",
+            "bodyslide",
+            "default",
+            db.active_profile_id.clone(),
+            generated_dir,
+        );
+        package.enabled = true;
+        db.generated_outputs.push(package);
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let winner = fs::read(game.data_path.join("textures/shared.dds")).unwrap();
+        assert_eq!(winner, b"generated");
+
+        db.generated_outputs[0].enabled = false;
+        rebuild_deployment(&game, &mut db).unwrap();
+        let winner_after = fs::read(game.data_path.join("textures/shared.dds")).unwrap();
+        assert_eq!(winner_after, b"mod");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_switch_rebuilds_isolated_mod_state() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "a", "Data/textures/same.dds", b"a", true);
+        add_mod(&game, &mut db, "b", "Data/textures/same.dds", b"b", false);
+        db.save(&game);
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let winner_default = fs::read(game.data_path.join("textures/same.dds")).unwrap();
+        assert_eq!(winner_default, b"a");
+
+        db.switch_active_profile("second");
+        db.mods[0].enabled = false;
+        db.mods[1].enabled = true;
+        rebuild_deployment(&game, &mut db).unwrap();
+        db.save(&game);
+        let winner_second = fs::read(game.data_path.join("textures/same.dds")).unwrap();
+        assert_eq!(winner_second, b"b");
+
+        db.switch_active_profile("default");
+        rebuild_deployment(&game, &mut db).unwrap();
+        let winner_back = fs::read(game.data_path.join("textures/same.dds")).unwrap();
+        assert_eq!(winner_back, b"a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_switch_changes_plugins_txt_state() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "plugins", "Data/SwitchTest.esp", b"x", true);
+        rebuild_deployment(&game, &mut db).unwrap();
+        db.plugin_disabled.remove("SwitchTest.esp");
+        db.write_plugins_txt(&game).unwrap();
+        let default_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
+        assert!(default_plugins.contains("*SwitchTest.esp"));
+
+        db.switch_active_profile("profile_two");
+        db.plugin_disabled.insert("SwitchTest.esp".to_string());
+        rebuild_deployment(&game, &mut db).unwrap();
+        db.write_plugins_txt(&game).unwrap();
+        let other_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
+        assert!(other_plugins.lines().any(|l| l.trim() == "SwitchTest.esp"));
     }
 }
