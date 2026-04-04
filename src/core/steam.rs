@@ -515,14 +515,55 @@ pub fn launch_game_managed_command(
         .kind
         .steam_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
-    // Use a shell wrapper so we can gracefully fallback when `steam` is not
-    // on PATH (common for some distro/Flatpak setups). We still prefer
-    // `steam -applaunch` for best process visibility when available.
-    let mut command = std::process::Command::new("sh");
-    command.arg("-lc").arg(format!(
-        "if command -v steam >/dev/null 2>&1; then exec steam -applaunch {app_id}; else exec xdg-open steam://run/{app_id}; fi"
-    ));
+    let command = match select_managed_steam_backend(is_steam_flatpak(), steam_binary_on_path()) {
+        ManagedSteamBackend::Flatpak => launch_game_managed_flatpak_command(app_id),
+        ManagedSteamBackend::Native => launch_game_managed_native_command(app_id),
+        ManagedSteamBackend::XdgOpenFallback => {
+            let mut command = std::process::Command::new("xdg-open");
+            command.arg(format!("steam://run/{app_id}"));
+            command
+        }
+    };
     Ok(command)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedSteamBackend {
+    Native,
+    Flatpak,
+    XdgOpenFallback,
+}
+
+fn select_managed_steam_backend(is_flatpak: bool, steam_on_path: bool) -> ManagedSteamBackend {
+    if is_flatpak {
+        ManagedSteamBackend::Flatpak
+    } else if steam_on_path {
+        ManagedSteamBackend::Native
+    } else {
+        ManagedSteamBackend::XdgOpenFallback
+    }
+}
+
+fn steam_binary_on_path() -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join("steam").is_file()))
+        .unwrap_or(false)
+}
+
+fn launch_game_managed_native_command(app_id: u32) -> std::process::Command {
+    let mut command = std::process::Command::new("steam");
+    command.arg("-applaunch").arg(app_id.to_string());
+    command
+}
+
+fn launch_game_managed_flatpak_command(app_id: u32) -> std::process::Command {
+    let mut command = std::process::Command::new("flatpak");
+    command
+        .arg("run")
+        .arg("com.valvesoftware.Steam")
+        .arg("-applaunch")
+        .arg(app_id.to_string());
+    command
 }
 
 /// Find the Proton runtime path for a given game's App ID.
@@ -740,10 +781,8 @@ fn launch_tool_native(
     command.arg(exe_path);
 
     // Add any additional arguments
-    if !arguments.is_empty() {
-        for arg in arguments.split_whitespace() {
-            command.arg(arg);
-        }
+    for arg in split_launch_arguments(arguments)? {
+        command.arg(arg);
     }
 
     // Capture stdout and stderr for logging
@@ -772,10 +811,8 @@ fn build_native_tool_command(
     command.env("SteamGameId", app_id.to_string());
     command.arg("run");
     command.arg(exe_path);
-    if !arguments.is_empty() {
-        for arg in arguments.split_whitespace() {
-            command.arg(arg);
-        }
+    for arg in split_launch_arguments(arguments)? {
+        command.arg(arg);
     }
     Ok(command)
 }
@@ -789,40 +826,14 @@ fn launch_tool_with_flatpak(
     compatdata_path: &Path,
     app_id: u32,
 ) -> Result<std::process::Child, String> {
-    // Build the shell command to run inside Flatpak
-    let mut shell_cmd = String::new();
-
-    // Export environment variables
-    shell_cmd.push_str(&format!(
-        "export STEAM_COMPAT_CLIENT_INSTALL_PATH=\"{}\"\n",
-        steam_root.display()
-    ));
-    shell_cmd.push_str(&format!(
-        "export STEAM_COMPAT_DATA_PATH=\"{}\"\n",
-        compatdata_path.display()
-    ));
-    shell_cmd.push_str(&format!("export SteamAppId=\"{}\"\n", app_id));
-
-    // Build the proton run command
-    shell_cmd.push_str(&format!(
-        "\"{}\" run \"{}\"",
-        proton_script.display(),
-        exe_path.display()
-    ));
-
-    // Add arguments if present
-    if !arguments.is_empty() {
-        shell_cmd.push_str(&format!(" {}", arguments));
-    }
-
-    log::debug!("Flatpak shell command: {}", shell_cmd);
-
-    let mut command = std::process::Command::new("flatpak");
-    command.arg("run");
-    command.arg("--command=sh");
-    command.arg("com.valvesoftware.Steam");
-    command.arg("-c");
-    command.arg(&shell_cmd);
+    let mut command = build_flatpak_tool_command(
+        proton_script,
+        exe_path,
+        arguments,
+        steam_root,
+        compatdata_path,
+        app_id,
+    )?;
 
     // Capture stdout and stderr for logging
     command.stdout(std::process::Stdio::piped());
@@ -843,32 +854,69 @@ fn build_flatpak_tool_command(
     compatdata_path: &Path,
     app_id: u32,
 ) -> Result<std::process::Command, String> {
-    let mut shell_cmd = String::new();
-    shell_cmd.push_str(&format!(
-        "export STEAM_COMPAT_CLIENT_INSTALL_PATH=\"{}\"\n",
-        steam_root.display()
-    ));
-    shell_cmd.push_str(&format!(
-        "export STEAM_COMPAT_DATA_PATH=\"{}\"\n",
-        compatdata_path.display()
-    ));
-    shell_cmd.push_str(&format!("export SteamAppId=\"{}\"\n", app_id));
-    shell_cmd.push_str(&format!(
-        "\"{}\" run \"{}\"",
-        proton_script.display(),
-        exe_path.display()
-    ));
-    if !arguments.is_empty() {
-        shell_cmd.push_str(&format!(" {}", arguments));
-    }
-
     let mut command = std::process::Command::new("flatpak");
-    command.arg("run");
-    command.arg("--command=sh");
-    command.arg("com.valvesoftware.Steam");
-    command.arg("-c");
-    command.arg(shell_cmd);
+    command
+        .arg("run")
+        .arg(format!(
+            "--env=STEAM_COMPAT_CLIENT_INSTALL_PATH={}",
+            steam_root.display()
+        ))
+        .arg(format!(
+            "--env=STEAM_COMPAT_DATA_PATH={}",
+            compatdata_path.display()
+        ))
+        .arg(format!("--env=SteamAppId={app_id}"))
+        .arg(format!("--env=SteamGameId={app_id}"))
+        .arg(format!("--command={}", proton_script.display()))
+        .arg("com.valvesoftware.Steam")
+        .arg("run")
+        .arg(exe_path);
+    for arg in split_launch_arguments(arguments)? {
+        command.arg(arg);
+    }
     Ok(command)
+}
+
+fn split_launch_arguments(arguments: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in arguments.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '\'' | '"' => {
+                if quote == Some(c) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(c);
+                } else {
+                    current.push(c);
+                }
+            }
+            c if c.is_whitespace() && quote.is_none() => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if quote.is_some() {
+        return Err("Tool arguments contain an unmatched quote".to_string());
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -924,6 +972,98 @@ mod tests {
 
         let external_lib = PathBuf::from("/mnt/data0/.steamlib/steamapps/compatdata/489830");
         assert!(!is_path_in_flatpak(&external_lib));
+    }
+
+    #[test]
+    fn managed_backend_selection_prefers_flatpak_when_detected() {
+        assert_eq!(
+            select_managed_steam_backend(true, true),
+            ManagedSteamBackend::Flatpak
+        );
+        assert_eq!(
+            select_managed_steam_backend(true, false),
+            ManagedSteamBackend::Flatpak
+        );
+    }
+
+    #[test]
+    fn managed_backend_selection_uses_native_when_available() {
+        assert_eq!(
+            select_managed_steam_backend(false, true),
+            ManagedSteamBackend::Native
+        );
+    }
+
+    #[test]
+    fn managed_backend_selection_uses_xdg_open_only_as_last_resort() {
+        assert_eq!(
+            select_managed_steam_backend(false, false),
+            ManagedSteamBackend::XdgOpenFallback
+        );
+    }
+
+    #[test]
+    fn flatpak_managed_game_command_uses_flatpak_run_applaunch() {
+        let command = launch_game_managed_flatpak_command(489830);
+        let program = command.get_program().to_string_lossy().to_string();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(program, "flatpak");
+        assert_eq!(
+            args,
+            vec!["run", "com.valvesoftware.Steam", "-applaunch", "489830"]
+        );
+    }
+
+    #[test]
+    fn native_managed_game_command_uses_steam_applaunch() {
+        let command = launch_game_managed_native_command(489830);
+        let program = command.get_program().to_string_lossy().to_string();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(program, "steam");
+        assert_eq!(args, vec!["-applaunch", "489830"]);
+    }
+
+    #[test]
+    fn split_launch_arguments_preserves_quoted_spaces() {
+        let args = split_launch_arguments(r#"-flag "value one" --path '/tmp/tool dir'"#).unwrap();
+        assert_eq!(
+            args,
+            vec!["-flag", "value one", "--path", "/tmp/tool dir"]
+        );
+    }
+
+    #[test]
+    fn build_flatpak_tool_command_handles_spaces_without_shell_concat() {
+        let cmd = build_flatpak_tool_command(
+            Path::new("/flatpak/proton/proton"),
+            Path::new("/games/My Tool.exe"),
+            r#"--profile "Default Profile" --output "out dir""#,
+            Path::new("/flatpak/steam/root"),
+            Path::new("/flatpak/compatdata/489830"),
+            489830,
+        )
+        .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().any(|a| a == "--profile"));
+        assert!(args.iter().any(|a| a == "Default Profile"));
+        assert!(args.iter().any(|a| a == "out dir"));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("--env=SteamAppId=489830"))
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("--env=SteamGameId=489830"))
+        );
     }
 
     #[test]

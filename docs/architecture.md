@@ -99,6 +99,8 @@ It also owns per-session rolling log buffers for stdout/stderr capture.
 
 - Tool sessions are launched as tracked child processes and can be stopped from LinkMM.
 - Non-Steam UMU game sessions are launched as tracked child processes and can be stopped from LinkMM.
-- Steam game sessions are launched via `steam -applaunch` wrapper process for tracking.
-  Stop targets that wrapper process. Steam can re-parent the real game process, so stop/kill
-  visibility for Steam sessions is inherently best-effort.
+- Steam game sessions use backend-specific managed commands:
+  - native Steam installs: `steam -applaunch <app_id>`
+  - Flatpak Steam installs: `flatpak run com.valvesoftware.Steam -applaunch <app_id>`
+- Stop targets the spawned Steam wrapper process. Steam can re-parent the real game process, so
+  stop/kill visibility for both native and Flatpak Steam sessions is inherently best-effort.
