@@ -171,6 +171,7 @@ fn replace_package_for_tool(
         name.to_string(),
         tool.tool_id.clone(),
         tool.run_profile.clone(),
+        db.active_profile_id.clone(),
         dest,
     );
     package.owned_files = enumerate_owned_files(&package)?;
