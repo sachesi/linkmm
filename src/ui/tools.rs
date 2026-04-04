@@ -11,7 +11,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile};
-use crate::core::games::Game;
+use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::{ModDatabase, ModManager};
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
@@ -613,7 +613,7 @@ fn default_profiles_for_name(name: &str) -> Vec<ToolRunProfile> {
     adapter_for_tool(&tool).default_profiles(&tool)
 }
 
-/// Launch a tool with Proton.
+/// Launch a tool in the selected game instance context.
 fn launch_tool(
     game: &Game,
     tool: &ToolConfig,
@@ -644,11 +644,22 @@ fn launch_tool(
             &tool_clone,
             &profile,
             |tool_cfg, _profile_cfg| {
-                let mut child = crate::core::steam::launch_tool_with_proton(
-                    &tool_cfg.exe_path,
-                    &tool_cfg.arguments,
-                    tool_cfg.app_id,
-                )?;
+                let mut child = match game_clone.launcher_source {
+                    GameLauncherSource::Steam => crate::core::steam::launch_tool_with_proton(
+                        &tool_cfg.exe_path,
+                        &tool_cfg.arguments,
+                        tool_cfg.app_id,
+                    )?,
+                    GameLauncherSource::NonSteamUmu => {
+                        let umu_cfg = game_clone.validate_umu_setup()?;
+                        crate::core::umu::launch_with_umu(
+                            &tool_cfg.exe_path,
+                            tool_cfg.app_id,
+                            umu_cfg.prefix_path.as_deref(),
+                            umu_cfg.proton_path.as_deref(),
+                        )?
+                    }
+                };
                 if let Some(stdout) = child.stdout.take() {
                     let reader = BufReader::new(stdout);
                     for line in reader.lines().map_while(Result::ok) {

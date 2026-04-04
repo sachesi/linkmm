@@ -10,6 +10,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
+use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
 
 pub mod downloads;
@@ -34,7 +35,11 @@ pub fn build_ui(app: &libadwaita::Application) {
 
     // If any game is configured via UMU, check for a newer umu-run release in
     // the background and re-download automatically when the tag has changed.
-    let has_umu_game = config.borrow().games.iter().any(|g| g.umu_config.is_some());
+    let has_umu_game = config
+        .borrow()
+        .games
+        .iter()
+        .any(|g| g.launcher_source == GameLauncherSource::NonSteamUmu);
     if has_umu_game {
         let installed_version = config.borrow().umu_installed_version.clone();
         let config_for_update = Rc::clone(&config);
@@ -115,7 +120,7 @@ fn build_main_window(
         let cfg = config.borrow();
         update_active_game_row(
             &active_game_row,
-            cfg.current_game().map(|g| g.name.as_str()),
+            cfg.current_game().map(|g| g.instance_label()),
         );
     }
 
@@ -135,7 +140,10 @@ fn build_main_window(
         let cfg = config.borrow();
         play_btn.set_visible(
             cfg.current_game()
-                .map(|g| g.kind.steam_app_id().is_some() || g.umu_config.is_some())
+                .map(|g| {
+                    g.kind.steam_app_id().is_some()
+                        || g.launcher_source == GameLauncherSource::NonSteamUmu
+                })
                 .unwrap_or(false),
         );
     }
@@ -146,22 +154,25 @@ fn build_main_window(
             let game = config_c.borrow().current_game().cloned();
             let Some(g) = game else { return };
 
-            if let Some(ref umu_cfg) = g.umu_config {
-                // UMU-configured (non-Steam) game — launch via umu-run.
-                let app_id = g.kind.steam_app_id().unwrap_or(0);
-                match crate::core::umu::launch_with_umu(
-                    &umu_cfg.exe_path,
-                    app_id,
-                    umu_cfg.prefix_path.as_deref(),
-                    umu_cfg.proton_path.as_deref(),
-                ) {
-                    Ok(_) => log::info!("Launched {} via umu-run", g.name),
-                    Err(e) => log::warn!("Could not launch {} via umu-run: {e}", g.name),
+            match g.launcher_source {
+                GameLauncherSource::NonSteamUmu => {
+                    let app_id = g.kind.steam_app_id().unwrap_or(0);
+                    match g.validate_umu_setup().and_then(|umu_cfg| {
+                        crate::core::umu::launch_with_umu(
+                            &umu_cfg.exe_path,
+                            app_id,
+                            umu_cfg.prefix_path.as_deref(),
+                            umu_cfg.proton_path.as_deref(),
+                        )
+                    }) {
+                        Ok(_) => log::info!("Launched {} via umu-run", g.name),
+                        Err(e) => log::warn!("Could not launch {} via umu-run: {e}", g.name),
+                    }
                 }
-            } else {
-                // Steam game — launch via steam://run/<appid>.
-                if let Err(e) = crate::core::steam::launch_game(&g) {
-                    log::warn!("Could not launch {}: {e}", g.name);
+                GameLauncherSource::Steam => {
+                    if let Err(e) = crate::core::steam::launch_game(&g) {
+                        log::warn!("Could not launch {}: {e}", g.name);
+                    }
                 }
             }
         });
@@ -420,7 +431,7 @@ fn build_main_window(
         };
 
         if let Some(game) = &game_info {
-            update_active_game_row(&active_game_row_r, Some(game.name.as_str()));
+            update_active_game_row(&active_game_row_r, Some(game.instance_label()));
         } else {
             update_active_game_row(&active_game_row_r, None);
         }
@@ -429,7 +440,10 @@ fn build_main_window(
         play_btn_r.set_visible(
             game_info
                 .as_ref()
-                .map(|g| g.kind.steam_app_id().is_some() || g.umu_config.is_some())
+                .map(|g| {
+                    g.kind.steam_app_id().is_some()
+                        || g.launcher_source == GameLauncherSource::NonSteamUmu
+                })
                 .unwrap_or(false),
         );
 
@@ -523,10 +537,10 @@ fn make_section_label(text: &str) -> gtk4::Label {
     label
 }
 
-fn update_active_game_row(row: &adw::ActionRow, name: Option<&str>) {
+fn update_active_game_row(row: &adw::ActionRow, name: Option<String>) {
     match name {
         Some(n) => {
-            row.set_title(n);
+            row.set_title(&n);
             row.set_subtitle("Click to switch game");
         }
         None => {
@@ -596,9 +610,14 @@ fn show_game_picker(
     {
         let games = config.borrow().games.clone();
         for game in &games {
+            let subtitle = format!(
+                "{} · {}",
+                game.kind.display_name(),
+                game.root_path.display()
+            );
             let row = adw::ActionRow::builder()
-                .title(&game.name)
-                .subtitle(game.root_path.to_string_lossy().as_ref())
+                .title(game.instance_label())
+                .subtitle(&subtitle)
                 .activatable(true)
                 .build();
 

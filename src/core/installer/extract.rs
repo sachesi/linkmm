@@ -229,10 +229,10 @@ pub(super) fn extract_7z_archive_to(
     // When no prefix stripping is needed, try the system `7z` binary first.
     // It is typically 3–10× faster than the pure-Rust decompressor for large
     // LZMA2 solid archives.
-    if strip_prefix.is_empty() {
-        if let Some(result) = try_extract_with_system_7z(archive_path, dest_dir, progress) {
-            return result;
-        }
+    if strip_prefix.is_empty()
+        && let Some(result) = try_extract_with_system_7z(archive_path, dest_dir, progress)
+    {
+        return result;
     }
 
     // Reading the archive header is cheap (no decompression) and gives us
@@ -699,15 +699,30 @@ pub(super) fn normalize_paths_to_lowercase(dir: &Path) {
             let target = dir.join(&lower);
 
             if target.exists() {
-                // A file/dir with the same lowercase name already exists
-                // (can happen when an archive contains both `Data` and `data`).
-                // Keep the original to avoid an unintended overwrite.
-                log::debug!(
-                    "[normalize] Skipping {:?}: target {:?} already exists",
-                    name,
-                    lower,
-                );
-                original_path
+                match (original_path.is_dir(), target.is_dir()) {
+                    (true, true) => {
+                        if let Err(e) = merge_directory_into(&original_path, &target) {
+                            log::warn!(
+                                "[normalize] Failed to merge {:?} into {:?}: {e}",
+                                original_path,
+                                target,
+                            );
+                            original_path
+                        } else {
+                            target
+                        }
+                    }
+                    _ => {
+                        // Keep original on file/file or file/dir collisions to avoid
+                        // unintended overwrite.
+                        log::debug!(
+                            "[normalize] Skipping {:?}: target {:?} already exists",
+                            name,
+                            lower,
+                        );
+                        original_path
+                    }
+                }
             } else {
                 match std::fs::rename(&original_path, &target) {
                     Ok(()) => {
@@ -731,6 +746,50 @@ pub(super) fn normalize_paths_to_lowercase(dir: &Path) {
             normalize_paths_to_lowercase(&final_path);
         }
     }
+}
+
+fn merge_directory_into(src: &Path, dst: &Path) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(src).map_err(|e| format!("Failed reading {}: {e}", src.display()))?;
+    for entry in entries.flatten() {
+        let src_child = entry.path();
+        let file_name = entry.file_name();
+        let dst_child = dst.join(file_name.to_string_lossy().to_lowercase());
+        if src_child.is_dir() {
+            if !dst_child.exists() {
+                std::fs::rename(&src_child, &dst_child).map_err(|e| {
+                    format!(
+                        "Failed moving directory {} -> {}: {e}",
+                        src_child.display(),
+                        dst_child.display()
+                    )
+                })?;
+            } else if dst_child.is_dir() {
+                merge_directory_into(&src_child, &dst_child)?;
+            }
+            continue;
+        }
+        if !dst_child.exists() {
+            std::fs::rename(&src_child, &dst_child).map_err(|e| {
+                format!(
+                    "Failed moving file {} -> {}: {e}",
+                    src_child.display(),
+                    dst_child.display()
+                )
+            })?;
+        } else {
+            log::debug!(
+                "[normalize] Skipping file collision {} -> {}",
+                src_child.display(),
+                dst_child.display()
+            );
+        }
+    }
+    if src.exists() {
+        std::fs::remove_dir(src)
+            .map_err(|e| format!("Failed removing merged source dir {}: {e}", src.display()))?;
+    }
+    Ok(())
 }
 
 // ── ExtractedArchive ──────────────────────────────────────────────────────────
