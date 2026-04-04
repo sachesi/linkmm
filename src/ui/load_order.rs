@@ -296,13 +296,15 @@ fn build_plugin_row(
             if let Some(pos) = ordered
                 .iter()
                 .position(|p| p.name == plugin_name && !p.is_vanilla)
-                && pos > 0 && !ordered[pos - 1].is_vanilla {
-                    ordered.swap(pos, pos - 1);
-                    db.set_plugin_order(&ordered);
-                    db.save(&game_c);
-                    let _ = db.write_plugins_txt(&game_c);
-                    refresh_load_order_content(&container_c, &game_c);
-                }
+                && pos > 0
+                && !ordered[pos - 1].is_vanilla
+            {
+                ordered.swap(pos, pos - 1);
+                db.set_plugin_order(&ordered);
+                db.save(&game_c);
+                let _ = db.write_plugins_txt(&game_c);
+                refresh_load_order_content(&container_c, &game_c);
+            }
         });
     }
 
@@ -318,13 +320,15 @@ fn build_plugin_row(
             if let Some(pos) = ordered
                 .iter()
                 .position(|p| p.name == plugin_name && !p.is_vanilla)
-                && pos + 1 < len && !ordered[pos + 1].is_vanilla {
-                    ordered.swap(pos, pos + 1);
-                    db.set_plugin_order(&ordered);
-                    db.save(&game_c);
-                    let _ = db.write_plugins_txt(&game_c);
-                    refresh_load_order_content(&container_c, &game_c);
-                }
+                && pos + 1 < len
+                && !ordered[pos + 1].is_vanilla
+            {
+                ordered.swap(pos, pos + 1);
+                db.set_plugin_order(&ordered);
+                db.save(&game_c);
+                let _ = db.write_plugins_txt(&game_c);
+                refresh_load_order_content(&container_c, &game_c);
+            }
         });
     }
 
@@ -367,17 +371,18 @@ fn build_plugin_row(
             if let (Some(src_pos), Some(tgt_pos)) = (
                 ordered.iter().position(|p| p.name == source_name),
                 ordered.iter().position(|p| p.name == target_name),
-            )
-                && !ordered[src_pos].is_vanilla && !ordered[tgt_pos].is_vanilla {
-                    let plugin_to_move = ordered.remove(src_pos);
-                    // After removal the indices above src_pos shift down by one
-                    let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &ordered);
-                    ordered.insert(insert_pos, plugin_to_move);
-                    db.set_plugin_order(&ordered);
-                    db.save(&game_drop);
-                    let _ = db.write_plugins_txt(&game_drop);
-                    refresh_load_order_content(&container_drop, &game_drop);
-                }
+            ) && !ordered[src_pos].is_vanilla
+                && !ordered[tgt_pos].is_vanilla
+            {
+                let plugin_to_move = ordered.remove(src_pos);
+                // After removal the indices above src_pos shift down by one
+                let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &ordered);
+                ordered.insert(insert_pos, plugin_to_move);
+                db.set_plugin_order(&ordered);
+                db.save(&game_drop);
+                let _ = db.write_plugins_txt(&game_drop);
+                refresh_load_order_content(&container_drop, &game_drop);
+            }
             true
         });
     }
@@ -442,17 +447,18 @@ fn build_plugin_row(
             move_item.connect_clicked(move |_| {
                 popover_c.popdown();
                 if let Some(root) = row_btn.root()
-                    && let Ok(window) = root.downcast::<gtk4::Window>() {
-                        show_move_to_position_dialog(
-                            &window,
-                            plugin_name_btn.clone(),
-                            current_idx,
-                            vanilla_count_rclick,
-                            total_rclick,
-                            Rc::clone(&game_btn),
-                            container_btn.clone(),
-                        );
-                    }
+                    && let Ok(window) = root.downcast::<gtk4::Window>()
+                {
+                    show_move_to_position_dialog(
+                        &window,
+                        plugin_name_btn.clone(),
+                        current_idx,
+                        vanilla_count_rclick,
+                        total_rclick,
+                        Rc::clone(&game_btn),
+                        container_btn.clone(),
+                    );
+                }
             });
 
             let popover_enable = popover.clone();
@@ -574,15 +580,17 @@ fn show_move_to_position_dialog(
         let mut ordered = db.get_ordered_plugins(&game);
 
         if let Some(src_pos) = ordered.iter().position(|p| p.name == plugin_name)
-            && !ordered[src_pos].is_vanilla && target_idx < ordered.len() {
-                let p = ordered.remove(src_pos);
-                let insert_pos = adjusted_insert_pos(src_pos, target_idx, &ordered);
-                ordered.insert(insert_pos, p);
-                db.set_plugin_order(&ordered);
-                db.save(&game);
-                let _ = db.write_plugins_txt(&game);
-                refresh_load_order_content(&container, &game);
-            }
+            && !ordered[src_pos].is_vanilla
+            && target_idx < ordered.len()
+        {
+            let p = ordered.remove(src_pos);
+            let insert_pos = adjusted_insert_pos(src_pos, target_idx, &ordered);
+            ordered.insert(insert_pos, p);
+            db.set_plugin_order(&ordered);
+            db.save(&game);
+            let _ = db.write_plugins_txt(&game);
+            refresh_load_order_content(&container, &game);
+        }
     });
 
     dialog.present(Some(parent));

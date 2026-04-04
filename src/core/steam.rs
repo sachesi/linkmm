@@ -102,11 +102,13 @@ fn parse_library_folders_vdf(contents: &str) -> Vec<PathBuf> {
                 in_entry = false;
             }
             depth -= 1;
-        } else if in_entry && depth == 2
+        } else if in_entry
+            && depth == 2
             && let Some((key, value)) = parse_vdf_key_value(trimmed)
-                && key == "path" {
-                    paths.push(PathBuf::from(value));
-                }
+            && key == "path"
+        {
+            paths.push(PathBuf::from(value));
+        }
     }
 
     paths
@@ -135,9 +137,10 @@ fn parse_acf_install_dir(contents: &str) -> Option<String> {
     for line in contents.lines() {
         let trimmed = line.trim();
         if let Some((key, value)) = parse_vdf_key_value(trimmed)
-            && key == "installdir" {
-                return Some(value);
-            }
+            && key == "installdir"
+        {
+            return Some(value);
+        }
     }
     None
 }
@@ -149,10 +152,29 @@ fn parse_per_game_proton_config(app_id: u32) -> Option<String> {
     let home = dirs::home_dir()?;
 
     let candidate_config_paths = vec![
-        home.join(".steam").join("steam").join("config").join("config.vdf"),
-        home.join(".local").join("share").join("Steam").join("config").join("config.vdf"),
-        home.join("snap").join("steam").join("common").join(".steam").join("steam").join("config").join("config.vdf"),
-        home.join(".var").join("app").join("com.valvesoftware.Steam").join(".steam").join("steam").join("config").join("config.vdf"),
+        home.join(".steam")
+            .join("steam")
+            .join("config")
+            .join("config.vdf"),
+        home.join(".local")
+            .join("share")
+            .join("Steam")
+            .join("config")
+            .join("config.vdf"),
+        home.join("snap")
+            .join("steam")
+            .join("common")
+            .join(".steam")
+            .join("steam")
+            .join("config")
+            .join("config.vdf"),
+        home.join(".var")
+            .join("app")
+            .join("com.valvesoftware.Steam")
+            .join(".steam")
+            .join("steam")
+            .join("config")
+            .join("config.vdf"),
     ];
 
     for config_path in candidate_config_paths {
@@ -161,11 +183,16 @@ fn parse_per_game_proton_config(app_id: u32) -> Option<String> {
         }
 
         if let Ok(contents) = std::fs::read_to_string(&config_path)
-            && let Some(tool_name) = parse_compat_tool_mapping(&contents, app_id) {
-                log::debug!("Found per-game Proton config for {}: {} in {}",
-                    app_id, tool_name, config_path.display());
-                return Some(tool_name);
-            }
+            && let Some(tool_name) = parse_compat_tool_mapping(&contents, app_id)
+        {
+            log::debug!(
+                "Found per-game Proton config for {}: {} in {}",
+                app_id,
+                tool_name,
+                config_path.display()
+            );
+            return Some(tool_name);
+        }
     }
 
     None
@@ -191,10 +218,11 @@ fn parse_compat_tool_mapping(contents: &str, app_id: u32) -> Option<String> {
             in_compat_mapping = true;
         } else if in_compat_mapping && depth > 0 {
             if let Some((key, _)) = parse_vdf_key_value(trimmed)
-                && key == app_id_str {
-                    // Next section should have "name" key with the tool
-                    continue;
-                }
+                && key == app_id_str
+            {
+                // Next section should have "name" key with the tool
+                continue;
+            }
             // Check for nested structure: app_id { "name" "tool_name" }
             if trimmed.starts_with(&format!("\"{}\"", app_id_str)) {
                 // Found our app, look for the tool name in subsequent lines
@@ -211,9 +239,10 @@ fn parse_compat_tool_mapping(contents: &str, app_id: u32) -> Option<String> {
                             break;
                         }
                     } else if let Some((key, value)) = parse_vdf_key_value(next_trimmed)
-                        && (key == "name" || key == "Priority") {
-                            return Some(value);
-                        }
+                        && (key == "name" || key == "Priority")
+                    {
+                        return Some(value);
+                    }
                 }
             }
         }
@@ -250,7 +279,11 @@ fn find_proton_directories() -> Vec<PathBuf> {
         let roots = vec![
             home.join(".steam").join("steam"),
             home.join(".local").join("share").join("Steam"),
-            home.join(".var").join("app").join("com.valvesoftware.Steam").join(".steam").join("steam"),
+            home.join(".var")
+                .join("app")
+                .join("com.valvesoftware.Steam")
+                .join(".steam")
+                .join("steam"),
         ];
 
         for root in roots {
@@ -282,7 +315,9 @@ fn find_proton_by_name(tool_name: &str) -> Option<PathBuf> {
                 let dir_name = entry.file_name().to_string_lossy().to_string();
 
                 // Check for exact match or normalized match
-                if dir_name == tool_name || normalize_proton_name(&dir_name) == normalize_proton_name(tool_name) {
+                if dir_name == tool_name
+                    || normalize_proton_name(&dir_name) == normalize_proton_name(tool_name)
+                {
                     // Verify it has a proton script
                     if path.join("proton").exists() {
                         log::debug!("Found Proton at: {}", path.display());
@@ -296,7 +331,8 @@ fn find_proton_by_name(tool_name: &str) -> Option<PathBuf> {
                     let dir_lower = dir_name.to_lowercase();
 
                     // Extract version numbers for comparison
-                    if tools_match_version(&tool_lower, &dir_lower) && path.join("proton").exists() {
+                    if tools_match_version(&tool_lower, &dir_lower) && path.join("proton").exists()
+                    {
                         log::debug!("Found Proton at: {} (version match)", path.display());
                         return Some(path);
                     }
@@ -320,8 +356,14 @@ fn normalize_proton_name(name: &str) -> String {
 /// Check if two Proton tool names refer to the same version.
 fn tools_match_version(tool1: &str, tool2: &str) -> bool {
     // Extract numbers from both names
-    let nums1: Vec<&str> = tool1.split(|c: char| !c.is_numeric()).filter(|s| !s.is_empty()).collect();
-    let nums2: Vec<&str> = tool2.split(|c: char| !c.is_numeric()).filter(|s| !s.is_empty()).collect();
+    let nums1: Vec<&str> = tool1
+        .split(|c: char| !c.is_numeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let nums2: Vec<&str> = tool2
+        .split(|c: char| !c.is_numeric())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     // If we have version numbers, they should match
     if !nums1.is_empty() && !nums2.is_empty() {
@@ -337,12 +379,13 @@ pub fn find_game_path(app_id: u32) -> Option<PathBuf> {
         let manifest_path = lib.path.join(format!("appmanifest_{app_id}.acf"));
         if manifest_path.exists()
             && let Ok(contents) = std::fs::read_to_string(&manifest_path)
-                && let Some(install_dir) = parse_acf_install_dir(&contents) {
-                    let game_path = lib.path.join("common").join(install_dir);
-                    if game_path.is_dir() {
-                        return Some(game_path);
-                    }
-                }
+            && let Some(install_dir) = parse_acf_install_dir(&contents)
+        {
+            let game_path = lib.path.join("common").join(install_dir);
+            if game_path.is_dir() {
+                return Some(game_path);
+            }
+        }
     }
     None
 }
@@ -351,9 +394,10 @@ pub fn detect_games() -> Vec<(GameKind, PathBuf)> {
     let mut found = Vec::new();
     for kind in GameKind::all() {
         if let Some(app_id) = kind.steam_app_id()
-            && let Some(path) = find_game_path(app_id) {
-                found.push((kind, path));
-            }
+            && let Some(path) = find_game_path(app_id)
+        {
+            found.push((kind, path));
+        }
     }
     found
 }
@@ -483,7 +527,10 @@ pub fn find_proton_for_game(app_id: u32) -> Result<(PathBuf, PathBuf), String> {
             log::info!("Using configured Proton: {}", proton_path.display());
             return Ok((proton_path, compatdata_path));
         } else {
-            log::warn!("Configured Proton '{}' not found, falling back to detection", tool_name);
+            log::warn!(
+                "Configured Proton '{}' not found, falling back to detection",
+                tool_name
+            );
         }
     }
 
@@ -505,7 +552,10 @@ pub fn find_proton_for_game(app_id: u32) -> Result<(PathBuf, PathBuf), String> {
 
         // Try to find Proton matching this version
         if let Some(proton_path) = find_proton_by_name(version) {
-            log::info!("Found Proton matching version file: {}", proton_path.display());
+            log::info!(
+                "Found Proton matching version file: {}",
+                proton_path.display()
+            );
             return Ok((proton_path, compatdata_path));
         }
     }
@@ -566,8 +616,8 @@ pub fn launch_tool_with_proton(
         return Err(format!("Executable not found at {}", exe_path.display()));
     }
 
-    let steam_root = find_steam_root()
-        .ok_or_else(|| "Could not find Steam installation".to_string())?;
+    let steam_root =
+        find_steam_root().ok_or_else(|| "Could not find Steam installation".to_string())?;
 
     log::info!(
         "Launching tool {} with Proton from {}",
@@ -580,7 +630,9 @@ pub fn launch_tool_with_proton(
     let is_flatpak = is_path_in_flatpak(&proton_path) || is_path_in_flatpak(&compatdata_path);
 
     if is_flatpak {
-        log::info!("Detected Flatpak Steam (Proton or compatdata in Flatpak directory), using flatpak wrapper");
+        log::info!(
+            "Detected Flatpak Steam (Proton or compatdata in Flatpak directory), using flatpak wrapper"
+        );
         launch_tool_with_flatpak(
             &proton_script,
             exe_path,
@@ -667,7 +719,11 @@ fn launch_tool_with_flatpak(
     shell_cmd.push_str(&format!("export SteamAppId=\"{}\"\n", app_id));
 
     // Build the proton run command
-    shell_cmd.push_str(&format!("\"{}\" run \"{}\"", proton_script.display(), exe_path.display()));
+    shell_cmd.push_str(&format!(
+        "\"{}\" run \"{}\"",
+        proton_script.display(),
+        exe_path.display()
+    ));
 
     // Add arguments if present
     if !arguments.is_empty() {
@@ -733,14 +789,19 @@ mod tests {
         use std::path::PathBuf;
 
         // Flatpak paths should be detected
-        let flatpak_path = PathBuf::from("/home/user/.var/app/com.valvesoftware.Steam/.steam/steam/compatibilitytools.d/GE-Proton10-34");
+        let flatpak_path = PathBuf::from(
+            "/home/user/.var/app/com.valvesoftware.Steam/.steam/steam/compatibilitytools.d/GE-Proton10-34",
+        );
         assert!(is_path_in_flatpak(&flatpak_path));
 
-        let flatpak_compatdata = PathBuf::from("/home/user/.var/app/com.valvesoftware.Steam/data/steamapps/compatdata/489830");
+        let flatpak_compatdata = PathBuf::from(
+            "/home/user/.var/app/com.valvesoftware.Steam/data/steamapps/compatdata/489830",
+        );
         assert!(is_path_in_flatpak(&flatpak_compatdata));
 
         // Native paths should not be detected as Flatpak
-        let native_path = PathBuf::from("/home/user/.local/share/Steam/steamapps/common/Proton 8.0");
+        let native_path =
+            PathBuf::from("/home/user/.local/share/Steam/steamapps/common/Proton 8.0");
         assert!(!is_path_in_flatpak(&native_path));
 
         let external_lib = PathBuf::from("/mnt/data0/.steamlib/steamapps/compatdata/489830");
@@ -792,7 +853,10 @@ mod tests {
     fn normalize_proton_name_removes_separators() {
         assert_eq!(normalize_proton_name("Proton-8.0"), "proton80");
         assert_eq!(normalize_proton_name("GE-Proton9-2"), "geproton92");
-        assert_eq!(normalize_proton_name("proton_experimental"), "protonexperimental");
+        assert_eq!(
+            normalize_proton_name("proton_experimental"),
+            "protonexperimental"
+        );
     }
 
     #[test]

@@ -10,14 +10,12 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::core::config::{AppConfig, ToolConfig};
+use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile};
 use crate::core::games::Game;
+use crate::core::mods::{ModDatabase, ModManager};
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
-pub fn build_tools_page(
-    game: Option<&Game>,
-    config: Rc<RefCell<AppConfig>>,
-) -> gtk4::Widget {
+pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     let title_widget = adw::WindowTitle::new("Tools", "");
@@ -39,11 +37,40 @@ pub fn build_tools_page(
 
     let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
 
-    if let Some(game) = game {
+    if let Some(game) = game.cloned() {
+        let profile_group = adw::PreferencesGroup::builder()
+            .title("Active Profile")
+            .description("Tool runs and generated output management are scoped to this profile.")
+            .build();
+        let profile_row = adw::ComboRow::new();
+        profile_row.set_title("Profile");
+        let profile_names = gtk4::StringList::new(&[]);
+        {
+            let cfg = config.borrow();
+            if let Some(gs) = cfg.game_settings.get(&game.id) {
+                for p in &gs.profiles {
+                    profile_names.append(&p.name);
+                }
+                if let Some(idx) = gs
+                    .profiles
+                    .iter()
+                    .position(|p| p.id == gs.active_profile_id)
+                    .map(|i| i as u32)
+                {
+                    profile_row.set_selected(idx);
+                }
+            }
+        }
+        profile_row.set_model(Some(&profile_names));
+        profile_group.add(&profile_row);
+
         // Tools group
         let tools_group = adw::PreferencesGroup::builder()
             .title("External Tools")
-            .description(format!("Configure Windows-native utilities for {}", game.name))
+            .description(format!(
+                "Configure Windows-native utilities for {}",
+                game.name
+            ))
             .build();
 
         let add_tool_btn = gtk4::Button::new();
@@ -57,6 +84,20 @@ pub fn build_tools_page(
         tools_list.set_selection_mode(gtk4::SelectionMode::None);
         tools_group.add(&tools_list);
 
+        let generated_group = adw::PreferencesGroup::builder()
+            .title("Generated Outputs")
+            .description("Managed output packages produced by tool runs.")
+            .build();
+        let cleanup_generated_btn = gtk4::Button::new();
+        cleanup_generated_btn.set_icon_name("edit-clear-symbolic");
+        cleanup_generated_btn.add_css_class("flat");
+        cleanup_generated_btn.set_tooltip_text(Some("Cleanup stale generated outputs"));
+        generated_group.set_header_suffix(Some(&cleanup_generated_btn));
+        let generated_list = gtk4::ListBox::new();
+        generated_list.add_css_class("boxed-list");
+        generated_list.set_selection_mode(gtk4::SelectionMode::None);
+        generated_group.add(&generated_list);
+
         // Rebuild function to refresh the tool list
         let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
         let rebuild_weak = Rc::downgrade(&rebuild);
@@ -66,6 +107,9 @@ pub fn build_tools_page(
             let config_c = Rc::clone(&config);
             let game_id = game.id.clone();
             let toast_overlay_c = toast_overlay.clone();
+            let generated_list_c = generated_list.clone();
+            let game_for_generated = game.clone();
+            let game_for_rebuild = game.clone();
 
             *rebuild.borrow_mut() = Box::new(move || {
                 // Clear existing rows
@@ -103,8 +147,9 @@ pub fn build_tools_page(
                     {
                         let tool_clone = tool.clone();
                         let toast_overlay_c2 = toast_overlay_c.clone();
+                        let game_for_launch = game_for_rebuild.clone();
                         launch_btn.connect_clicked(move |btn| {
-                            launch_tool(&tool_clone, btn, &toast_overlay_c2);
+                            launch_tool(&game_for_launch, &tool_clone, btn, &toast_overlay_c2);
                         });
                     }
 
@@ -166,7 +211,96 @@ pub fn build_tools_page(
 
                     row.add_suffix(&delete_btn);
 
+                    let adopt_btn = gtk4::Button::new();
+                    adopt_btn.set_icon_name("folder-download-symbolic");
+                    adopt_btn.add_css_class("flat");
+                    adopt_btn.set_tooltip_text(Some("Adopt unmanaged generated output"));
+                    {
+                        let tool_for_adopt = tool.clone();
+                        let game_for_adopt = game_for_rebuild.clone();
+                        let rebuild_adopt = rebuild_weak.clone();
+                        adopt_btn.connect_clicked(move |_| {
+                            let profile = tool_for_adopt.primary_profile();
+                            let mut db = ModDatabase::load(&game_for_adopt);
+                            match crate::core::tool_runs::detect_unmanaged_outputs(
+                                &game_for_adopt,
+                                &db,
+                                &tool_for_adopt,
+                                &profile,
+                            ) {
+                                Ok(files) if files.is_empty() => {
+                                    log::info!(
+                                        "No unmanaged output candidates found for {}",
+                                        tool_for_adopt.name
+                                    );
+                                }
+                                Ok(files) => {
+                                    if let Err(e) = crate::core::tool_runs::adopt_unmanaged_outputs(
+                                        &game_for_adopt,
+                                        &mut db,
+                                        &tool_for_adopt,
+                                        &profile,
+                                        &files,
+                                    ) {
+                                        log::error!("Failed adopting unmanaged outputs: {e}");
+                                    }
+                                }
+                                Err(e) => log::error!("Unmanaged output detection failed: {e}"),
+                            }
+                            if let Some(rb) = rebuild_adopt.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                    }
+                    row.add_suffix(&adopt_btn);
+
                     tools_list_c.append(&row);
+                }
+
+                while let Some(child) = generated_list_c.first_child() {
+                    generated_list_c.remove(&child);
+                }
+                let db = ModDatabase::load(&game_for_generated);
+                if db.generated_outputs.is_empty() {
+                    let row = adw::ActionRow::builder()
+                        .title("No generated outputs captured")
+                        .build();
+                    row.set_sensitive(false);
+                    generated_list_c.append(&row);
+                } else {
+                    for output in &db.generated_outputs {
+                        let subtitle =
+                            format!("Tool: {} · Profile: {}", output.tool_id, output.run_profile);
+                        let row = adw::ActionRow::builder()
+                            .title(&output.name)
+                            .subtitle(&subtitle)
+                            .build();
+                        let remove_btn = gtk4::Button::new();
+                        remove_btn.set_icon_name("user-trash-symbolic");
+                        remove_btn.add_css_class("flat");
+                        remove_btn.add_css_class("destructive-action");
+                        let output_id = output.id.clone();
+                        let game_for_remove = game_for_generated.clone();
+                        let rebuild_remove = rebuild_weak.clone();
+                        remove_btn.connect_clicked(move |_| {
+                            let mut db = ModDatabase::load(&game_for_remove);
+                            if let Err(e) =
+                                crate::core::generated_outputs::remove_generated_output_package(
+                                    &game_for_remove,
+                                    &mut db,
+                                    &output_id,
+                                )
+                            {
+                                log::error!("Failed to remove generated output package: {e}");
+                            }
+                            let _ = ModManager::rebuild_all(&game_for_remove);
+                            if let Some(rb) = rebuild_remove.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                        row.add_suffix(&remove_btn);
+                        generated_list_c.append(&row);
+                    }
                 }
             });
         }
@@ -184,10 +318,48 @@ pub fn build_tools_page(
             });
         }
 
+        {
+            let game_cleanup = game.clone();
+            let rebuild_cleanup = Rc::clone(&rebuild);
+            cleanup_generated_btn.connect_clicked(move |_| {
+                let mut db = ModDatabase::load(&game_cleanup);
+                crate::core::generated_outputs::cleanup_stale_generated_outputs(
+                    &game_cleanup,
+                    &mut db,
+                );
+                let _ = ModManager::rebuild_all(&game_cleanup);
+                (rebuild_cleanup.borrow())();
+            });
+        }
+
+        {
+            let config_profile = Rc::clone(&config);
+            let game_profile = game.clone();
+            let rebuild_profile = Rc::clone(&rebuild);
+            profile_row.connect_selected_notify(move |row| {
+                let selected = row.selected() as usize;
+                let mut cfg = config_profile.borrow_mut();
+                let selected_profile_id = {
+                    let gs = cfg.game_settings_mut(&game_profile.id);
+                    gs.profiles.get(selected).map(|p| p.id.clone())
+                };
+                if let Some(profile_id) = selected_profile_id {
+                    cfg.game_settings_mut(&game_profile.id).active_profile_id = profile_id.clone();
+                    cfg.save();
+                    if let Err(e) = ModManager::switch_profile(&game_profile, &profile_id) {
+                        log::error!("Failed switching profile: {e}");
+                    }
+                    (rebuild_profile.borrow())();
+                }
+            });
+        }
+
         // Initial build
         (rebuild.borrow())();
 
+        content_box.append(&profile_group);
         content_box.append(&tools_group);
+        content_box.append(&generated_group);
     } else {
         // No game selected
         let status_page = adw::StatusPage::builder()
@@ -216,7 +388,11 @@ fn show_tool_dialog(
     toast_overlay: &adw::ToastOverlay,
 ) {
     let dialog = adw::Dialog::new();
-    dialog.set_title(if tool_id.is_some() { "Edit Tool" } else { "Add Tool" });
+    dialog.set_title(if tool_id.is_some() {
+        "Edit Tool"
+    } else {
+        "Add Tool"
+    });
 
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -259,24 +435,19 @@ fn show_tool_dialog(
             let exe_path_ref_c2 = Rc::clone(&exe_path_ref_c);
             let exe_label_c2 = exe_label_c.clone();
 
-            file_dialog.open(
-                gtk4::Window::NONE,
-                gio::Cancellable::NONE,
-                move |result| {
-                    if let Ok(file) = result
-                        && let Some(path) = file.path() {
-                            exe_label_c2.set_label(&path.to_string_lossy());
-                            *exe_path_ref_c2.borrow_mut() = Some(path);
-                        }
-                },
-            );
+            file_dialog.open(gtk4::Window::NONE, gio::Cancellable::NONE, move |result| {
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    exe_label_c2.set_label(&path.to_string_lossy());
+                    *exe_path_ref_c2.borrow_mut() = Some(path);
+                }
+            });
         });
     }
 
     // Arguments
-    let args_row = adw::EntryRow::builder()
-        .title("Arguments")
-        .build();
+    let args_row = adw::EntryRow::builder().title("Arguments").build();
 
     // App ID (get from current game)
     let app_id: u32 = {
@@ -302,12 +473,13 @@ fn show_tool_dialog(
     if let Some(tool_id) = tool_id {
         let cfg = config.borrow();
         if let Some(game_settings) = cfg.game_settings.get(game_id)
-            && let Some(tool) = game_settings.tools.iter().find(|t| t.id == tool_id) {
-                name_row.set_text(&tool.name);
-                args_row.set_text(&tool.arguments);
-                exe_label.set_label(&tool.exe_path.to_string_lossy());
-                *exe_path_ref.borrow_mut() = Some(tool.exe_path.clone());
-            }
+            && let Some(tool) = game_settings.tools.iter().find(|t| t.id == tool_id)
+        {
+            name_row.set_text(&tool.name);
+            args_row.set_text(&tool.arguments);
+            exe_label.set_label(&tool.exe_path.to_string_lossy());
+            *exe_path_ref.borrow_mut() = Some(tool.exe_path.clone());
+        }
     }
 
     // Buttons
@@ -374,17 +546,22 @@ fn show_tool_dialog(
                 }
             } else {
                 // Add new tool
-                let id = format!("tool_{}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis());
+                let id = format!(
+                    "tool_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                );
 
                 let tool = ToolConfig {
                     id,
-                    name,
+                    name: name.clone(),
                     exe_path,
                     arguments: args,
                     app_id,
+                    preset: infer_tool_preset(&name),
+                    run_profiles: default_profiles_for_name(&name),
                 };
                 game_settings.tools.push(tool);
             }
@@ -401,16 +578,53 @@ fn show_tool_dialog(
     }
 
     // Show the dialog
-    if let Some(window) = toast_overlay.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
+    if let Some(window) = toast_overlay
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+    {
         dialog.present(Some(&window));
     }
 }
 
+fn infer_tool_preset(name: &str) -> ToolPresetKind {
+    let lower = name.to_lowercase();
+    if lower.contains("bodyslide") {
+        ToolPresetKind::BodySlide
+    } else if lower.contains("pandora") {
+        ToolPresetKind::Pandora
+    } else if lower.contains("nemesis") {
+        ToolPresetKind::Nemesis
+    } else {
+        ToolPresetKind::Generic
+    }
+}
+
+fn default_profiles_for_name(name: &str) -> Vec<ToolRunProfile> {
+    use crate::core::tool_adapters::adapter_for_tool;
+    let tool = ToolConfig {
+        id: "preset_probe".to_string(),
+        name: name.to_string(),
+        exe_path: std::path::PathBuf::new(),
+        arguments: String::new(),
+        app_id: 0,
+        preset: infer_tool_preset(name),
+        run_profiles: Vec::new(),
+    };
+    adapter_for_tool(&tool).default_profiles(&tool)
+}
+
 /// Launch a tool with Proton.
-fn launch_tool(tool: &ToolConfig, btn: &gtk4::Button, toast_overlay: &adw::ToastOverlay) {
+fn launch_tool(
+    game: &Game,
+    tool: &ToolConfig,
+    btn: &gtk4::Button,
+    toast_overlay: &adw::ToastOverlay,
+) {
     btn.set_sensitive(false);
 
+    let game_clone = game.clone();
     let tool_clone = tool.clone();
+    let profile = tool.primary_profile();
     let btn_c = btn.clone();
     let toast_overlay_c = toast_overlay.clone();
 
@@ -418,49 +632,60 @@ fn launch_tool(tool: &ToolConfig, btn: &gtk4::Button, toast_overlay: &adw::Toast
 
     // Spawn a thread to launch the tool
     thread::spawn(move || {
-        log::info!("Launching tool: {}", tool_clone.name);
-
-        match crate::core::steam::launch_tool_with_proton(
-            &tool_clone.exe_path,
-            &tool_clone.arguments,
-            tool_clone.app_id,
-        ) {
-            Ok(mut child) => {
-                // Capture and log stdout/stderr
+        log::info!(
+            "Launching tool '{}' with managed profile '{}'",
+            tool_clone.name,
+            profile.name
+        );
+        let mut db = ModDatabase::load(&game_clone);
+        let result = crate::core::tool_runs::run_tool_with_managed_outputs(
+            &game_clone,
+            &mut db,
+            &tool_clone,
+            &profile,
+            |tool_cfg, _profile_cfg| {
+                let mut child = crate::core::steam::launch_tool_with_proton(
+                    &tool_cfg.exe_path,
+                    &tool_cfg.arguments,
+                    tool_cfg.app_id,
+                )?;
                 if let Some(stdout) = child.stdout.take() {
                     let reader = BufReader::new(stdout);
                     for line in reader.lines().map_while(Result::ok) {
-                        log::info!("[{}] {}", tool_clone.name, line);
+                        log::info!("[{}] {}", tool_cfg.name, line);
                     }
                 }
-
                 if let Some(stderr) = child.stderr.take() {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
-                        log::warn!("[{}] {}", tool_clone.name, line);
+                        log::warn!("[{}] {}", tool_cfg.name, line);
                     }
                 }
-
-                match child.wait() {
-                    Ok(status) => {
-                        if status.success() {
-                            let _ = tx.send(Ok(format!("{} exited successfully", tool_clone.name)));
-                        } else {
-                            let _ = tx.send(Err(format!(
-                                "{} exited with status: {}",
-                                tool_clone.name, status
-                            )));
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to wait for {}: {}", tool_clone.name, e)));
-                    }
+                child
+                    .wait()
+                    .map_err(|e| format!("Failed waiting for {}: {e}", tool_cfg.name))
+            },
+        );
+        match result {
+            Ok(run) => {
+                let _ = ModManager::rebuild_all(&game_clone);
+                let msg = if let Some(pkg) = run.package_id {
+                    format!(
+                        "{} run complete; package {} ({} files: {} assets, {} plugins)",
+                        tool_clone.name, pkg, run.captured_files, run.asset_files, run.plugin_files
+                    )
+                } else {
+                    format!("{} run complete", tool_clone.name)
+                };
+                for warning in run.preflight_warnings {
+                    log::warn!("[{} preflight] {}", tool_clone.name, warning);
                 }
+                let _ = tx.send(Ok(msg));
             }
             Err(e) => {
-                let _ = tx.send(Err(format!("Failed to launch {}: {}", tool_clone.name, e)));
+                let _ = tx.send(Err(format!("Tool run failed for {}: {e}", tool_clone.name)));
             }
-        }
+        };
     });
 
     // Poll for completion

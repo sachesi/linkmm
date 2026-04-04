@@ -8,15 +8,20 @@ license = "GPL-3.0-or-later"
 [[bin]]
 name = "linkmm"
 path = "src/main.rs"
+required-features = ["ui"]
+
+[features]
+default = ["ui"]
+ui = ["dep:gtk4", "dep:libadwaita", "dep:glib", "dep:gio"]
 
 [dev-dependencies]
 tempfile = "3"
 
 [dependencies]
-gtk4 = { version = "0.11", features = ["v4_14"] }
-libadwaita = { version = "0.9", features = ["v1_5"] }
-glib = "0.22"
-gio = { version = "0.22", features = ["v2_80"] }
+gtk4 = { version = "0.11", features = ["v4_14"], optional = true }
+libadwaita = { version = "0.9", features = ["v1_5"], optional = true }
+glib = { version = "0.22", optional = true }
+gio = { version = "0.22", features = ["v2_80"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
