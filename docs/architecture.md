@@ -75,3 +75,30 @@ This source drives:
 - per-instance launcher preferences in UI
 
 No launch behavior is inferred from optional fields alone.
+
+## 7. Managed runtime sessions
+
+Game launches and tool launches now run through `core::runtime::RuntimeSessionManager`.
+
+The manager is the single source of truth for launch state and stores:
+
+- stable session id
+- session kind (`Game` or `Tool`)
+- game instance id
+- profile id (when known)
+- tool id (tool sessions)
+- launcher source (`Steam` / `NonSteamUmu`)
+- tracked pid
+- start time
+- status (`Starting`, `Running`, `Exited`, `Failed`, `Killed`)
+- exit code
+
+It also owns per-session rolling log buffers for stdout/stderr capture.
+
+## 8. Stop semantics
+
+- Tool sessions are launched as tracked child processes and can be stopped from LinkMM.
+- Non-Steam UMU game sessions are launched as tracked child processes and can be stopped from LinkMM.
+- Steam game sessions are launched via `steam -applaunch` wrapper process for tracking.
+  Stop targets that wrapper process. Steam can re-parent the real game process, so stop/kill
+  visibility for Steam sessions is inherently best-effort.

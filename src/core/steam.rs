@@ -503,6 +503,23 @@ pub fn launch_game(game: &crate::core::games::Game) -> Result<(), String> {
         .map_err(|e| format!("Failed to open steam://run/{app_id}: {e}"))
 }
 
+/// Build a managed Steam launch command.
+///
+/// We use `steam -applaunch` so LinkMM can track and stop the spawned wrapper
+/// process. Steam may re-parent the real game process; stopping this session
+/// therefore targets the visible wrapper process only.
+pub fn launch_game_managed_command(
+    game: &crate::core::games::Game,
+) -> Result<std::process::Command, String> {
+    let app_id = game
+        .kind
+        .steam_app_id()
+        .ok_or_else(|| "Game has no Steam App ID".to_string())?;
+    let mut command = std::process::Command::new("steam");
+    command.arg("-applaunch").arg(app_id.to_string());
+    Ok(command)
+}
+
 /// Find the Proton runtime path for a given game's App ID.
 ///
 /// Returns the path to the Proton directory (e.g., `~/.steam/steam/steamapps/common/Proton 8.0`)
@@ -654,6 +671,46 @@ pub fn launch_tool_with_proton(
     }
 }
 
+pub fn build_tool_command(
+    exe_path: &PathBuf,
+    arguments: &str,
+    app_id: u32,
+) -> Result<std::process::Command, String> {
+    let (proton_path, compatdata_path) = find_proton_for_game(app_id)?;
+    let proton_script = proton_path.join("proton");
+    if !proton_script.exists() {
+        return Err(format!(
+            "Proton script not found at {}",
+            proton_script.display()
+        ));
+    }
+    if !exe_path.exists() {
+        return Err(format!("Executable not found at {}", exe_path.display()));
+    }
+    let steam_root =
+        find_steam_root().ok_or_else(|| "Could not find Steam installation".to_string())?;
+    let is_flatpak = is_path_in_flatpak(&proton_path) || is_path_in_flatpak(&compatdata_path);
+    if is_flatpak {
+        build_flatpak_tool_command(
+            &proton_script,
+            exe_path,
+            arguments,
+            &steam_root,
+            &compatdata_path,
+            app_id,
+        )
+    } else {
+        build_native_tool_command(
+            &proton_script,
+            exe_path,
+            arguments,
+            &steam_root,
+            &compatdata_path,
+            app_id,
+        )
+    }
+}
+
 /// Launch tool using native Steam (not Flatpak).
 fn launch_tool_native(
     proton_script: &PathBuf,
@@ -693,6 +750,29 @@ fn launch_tool_native(
     command
         .spawn()
         .map_err(|e| format!("Failed to spawn Proton process: {e}"))
+}
+
+fn build_native_tool_command(
+    proton_script: &PathBuf,
+    exe_path: &PathBuf,
+    arguments: &str,
+    steam_root: &PathBuf,
+    compatdata_path: &PathBuf,
+    app_id: u32,
+) -> Result<std::process::Command, String> {
+    let mut command = std::process::Command::new(proton_script);
+    command.env("STEAM_COMPAT_DATA_PATH", compatdata_path);
+    command.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", steam_root);
+    command.env("SteamAppId", app_id.to_string());
+    command.env("SteamGameId", app_id.to_string());
+    command.arg("run");
+    command.arg(exe_path);
+    if !arguments.is_empty() {
+        for arg in arguments.split_whitespace() {
+            command.arg(arg);
+        }
+    }
+    Ok(command)
 }
 
 /// Launch tool using Flatpak Steam wrapper.
@@ -748,6 +828,42 @@ fn launch_tool_with_flatpak(
     command
         .spawn()
         .map_err(|e| format!("Failed to spawn Flatpak process: {e}"))
+}
+
+fn build_flatpak_tool_command(
+    proton_script: &Path,
+    exe_path: &Path,
+    arguments: &str,
+    steam_root: &Path,
+    compatdata_path: &Path,
+    app_id: u32,
+) -> Result<std::process::Command, String> {
+    let mut shell_cmd = String::new();
+    shell_cmd.push_str(&format!(
+        "export STEAM_COMPAT_CLIENT_INSTALL_PATH=\"{}\"\n",
+        steam_root.display()
+    ));
+    shell_cmd.push_str(&format!(
+        "export STEAM_COMPAT_DATA_PATH=\"{}\"\n",
+        compatdata_path.display()
+    ));
+    shell_cmd.push_str(&format!("export SteamAppId=\"{}\"\n", app_id));
+    shell_cmd.push_str(&format!(
+        "\"{}\" run \"{}\"",
+        proton_script.display(),
+        exe_path.display()
+    ));
+    if !arguments.is_empty() {
+        shell_cmd.push_str(&format!(" {}", arguments));
+    }
+
+    let mut command = std::process::Command::new("flatpak");
+    command.arg("run");
+    command.arg("--command=sh");
+    command.arg("com.valvesoftware.Steam");
+    command.arg("-c");
+    command.arg(shell_cmd);
+    Ok(command)
 }
 
 #[cfg(test)]
