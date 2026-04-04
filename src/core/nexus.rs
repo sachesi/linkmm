@@ -234,7 +234,8 @@ impl NexusClient {
         }
 
         req.call()
-            .and_then(|resp| resp.into_string())
+            .map_err(ureq::Error::from)
+            .and_then(|resp| resp.into_string().map_err(ureq::Error::from))
             .map_err(|err| match err {
                 ureq::Error::Status(code, resp) => {
                     let body = resp.into_string().unwrap_or_default();

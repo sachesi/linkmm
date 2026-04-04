@@ -184,11 +184,11 @@ mod tests {
         }
     }
 
-    fn test_tool(profile: ToolRunProfile) -> ToolConfig {
+    fn test_tool(profile: ToolRunProfile, exe_path: PathBuf) -> ToolConfig {
         ToolConfig {
             id: "tool_a".to_string(),
             name: "ToolA".to_string(),
-            exe_path: PathBuf::from("tool.exe"),
+            exe_path,
             arguments: String::new(),
             app_id: 489830,
             preset: crate::core::config::ToolPresetKind::Generic,
@@ -210,7 +210,9 @@ mod tests {
             managed_output_dir: Some(output),
             generated_package_name: "ToolA Output".to_string(),
         };
-        let tool = test_tool(profile.clone());
+        let exe = temp.path().join("tool.exe");
+        std::fs::write(&exe, b"fake").unwrap();
+        let tool = test_tool(profile.clone(), exe);
         let mut db = ModDatabase::default();
 
         let run = run_tool_with_managed_outputs(&game, &mut db, &tool, &profile, |_tool, _profile| {
@@ -234,7 +236,9 @@ mod tests {
             managed_output_dir: None,
             generated_package_name: "ToolA Output".to_string(),
         };
-        let tool = test_tool(profile.clone());
+        let exe = temp.path().join("tool.exe");
+        std::fs::write(&exe, b"fake").unwrap();
+        let tool = test_tool(profile.clone(), exe);
         let mut db = ModDatabase::default();
         let err = run_tool_with_managed_outputs(&game, &mut db, &tool, &profile, |_tool, _profile| {
             Ok(std::process::ExitStatus::from_raw(1))
@@ -257,7 +261,9 @@ mod tests {
             managed_output_dir: None,
             generated_package_name: "ToolA Output".to_string(),
         };
-        let tool = test_tool(profile.clone());
+        let exe = temp.path().join("tool.exe");
+        std::fs::write(&exe, b"fake").unwrap();
+        let tool = test_tool(profile.clone(), exe);
         let mut db = ModDatabase::default();
         let unmanaged = detect_unmanaged_outputs(&game, &db, &tool, &profile).unwrap();
         assert_eq!(unmanaged.len(), 1);

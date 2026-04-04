@@ -187,7 +187,7 @@ impl GeneratedOutputPackage {
 
 // ── ModDatabase ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModDatabase {
     #[serde(default = "default_active_profile_id")]
     pub active_profile_id: String,
@@ -212,6 +212,24 @@ pub struct ModDatabase {
     pub profile_plugin_disabled: HashMap<String, HashSet<String>>,
     #[serde(default)]
     pub profile_generated_outputs: HashMap<String, Vec<GeneratedOutputPackage>>,
+}
+
+impl Default for ModDatabase {
+    fn default() -> Self {
+        Self {
+            active_profile_id: default_active_profile_id(),
+            mods: Vec::new(),
+            generated_outputs: Vec::new(),
+            load_order: Vec::new(),
+            plugin_load_order: Vec::new(),
+            plugin_disabled: HashSet::new(),
+            profile_mod_enabled: HashMap::new(),
+            profile_mod_order: HashMap::new(),
+            profile_plugin_load_order: HashMap::new(),
+            profile_plugin_disabled: HashMap::new(),
+            profile_generated_outputs: HashMap::new(),
+        }
+    }
 }
 
 impl ModDatabase {
