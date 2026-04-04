@@ -10,8 +10,9 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::core::config::{AppConfig, ToolConfig, ToolOutputMode};
+use crate::core::config::{AppConfig, ToolConfig, ToolRunProfile};
 use crate::core::games::Game;
+use crate::core::mods::{ModDatabase, ModManager};
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
 pub fn build_tools_page(
@@ -57,6 +58,20 @@ pub fn build_tools_page(
         tools_list.set_selection_mode(gtk4::SelectionMode::None);
         tools_group.add(&tools_list);
 
+        let generated_group = adw::PreferencesGroup::builder()
+            .title("Generated Outputs")
+            .description("Managed output packages produced by tool runs.")
+            .build();
+        let cleanup_generated_btn = gtk4::Button::new();
+        cleanup_generated_btn.set_icon_name("edit-clear-symbolic");
+        cleanup_generated_btn.add_css_class("flat");
+        cleanup_generated_btn.set_tooltip_text(Some("Cleanup stale generated outputs"));
+        generated_group.set_header_suffix(Some(&cleanup_generated_btn));
+        let generated_list = gtk4::ListBox::new();
+        generated_list.add_css_class("boxed-list");
+        generated_list.set_selection_mode(gtk4::SelectionMode::None);
+        generated_group.add(&generated_list);
+
         // Rebuild function to refresh the tool list
         let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
         let rebuild_weak = Rc::downgrade(&rebuild);
@@ -66,6 +81,8 @@ pub fn build_tools_page(
             let config_c = Rc::clone(&config);
             let game_id = game.id.clone();
             let toast_overlay_c = toast_overlay.clone();
+            let generated_list_c = generated_list.clone();
+            let game_for_generated = game.clone();
 
             *rebuild.borrow_mut() = Box::new(move || {
                 // Clear existing rows
@@ -103,8 +120,9 @@ pub fn build_tools_page(
                     {
                         let tool_clone = tool.clone();
                         let toast_overlay_c2 = toast_overlay_c.clone();
+                        let game_for_launch = game.clone();
                         launch_btn.connect_clicked(move |btn| {
-                            launch_tool(&tool_clone, btn, &toast_overlay_c2);
+                            launch_tool(&game_for_launch, &tool_clone, btn, &toast_overlay_c2);
                         });
                     }
 
@@ -168,6 +186,50 @@ pub fn build_tools_page(
 
                     tools_list_c.append(&row);
                 }
+
+                while let Some(child) = generated_list_c.first_child() {
+                    generated_list_c.remove(&child);
+                }
+                let db = ModDatabase::load(&game_for_generated);
+                if db.generated_outputs.is_empty() {
+                    let row = adw::ActionRow::builder()
+                        .title("No generated outputs captured")
+                        .build();
+                    row.set_sensitive(false);
+                    generated_list_c.append(&row);
+                } else {
+                    for output in &db.generated_outputs {
+                        let subtitle =
+                            format!("Tool: {} · Profile: {}", output.tool_id, output.run_profile);
+                        let row = adw::ActionRow::builder()
+                            .title(&output.name)
+                            .subtitle(&subtitle)
+                            .build();
+                        let remove_btn = gtk4::Button::new();
+                        remove_btn.set_icon_name("user-trash-symbolic");
+                        remove_btn.add_css_class("flat");
+                        remove_btn.add_css_class("destructive-action");
+                        let output_id = output.id.clone();
+                        let game_for_remove = game_for_generated.clone();
+                        let rebuild_remove = rebuild_weak.clone();
+                        remove_btn.connect_clicked(move |_| {
+                            let mut db = ModDatabase::load(&game_for_remove);
+                            if let Err(e) = crate::core::generated_outputs::remove_generated_output_package(
+                                &game_for_remove,
+                                &mut db,
+                                &output_id,
+                            ) {
+                                log::error!("Failed to remove generated output package: {e}");
+                            }
+                            let _ = ModManager::rebuild_all(&game_for_remove);
+                            if let Some(rb) = rebuild_remove.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                        row.add_suffix(&remove_btn);
+                        generated_list_c.append(&row);
+                    }
+                }
             });
         }
 
@@ -184,10 +246,25 @@ pub fn build_tools_page(
             });
         }
 
+        {
+            let game_cleanup = game.clone();
+            let rebuild_cleanup = Rc::clone(&rebuild);
+            cleanup_generated_btn.connect_clicked(move |_| {
+                let mut db = ModDatabase::load(&game_cleanup);
+                crate::core::generated_outputs::cleanup_stale_generated_outputs(
+                    &game_cleanup,
+                    &mut db,
+                );
+                let _ = ModManager::rebuild_all(&game_cleanup);
+                (rebuild_cleanup.borrow())();
+            });
+        }
+
         // Initial build
         (rebuild.borrow())();
 
         content_box.append(&tools_group);
+        content_box.append(&generated_group);
     } else {
         // No game selected
         let status_page = adw::StatusPage::builder()
@@ -385,9 +462,13 @@ fn show_tool_dialog(
                     exe_path,
                     arguments: args,
                     app_id,
-                    output_mode: ToolOutputMode::SnapshotGameData,
-                    managed_output_dir: None,
-                    run_profile: "default".to_string(),
+                    run_profiles: vec![ToolRunProfile {
+                        id: "default".to_string(),
+                        name: "Default".to_string(),
+                        output_mode: crate::core::config::ToolOutputMode::SnapshotGameData,
+                        managed_output_dir: None,
+                        generated_package_name: "Generated Output".to_string(),
+                    }],
                 };
                 game_settings.tools.push(tool);
             }
@@ -410,10 +491,12 @@ fn show_tool_dialog(
 }
 
 /// Launch a tool with Proton.
-fn launch_tool(tool: &ToolConfig, btn: &gtk4::Button, toast_overlay: &adw::ToastOverlay) {
+fn launch_tool(game: &Game, tool: &ToolConfig, btn: &gtk4::Button, toast_overlay: &adw::ToastOverlay) {
     btn.set_sensitive(false);
 
+    let game_clone = game.clone();
     let tool_clone = tool.clone();
+    let profile = tool.primary_profile();
     let btn_c = btn.clone();
     let toast_overlay_c = toast_overlay.clone();
 
@@ -421,49 +504,54 @@ fn launch_tool(tool: &ToolConfig, btn: &gtk4::Button, toast_overlay: &adw::Toast
 
     // Spawn a thread to launch the tool
     thread::spawn(move || {
-        log::info!("Launching tool: {}", tool_clone.name);
-
-        match crate::core::steam::launch_tool_with_proton(
-            &tool_clone.exe_path,
-            &tool_clone.arguments,
-            tool_clone.app_id,
-        ) {
-            Ok(mut child) => {
-                // Capture and log stdout/stderr
+        log::info!(
+            "Launching tool '{}' with managed profile '{}'",
+            tool_clone.name,
+            profile.name
+        );
+        let mut db = ModDatabase::load(&game_clone);
+        let result = crate::core::tool_runs::run_tool_with_managed_outputs(
+            &game_clone,
+            &mut db,
+            &tool_clone,
+            &profile,
+            |tool_cfg, _profile_cfg| {
+                let mut child = crate::core::steam::launch_tool_with_proton(
+                    &tool_cfg.exe_path,
+                    &tool_cfg.arguments,
+                    tool_cfg.app_id,
+                )?;
                 if let Some(stdout) = child.stdout.take() {
                     let reader = BufReader::new(stdout);
                     for line in reader.lines().map_while(Result::ok) {
-                        log::info!("[{}] {}", tool_clone.name, line);
+                        log::info!("[{}] {}", tool_cfg.name, line);
                     }
                 }
-
                 if let Some(stderr) = child.stderr.take() {
                     let reader = BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
-                        log::warn!("[{}] {}", tool_clone.name, line);
+                        log::warn!("[{}] {}", tool_cfg.name, line);
                     }
                 }
-
-                match child.wait() {
-                    Ok(status) => {
-                        if status.success() {
-                            let _ = tx.send(Ok(format!("{} exited successfully", tool_clone.name)));
-                        } else {
-                            let _ = tx.send(Err(format!(
-                                "{} exited with status: {}",
-                                tool_clone.name, status
-                            )));
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to wait for {}: {}", tool_clone.name, e)));
-                    }
-                }
+                child
+                    .wait()
+                    .map_err(|e| format!("Failed waiting for {}: {e}", tool_cfg.name))
+            },
+        );
+        match result {
+            Ok(run) => {
+                let _ = ModManager::rebuild_all(&game_clone);
+                let msg = if let Some(pkg) = run.package_id {
+                    format!("{} run complete; updated output package {}", tool_clone.name, pkg)
+                } else {
+                    format!("{} run complete", tool_clone.name)
+                };
+                let _ = tx.send(Ok(msg));
             }
             Err(e) => {
-                let _ = tx.send(Err(format!("Failed to launch {}: {}", tool_clone.name, e)));
+                let _ = tx.send(Err(format!("Tool run failed for {}: {e}", tool_clone.name)));
             }
-        }
+        };
     });
 
     // Poll for completion
