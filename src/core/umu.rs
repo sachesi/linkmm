@@ -39,7 +39,9 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ui")]
 use std::rc::Rc;
+#[cfg(feature = "ui")]
 use std::sync::mpsc;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
