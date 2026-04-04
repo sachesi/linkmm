@@ -24,24 +24,31 @@ struct DeploymentState {
 }
 
 impl DeploymentState {
-    fn path(game: &Game) -> PathBuf {
-        game.config_dir().join(DEPLOY_STATE_FILE)
+    fn path(game: &Game, profile_id: &str) -> PathBuf {
+        game.config_dir()
+            .join("profiles")
+            .join(profile_id)
+            .join(DEPLOY_STATE_FILE)
     }
 
-    fn load(game: &Game) -> Self {
-        let path = Self::path(game);
+    fn load(game: &Game, profile_id: &str) -> Self {
+        let path = Self::path(game, profile_id);
         let Ok(raw) = fs::read_to_string(path) else {
             return Self::default();
         };
         toml::from_str(&raw).unwrap_or_default()
     }
 
-    fn save(&self, game: &Game) -> Result<(), String> {
-        fs::create_dir_all(game.config_dir())
+    fn save(&self, game: &Game, profile_id: &str) -> Result<(), String> {
+        fs::create_dir_all(
+            game.config_dir()
+                .join("profiles")
+                .join(profile_id),
+        )
             .map_err(|e| format!("Failed to create config dir for deployment state: {e}"))?;
         let raw = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize deployment state: {e}"))?;
-        fs::write(Self::path(game), raw)
+        fs::write(Self::path(game, profile_id), raw)
             .map_err(|e| format!("Failed to write deployment state: {e}"))?;
         Ok(())
     }
@@ -330,7 +337,7 @@ impl Deployer for AssetsDeployer {
 
     fn rebuild(&self, game: &Game, db: &mut ModDatabase) -> Result<(), String> {
         let desired = build_assets_plan(db, self.id());
-        apply_assets_plan(game, desired)
+        apply_assets_plan(game, &db.active_profile_id, desired)
     }
 }
 
@@ -364,7 +371,11 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, De
     for output in db
         .generated_outputs
         .iter()
-        .filter(|o| o.enabled && o.deployer.as_str() == deployer_id)
+        .filter(|o| {
+            o.enabled
+                && o.deployer.as_str() == deployer_id
+                && o.manager_profile_id == db.active_profile_id
+        })
     {
         for (dest, src) in collect_generated_output_destinations(output) {
             desired.insert(
@@ -379,8 +390,12 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, De
     desired
 }
 
-fn apply_assets_plan(game: &Game, desired: HashMap<PathBuf, DesiredDeployment>) -> Result<(), String> {
-    let mut state = DeploymentState::load(game);
+fn apply_assets_plan(
+    game: &Game,
+    profile_id: &str,
+    desired: HashMap<PathBuf, DesiredDeployment>,
+) -> Result<(), String> {
+    let mut state = DeploymentState::load(game, profile_id);
     let desired_set: HashSet<PathBuf> = desired.keys().cloned().collect();
 
     for (dest_rel, src_rel) in state.deployed.clone() {
@@ -415,7 +430,7 @@ fn apply_assets_plan(game: &Game, desired: HashMap<PathBuf, DesiredDeployment>) 
     }
 
     restore_backups_not_in_desired(game, &mut state, &desired_set)?;
-    state.save(game)
+    state.save(game, profile_id)
 }
 
 fn restore_backups_not_in_desired(
@@ -1151,6 +1166,7 @@ mod tests {
             "BodySlide Output",
             "bodyslide",
             "default",
+            db.active_profile_id.clone(),
             generated_dir,
         );
         package.enabled = true;
@@ -1164,5 +1180,54 @@ mod tests {
         rebuild_deployment(&game, &mut db).unwrap();
         let winner_after = fs::read_link(game.data_path.join("textures/shared.dds")).unwrap();
         assert!(winner_after.to_string_lossy().contains("base_mod"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_switch_rebuilds_isolated_mod_state() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "a", "Data/textures/same.dds", b"a", true);
+        add_mod(&game, &mut db, "b", "Data/textures/same.dds", b"b", false);
+        db.save(&game);
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let winner_default = fs::read_link(game.data_path.join("textures/same.dds")).unwrap();
+        assert!(winner_default.to_string_lossy().contains("/a/"));
+
+        db.switch_active_profile("second");
+        db.mods[0].enabled = false;
+        db.mods[1].enabled = true;
+        rebuild_deployment(&game, &mut db).unwrap();
+        db.save(&game);
+        let winner_second = fs::read_link(game.data_path.join("textures/same.dds")).unwrap();
+        assert!(winner_second.to_string_lossy().contains("/b/"));
+
+        db.switch_active_profile("default");
+        rebuild_deployment(&game, &mut db).unwrap();
+        let winner_back = fs::read_link(game.data_path.join("textures/same.dds")).unwrap();
+        assert!(winner_back.to_string_lossy().contains("/a/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_switch_changes_plugins_txt_state() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "plugins", "Data/SwitchTest.esp", b"x", true);
+        rebuild_deployment(&game, &mut db).unwrap();
+        db.plugin_disabled.remove("SwitchTest.esp");
+        db.write_plugins_txt(&game).unwrap();
+        let default_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
+        assert!(default_plugins.contains("*SwitchTest.esp"));
+
+        db.switch_active_profile("profile_two");
+        db.plugin_disabled.insert("SwitchTest.esp".to_string());
+        rebuild_deployment(&game, &mut db).unwrap();
+        db.write_plugins_txt(&game).unwrap();
+        let other_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
+        assert!(other_plugins.lines().any(|l| l.trim() == "SwitchTest.esp"));
     }
 }

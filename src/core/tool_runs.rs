@@ -29,6 +29,9 @@ pub fn run_tool_with_managed_outputs<F>(
 where
     F: FnOnce(&ToolConfig, &ToolRunProfile) -> Result<std::process::ExitStatus, String>,
 {
+    if db.active_profile_id.trim().is_empty() {
+        return Err("Active profile is not set for this game context".to_string());
+    }
     let adapter = adapter_for_tool(tool);
     let preflight = adapter.validate(game, tool, profile)?;
     let snapshot = match profile.output_mode {
@@ -217,6 +220,7 @@ mod tests {
         assert_eq!(run.captured_files, 1);
         assert!(game.data_path.join("meshes/gen.nif").exists());
         assert_eq!(db.generated_outputs.len(), 1);
+        assert_eq!(db.generated_outputs[0].manager_profile_id, db.active_profile_id);
     }
 
     #[test]

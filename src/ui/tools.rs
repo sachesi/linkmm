@@ -41,6 +41,32 @@ pub fn build_tools_page(
     let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
 
     if let Some(game) = game {
+        let profile_group = adw::PreferencesGroup::builder()
+            .title("Active Profile")
+            .description("Tool runs and generated output management are scoped to this profile.")
+            .build();
+        let profile_row = adw::ComboRow::new();
+        profile_row.set_title("Profile");
+        let profile_names = gtk4::StringList::new(&[]);
+        {
+            let cfg = config.borrow();
+            if let Some(gs) = cfg.game_settings.get(&game.id) {
+                for p in &gs.profiles {
+                    profile_names.append(&p.name);
+                }
+                if let Some(idx) = gs
+                    .profiles
+                    .iter()
+                    .position(|p| p.id == gs.active_profile_id)
+                    .map(|i| i as u32)
+                {
+                    profile_row.set_selected(idx);
+                }
+            }
+        }
+        profile_row.set_model(Some(&profile_names));
+        profile_group.add(&profile_row);
+
         // Tools group
         let tools_group = adw::PreferencesGroup::builder()
             .title("External Tools")
@@ -300,9 +326,29 @@ pub fn build_tools_page(
             });
         }
 
+        {
+            let config_profile = Rc::clone(&config);
+            let game_profile = game.clone();
+            let rebuild_profile = Rc::clone(&rebuild);
+            profile_row.connect_selected_notify(move |row| {
+                let selected = row.selected() as usize;
+                let mut cfg = config_profile.borrow_mut();
+                let gs = cfg.game_settings_mut(&game_profile.id);
+                if let Some(profile) = gs.profiles.get(selected) {
+                    gs.active_profile_id = profile.id.clone();
+                    cfg.save();
+                    if let Err(e) = ModManager::switch_profile(&game_profile, &profile.id) {
+                        log::error!("Failed switching profile: {e}");
+                    }
+                    (rebuild_profile.borrow())();
+                }
+            });
+        }
+
         // Initial build
         (rebuild.borrow())();
 
+        content_box.append(&profile_group);
         content_box.append(&tools_group);
         content_box.append(&generated_group);
     } else {
