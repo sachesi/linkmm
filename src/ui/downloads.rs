@@ -1452,7 +1452,7 @@ mod tests {
         )
         .unwrap();
 
-        let game = Game::new(GameKind::SkyrimSE, tmp.join("game_root"));
+        let game = Game::new_steam(GameKind::SkyrimSE, tmp.join("game_root"));
         assert_eq!(
             read_nxm_mod_id_for_archive(&archive_path, &game),
             Some(173949)
@@ -1468,7 +1468,7 @@ mod tests {
         std::fs::write(&metadata_path, r#"{"game_domain":"fallout4","mod_id":999}"#).unwrap();
 
         // Sidecar says fallout4 but game is SkyrimSE → mismatch → None
-        let game = Game::new(GameKind::SkyrimSE, tmp.join("game_root"));
+        let game = Game::new_steam(GameKind::SkyrimSE, tmp.join("game_root"));
         assert_eq!(read_nxm_mod_id_for_archive(&archive_path, &game), None);
     }
 }

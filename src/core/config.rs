@@ -249,6 +249,7 @@ impl AppConfig {
                 Ok(contents) => match toml::from_str::<AppConfig>(&contents) {
                     Ok(mut config) => {
                         config.migrate_legacy_global_settings();
+                        config.normalize_game_instances();
                         config.apply_mods_base_dirs();
                         return config;
                     }
@@ -293,6 +294,33 @@ impl AppConfig {
             self.game_settings
                 .entry(game.id.clone())
                 .or_insert_with(|| legacy.clone());
+        }
+    }
+
+    fn normalize_game_instances(&mut self) {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let mut remap = HashMap::new();
+        for game in &mut self.games {
+            let old_id = game.id.clone();
+            if old_id.trim().is_empty() || seen.contains(&old_id) {
+                game.id = uuid::Uuid::new_v4().to_string();
+            }
+            seen.insert(game.id.clone());
+            if old_id != game.id {
+                remap.insert(old_id, game.id.clone());
+            }
+        }
+        if !remap.is_empty() {
+            let mut new_settings = HashMap::new();
+            for (key, value) in std::mem::take(&mut self.game_settings) {
+                let new_key = remap.get(&key).cloned().unwrap_or(key);
+                new_settings.insert(new_key, value);
+            }
+            self.game_settings = new_settings;
+            if let Some(current) = self.current_game_id.clone() {
+                self.current_game_id = Some(remap.get(&current).cloned().unwrap_or(current));
+            }
         }
     }
 
@@ -426,7 +454,7 @@ mod tests {
     #[test]
     fn migrate_legacy_global_settings_populates_per_game() {
         let mut cfg = AppConfig {
-            games: vec![crate::core::games::Game::new(
+            games: vec![crate::core::games::Game::new_steam(
                 crate::core::games::GameKind::SkyrimSE,
                 PathBuf::from("/games/skyrim"),
             )],
@@ -437,7 +465,8 @@ mod tests {
             ..AppConfig::default()
         };
         cfg.migrate_legacy_global_settings();
-        let gs = cfg.game_settings.get("skyrim_se").unwrap();
+        let game_id = cfg.games[0].id.clone();
+        let gs = cfg.game_settings.get(&game_id).unwrap();
         assert_eq!(gs.app_data_dir, Some(PathBuf::from("/data/linkmm")));
         assert_eq!(gs.installed_archives, vec!["mod.zip"]);
     }
@@ -445,7 +474,7 @@ mod tests {
     #[test]
     fn migrate_legacy_does_not_overwrite_existing_game_settings() {
         let mut cfg = AppConfig {
-            games: vec![crate::core::games::Game::new(
+            games: vec![crate::core::games::Game::new_steam(
                 crate::core::games::GameKind::SkyrimSE,
                 PathBuf::from("/games/skyrim"),
             )],
@@ -453,8 +482,9 @@ mod tests {
             ..AppConfig::default()
         };
         // Pre-populate game_settings so migration should be skipped
+        let game_id = cfg.games[0].id.clone();
         cfg.game_settings.insert(
-            "skyrim_se".to_string(),
+            game_id.clone(),
             GameSettings {
                 app_data_dir: Some(PathBuf::from("/new/data")),
                 ..GameSettings::default()
@@ -463,7 +493,7 @@ mod tests {
         cfg.migrate_legacy_global_settings();
         // Should NOT have been overwritten
         assert_eq!(
-            cfg.game_settings.get("skyrim_se").unwrap().app_data_dir,
+            cfg.game_settings.get(&game_id).unwrap().app_data_dir,
             Some(PathBuf::from("/new/data"))
         );
     }

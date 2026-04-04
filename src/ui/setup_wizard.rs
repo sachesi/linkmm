@@ -1049,12 +1049,12 @@ fn finish_wizard_apply(
         }
 
         let game_opt: Option<Game> = match selected_game.borrow().clone() {
-            Some(GameSelection::Steam(kind, path)) => Some(Game::new(kind, path)),
+            Some(GameSelection::Steam(kind, path)) => Some(Game::new_steam(kind, path)),
             Some(GameSelection::Umu {
                 kind,
                 root_path,
                 umu_cfg,
-            }) => Some(Game::new_umu(kind, root_path, umu_cfg)),
+            }) => Some(Game::new_non_steam_umu(kind, root_path, umu_cfg)),
             None => None,
         };
 
