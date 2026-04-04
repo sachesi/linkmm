@@ -118,6 +118,38 @@ pub fn cleanup_stale_generated_outputs(game: &Game, db: &mut ModDatabase) {
     db.save(game);
 }
 
+pub fn adopt_existing_game_data_files(
+    game: &Game,
+    db: &mut ModDatabase,
+    tool: &ToolRunContext,
+    files: &[PathBuf],
+    package_name: &str,
+) -> Result<String, String> {
+    let staging = game
+        .mods_dir()
+        .join("generated_outputs")
+        .join(format!("{}_adopt_staging", tool.tool_id));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|e| format!("Failed clearing previous adoption staging directory: {e}"))?;
+    }
+    for rel in files {
+        let src = game.data_path.join(rel);
+        if !src.is_file() {
+            continue;
+        }
+        let dst = staging.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed creating adoption parent directory: {e}"))?;
+        }
+        std::fs::copy(&src, &dst).map_err(|e| format!("Failed copying adopted file: {e}"))?;
+        std::fs::remove_file(&src)
+            .map_err(|e| format!("Failed cleaning adopted file from game folder: {e}"))?;
+    }
+    replace_package_for_tool(game, db, tool, &staging, package_name)
+}
+
 fn replace_package_for_tool(
     game: &Game,
     db: &mut ModDatabase,
