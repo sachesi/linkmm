@@ -64,6 +64,18 @@ struct SessionRecord {
     control: Arc<SessionControl>,
 }
 
+type SessionCompletion = Box<dyn FnOnce(ExitStatus) -> Result<(), String> + Send + 'static>;
+
+struct SessionStart {
+    kind: SessionKind,
+    game_id: String,
+    profile_id: Option<String>,
+    tool_id: Option<String>,
+    launcher_source: GameLauncherSource,
+    command: std::process::Command,
+    completion: Option<SessionCompletion>,
+}
+
 #[derive(Clone)]
 pub struct RuntimeSessionManager {
     inner: Arc<RuntimeSessionManagerInner>,
@@ -171,15 +183,15 @@ impl RuntimeSessionManager {
             }
         };
 
-        self.spawn_managed_session(
-            SessionKind::Game,
-            game.id,
+        self.spawn_managed_session(SessionStart {
+            kind: SessionKind::Game,
+            game_id: game.id,
             profile_id,
-            None,
-            game.launcher_source,
+            tool_id: None,
+            launcher_source: game.launcher_source,
             command,
-            None,
-        )
+            completion: None,
+        })
         .map(|(id, _)| id)
     }
 
@@ -199,7 +211,7 @@ impl RuntimeSessionManager {
         let tool_clone = tool.clone();
         let run_profile_clone = run_profile.clone();
 
-        let completion = Box::new(move |status: ExitStatus| {
+        let completion: SessionCompletion = Box::new(move |status: ExitStatus| {
             let mut db = ModDatabase::load(&game_clone);
             let result = tool_runs::run_tool_with_managed_outputs(
                 &game_clone,
@@ -218,15 +230,15 @@ impl RuntimeSessionManager {
         let command = self.tool_command(&game, &tool)?;
 
         let id = self
-            .spawn_managed_session(
-                SessionKind::Tool,
-                game.id,
-                Some(profile_id),
-                Some(tool.id),
-                game.launcher_source,
+            .spawn_managed_session(SessionStart {
+                kind: SessionKind::Tool,
+                game_id: game.id,
+                profile_id: Some(profile_id),
+                tool_id: Some(tool.id),
+                launcher_source: game.launcher_source,
                 command,
-                Some(completion),
-            )
+                completion: Some(completion),
+            })
             .map(|(id, _)| id)?;
 
         Ok((id, done_rx))
@@ -255,18 +267,13 @@ impl RuntimeSessionManager {
 
     fn spawn_managed_session(
         &self,
-        kind: SessionKind,
-        game_id: String,
-        profile_id: Option<String>,
-        tool_id: Option<String>,
-        launcher_source: GameLauncherSource,
-        mut command: std::process::Command,
-        completion: Option<Box<dyn FnOnce(ExitStatus) -> Result<(), String> + Send + 'static>>,
+        mut start: SessionStart,
     ) -> Result<(u64, Arc<SessionControl>), String> {
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
+        start.command.stdout(Stdio::piped());
+        start.command.stderr(Stdio::piped());
 
-        let mut child = command
+        let mut child = start
+            .command
             .spawn()
             .map_err(|e| format!("Failed to spawn managed session: {e}"))?;
         let pid = Some(child.id());
@@ -286,11 +293,11 @@ impl RuntimeSessionManager {
                 SessionRecord {
                     session: ManagedSession {
                         id,
-                        kind,
-                        game_id,
-                        profile_id,
-                        tool_id,
-                        launcher_source,
+                        kind: start.kind,
+                        game_id: start.game_id,
+                        profile_id: start.profile_id,
+                        tool_id: start.tool_id,
+                        launcher_source: start.launcher_source,
                         pid,
                         started_at: SystemTime::now(),
                         status: SessionStatus::Running,
@@ -327,7 +334,7 @@ impl RuntimeSessionManager {
             manager.finish_session(
                 id,
                 status_result,
-                completion,
+                start.completion,
                 control_for_wait.stop_requested.load(Ordering::SeqCst),
             );
         });
@@ -339,7 +346,7 @@ impl RuntimeSessionManager {
         &self,
         id: u64,
         status_result: Result<ExitStatus, String>,
-        completion: Option<Box<dyn FnOnce(ExitStatus) -> Result<(), String> + Send + 'static>>,
+        completion: Option<SessionCompletion>,
         stop_requested: bool,
     ) {
         let mut next_status = SessionStatus::Failed;
@@ -361,7 +368,7 @@ impl RuntimeSessionManager {
                 };
             }
             Err(e) => {
-                self.push_log(id, SessionStream::Stderr, format!("{e}"));
+                self.push_log(id, SessionStream::Stderr, e.to_string());
             }
         }
 
@@ -406,6 +413,12 @@ impl RuntimeSessionManager {
     }
 }
 
+impl Default for RuntimeSessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn global_runtime_manager() -> RuntimeSessionManager {
     static MANAGER: OnceLock<RuntimeSessionManager> = OnceLock::new();
     MANAGER.get_or_init(RuntimeSessionManager::new).clone()
@@ -421,15 +434,15 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg("sleep 5");
         let (id, _) = manager
-            .spawn_managed_session(
-                SessionKind::Tool,
-                "g".to_string(),
-                Some("p".to_string()),
-                Some("t".to_string()),
-                GameLauncherSource::Steam,
-                cmd,
-                None,
-            )
+            .spawn_managed_session(SessionStart {
+                kind: SessionKind::Tool,
+                game_id: "g".to_string(),
+                profile_id: Some("p".to_string()),
+                tool_id: Some("t".to_string()),
+                launcher_source: GameLauncherSource::Steam,
+                command: cmd,
+                completion: None,
+            })
             .unwrap();
         assert!(manager.any_active());
         manager.stop_session(id).unwrap();
@@ -447,15 +460,15 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg("echo out; echo err 1>&2");
         let (id, _) = manager
-            .spawn_managed_session(
-                SessionKind::Game,
-                "g".to_string(),
-                None,
-                None,
-                GameLauncherSource::Steam,
-                cmd,
-                None,
-            )
+            .spawn_managed_session(SessionStart {
+                kind: SessionKind::Game,
+                game_id: "g".to_string(),
+                profile_id: None,
+                tool_id: None,
+                launcher_source: GameLauncherSource::Steam,
+                command: cmd,
+                completion: None,
+            })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let logs = manager.session_logs(id);
