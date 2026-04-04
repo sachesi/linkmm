@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::installer::{determine_link_type, LinkKind};
+use super::installer::{LinkKind, determine_link_type};
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase};
 
@@ -40,11 +40,7 @@ impl DeploymentState {
     }
 
     fn save(&self, game: &Game, profile_id: &str) -> Result<(), String> {
-        fs::create_dir_all(
-            game.config_dir()
-                .join("profiles")
-                .join(profile_id),
-        )
+        fs::create_dir_all(game.config_dir().join("profiles").join(profile_id))
             .map_err(|e| format!("Failed to create config dir for deployment state: {e}"))?;
         let raw = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize deployment state: {e}"))?;
@@ -368,15 +364,11 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, De
             );
         }
     }
-    for output in db
-        .generated_outputs
-        .iter()
-        .filter(|o| {
-            o.enabled
-                && o.deployer.as_str() == deployer_id
-                && o.manager_profile_id == db.active_profile_id
-        })
-    {
+    for output in db.generated_outputs.iter().filter(|o| {
+        o.enabled
+            && o.deployer.as_str() == deployer_id
+            && o.manager_profile_id == db.active_profile_id
+    }) {
         for (dest, src) in collect_generated_output_destinations(output) {
             desired.insert(
                 dest,
@@ -418,7 +410,9 @@ fn apply_assets_plan(
     for (dest_rel, entry) in &desired {
         let dest = game.root_path.join(dest_rel);
         ensure_path_ready_for_link(game, &mut state, &dest)?;
-        if remove_link_if_matches(&entry.source, &dest).is_err() && (dest.exists() || dest.is_symlink()) {
+        if remove_link_if_matches(&entry.source, &dest).is_err()
+            && (dest.exists() || dest.is_symlink())
+        {
             let _ = fs::remove_file(&dest);
         }
         let _ = create_link(&entry.source, &dest)?;

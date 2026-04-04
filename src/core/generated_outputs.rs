@@ -437,7 +437,8 @@ mod tests {
         std::fs::write(explicit_output.join("GeneratedPatch.esp"), b"patch").unwrap();
 
         let mut db = ModDatabase::default();
-        register_output_directory_package(&game, &mut db, &tool, &explicit_output, "xEdit Output").unwrap();
+        register_output_directory_package(&game, &mut db, &tool, &explicit_output, "xEdit Output")
+            .unwrap();
         deployment::rebuild_deployment(&game, &mut db).unwrap();
 
         let plugins = std::fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
