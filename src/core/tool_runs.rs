@@ -2,11 +2,11 @@ use crate::core::config::{ToolConfig, ToolOutputMode, ToolRunProfile};
 use crate::core::deployment;
 use crate::core::games::Game;
 use crate::core::generated_outputs::{
-    adopt_existing_game_data_files, capture_and_register_from_game_data_diff,
-    register_output_directory_package, snapshot_game_data, ToolRunContext,
+    ToolRunContext, adopt_existing_game_data_files, capture_and_register_from_game_data_diff,
+    register_output_directory_package, snapshot_game_data,
 };
 use crate::core::mods::ModDatabase;
-use crate::core::tool_adapters::{adapter_for_tool, OutputClass};
+use crate::core::tool_adapters::{OutputClass, adapter_for_tool};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -59,10 +59,9 @@ where
 
     let package_id = match profile.output_mode {
         ToolOutputMode::DedicatedDirectory => {
-            let output_dir = profile
-                .managed_output_dir
-                .as_ref()
-                .ok_or_else(|| "Dedicated output mode requires a managed output directory".to_string())?;
+            let output_dir = profile.managed_output_dir.as_ref().ok_or_else(|| {
+                "Dedicated output mode requires a managed output directory".to_string()
+            })?;
             Some(register_output_directory_package(
                 game,
                 db,
@@ -215,14 +214,18 @@ mod tests {
         let tool = test_tool(profile.clone(), exe);
         let mut db = ModDatabase::default();
 
-        let run = run_tool_with_managed_outputs(&game, &mut db, &tool, &profile, |_tool, _profile| {
-            Ok(std::process::ExitStatus::from_raw(0))
-        })
-        .unwrap();
+        let run =
+            run_tool_with_managed_outputs(&game, &mut db, &tool, &profile, |_tool, _profile| {
+                Ok(std::process::ExitStatus::from_raw(0))
+            })
+            .unwrap();
         assert_eq!(run.captured_files, 1);
         assert!(game.data_path.join("meshes/gen.nif").exists());
         assert_eq!(db.generated_outputs.len(), 1);
-        assert_eq!(db.generated_outputs[0].manager_profile_id, db.active_profile_id);
+        assert_eq!(
+            db.generated_outputs[0].manager_profile_id,
+            db.active_profile_id
+        );
     }
 
     #[test]
@@ -240,10 +243,11 @@ mod tests {
         std::fs::write(&exe, b"fake").unwrap();
         let tool = test_tool(profile.clone(), exe);
         let mut db = ModDatabase::default();
-        let err = run_tool_with_managed_outputs(&game, &mut db, &tool, &profile, |_tool, _profile| {
-            Ok(std::process::ExitStatus::from_raw(1))
-        })
-        .unwrap_err();
+        let err =
+            run_tool_with_managed_outputs(&game, &mut db, &tool, &profile, |_tool, _profile| {
+                Ok(std::process::ExitStatus::from_raw(1))
+            })
+            .unwrap_err();
         assert!(err.contains("non-zero"));
         assert!(db.generated_outputs.is_empty());
     }
@@ -267,7 +271,8 @@ mod tests {
         let mut db = ModDatabase::default();
         let unmanaged = detect_unmanaged_outputs(&game, &db, &tool, &profile).unwrap();
         assert_eq!(unmanaged.len(), 1);
-        let package_id = adopt_unmanaged_outputs(&game, &mut db, &tool, &profile, &unmanaged).unwrap();
+        let package_id =
+            adopt_unmanaged_outputs(&game, &mut db, &tool, &profile, &unmanaged).unwrap();
         assert!(!package_id.is_empty());
         assert_eq!(db.generated_outputs.len(), 1);
         assert!(game.data_path.join("meshes/adopt_me.nif").exists());

@@ -276,8 +276,10 @@ pub fn build_settings_page(
                     row.connect_activated(move |_| {
                         let mut cfg = config_s.borrow_mut();
                         if let Some(game_id) = cfg.current_game_id.clone() {
-                            cfg.game_settings_mut(&game_id).active_profile_id = profile_id_s.clone();
-                            if let Some(game) = cfg.games.iter().find(|g| g.id == game_id).cloned() {
+                            cfg.game_settings_mut(&game_id).active_profile_id =
+                                profile_id_s.clone();
+                            if let Some(game) = cfg.games.iter().find(|g| g.id == game_id).cloned()
+                            {
                                 if let Err(e) = ModManager::switch_profile(&game, &profile_id_s) {
                                     log::error!("Failed switching profile state: {e}");
                                 }
