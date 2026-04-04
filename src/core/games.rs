@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GameKind {
@@ -13,6 +14,16 @@ pub enum GameKind {
     Oblivion,
     Morrowind,
     Starfield,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameLauncherSource {
+    Steam,
+    NonSteamUmu,
+}
+
+fn default_launcher_source() -> GameLauncherSource {
+    GameLauncherSource::Steam
 }
 
 impl GameKind {
@@ -221,6 +232,8 @@ pub struct Game {
     pub id: String,
     pub name: String,
     pub kind: GameKind,
+    #[serde(default = "default_launcher_source")]
+    pub launcher_source: GameLauncherSource,
     pub root_path: PathBuf,
     /// Always computed from `root_path` at load time; never persisted to JSON
     /// so it stays in sync even when the user changes the game root path.
@@ -231,9 +244,7 @@ pub struct Game {
     /// Populated from `AppConfig::app_data_dir` at load time.
     #[serde(skip)]
     pub mods_base_dir: Option<PathBuf>,
-    /// UMU launcher configuration for non-Steam games. When set, the game
-    /// was configured through the UMU/Custom setup path rather than Steam.
-    #[serde(default)]
+    /// UMU launcher configuration for non-Steam games.
     pub umu_config: Option<UmuGameConfig>,
 }
 
@@ -246,14 +257,15 @@ struct NxmEntry {
 }
 
 impl Game {
-    pub fn new(kind: GameKind, root_path: PathBuf) -> Self {
+    pub fn new_steam(kind: GameKind, root_path: PathBuf) -> Self {
         let data_path = root_path.join(kind.default_data_subdir());
-        let id = kind.id_str().to_string();
+        let id = Uuid::new_v4().to_string();
         let name = kind.display_name().to_string();
         Self {
             id,
             name,
             kind,
+            launcher_source: GameLauncherSource::Steam,
             root_path,
             data_path,
             mods_base_dir: None,
@@ -262,18 +274,26 @@ impl Game {
     }
 
     /// Create a new UMU-based (non-Steam) game from an executable path.
-    pub fn new_umu(kind: GameKind, root_path: PathBuf, umu_cfg: UmuGameConfig) -> Self {
+    pub fn new_non_steam_umu(kind: GameKind, root_path: PathBuf, umu_cfg: UmuGameConfig) -> Self {
         let data_path = root_path.join(kind.default_data_subdir());
-        let id = kind.id_str().to_string();
+        let id = Uuid::new_v4().to_string();
         let name = kind.display_name().to_string();
         Self {
             id,
             name,
             kind,
+            launcher_source: GameLauncherSource::NonSteamUmu,
             root_path,
             data_path,
             mods_base_dir: None,
             umu_config: Some(umu_cfg),
+        }
+    }
+
+    pub fn instance_label(&self) -> String {
+        match self.launcher_source {
+            GameLauncherSource::Steam => format!("{} (Steam)", self.name),
+            GameLauncherSource::NonSteamUmu => format!("{} (Non-Steam / UMU)", self.name),
         }
     }
 
@@ -304,9 +324,16 @@ impl Game {
     pub fn plugins_txt_dir(&self) -> Option<PathBuf> {
         let sub = self.kind.local_app_data_folder();
 
-        // UMU-configured game: look inside the configured prefix
-        if let Some(ref umu) = self.umu_config {
-            if let Some(ref prefix) = umu.prefix_path {
+        match self.launcher_source {
+            GameLauncherSource::NonSteamUmu => {
+                let umu = self
+                    .umu_config
+                    .as_ref()
+                    .expect("non-steam game must have umu config");
+                let prefix = umu
+                    .prefix_path
+                    .clone()
+                    .unwrap_or_else(crate::core::umu::default_wineprefix);
                 let path = prefix
                     .join("pfx")
                     .join("drive_c")
@@ -329,23 +356,58 @@ impl Game {
                 if path_alt.is_dir() {
                     return Some(path_alt);
                 }
+                None
             }
-            // If no prefix, umu uses its default - we can't determine it easily
-            return None;
+            GameLauncherSource::Steam => {
+                let app_id = self.kind.steam_app_id()?;
+                let compatdata = crate::core::steam::find_compatdata_path(app_id)?;
+                let path = compatdata
+                    .join("pfx")
+                    .join("drive_c")
+                    .join("users")
+                    .join("steamuser")
+                    .join("AppData")
+                    .join("Local")
+                    .join(sub);
+                if path.is_dir() { Some(path) } else { None }
+            }
         }
+    }
 
-        // Steam-configured game: use compatdata
-        let app_id = self.kind.steam_app_id()?;
-        let compatdata = crate::core::steam::find_compatdata_path(app_id)?;
-        let path = compatdata
-            .join("pfx")
-            .join("drive_c")
-            .join("users")
-            .join("steamuser")
-            .join("AppData")
-            .join("Local")
-            .join(sub);
-        if path.is_dir() { Some(path) } else { None }
+    pub fn validate_umu_setup(&self) -> Result<&UmuGameConfig, String> {
+        if self.launcher_source != GameLauncherSource::NonSteamUmu {
+            return Err("UMU setup validation is only valid for non-Steam UMU games".to_string());
+        }
+        let umu_cfg = self
+            .umu_config
+            .as_ref()
+            .ok_or_else(|| "Missing UMU configuration for non-Steam game".to_string())?;
+        if !umu_cfg.exe_path.is_file() {
+            return Err(format!(
+                "UMU game executable does not exist: {}",
+                umu_cfg.exe_path.display()
+            ));
+        }
+        if let Some(prefix) = &umu_cfg.prefix_path
+            && !prefix.is_dir()
+        {
+            return Err(format!(
+                "UMU Wine prefix path does not exist: {}",
+                prefix.display()
+            ));
+        }
+        if let Some(proton) = &umu_cfg.proton_path
+            && !proton.is_dir()
+        {
+            return Err(format!(
+                "UMU Proton path does not exist: {}",
+                proton.display()
+            ));
+        }
+        if !crate::core::umu::is_umu_available() {
+            return Err("umu-run is not installed. Install/update it in Preferences first.".into());
+        }
+        Ok(umu_cfg)
     }
 
     /// Return the expected path of `plugins.txt`, even if it does not yet exist.
@@ -442,5 +504,53 @@ impl Game {
         if let Ok(body) = toml::to_string_pretty(&map) {
             let _ = std::fs::write(&path, body);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn steam_and_non_steam_instances_of_same_kind_get_distinct_ids() {
+        let steam = Game::new_steam(GameKind::SkyrimSE, PathBuf::from("/tmp/steam_skyrim"));
+        let nonsteam = Game::new_non_steam_umu(
+            GameKind::SkyrimSE,
+            PathBuf::from("/tmp/nonsteam_skyrim"),
+            UmuGameConfig {
+                exe_path: PathBuf::from("/tmp/nonsteam_skyrim/SkyrimSE.exe"),
+                prefix_path: None,
+                proton_path: None,
+            },
+        );
+        assert_ne!(steam.id, nonsteam.id);
+        assert_eq!(steam.launcher_source, GameLauncherSource::Steam);
+        assert_eq!(nonsteam.launcher_source, GameLauncherSource::NonSteamUmu);
+    }
+
+    #[test]
+    fn non_steam_plugins_resolution_uses_configured_prefix() {
+        let temp = TempDir::new().unwrap();
+        let prefix = temp.path().join("prefix");
+        let target = prefix
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("AppData")
+            .join("Local")
+            .join(GameKind::SkyrimSE.local_app_data_folder());
+        std::fs::create_dir_all(&target).unwrap();
+        let game = Game::new_non_steam_umu(
+            GameKind::SkyrimSE,
+            temp.path().join("root"),
+            UmuGameConfig {
+                exe_path: temp.path().join("SkyrimSE.exe"),
+                prefix_path: Some(prefix.clone()),
+                proton_path: None,
+            },
+        );
+        assert_eq!(game.plugins_txt_dir(), Some(target));
     }
 }

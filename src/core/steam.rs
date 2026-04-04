@@ -761,7 +761,7 @@ mod tests {
         // may or may not be installed in CI, so we only check the error
         // message shape if it fails).
         use crate::core::games::{Game, GameKind};
-        let game = Game::new(GameKind::SkyrimSE, std::path::PathBuf::from("/fake"));
+        let game = Game::new_steam(GameKind::SkyrimSE, std::path::PathBuf::from("/fake"));
         // We cannot assert Ok because xdg-open may not exist in CI.
         // The important property is that the function does NOT return an error
         // about "Steam App ID".
@@ -778,10 +778,7 @@ mod tests {
     fn is_steam_flatpak_detects_flatpak_path() {
         // This test verifies the detection logic, but won't actually find
         // a Flatpak Steam in CI since it's not installed there.
-        // The function should return false when no Steam is found.
-        let result = is_steam_flatpak();
-        // In CI, this will be false since Steam isn't installed
-        assert!(!result || result); // Always passes, just exercises the code
+        let _ = is_steam_flatpak();
     }
 
     #[test]

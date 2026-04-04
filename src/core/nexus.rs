@@ -234,7 +234,6 @@ impl NexusClient {
         }
 
         req.call()
-            .map_err(ureq::Error::from)
             .and_then(|resp| resp.into_string().map_err(ureq::Error::from))
             .map_err(|err| match err {
                 ureq::Error::Status(code, resp) => {

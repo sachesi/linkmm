@@ -10,7 +10,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::{AppConfig, Profile};
-use crate::core::games::UmuGameConfig;
+use crate::core::games::{GameLauncherSource, UmuGameConfig};
 use crate::core::mods::ModManager;
 use crate::core::nexus::NexusClient;
 use crate::core::umu;
@@ -374,8 +374,11 @@ pub fn build_settings_page(
     // Only shown when the currently active game was set up via UMU (non-Steam).
     let current_umu_config: Option<(String, UmuGameConfig)> = {
         let cfg = config.borrow();
-        cfg.current_game()
-            .and_then(|g| g.umu_config.as_ref().map(|u| (g.id.clone(), u.clone())))
+        cfg.current_game().and_then(|g| {
+            (g.launcher_source == GameLauncherSource::NonSteamUmu)
+                .then(|| g.umu_config.as_ref().map(|u| (g.id.clone(), u.clone())))
+                .flatten()
+        })
     };
 
     if let Some((game_id_for_umu, umu_cfg)) = current_umu_config {
@@ -505,6 +508,12 @@ pub fn build_settings_page(
                     Some(PathBuf::from(&text))
                 };
                 let mut cfg = config_c.borrow_mut();
+                if let Some(ref p) = new_prefix
+                    && !p.is_dir()
+                {
+                    toast_c.add_toast(adw::Toast::new("Prefix path must be an existing folder."));
+                    return;
+                }
                 if let Some(game) = cfg.games.iter_mut().find(|g| g.id == game_id_c) {
                     if let Some(ref mut umu) = game.umu_config {
                         umu.prefix_path = new_prefix;
@@ -562,6 +571,12 @@ pub fn build_settings_page(
                     Some(PathBuf::from(&text))
                 };
                 let mut cfg = config_c.borrow_mut();
+                if let Some(ref p) = new_proton
+                    && !p.is_dir()
+                {
+                    toast_c.add_toast(adw::Toast::new("Proton path must be an existing folder."));
+                    return;
+                }
                 if let Some(game) = cfg.games.iter_mut().find(|g| g.id == game_id_c) {
                     if let Some(ref mut umu) = game.umu_config {
                         umu.proton_path = new_proton;
@@ -574,15 +589,31 @@ pub fn build_settings_page(
 
         umu_group.add(&proton_row);
 
-        // ── Game Executable (read-only info row) ──────────────────────────
-        let exe_row = adw::ActionRow::builder()
-            .title("Game Executable")
-            .subtitle(umu_cfg.exe_path.to_string_lossy().as_ref())
+        let exe_row = adw::EntryRow::builder()
+            .title("Game Executable (.exe)")
+            .show_apply_button(true)
             .build();
-        exe_row.set_tooltip_text(Some(
-            "The game executable that was set during setup. \
-             To change this, add the game again through the setup wizard.",
-        ));
+        exe_row.set_text(&umu_cfg.exe_path.to_string_lossy());
+        {
+            let config_c = Rc::clone(&config);
+            let game_id_c = game_id_for_umu.clone();
+            let toast_c = toast_overlay.clone();
+            exe_row.connect_apply(move |row| {
+                let new_path = PathBuf::from(row.text().as_str());
+                if !new_path.is_file() {
+                    toast_c.add_toast(adw::Toast::new("Executable path must be an existing file."));
+                    return;
+                }
+                let mut cfg = config_c.borrow_mut();
+                if let Some(game) = cfg.games.iter_mut().find(|g| g.id == game_id_c)
+                    && let Some(ref mut umu) = game.umu_config
+                {
+                    umu.exe_path = new_path;
+                }
+                cfg.save();
+                toast_c.add_toast(adw::Toast::new("Executable saved."));
+            });
+        }
         umu_group.add(&exe_row);
 
         content_box.append(&umu_group);

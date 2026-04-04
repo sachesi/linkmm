@@ -214,7 +214,7 @@ fn find_fomod_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String, 
 pub(super) fn decode_fomod_xml(raw: &[u8]) -> Result<String, String> {
     if raw.starts_with(&[0xFF, 0xFE]) {
         let payload = &raw[2..];
-        if payload.len() % 2 != 0 {
+        if !payload.len().is_multiple_of(2) {
             return Err(format!(
                 "UTF-16 LE data has odd byte count ({} bytes after BOM)",
                 payload.len()
@@ -228,7 +228,7 @@ pub(super) fn decode_fomod_xml(raw: &[u8]) -> Result<String, String> {
     }
     if raw.starts_with(&[0xFE, 0xFF]) {
         let payload = &raw[2..];
-        if payload.len() % 2 != 0 {
+        if !payload.len().is_multiple_of(2) {
             return Err(format!(
                 "UTF-16 BE data has odd byte count ({} bytes after BOM)",
                 payload.len()
@@ -280,7 +280,7 @@ fn decode_windows_1252(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|&b| {
-            if b < 0x80 || b >= 0xA0 {
+            if !(0x80..0xA0).contains(&b) {
                 b as char
             } else {
                 let ch = WIN1252_80_9F[(b - 0x80) as usize];

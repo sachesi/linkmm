@@ -285,7 +285,7 @@ fn copy_tree(source: &Path, dest: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::core::deployment;
-    use crate::core::games::{Game, GameKind, UmuGameConfig};
+    use crate::core::games::{Game, GameKind, GameLauncherSource, UmuGameConfig};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
 
@@ -314,6 +314,7 @@ mod tests {
             id,
             name: "Test".to_string(),
             kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::NonSteamUmu,
             root_path: root,
             data_path: data,
             mods_base_dir: Some(mods_base),
