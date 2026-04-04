@@ -217,7 +217,7 @@ pub fn build_tools_page(
                     adopt_btn.set_tooltip_text(Some("Adopt unmanaged generated output"));
                     {
                         let tool_for_adopt = tool.clone();
-                        let game_for_adopt = game.clone();
+                        let game_for_adopt = game_for_rebuild.clone();
                         let rebuild_adopt = rebuild_weak.clone();
                         adopt_btn.connect_clicked(move |_| {
                             let profile = tool_for_adopt.primary_profile();
