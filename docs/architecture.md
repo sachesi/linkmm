@@ -45,3 +45,33 @@ Adapters (`tool_adapters`) hold tool-specific policy:
 - validation
 - output classification
 - unmanaged detection heuristics
+
+## 5. Game kind vs game instance
+
+Game entries are instance-based, not kind-keyed:
+
+- each managed game has a stable unique `id`
+- `GameKind` defines family/type only (Skyrim SE, Fallout 4, etc.)
+- multiple instances of the same `GameKind` are valid and supported
+
+Examples:
+
+- Skyrim SE (Steam)
+- Skyrim SE (Non-Steam / UMU)
+- Skyrim SE (Non-Steam / UMU, custom prefix)
+
+## 6. Launcher-source contract
+
+Each game instance has explicit `launcher_source`:
+
+- `Steam`
+- `NonSteamUmu`
+
+This source drives:
+
+- game launch backend
+- tool launch backend
+- `%LOCALAPPDATA%`/`plugins.txt` resolution
+- per-instance launcher preferences in UI
+
+No launch behavior is inferred from optional fields alone.

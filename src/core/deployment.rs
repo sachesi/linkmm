@@ -891,7 +891,7 @@ pub struct DeploymentReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::games::{Game, GameKind, UmuGameConfig};
+    use crate::core::games::{Game, GameKind, GameLauncherSource, UmuGameConfig};
     use crate::core::mods::{Mod, ModDatabase};
     use std::fs::File;
     use std::io::Write;
@@ -1002,6 +1002,7 @@ mod tests {
             id,
             name: "Test".to_string(),
             kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::NonSteamUmu,
             root_path: root,
             data_path: data,
             mods_base_dir: Some(mods_base),
