@@ -394,9 +394,9 @@ fn apply_assets_plan(
         let dest = game.root_path.join(&dest_rel);
         let src = PathBuf::from(&src_rel);
         if !desired_set.contains(&PathBuf::from(&dest_rel))
-            || !desired
+            || desired
                 .get(&PathBuf::from(&dest_rel))
-                .is_some_and(|s| s.source == src)
+                .is_none_or(|s| s.source != src)
         {
             let removed = remove_link_if_matches(&src, &dest).unwrap_or(false);
             if !removed && (dest.exists() || dest.is_symlink()) {

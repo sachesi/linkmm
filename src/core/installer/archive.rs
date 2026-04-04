@@ -316,10 +316,11 @@ pub(super) fn find_common_prefix(zip: &zip::ZipArchive<std::fs::File>) -> String
         }
     }
 
-    if all_same && let Some(ft) = first_top {
-        if zip.len() > 1 {
-            return format!("{ft}/");
-        }
+    if all_same
+        && let Some(ft) = first_top
+        && zip.len() > 1
+    {
+        return format!("{ft}/");
     }
     String::new()
 }
