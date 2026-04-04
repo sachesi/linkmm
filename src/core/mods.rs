@@ -761,7 +761,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn get_ordered_plugins_respects_saved_order_and_sorts_untracked() {
-        use crate::core::games::{Game, GameKind};
+        use crate::core::games::{Game, GameKind, GameLauncherSource};
 
         let tmp = tempdir();
         let game_root = tmp.join("game");
@@ -777,6 +777,7 @@ mod tests {
             id: "test_game".to_string(),
             name: "Test Game".to_string(),
             kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::Steam,
             root_path: game_root.clone(),
             data_path: data_dir,
             mods_base_dir: Some(mods_base),
@@ -816,7 +817,7 @@ mod tests {
 
     #[test]
     fn sort_plugins_by_type_falls_back_when_libloot_cannot_parse_plugins() {
-        use crate::core::games::{Game, GameKind};
+        use crate::core::games::{Game, GameKind, GameLauncherSource};
 
         let tmp = tempdir();
         let game_root = tmp.join("game");
@@ -833,6 +834,7 @@ mod tests {
             id: "test_game".to_string(),
             name: "Test Game".to_string(),
             kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::Steam,
             root_path: game_root,
             data_path: data_dir,
             mods_base_dir: Some(mods_base),
@@ -859,7 +861,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn uninstall_mod_removes_source_directory_and_database_entry() {
-        use crate::core::games::{Game, GameKind};
+        use crate::core::games::{Game, GameKind, GameLauncherSource};
 
         let tmp = tempdir();
 
@@ -874,6 +876,7 @@ mod tests {
             id: "test_game".to_string(),
             name: "Test Game".to_string(),
             kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::Steam,
             root_path: game_root.clone(),
             data_path: game_root.join("Data"),
             mods_base_dir: Some(mods_base.clone()),

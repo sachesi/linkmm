@@ -143,7 +143,7 @@ pub fn adopt_unmanaged_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::games::{GameKind, UmuGameConfig};
+    use crate::core::games::{GameKind, GameLauncherSource, UmuGameConfig};
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
@@ -172,6 +172,7 @@ mod tests {
             id,
             name: "Test".to_string(),
             kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::NonSteamUmu,
             root_path: root,
             data_path: data,
             mods_base_dir: Some(mods_base),

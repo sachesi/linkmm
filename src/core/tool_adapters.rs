@@ -310,7 +310,7 @@ impl BoolExt for bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::games::{Game, GameKind, UmuGameConfig};
+    use crate::core::games::{Game, GameKind, GameLauncherSource, UmuGameConfig};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -322,6 +322,7 @@ mod tests {
             id: "adapter_test".to_string(),
             name: "Adapter Test".to_string(),
             kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::NonSteamUmu,
             root_path: root,
             data_path: data,
             mods_base_dir: Some(tmp.path().join("mods")),

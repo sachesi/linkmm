@@ -761,7 +761,7 @@ mod tests {
         // may or may not be installed in CI, so we only check the error
         // message shape if it fails).
         use crate::core::games::{Game, GameKind};
-        let game = Game::new(GameKind::SkyrimSE, std::path::PathBuf::from("/fake"));
+        let game = Game::new_steam(GameKind::SkyrimSE, std::path::PathBuf::from("/fake"));
         // We cannot assert Ok because xdg-open may not exist in CI.
         // The important property is that the function does NOT return an error
         // about "Steam App ID".
