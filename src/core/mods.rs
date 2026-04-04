@@ -91,6 +91,10 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
+fn default_active_profile_id() -> String {
+    "default".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
     pub id: String,
@@ -142,6 +146,8 @@ pub struct GeneratedOutputPackage {
     pub name: String,
     pub tool_id: String,
     pub run_profile: String,
+    #[serde(default = "default_active_profile_id")]
+    pub manager_profile_id: String,
     pub source_path: PathBuf,
     pub enabled: bool,
     pub priority: i32,
@@ -158,6 +164,7 @@ impl GeneratedOutputPackage {
         name: impl Into<String>,
         tool_id: impl Into<String>,
         run_profile: impl Into<String>,
+        manager_profile_id: impl Into<String>,
         source_path: PathBuf,
     ) -> Self {
         let ts = now_unix_secs();
@@ -166,6 +173,7 @@ impl GeneratedOutputPackage {
             name: name.into(),
             tool_id: tool_id.into(),
             run_profile: run_profile.into(),
+            manager_profile_id: manager_profile_id.into(),
             source_path,
             enabled: true,
             priority: 0,
@@ -181,6 +189,8 @@ impl GeneratedOutputPackage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModDatabase {
+    #[serde(default = "default_active_profile_id")]
+    pub active_profile_id: String,
     pub mods: Vec<Mod>,
     #[serde(default)]
     pub generated_outputs: Vec<GeneratedOutputPackage>,
@@ -192,6 +202,16 @@ pub struct ModDatabase {
     /// Plugin file names that the user has explicitly *disabled* in the Load Order.
     #[serde(default)]
     pub plugin_disabled: HashSet<String>,
+    #[serde(default)]
+    pub profile_mod_enabled: HashMap<String, HashSet<String>>,
+    #[serde(default)]
+    pub profile_mod_order: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub profile_plugin_load_order: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub profile_plugin_disabled: HashMap<String, HashSet<String>>,
+    #[serde(default)]
+    pub profile_generated_outputs: HashMap<String, Vec<GeneratedOutputPackage>>,
 }
 
 impl ModDatabase {
@@ -260,7 +280,10 @@ impl ModDatabase {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(contents) => match toml::from_str::<ModDatabase>(&contents) {
-                    Ok(db) => return db,
+                    Ok(mut db) => {
+                        db.apply_active_profile_state();
+                        return db;
+                    }
                     Err(e) => {
                         log::warn!("Failed to parse mods database: {e}, using empty database");
                     }
@@ -274,13 +297,15 @@ impl ModDatabase {
     }
 
     pub fn save(&self, game: &Game) {
+        let mut snapshot = self.clone();
+        snapshot.persist_active_profile_state();
         let dir = game.config_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             log::error!("Failed to create game config directory: {e}");
             return;
         }
         let path = Self::db_path(game);
-        match toml::to_string_pretty(self) {
+        match toml::to_string_pretty(&snapshot) {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {
                     log::error!("Failed to write mods database: {e}");
@@ -290,6 +315,72 @@ impl ModDatabase {
                 log::error!("Failed to serialize mods database: {e}");
             }
         }
+    }
+
+    fn apply_active_profile_state(&mut self) {
+        let profile_id = self.active_profile_id.clone();
+        let enabled = self
+            .profile_mod_enabled
+            .get(&profile_id)
+            .cloned()
+            .unwrap_or_default();
+        for m in &mut self.mods {
+            m.enabled = enabled.contains(&m.id);
+        }
+
+        if let Some(order) = self.profile_mod_order.get(&profile_id).cloned() {
+            let mut index: HashMap<String, usize> = order
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| (id, i))
+                .collect();
+            self.mods.sort_by_key(|m| {
+                index
+                    .remove(&m.id)
+                    .unwrap_or(usize::MAX.saturating_sub(m.name.len()))
+            });
+        }
+
+        self.plugin_load_order = self
+            .profile_plugin_load_order
+            .get(&profile_id)
+            .cloned()
+            .unwrap_or_default();
+        self.plugin_disabled = self
+            .profile_plugin_disabled
+            .get(&profile_id)
+            .cloned()
+            .unwrap_or_default();
+        self.generated_outputs = self
+            .profile_generated_outputs
+            .get(&profile_id)
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    fn persist_active_profile_state(&mut self) {
+        let profile_id = self.active_profile_id.clone();
+        let enabled: HashSet<String> = self
+            .mods
+            .iter()
+            .filter(|m| m.enabled)
+            .map(|m| m.id.clone())
+            .collect();
+        let order: Vec<String> = self.mods.iter().map(|m| m.id.clone()).collect();
+        self.profile_mod_enabled.insert(profile_id.clone(), enabled);
+        self.profile_mod_order.insert(profile_id.clone(), order);
+        self.profile_plugin_load_order
+            .insert(profile_id.clone(), self.plugin_load_order.clone());
+        self.profile_plugin_disabled
+            .insert(profile_id.clone(), self.plugin_disabled.clone());
+        self.profile_generated_outputs
+            .insert(profile_id, self.generated_outputs.clone());
+    }
+
+    pub fn switch_active_profile(&mut self, profile_id: &str) {
+        self.persist_active_profile_state();
+        self.active_profile_id = profile_id.to_string();
+        self.apply_active_profile_state();
     }
 
     pub fn scan_mods_dir(&mut self, game: &Game) {
@@ -548,6 +639,14 @@ impl ModManager {
     pub fn rebuild_all(game: &Game) -> Result<(), String> {
         let mut db = ModDatabase::load(game);
         deployment::rebuild_deployment(game, &mut db)
+    }
+
+    pub fn switch_profile(game: &Game, profile_id: &str) -> Result<(), String> {
+        let mut db = ModDatabase::load(game);
+        db.switch_active_profile(profile_id);
+        deployment::rebuild_deployment(game, &mut db)?;
+        db.save(game);
+        Ok(())
     }
 
     pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
