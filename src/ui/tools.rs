@@ -10,7 +10,7 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::core::config::{AppConfig, ToolConfig, ToolRunProfile};
+use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile};
 use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, ModManager};
 
@@ -183,6 +183,46 @@ pub fn build_tools_page(
                     }
 
                     row.add_suffix(&delete_btn);
+
+                    let adopt_btn = gtk4::Button::new();
+                    adopt_btn.set_icon_name("folder-download-symbolic");
+                    adopt_btn.add_css_class("flat");
+                    adopt_btn.set_tooltip_text(Some("Adopt unmanaged generated output"));
+                    {
+                        let tool_for_adopt = tool.clone();
+                        let game_for_adopt = game.clone();
+                        let rebuild_adopt = rebuild_weak.clone();
+                        adopt_btn.connect_clicked(move |_| {
+                            let profile = tool_for_adopt.primary_profile();
+                            let mut db = ModDatabase::load(&game_for_adopt);
+                            match crate::core::tool_runs::detect_unmanaged_outputs(
+                                &game_for_adopt,
+                                &db,
+                                &tool_for_adopt,
+                                &profile,
+                            ) {
+                                Ok(files) if files.is_empty() => {
+                                    log::info!("No unmanaged output candidates found for {}", tool_for_adopt.name);
+                                }
+                                Ok(files) => {
+                                    if let Err(e) = crate::core::tool_runs::adopt_unmanaged_outputs(
+                                        &game_for_adopt,
+                                        &mut db,
+                                        &tool_for_adopt,
+                                        &profile,
+                                        &files,
+                                    ) {
+                                        log::error!("Failed adopting unmanaged outputs: {e}");
+                                    }
+                                }
+                                Err(e) => log::error!("Unmanaged output detection failed: {e}"),
+                            }
+                            if let Some(rb) = rebuild_adopt.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                    }
+                    row.add_suffix(&adopt_btn);
 
                     tools_list_c.append(&row);
                 }
@@ -458,17 +498,12 @@ fn show_tool_dialog(
 
                 let tool = ToolConfig {
                     id,
-                    name,
+                    name: name.clone(),
                     exe_path,
                     arguments: args,
                     app_id,
-                    run_profiles: vec![ToolRunProfile {
-                        id: "default".to_string(),
-                        name: "Default".to_string(),
-                        output_mode: crate::core::config::ToolOutputMode::SnapshotGameData,
-                        managed_output_dir: None,
-                        generated_package_name: "Generated Output".to_string(),
-                    }],
+                    preset: infer_tool_preset(&name),
+                    run_profiles: default_profiles_for_name(&name),
                 };
                 game_settings.tools.push(tool);
             }
@@ -488,6 +523,33 @@ fn show_tool_dialog(
     if let Some(window) = toast_overlay.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
         dialog.present(Some(&window));
     }
+}
+
+fn infer_tool_preset(name: &str) -> ToolPresetKind {
+    let lower = name.to_lowercase();
+    if lower.contains("bodyslide") {
+        ToolPresetKind::BodySlide
+    } else if lower.contains("pandora") {
+        ToolPresetKind::Pandora
+    } else if lower.contains("nemesis") {
+        ToolPresetKind::Nemesis
+    } else {
+        ToolPresetKind::Generic
+    }
+}
+
+fn default_profiles_for_name(name: &str) -> Vec<ToolRunProfile> {
+    use crate::core::tool_adapters::adapter_for_tool;
+    let tool = ToolConfig {
+        id: "preset_probe".to_string(),
+        name: name.to_string(),
+        exe_path: std::path::PathBuf::new(),
+        arguments: String::new(),
+        app_id: 0,
+        preset: infer_tool_preset(name),
+        run_profiles: Vec::new(),
+    };
+    adapter_for_tool(&tool).default_profiles(&tool)
 }
 
 /// Launch a tool with Proton.
@@ -542,10 +604,16 @@ fn launch_tool(game: &Game, tool: &ToolConfig, btn: &gtk4::Button, toast_overlay
             Ok(run) => {
                 let _ = ModManager::rebuild_all(&game_clone);
                 let msg = if let Some(pkg) = run.package_id {
-                    format!("{} run complete; updated output package {}", tool_clone.name, pkg)
+                    format!(
+                        "{} run complete; package {} ({} files: {} assets, {} plugins)",
+                        tool_clone.name, pkg, run.captured_files, run.asset_files, run.plugin_files
+                    )
                 } else {
                     format!("{} run complete", tool_clone.name)
                 };
+                for warning in run.preflight_warnings {
+                    log::warn!("[{} preflight] {}", tool_clone.name, warning);
+                }
                 let _ = tx.send(Ok(msg));
             }
             Err(e) => {
