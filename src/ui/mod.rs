@@ -12,7 +12,7 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
-use crate::core::runtime::{SessionKind, SessionStatus, SessionStream, global_runtime_manager};
+use crate::core::runtime::global_runtime_manager;
 
 pub mod downloads;
 pub mod library;
@@ -174,36 +174,6 @@ fn build_main_window(
 
     sidebar_box.append(&play_btn);
 
-    // ── Managed runtime session status ───────────────────────────────────
-    let session_group = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    session_group.set_margin_start(12);
-    session_group.set_margin_end(12);
-    session_group.set_margin_bottom(12);
-    let session_state = gtk4::Label::new(Some("No active managed sessions"));
-    session_state.set_halign(gtk4::Align::Start);
-    session_state.add_css_class("dim-label");
-    let session_meta = gtk4::Label::new(None);
-    session_meta.set_halign(gtk4::Align::Start);
-    session_meta.add_css_class("caption");
-    let lock_reason = gtk4::Label::new(None);
-    lock_reason.set_halign(gtk4::Align::Start);
-    lock_reason.add_css_class("caption");
-    lock_reason.add_css_class("warning");
-    let session_logs = gtk4::TextView::new();
-    session_logs.set_editable(false);
-    session_logs.set_cursor_visible(false);
-    session_logs.set_monospace(true);
-    session_logs.set_vexpand(true);
-    session_logs.set_size_request(-1, 160);
-    let logs_scroll = gtk4::ScrolledWindow::new();
-    logs_scroll.set_min_content_height(140);
-    logs_scroll.set_child(Some(&session_logs));
-    session_group.append(&session_state);
-    session_group.append(&session_meta);
-    session_group.append(&lock_reason);
-    session_group.append(&logs_scroll);
-    sidebar_box.append(&session_group);
-
     // ── Navigation section ────────────────────────────────────────────────
     sidebar_box.append(&make_section_label("Navigation"));
 
@@ -275,20 +245,11 @@ fn build_main_window(
         let play_btn_t = play_btn.clone();
         let active_game_row_t = active_game_row.clone();
         let nav_list_t = nav_list.clone();
-        let session_state_t = session_state.clone();
-        let session_meta_t = session_meta.clone();
-        let session_logs_t = session_logs.clone();
-        let lock_reason_t = lock_reason.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             let manager = global_runtime_manager();
             let active_any = manager.any_active();
             nav_list_t.set_sensitive(!active_any);
             active_game_row_t.set_sensitive(!active_any);
-            lock_reason_t.set_text(if active_any {
-                "UI is locked while managed process sessions are active. Stop the session to unlock."
-            } else {
-                ""
-            });
 
             let current_game = config_t.borrow().current_game().cloned();
             if let Some(game) = current_game {
@@ -303,47 +264,6 @@ fn build_main_window(
                     "Play"
                 });
                 play_btn_t.set_sensitive(true);
-            }
-
-            let active_session = manager
-                .sessions()
-                .into_iter()
-                .rev()
-                .find(|s| matches!(s.status, SessionStatus::Starting | SessionStatus::Running));
-            if let Some(s) = active_session {
-                session_state_t.set_text(match s.status {
-                    SessionStatus::Starting => "Session starting…",
-                    SessionStatus::Running => "Session running",
-                    SessionStatus::Exited => "Session exited",
-                    SessionStatus::Failed => "Session failed",
-                    SessionStatus::Killed => "Session stopped",
-                });
-                let launcher = match s.launcher_source {
-                    GameLauncherSource::Steam => "Steam",
-                    GameLauncherSource::NonSteamUmu => "NonSteamUmu",
-                };
-                let kind = match s.kind {
-                    SessionKind::Game => "Game",
-                    SessionKind::Tool => "Tool",
-                };
-                session_meta_t.set_text(&format!(
-                    "{} session · launcher {} · pid {:?}",
-                    kind, launcher, s.pid
-                ));
-                let logs = manager.session_logs(s.id);
-                let text = logs
-                    .iter()
-                    .map(|l| match l.stream {
-                        SessionStream::Stdout => format!("[out] {}", l.message),
-                        SessionStream::Stderr => format!("[err] {}", l.message),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                session_logs_t.buffer().set_text(&text);
-            } else {
-                session_state_t.set_text("No active managed sessions");
-                session_meta_t.set_text("");
-                session_logs_t.buffer().set_text("");
             }
             glib::ControlFlow::Continue
         });
