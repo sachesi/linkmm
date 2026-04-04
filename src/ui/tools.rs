@@ -109,6 +109,7 @@ pub fn build_tools_page(
             let toast_overlay_c = toast_overlay.clone();
             let generated_list_c = generated_list.clone();
             let game_for_generated = game.clone();
+            let game_for_rebuild = game.clone();
 
             *rebuild.borrow_mut() = Box::new(move || {
                 // Clear existing rows
@@ -146,7 +147,7 @@ pub fn build_tools_page(
                     {
                         let tool_clone = tool.clone();
                         let toast_overlay_c2 = toast_overlay_c.clone();
-                        let game_for_launch = game.clone();
+                        let game_for_launch = game_for_rebuild.clone();
                         launch_btn.connect_clicked(move |btn| {
                             launch_tool(&game_for_launch, &tool_clone, btn, &toast_overlay_c2);
                         });
