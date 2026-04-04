@@ -410,4 +410,32 @@ mod tests {
         let plugins = std::fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
         assert!(plugins.contains("*GeneratedPatch.esp"));
     }
+
+    #[test]
+    fn remove_generated_output_package_cleans_deployment_links() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let tool = ToolRunContext {
+            tool_id: "bodyslide".to_string(),
+            run_profile: "default".to_string(),
+        };
+        let explicit_output = temp.path().join("tool_output");
+        std::fs::create_dir_all(explicit_output.join("meshes")).unwrap();
+        std::fs::write(explicit_output.join("meshes/out.nif"), b"mesh").unwrap();
+        let mut db = ModDatabase::default();
+        let package_id = register_output_directory_package(
+            &game,
+            &mut db,
+            &tool,
+            &explicit_output,
+            "BodySlide Output",
+        )
+        .unwrap();
+        deployment::rebuild_deployment(&game, &mut db).unwrap();
+        assert!(game.data_path.join("meshes/out.nif").exists());
+
+        remove_generated_output_package(&game, &mut db, &package_id).unwrap();
+        deployment::rebuild_deployment(&game, &mut db).unwrap();
+        assert!(!game.data_path.join("meshes/out.nif").exists());
+    }
 }

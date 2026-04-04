@@ -9,7 +9,6 @@ pub struct Profile {
     pub name: String,
 }
 
-/// Configuration for a single external tool (e.g., BodySlide, xEdit).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ToolOutputMode {
     DedicatedDirectory,
@@ -25,6 +24,19 @@ fn default_run_profile() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolRunProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_tool_output_mode")]
+    pub output_mode: ToolOutputMode,
+    #[serde(default)]
+    pub managed_output_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub generated_package_name: String,
+}
+
+/// Configuration for a single external tool (e.g., BodySlide, xEdit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolConfig {
     /// Unique identifier for this tool.
     pub id: String,
@@ -37,15 +49,23 @@ pub struct ToolConfig {
     pub arguments: String,
     /// Steam App ID to determine which game's Proton prefix to use.
     pub app_id: u32,
-    /// Generated output capture strategy for this tool.
-    #[serde(default = "default_tool_output_mode")]
-    pub output_mode: ToolOutputMode,
-    /// Preferred output directory for tools that support explicit output paths.
     #[serde(default)]
-    pub managed_output_dir: Option<PathBuf>,
-    /// Tool run profile identifier used when replacing generated output packages.
-    #[serde(default = "default_run_profile")]
-    pub run_profile: String,
+    pub run_profiles: Vec<ToolRunProfile>,
+}
+
+impl ToolConfig {
+    pub fn primary_profile(&self) -> ToolRunProfile {
+        if let Some(profile) = self.run_profiles.first() {
+            return profile.clone();
+        }
+        ToolRunProfile {
+            id: default_run_profile(),
+            name: "Default".to_string(),
+            output_mode: default_tool_output_mode(),
+            managed_output_dir: None,
+            generated_package_name: format!("{} Output", self.name),
+        }
+    }
 }
 
 impl Profile {
