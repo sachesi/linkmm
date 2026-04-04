@@ -15,10 +15,7 @@ use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, ModManager};
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
-pub fn build_tools_page(
-    game: Option<&Game>,
-    config: Rc<RefCell<AppConfig>>,
-) -> gtk4::Widget {
+pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     let title_widget = adw::WindowTitle::new("Tools", "");
@@ -70,7 +67,10 @@ pub fn build_tools_page(
         // Tools group
         let tools_group = adw::PreferencesGroup::builder()
             .title("External Tools")
-            .description(format!("Configure Windows-native utilities for {}", game.name))
+            .description(format!(
+                "Configure Windows-native utilities for {}",
+                game.name
+            ))
             .build();
 
         let add_tool_btn = gtk4::Button::new();
@@ -229,7 +229,10 @@ pub fn build_tools_page(
                                 &profile,
                             ) {
                                 Ok(files) if files.is_empty() => {
-                                    log::info!("No unmanaged output candidates found for {}", tool_for_adopt.name);
+                                    log::info!(
+                                        "No unmanaged output candidates found for {}",
+                                        tool_for_adopt.name
+                                    );
                                 }
                                 Ok(files) => {
                                     if let Err(e) = crate::core::tool_runs::adopt_unmanaged_outputs(
@@ -281,11 +284,13 @@ pub fn build_tools_page(
                         let rebuild_remove = rebuild_weak.clone();
                         remove_btn.connect_clicked(move |_| {
                             let mut db = ModDatabase::load(&game_for_remove);
-                            if let Err(e) = crate::core::generated_outputs::remove_generated_output_package(
-                                &game_for_remove,
-                                &mut db,
-                                &output_id,
-                            ) {
+                            if let Err(e) =
+                                crate::core::generated_outputs::remove_generated_output_package(
+                                    &game_for_remove,
+                                    &mut db,
+                                    &output_id,
+                                )
+                            {
                                 log::error!("Failed to remove generated output package: {e}");
                             }
                             let _ = ModManager::rebuild_all(&game_for_remove);
@@ -383,7 +388,11 @@ fn show_tool_dialog(
     toast_overlay: &adw::ToastOverlay,
 ) {
     let dialog = adw::Dialog::new();
-    dialog.set_title(if tool_id.is_some() { "Edit Tool" } else { "Add Tool" });
+    dialog.set_title(if tool_id.is_some() {
+        "Edit Tool"
+    } else {
+        "Add Tool"
+    });
 
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -426,24 +435,19 @@ fn show_tool_dialog(
             let exe_path_ref_c2 = Rc::clone(&exe_path_ref_c);
             let exe_label_c2 = exe_label_c.clone();
 
-            file_dialog.open(
-                gtk4::Window::NONE,
-                gio::Cancellable::NONE,
-                move |result| {
-                    if let Ok(file) = result
-                        && let Some(path) = file.path() {
-                            exe_label_c2.set_label(&path.to_string_lossy());
-                            *exe_path_ref_c2.borrow_mut() = Some(path);
-                        }
-                },
-            );
+            file_dialog.open(gtk4::Window::NONE, gio::Cancellable::NONE, move |result| {
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    exe_label_c2.set_label(&path.to_string_lossy());
+                    *exe_path_ref_c2.borrow_mut() = Some(path);
+                }
+            });
         });
     }
 
     // Arguments
-    let args_row = adw::EntryRow::builder()
-        .title("Arguments")
-        .build();
+    let args_row = adw::EntryRow::builder().title("Arguments").build();
 
     // App ID (get from current game)
     let app_id: u32 = {
@@ -469,12 +473,13 @@ fn show_tool_dialog(
     if let Some(tool_id) = tool_id {
         let cfg = config.borrow();
         if let Some(game_settings) = cfg.game_settings.get(game_id)
-            && let Some(tool) = game_settings.tools.iter().find(|t| t.id == tool_id) {
-                name_row.set_text(&tool.name);
-                args_row.set_text(&tool.arguments);
-                exe_label.set_label(&tool.exe_path.to_string_lossy());
-                *exe_path_ref.borrow_mut() = Some(tool.exe_path.clone());
-            }
+            && let Some(tool) = game_settings.tools.iter().find(|t| t.id == tool_id)
+        {
+            name_row.set_text(&tool.name);
+            args_row.set_text(&tool.arguments);
+            exe_label.set_label(&tool.exe_path.to_string_lossy());
+            *exe_path_ref.borrow_mut() = Some(tool.exe_path.clone());
+        }
     }
 
     // Buttons
@@ -541,10 +546,13 @@ fn show_tool_dialog(
                 }
             } else {
                 // Add new tool
-                let id = format!("tool_{}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis());
+                let id = format!(
+                    "tool_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                );
 
                 let tool = ToolConfig {
                     id,
@@ -570,7 +578,10 @@ fn show_tool_dialog(
     }
 
     // Show the dialog
-    if let Some(window) = toast_overlay.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
+    if let Some(window) = toast_overlay
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+    {
         dialog.present(Some(&window));
     }
 }
@@ -603,7 +614,12 @@ fn default_profiles_for_name(name: &str) -> Vec<ToolRunProfile> {
 }
 
 /// Launch a tool with Proton.
-fn launch_tool(game: &Game, tool: &ToolConfig, btn: &gtk4::Button, toast_overlay: &adw::ToastOverlay) {
+fn launch_tool(
+    game: &Game,
+    tool: &ToolConfig,
+    btn: &gtk4::Button,
+    toast_overlay: &adw::ToastOverlay,
+) {
     btn.set_sensitive(false);
 
     let game_clone = game.clone();

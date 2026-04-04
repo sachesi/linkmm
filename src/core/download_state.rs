@@ -39,10 +39,11 @@ pub fn set_active(file_name: String) -> u64 {
 
 pub fn update_progress(download_id: u64, downloaded: u64, total: u64) {
     if let Ok(mut state) = active_download_cell().lock()
-        && let Some(active) = state.get_mut(&download_id) {
-            active.downloaded = downloaded;
-            active.total = total;
-        }
+        && let Some(active) = state.get_mut(&download_id)
+    {
+        active.downloaded = downloaded;
+        active.total = total;
+    }
 }
 
 pub fn clear_active(download_id: u64) {
@@ -53,16 +54,21 @@ pub fn clear_active(download_id: u64) {
 
 pub fn request_cancel(download_id: u64) {
     if let Ok(mut state) = active_download_cell().lock()
-        && let Some(active) = state.get_mut(&download_id) {
-            active.cancel_requested = true;
-        }
+        && let Some(active) = state.get_mut(&download_id)
+    {
+        active.cancel_requested = true;
+    }
 }
 
 pub fn is_cancel_requested(download_id: u64) -> bool {
     active_download_cell()
         .lock()
         .ok()
-        .and_then(|state| state.get(&download_id).map(|active| active.cancel_requested))
+        .and_then(|state| {
+            state
+                .get(&download_id)
+                .map(|active| active.cancel_requested)
+        })
         .unwrap_or(false)
 }
 

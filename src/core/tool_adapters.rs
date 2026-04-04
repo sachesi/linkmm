@@ -105,7 +105,13 @@ impl ToolAdapter for BodySlideAdapter {
         profile: &ToolRunProfile,
     ) -> Result<PreflightReport, String> {
         let mut report = validate_common(game, tool, profile)?;
-        if tool.exe_path.to_string_lossy().to_lowercase().contains("bodyslide").not() {
+        if tool
+            .exe_path
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("bodyslide")
+            .not()
+        {
             report
                 .warnings
                 .push("Executable path does not look like BodySlide".to_string());
@@ -121,7 +127,9 @@ impl ToolAdapter for BodySlideAdapter {
         db: &ModDatabase,
         _profile: &ToolRunProfile,
     ) -> Result<Vec<PathBuf>, String> {
-        detect_unowned_paths(game, db, |rel| rel.starts_with("meshes") || rel.starts_with("textures"))
+        detect_unowned_paths(game, db, |rel| {
+            rel.starts_with("meshes") || rel.starts_with("textures")
+        })
     }
 }
 
@@ -255,7 +263,13 @@ where
         }
     }
     let mut unmanaged = Vec::new();
-    collect_unmanaged(&game.data_path, Path::new(""), &owned, &filter, &mut unmanaged)?;
+    collect_unmanaged(
+        &game.data_path,
+        Path::new(""),
+        &owned,
+        &filter,
+        &mut unmanaged,
+    )?;
     Ok(unmanaged)
 }
 
@@ -269,7 +283,9 @@ fn collect_unmanaged<F>(
 where
     F: Fn(&Path) -> bool,
 {
-    for entry in std::fs::read_dir(root).map_err(|e| format!("Failed reading {}: {e}", root.display()))? {
+    for entry in
+        std::fs::read_dir(root).map_err(|e| format!("Failed reading {}: {e}", root.display()))?
+    {
         let entry = entry.map_err(|e| format!("Failed reading directory entry: {e}"))?;
         let p = entry.path();
         let rel_path = rel.join(entry.file_name());
