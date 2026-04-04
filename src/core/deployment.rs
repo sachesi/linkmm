@@ -20,6 +20,7 @@ const DEPLOY_STATE_FILE: &str = "deployment_state.toml";
 struct DeploymentState {
     backups: HashMap<String, String>,
     deployed: HashMap<String, String>,
+    owners: HashMap<String, String>,
 }
 
 impl DeploymentState {
@@ -55,6 +56,12 @@ trait Deployer {
 
 struct AssetsDeployer;
 struct PluginsDeployer;
+
+#[derive(Debug, Clone)]
+struct DesiredDeployment {
+    source: PathBuf,
+    owner_id: String,
+}
 
 // ── Link Creation ─────────────────────────────────────────────────────────────
 
@@ -337,7 +344,7 @@ impl Deployer for PluginsDeployer {
     }
 }
 
-fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, PathBuf> {
+fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, DesiredDeployment> {
     let mut desired = HashMap::new();
     for mod_entry in db
         .mods
@@ -345,13 +352,34 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, Pa
         .filter(|m| m.enabled && m.deployer.as_str() == deployer_id)
     {
         for (dest, src) in collect_mod_destinations(mod_entry) {
-            desired.insert(dest, src);
+            desired.insert(
+                dest,
+                DesiredDeployment {
+                    source: src,
+                    owner_id: format!("mod:{}", mod_entry.id),
+                },
+            );
+        }
+    }
+    for output in db
+        .generated_outputs
+        .iter()
+        .filter(|o| o.enabled && o.deployer.as_str() == deployer_id)
+    {
+        for (dest, src) in collect_generated_output_destinations(output) {
+            desired.insert(
+                dest,
+                DesiredDeployment {
+                    source: src,
+                    owner_id: format!("generated:{}", output.id),
+                },
+            );
         }
     }
     desired
 }
 
-fn apply_assets_plan(game: &Game, desired: HashMap<PathBuf, PathBuf>) -> Result<(), String> {
+fn apply_assets_plan(game: &Game, desired: HashMap<PathBuf, DesiredDeployment>) -> Result<(), String> {
     let mut state = DeploymentState::load(game);
     let desired_set: HashSet<PathBuf> = desired.keys().cloned().collect();
 
@@ -361,23 +389,28 @@ fn apply_assets_plan(game: &Game, desired: HashMap<PathBuf, PathBuf>) -> Result<
         if !desired_set.contains(&PathBuf::from(&dest_rel))
             || !desired
                 .get(&PathBuf::from(&dest_rel))
-                .is_some_and(|s| s == &src)
+                .is_some_and(|s| s.source == src)
         {
             let _ = remove_link_if_matches(&src, &dest);
             state.deployed.remove(&dest_rel);
+            state.owners.remove(&dest_rel);
         }
     }
 
-    for (dest_rel, src) in &desired {
+    for (dest_rel, entry) in &desired {
         let dest = game.root_path.join(dest_rel);
         ensure_path_ready_for_link(game, &mut state, &dest)?;
-        if remove_link_if_matches(src, &dest).is_err() && (dest.exists() || dest.is_symlink()) {
+        if remove_link_if_matches(&entry.source, &dest).is_err() && (dest.exists() || dest.is_symlink()) {
             let _ = fs::remove_file(&dest);
         }
-        let _ = create_link(src, &dest)?;
+        let _ = create_link(&entry.source, &dest)?;
         state.deployed.insert(
             dest_rel.to_string_lossy().into_owned(),
-            src.to_string_lossy().into_owned(),
+            entry.source.to_string_lossy().into_owned(),
+        );
+        state.owners.insert(
+            dest_rel.to_string_lossy().into_owned(),
+            entry.owner_id.clone(),
         );
     }
 
@@ -465,6 +498,14 @@ fn collect_mod_destinations(mod_entry: &Mod) -> HashMap<PathBuf, PathBuf> {
     } else {
         collect_data_paths_recursive(&mod_entry.source_path, Path::new("Data"), &mut map);
     }
+    map
+}
+
+fn collect_generated_output_destinations(
+    output: &crate::core::mods::GeneratedOutputPackage,
+) -> HashMap<PathBuf, PathBuf> {
+    let mut map = HashMap::new();
+    collect_data_paths_recursive(&output.source_path, Path::new("Data"), &mut map);
     map
 }
 
@@ -1086,5 +1127,42 @@ mod tests {
         let plugins_txt = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
         assert!(plugins_txt.contains("*Base.esm"));
         assert!(plugins_txt.contains("Addon.esp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_outputs_participate_in_conflict_resolution_order() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "base_mod",
+            "Data/textures/shared.dds",
+            b"mod",
+            true,
+        );
+
+        let generated_dir = game.mods_dir().join("generated_outputs").join("bodyslide");
+        fs::create_dir_all(generated_dir.join("textures")).unwrap();
+        fs::write(generated_dir.join("textures/shared.dds"), b"generated").unwrap();
+        let mut package = crate::core::mods::GeneratedOutputPackage::new(
+            "BodySlide Output",
+            "bodyslide",
+            "default",
+            generated_dir,
+        );
+        package.enabled = true;
+        db.generated_outputs.push(package);
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let winner = fs::read_link(game.data_path.join("textures/shared.dds")).unwrap();
+        assert!(winner.to_string_lossy().contains("generated_outputs"));
+
+        db.generated_outputs[0].enabled = false;
+        rebuild_deployment(&game, &mut db).unwrap();
+        let winner_after = fs::read_link(game.data_path.join("textures/shared.dds")).unwrap();
+        assert!(winner_after.to_string_lossy().contains("base_mod"));
     }
 }

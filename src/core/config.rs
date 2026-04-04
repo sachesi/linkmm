@@ -10,6 +10,20 @@ pub struct Profile {
 }
 
 /// Configuration for a single external tool (e.g., BodySlide, xEdit).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolOutputMode {
+    DedicatedDirectory,
+    SnapshotGameData,
+}
+
+fn default_tool_output_mode() -> ToolOutputMode {
+    ToolOutputMode::SnapshotGameData
+}
+
+fn default_run_profile() -> String {
+    "default".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolConfig {
     /// Unique identifier for this tool.
@@ -23,6 +37,15 @@ pub struct ToolConfig {
     pub arguments: String,
     /// Steam App ID to determine which game's Proton prefix to use.
     pub app_id: u32,
+    /// Generated output capture strategy for this tool.
+    #[serde(default = "default_tool_output_mode")]
+    pub output_mode: ToolOutputMode,
+    /// Preferred output directory for tools that support explicit output paths.
+    #[serde(default)]
+    pub managed_output_dir: Option<PathBuf>,
+    /// Tool run profile identifier used when replacing generated output packages.
+    #[serde(default = "default_run_profile")]
+    pub run_profile: String,
 }
 
 impl Profile {

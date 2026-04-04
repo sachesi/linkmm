@@ -10,7 +10,7 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::core::config::{AppConfig, ToolConfig};
+use crate::core::config::{AppConfig, ToolConfig, ToolOutputMode};
 use crate::core::games::Game;
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
@@ -385,6 +385,9 @@ fn show_tool_dialog(
                     exe_path,
                     arguments: args,
                     app_id,
+                    output_mode: ToolOutputMode::SnapshotGameData,
+                    managed_output_dir: None,
+                    run_profile: "default".to_string(),
                 };
                 game_settings.tools.push(tool);
             }

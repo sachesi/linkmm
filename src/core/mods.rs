@@ -84,6 +84,13 @@ fn default_deployer() -> String {
     "assets".to_string()
 }
 
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
     pub id: String,
@@ -122,11 +129,61 @@ impl Mod {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnedGeneratedFile {
+    pub relative_path: PathBuf,
+    pub captured_at: u64,
+    pub source_tool: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratedOutputPackage {
+    pub id: String,
+    pub name: String,
+    pub tool_id: String,
+    pub run_profile: String,
+    pub source_path: PathBuf,
+    pub enabled: bool,
+    pub priority: i32,
+    #[serde(default = "default_deployer")]
+    pub deployer: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub owned_files: Vec<OwnedGeneratedFile>,
+}
+
+impl GeneratedOutputPackage {
+    pub fn new(
+        name: impl Into<String>,
+        tool_id: impl Into<String>,
+        run_profile: impl Into<String>,
+        source_path: PathBuf,
+    ) -> Self {
+        let ts = now_unix_secs();
+        Self {
+            id: generate_mod_uuid(),
+            name: name.into(),
+            tool_id: tool_id.into(),
+            run_profile: run_profile.into(),
+            source_path,
+            enabled: true,
+            priority: 0,
+            deployer: default_deployer(),
+            created_at: ts,
+            updated_at: ts,
+            owned_files: Vec::new(),
+        }
+    }
+}
+
 // ── ModDatabase ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModDatabase {
     pub mods: Vec<Mod>,
+    #[serde(default)]
+    pub generated_outputs: Vec<GeneratedOutputPackage>,
     /// Ordered mod IDs (legacy – kept for compatibility).
     pub load_order: Vec<String>,
     /// Ordered plugin file names for the Load Order page.
