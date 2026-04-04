@@ -40,7 +40,7 @@ pub fn build_tools_page(
 
     let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
 
-    if let Some(game) = game {
+    if let Some(game) = game.cloned() {
         let profile_group = adw::PreferencesGroup::builder()
             .title("Active Profile")
             .description("Tool runs and generated output management are scoped to this profile.")
@@ -333,11 +333,14 @@ pub fn build_tools_page(
             profile_row.connect_selected_notify(move |row| {
                 let selected = row.selected() as usize;
                 let mut cfg = config_profile.borrow_mut();
-                let gs = cfg.game_settings_mut(&game_profile.id);
-                if let Some(profile) = gs.profiles.get(selected) {
-                    gs.active_profile_id = profile.id.clone();
+                let selected_profile_id = {
+                    let gs = cfg.game_settings_mut(&game_profile.id);
+                    gs.profiles.get(selected).map(|p| p.id.clone())
+                };
+                if let Some(profile_id) = selected_profile_id {
+                    cfg.game_settings_mut(&game_profile.id).active_profile_id = profile_id.clone();
                     cfg.save();
-                    if let Err(e) = ModManager::switch_profile(&game_profile, &profile.id) {
+                    if let Err(e) = ModManager::switch_profile(&game_profile, &profile_id) {
                         log::error!("Failed switching profile: {e}");
                     }
                     (rebuild_profile.borrow())();
