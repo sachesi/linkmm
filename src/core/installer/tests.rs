@@ -1,9 +1,8 @@
-use super::archive::find_common_prefix;
 use super::extract::{extract_zip_to, normalize_paths_to_lowercase};
 use super::fomod::{decode_fomod_xml, parse_fomod_xml};
 use super::heuristics::{
     archive_has_data_folder, build_data_archive_plan, detect_data_root, find_data_root_in_paths,
-    find_fomod_parent_dir, score_as_data_root, score_as_data_root_owned,
+    find_fomod_parent_dir, score_as_data_root_owned,
 };
 use super::install::install_fomod_files;
 use super::paths::{is_safe_relative_path, normalize_path_lowercase, strip_data_prefix};
