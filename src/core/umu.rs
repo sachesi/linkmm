@@ -281,6 +281,7 @@ pub fn ensure_umu_available(
 /// binary remains usable).
 ///
 /// Call this once from `build_ui` after the main window is shown.
+#[cfg(feature = "ui")]
 pub fn check_and_update_in_background(
     installed_version: Option<String>,
     on_updated: impl Fn(String) + 'static,
@@ -318,6 +319,13 @@ pub fn check_and_update_in_background(
             }
         }
     });
+}
+
+#[cfg(not(feature = "ui"))]
+pub fn check_and_update_in_background(
+    _installed_version: Option<String>,
+    _on_updated: impl Fn(String) + 'static,
+) {
 }
 
 // ── Launch ────────────────────────────────────────────────────────────────────

@@ -406,7 +406,10 @@ fn apply_assets_plan(
                 .get(&PathBuf::from(&dest_rel))
                 .is_some_and(|s| s.source == src)
         {
-            let _ = remove_link_if_matches(&src, &dest);
+            let removed = remove_link_if_matches(&src, &dest).unwrap_or(false);
+            if !removed && (dest.exists() || dest.is_symlink()) {
+                let _ = fs::remove_file(&dest);
+            }
             state.deployed.remove(&dest_rel);
             state.owners.remove(&dest_rel);
         }
@@ -1060,13 +1063,13 @@ mod tests {
         );
 
         rebuild_deployment(&game, &mut db).unwrap();
-        let target_first = fs::read_link(game.data_path.join("textures/file.txt")).unwrap();
-        assert!(target_first.to_string_lossy().contains("/b/"));
+        let target_first = fs::read(game.data_path.join("textures/file.txt")).unwrap();
+        assert_eq!(target_first, b"from-b");
 
         db.mods.swap(0, 1);
         rebuild_deployment(&game, &mut db).unwrap();
-        let target_second = fs::read_link(game.data_path.join("textures/file.txt")).unwrap();
-        assert!(target_second.to_string_lossy().contains("/a/"));
+        let target_second = fs::read(game.data_path.join("textures/file.txt")).unwrap();
+        assert_eq!(target_second, b"from-a");
     }
 
     #[cfg(unix)]
@@ -1079,16 +1082,16 @@ mod tests {
         add_mod(&game, &mut db, "b", "Data/meshes/conflict.nif", b"b", false);
 
         rebuild_deployment(&game, &mut db).unwrap();
-        let target = fs::read_link(game.data_path.join("meshes/conflict.nif")).unwrap();
-        assert!(target.to_string_lossy().contains("/a/"));
+        let target = fs::read(game.data_path.join("meshes/conflict.nif")).unwrap();
+        assert_eq!(target, b"a");
 
         db.mods[1].enabled = true;
         rebuild_deployment(&game, &mut db).unwrap();
         db.mods[1].enabled = false;
         rebuild_deployment(&game, &mut db).unwrap();
 
-        let final_target = fs::read_link(game.data_path.join("meshes/conflict.nif")).unwrap();
-        assert!(final_target.to_string_lossy().contains("/a/"));
+        let final_target = fs::read(game.data_path.join("meshes/conflict.nif")).unwrap();
+        assert_eq!(final_target, b"a");
     }
 
     #[cfg(unix)]
@@ -1111,7 +1114,7 @@ mod tests {
         );
         rebuild_deployment(&game, &mut db).unwrap();
 
-        assert!(target.is_symlink());
+        assert!(target.exists());
         let backup = game
             .config_dir()
             .join("backups")
@@ -1173,13 +1176,13 @@ mod tests {
         db.generated_outputs.push(package);
 
         rebuild_deployment(&game, &mut db).unwrap();
-        let winner = fs::read_link(game.data_path.join("textures/shared.dds")).unwrap();
-        assert!(winner.to_string_lossy().contains("generated_outputs"));
+        let winner = fs::read(game.data_path.join("textures/shared.dds")).unwrap();
+        assert_eq!(winner, b"generated");
 
         db.generated_outputs[0].enabled = false;
         rebuild_deployment(&game, &mut db).unwrap();
-        let winner_after = fs::read_link(game.data_path.join("textures/shared.dds")).unwrap();
-        assert!(winner_after.to_string_lossy().contains("base_mod"));
+        let winner_after = fs::read(game.data_path.join("textures/shared.dds")).unwrap();
+        assert_eq!(winner_after, b"mod");
     }
 
     #[cfg(unix)]
@@ -1193,21 +1196,21 @@ mod tests {
         db.save(&game);
 
         rebuild_deployment(&game, &mut db).unwrap();
-        let winner_default = fs::read_link(game.data_path.join("textures/same.dds")).unwrap();
-        assert!(winner_default.to_string_lossy().contains("/a/"));
+        let winner_default = fs::read(game.data_path.join("textures/same.dds")).unwrap();
+        assert_eq!(winner_default, b"a");
 
         db.switch_active_profile("second");
         db.mods[0].enabled = false;
         db.mods[1].enabled = true;
         rebuild_deployment(&game, &mut db).unwrap();
         db.save(&game);
-        let winner_second = fs::read_link(game.data_path.join("textures/same.dds")).unwrap();
-        assert!(winner_second.to_string_lossy().contains("/b/"));
+        let winner_second = fs::read(game.data_path.join("textures/same.dds")).unwrap();
+        assert_eq!(winner_second, b"b");
 
         db.switch_active_profile("default");
         rebuild_deployment(&game, &mut db).unwrap();
-        let winner_back = fs::read_link(game.data_path.join("textures/same.dds")).unwrap();
-        assert!(winner_back.to_string_lossy().contains("/a/"));
+        let winner_back = fs::read(game.data_path.join("textures/same.dds")).unwrap();
+        assert_eq!(winner_back, b"a");
     }
 
     #[cfg(unix)]

@@ -11,6 +11,7 @@ use libadwaita::prelude::*;
 
 use crate::core::config::{AppConfig, Profile};
 use crate::core::games::UmuGameConfig;
+use crate::core::mods::ModManager;
 use crate::core::nexus::NexusClient;
 use crate::core::umu;
 
@@ -186,7 +187,64 @@ pub fn build_settings_page(
                     let icon = gtk4::Image::from_icon_name("object-select-symbolic");
                     row.add_suffix(&icon);
                     row.set_subtitle("Active");
-                } else {
+                }
+
+                let rename_btn = gtk4::Button::new();
+                rename_btn.set_icon_name("document-edit-symbolic");
+                rename_btn.add_css_class("flat");
+                rename_btn.set_valign(gtk4::Align::Center);
+                rename_btn.set_tooltip_text(Some("Rename this profile"));
+                {
+                    let profile_id_r = profile.id.clone();
+                    let config_r = Rc::clone(&config_c);
+                    let rebuild_r = rebuild_weak_c.clone();
+                    rename_btn.connect_clicked(move |_| {
+                        let mut cfg = config_r.borrow_mut();
+                        if let Some(game_id) = cfg.current_game_id.clone()
+                            && let Some(p) = cfg
+                                .game_settings_mut(&game_id)
+                                .profiles
+                                .iter_mut()
+                                .find(|p| p.id == profile_id_r)
+                        {
+                            p.name = format!("{} (Renamed)", p.name);
+                        }
+                        cfg.save();
+                        drop(cfg);
+                        if let Some(rb) = rebuild_r.upgrade() {
+                            (rb.borrow())();
+                        }
+                    });
+                }
+                row.add_suffix(&rename_btn);
+
+                let duplicate_btn = gtk4::Button::new();
+                duplicate_btn.set_icon_name("edit-copy-symbolic");
+                duplicate_btn.add_css_class("flat");
+                duplicate_btn.set_valign(gtk4::Align::Center);
+                duplicate_btn.set_tooltip_text(Some("Duplicate this profile"));
+                {
+                    let profile_d = profile.clone();
+                    let config_dup = Rc::clone(&config_c);
+                    let rebuild_dup = rebuild_weak_c.clone();
+                    duplicate_btn.connect_clicked(move |_| {
+                        let mut cfg = config_dup.borrow_mut();
+                        if let Some(game_id) = cfg.current_game_id.clone() {
+                            let mut clone = profile_d.clone();
+                            clone.id = format!("{}_copy_{}", clone.id, std::process::id());
+                            clone.name = format!("{} Copy", clone.name);
+                            cfg.game_settings_mut(&game_id).profiles.push(clone);
+                        }
+                        cfg.save();
+                        drop(cfg);
+                        if let Some(rb) = rebuild_dup.upgrade() {
+                            (rb.borrow())();
+                        }
+                    });
+                }
+                row.add_suffix(&duplicate_btn);
+
+                if !is_active {
                     let del_btn = gtk4::Button::new();
                     del_btn.set_icon_name("edit-delete-symbolic");
                     del_btn.add_css_class("flat");
@@ -218,8 +276,12 @@ pub fn build_settings_page(
                     row.connect_activated(move |_| {
                         let mut cfg = config_s.borrow_mut();
                         if let Some(game_id) = cfg.current_game_id.clone() {
-                            cfg.game_settings_mut(&game_id).active_profile_id =
-                                profile_id_s.clone();
+                            cfg.game_settings_mut(&game_id).active_profile_id = profile_id_s.clone();
+                            if let Some(game) = cfg.games.iter().find(|g| g.id == game_id).cloned() {
+                                if let Err(e) = ModManager::switch_profile(&game, &profile_id_s) {
+                                    log::error!("Failed switching profile state: {e}");
+                                }
+                            }
                         }
                         cfg.save();
                         drop(cfg);
