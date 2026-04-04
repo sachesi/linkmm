@@ -5,6 +5,7 @@ mod core {
     pub mod download;
     pub mod download_state;
     pub mod games;
+    pub mod generated_outputs;
     pub mod installer;
     pub mod logger;
     pub mod mods;
