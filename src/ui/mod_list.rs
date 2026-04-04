@@ -49,21 +49,22 @@ pub fn build_mod_list(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widg
         let container_clone2 = container_clone.clone();
         dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
             if let Ok(file) = result
-                && let Some(path) = file.path() {
-                    let mod_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Unknown Mod".to_string());
+                && let Some(path) = file.path()
+            {
+                let mod_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Unknown Mod".to_string());
 
-                    let mut db = ModDatabase::load(&game_clone2);
-                    let new_mod = crate::core::mods::Mod::new(mod_name, path);
-                    db.mods.push(new_mod);
-                    db.save(&game_clone2);
-                    config_clone2.borrow().save();
+                let mut db = ModDatabase::load(&game_clone2);
+                let new_mod = crate::core::mods::Mod::new(mod_name, path);
+                db.mods.push(new_mod);
+                db.save(&game_clone2);
+                config_clone2.borrow().save();
 
-                    // Refresh the list to show the newly added mod
-                    refresh_mod_list(&container_clone2, &game_clone2, Rc::clone(&config_clone2));
-                }
+                // Refresh the list to show the newly added mod
+                refresh_mod_list(&container_clone2, &game_clone2, Rc::clone(&config_clone2));
+            }
         });
     });
 
@@ -142,28 +143,16 @@ fn build_mod_row(
             return;
         }
         let enabled = switch_row.is_active();
-        let mut db = ModDatabase::load(&game_clone);
-
-        if let Some(mod_entry) = db.mods.iter_mut().find(|m| m.id == mod_id) {
-            let result = if enabled {
-                ModManager::enable_mod(&game_clone, mod_entry)
-            } else {
-                ModManager::disable_mod(&game_clone, mod_entry)
-            };
-
-            match result {
-                Ok(()) => {
-                    mod_entry.enabled = enabled;
-                    db.save(&game_clone);
-                    config_clone.borrow().save();
-                }
-                Err(e) => {
-                    log::error!("Failed to toggle mod: {e}");
-                    // Revert the switch without re-entering the handler
-                    *reverting.borrow_mut() = true;
-                    switch_row.set_active(!enabled);
-                    *reverting.borrow_mut() = false;
-                }
+        match ModManager::set_mod_enabled(&game_clone, &mod_id, enabled) {
+            Ok(()) => {
+                config_clone.borrow().save();
+            }
+            Err(e) => {
+                log::error!("Failed to toggle mod: {e}");
+                // Revert the switch without re-entering the handler
+                *reverting.borrow_mut() = true;
+                switch_row.set_active(!enabled);
+                *reverting.borrow_mut() = false;
             }
         }
     });

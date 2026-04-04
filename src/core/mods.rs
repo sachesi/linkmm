@@ -463,19 +463,11 @@ pub struct ModManager;
 
 impl ModManager {
     pub fn enable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        // Use new deployment module with improved link management
-        let report = deployment::deploy_mod(game, mod_entry)?;
-        log::info!(
-            "Deployed mod '{}': {} data links, {} root links",
-            mod_entry.name,
-            report.data_links_created,
-            report.root_links_created
-        );
-        Ok(())
+        Self::set_mod_enabled(game, &mod_entry.id, true)
     }
 
     pub fn disable_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        Self::disable_mod_internal(game, mod_entry, true)
+        Self::set_mod_enabled(game, &mod_entry.id, false)
     }
 
     /// Disable a mod without running the legacy nested Data/Data cleanup.
@@ -483,7 +475,7 @@ impl ModManager {
     /// Use this in batch undeploy paths, then call `purge_legacy_nested_data_dir`
     /// once after all mods are processed to avoid repeated full-directory scans.
     pub fn disable_mod_without_legacy_cleanup(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        Self::disable_mod_internal(game, mod_entry, false)
+        Self::set_mod_enabled(game, &mod_entry.id, false)
     }
 
     /// Clean up legacy symlinks from game Data/Data left by older deployment logic.
@@ -493,26 +485,20 @@ impl ModManager {
         deployment::cleanup_legacy_nested_data(game);
     }
 
-    fn disable_mod_internal(
-        game: &Game,
-        mod_entry: &Mod,
-        run_legacy_cleanup: bool,
-    ) -> Result<(), String> {
-        // Use new deployment module with improved link management
-        let report = deployment::undeploy_mod(game, mod_entry)?;
-        log::info!(
-            "Undeployed mod '{}': removed {} data links, {} root links",
-            mod_entry.name,
-            report.data_links_removed,
-            report.root_links_removed
-        );
-
-        // Legacy cleanup if requested
-        if run_legacy_cleanup {
-            deployment::cleanup_legacy_nested_data(game);
-        }
-
+    pub fn set_mod_enabled(game: &Game, mod_id: &str, enabled: bool) -> Result<(), String> {
+        let mut db = ModDatabase::load(game);
+        let Some(target) = db.mods.iter_mut().find(|m| m.id == mod_id) else {
+            return Err(format!("Unknown mod id: {mod_id}"));
+        };
+        target.enabled = enabled;
+        deployment::rebuild_deployment(game, &db)?;
+        db.save(game);
         Ok(())
+    }
+
+    pub fn rebuild_all(game: &Game) -> Result<(), String> {
+        let db = ModDatabase::load(game);
+        deployment::rebuild_deployment(game, &db)
     }
 
     pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
