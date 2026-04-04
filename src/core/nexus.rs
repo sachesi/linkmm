@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -234,7 +234,8 @@ impl NexusClient {
         }
 
         req.call()
-            .and_then(|resp| resp.into_string())
+            .map_err(ureq::Error::from)
+            .and_then(|resp| resp.into_string().map_err(ureq::Error::from))
             .map_err(|err| match err {
                 ureq::Error::Status(code, resp) => {
                     let body = resp.into_string().unwrap_or_default();

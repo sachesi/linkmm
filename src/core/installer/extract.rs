@@ -8,7 +8,7 @@ use super::paths::{
     normalize_path,
 };
 use super::types::{
-    EXTRACTION_TICK_INTERVAL_MS, EXTRACT_BUFFER_SIZE, JUNK_TOPLEVEL_ENTRIES, SINGLE_FILE_READ_CAP,
+    EXTRACT_BUFFER_SIZE, EXTRACTION_TICK_INTERVAL_MS, JUNK_TOPLEVEL_ENTRIES, SINGLE_FILE_READ_CAP,
 };
 
 /// Extract all files from a zip archive into `dest_dir`, stripping

@@ -8,6 +8,7 @@ License:        GPL-3.0-or-later
 URL:            https://github.com/sachesi/linkmm
 BuildRequires:  cargo
 BuildRequires:  rust >= 1.85
+BuildRequires:  gcc-c++
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
 
