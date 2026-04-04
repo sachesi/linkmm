@@ -5,12 +5,58 @@
 // This module handles deploying and undeploying mods using symbolic or hard links.
 // Core principle: Game Data/ directory contains ONLY links, never copies of mod files.
 
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::installer::{LinkKind, determine_link_type};
 use crate::core::games::Game;
-use crate::core::mods::Mod;
+use crate::core::mods::{Mod, ModDatabase};
+
+const DEPLOY_STATE_FILE: &str = "deployment_state.toml";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DeploymentState {
+    backups: HashMap<String, String>,
+    deployed: HashMap<String, String>,
+}
+
+impl DeploymentState {
+    fn path(game: &Game) -> PathBuf {
+        game.config_dir().join(DEPLOY_STATE_FILE)
+    }
+
+    fn load(game: &Game) -> Self {
+        let path = Self::path(game);
+        let Ok(raw) = fs::read_to_string(path) else {
+            return Self::default();
+        };
+        toml::from_str(&raw).unwrap_or_default()
+    }
+
+    fn save(&self, game: &Game) -> Result<(), String> {
+        fs::create_dir_all(game.config_dir())
+            .map_err(|e| format!("Failed to create config dir for deployment state: {e}"))?;
+        let raw = toml::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize deployment state: {e}"))?;
+        fs::write(Self::path(game), raw)
+            .map_err(|e| format!("Failed to write deployment state: {e}"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeployerKind {
+    Assets,
+    Plugins,
+}
+
+#[derive(Debug, Clone)]
+struct DeployerPlan {
+    kind: DeployerKind,
+    desired: HashMap<PathBuf, PathBuf>,
+}
 
 // ── Link Creation ─────────────────────────────────────────────────────────────
 
@@ -261,6 +307,195 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
 }
 
 // ── High-Level Deployment ─────────────────────────────────────────────────────
+
+pub fn rebuild_deployment(game: &Game, db: &ModDatabase) -> Result<(), String> {
+    let asset_plan = build_assets_plan(db);
+    apply_assets_plan(game, asset_plan)?;
+
+    let plugins_plan = DeployerPlan {
+        kind: DeployerKind::Plugins,
+        desired: HashMap::new(),
+    };
+    apply_plugins_plan(game, db, plugins_plan)?;
+    Ok(())
+}
+
+fn build_assets_plan(db: &ModDatabase) -> DeployerPlan {
+    let mut desired = HashMap::new();
+    for mod_entry in db.mods.iter().filter(|m| m.enabled) {
+        for (dest, src) in collect_mod_destinations(mod_entry) {
+            desired.insert(dest, src);
+        }
+    }
+    DeployerPlan {
+        kind: DeployerKind::Assets,
+        desired,
+    }
+}
+
+fn apply_assets_plan(game: &Game, plan: DeployerPlan) -> Result<(), String> {
+    match plan.kind {
+        DeployerKind::Assets => {}
+        DeployerKind::Plugins => return Ok(()),
+    }
+    let mut state = DeploymentState::load(game);
+    let desired = plan.desired;
+    let desired_set: HashSet<PathBuf> = desired.keys().cloned().collect();
+
+    for (dest_rel, src_rel) in state.deployed.clone() {
+        let dest = game.root_path.join(&dest_rel);
+        let src = PathBuf::from(&src_rel);
+        if !desired_set.contains(&PathBuf::from(&dest_rel))
+            || !desired
+                .get(&PathBuf::from(&dest_rel))
+                .is_some_and(|s| s == &src)
+        {
+            let _ = remove_link_if_matches(&src, &dest);
+            state.deployed.remove(&dest_rel);
+        }
+    }
+
+    for (dest_rel, src) in &desired {
+        let dest = game.root_path.join(dest_rel);
+        ensure_path_ready_for_link(game, &mut state, &dest)?;
+        if remove_link_if_matches(src, &dest).is_err() && (dest.exists() || dest.is_symlink()) {
+            let _ = fs::remove_file(&dest);
+        }
+        let _ = create_link(src, &dest)?;
+        state.deployed.insert(
+            dest_rel.to_string_lossy().into_owned(),
+            src.to_string_lossy().into_owned(),
+        );
+    }
+
+    restore_backups_not_in_desired(game, &mut state, &desired_set)?;
+    state.save(game)
+}
+
+fn apply_plugins_plan(game: &Game, db: &ModDatabase, plan: DeployerPlan) -> Result<(), String> {
+    match plan.kind {
+        DeployerKind::Plugins => db.write_plugins_txt(game),
+        DeployerKind::Assets => Ok(()),
+    }
+}
+
+fn restore_backups_not_in_desired(
+    game: &Game,
+    state: &mut DeploymentState,
+    desired: &HashSet<PathBuf>,
+) -> Result<(), String> {
+    let backup_keys: Vec<String> = state.backups.keys().cloned().collect();
+    for dest_rel in backup_keys {
+        if desired.contains(&PathBuf::from(&dest_rel)) {
+            continue;
+        }
+        let dest = game.root_path.join(&dest_rel);
+        if dest.exists() || dest.is_symlink() {
+            let _ = fs::remove_file(&dest);
+        }
+        if let Some(backup_rel) = state.backups.remove(&dest_rel) {
+            let backup_path = game.config_dir().join(backup_rel);
+            if backup_path.exists() {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to restore parent directory: {e}"))?;
+                }
+                fs::rename(&backup_path, &dest)
+                    .map_err(|e| format!("Failed to restore backup for {}: {e}", dest.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_path_ready_for_link(
+    game: &Game,
+    state: &mut DeploymentState,
+    dest: &Path,
+) -> Result<(), String> {
+    if dest.is_symlink() {
+        return Ok(());
+    }
+    if !dest.exists() {
+        return Ok(());
+    }
+    if !dest.is_file() {
+        return Err(format!(
+            "Destination exists and is not a file: {}",
+            dest.display()
+        ));
+    }
+
+    let rel = dest
+        .strip_prefix(&game.root_path)
+        .map_err(|_| format!("Destination not inside game root: {}", dest.display()))?
+        .to_path_buf();
+    let rel_s = rel.to_string_lossy().into_owned();
+    if state.backups.contains_key(&rel_s) {
+        fs::remove_file(dest)
+            .map_err(|e| format!("Failed to remove existing file {}: {e}", dest.display()))?;
+        return Ok(());
+    }
+    let backup_rel = PathBuf::from("backups").join(&rel);
+    let backup_path = game.config_dir().join(&backup_rel);
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create backup directory: {e}"))?;
+    }
+    fs::rename(dest, &backup_path)
+        .map_err(|e| format!("Failed to backup existing file {}: {e}", dest.display()))?;
+    state
+        .backups
+        .insert(rel_s, backup_rel.to_string_lossy().into_owned());
+    Ok(())
+}
+
+fn collect_mod_destinations(mod_entry: &Mod) -> HashMap<PathBuf, PathBuf> {
+    let mut map = HashMap::new();
+    let data_dir = mod_entry.source_path.join("Data");
+    if data_dir.is_dir() {
+        collect_data_paths_recursive(&data_dir, Path::new("Data"), &mut map);
+        collect_root_paths_recursive(&mod_entry.source_path, Path::new(""), &mut map);
+    } else {
+        collect_data_paths_recursive(&mod_entry.source_path, Path::new("Data"), &mut map);
+    }
+    map
+}
+
+fn collect_data_paths_recursive(src: &Path, dest: &Path, out: &mut HashMap<PathBuf, PathBuf>) {
+    let Ok(entries) = fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let name = entry.file_name();
+        if src_path.is_dir() && name.as_encoded_bytes().eq_ignore_ascii_case(b"data") {
+            collect_data_paths_recursive(&src_path, dest, out);
+        } else if src_path.is_dir() {
+            collect_data_paths_recursive(&src_path, &dest.join(&name), out);
+        } else if src_path.is_file() {
+            out.insert(dest.join(&name), src_path);
+        }
+    }
+}
+
+fn collect_root_paths_recursive(src: &Path, dest: &Path, out: &mut HashMap<PathBuf, PathBuf>) {
+    let Ok(entries) = fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let name = entry.file_name();
+        if name.as_encoded_bytes().eq_ignore_ascii_case(b"data") {
+            continue;
+        }
+        if src_path.is_dir() {
+            collect_root_paths_recursive(&src_path, &dest.join(&name), out);
+        } else if src_path.is_file() {
+            out.insert(dest.join(&name), src_path);
+        }
+    }
+}
 
 /// Deploy a mod by creating links from mod storage to game directory.
 ///

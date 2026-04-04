@@ -15,12 +15,6 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
 const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
-const POST_LOOP_PROGRESS_STEPS: usize = 2;
-/// Minimum interval (ms) between UI progress updates in the deploy loop.
-/// Throttling at one frame (~16 ms) prevents the GTK ProgressBar CSS
-/// transition from being restarted on every fast iteration and keeps the
-/// Revealer slide animation smooth.
-const PROGRESS_UPDATE_INTERVAL_MS: u64 = 16;
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
@@ -160,113 +154,16 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let btn = btn.clone();
             gtk4::glib::idle_add_local_once(move || {
                 let db = ModDatabase::load(&game_c);
-                let mut errors: Vec<String> = Vec::new();
-                let undeploy_total = db.mods.len();
-                // Progress covers both phases in a single bar: cleanup undeploy pass
-                // + enabled-mod deploy pass.
-                let deploy_total = db.mods.iter().filter(|m| m.enabled).count();
-                let total_steps = (undeploy_total + deploy_total + POST_LOOP_PROGRESS_STEPS).max(1);
-                let mut steps_done = 0usize;
-
-                // Throttle UI updates so we don't restart the ProgressBar CSS
-                // transition on every fast iteration and let the Revealer
-                // animation advance smoothly at the display frame rate.
-                // Initialise to one interval in the past so the very first
-                // iteration always produces a visible UI update.
-                let mut last_ui_update = std::time::Instant::now()
-                    - std::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS);
-
-                // First, unlink all tracked mods so we start from a clean state
-                for (idx, m) in db.mods.iter().enumerate() {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_ui_update).as_millis() as u64
-                        >= PROGRESS_UPDATE_INTERVAL_MS
-                    {
-                        status_label_c.set_text(&format!(
-                            "Undeploying existing links ({}/{})…",
-                            idx + 1,
-                            undeploy_total
-                        ));
-                        let frac = steps_done as f64 / total_steps as f64;
-                        status_progress_c.set_fraction(frac);
-                        status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
-                        flush_ui_events();
-                        last_ui_update = now;
-                    }
-                    if let Err(e) = ModManager::disable_mod_without_legacy_cleanup(&game_c, m) {
-                        log::warn!("Undeploy warning for {}: {e}", m.name);
-                    }
-                    steps_done += 1;
-                }
-                ModManager::purge_legacy_nested_data_dir(&game_c);
-                steps_done += 1;
-                {
-                    let frac = steps_done as f64 / total_steps as f64;
-                    status_progress_c.set_fraction(frac);
-                    status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
-                }
-
-                // Then deploy all enabled mods.
-                //
-                // The linker helpers skip creating a new link when a destination
-                // file already exists, so the first deployed mod "wins" each
-                // conflicting path. Because UI priority is defined as
-                // top (lowest priority) -> bottom (highest priority), we deploy in
-                // reverse visual order to ensure the bottom-most enabled mod wins
-                // conflicts.
-                log::info!(
-                    "[Deploy] Starting priority deployment: {} enabled mod(s) out of {} total",
-                    deploy_total,
-                    db.mods.len()
-                );
-                let mut deployed_count = 0usize;
-                for (idx, m) in db.mods.iter().rev().filter(|m| m.enabled).enumerate() {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_ui_update).as_millis() as u64
-                        >= PROGRESS_UPDATE_INTERVAL_MS
-                    {
-                        status_label_c.set_text(&format!(
-                            "Deploying mods ({}/{})…",
-                            idx + 1,
-                            deploy_total
-                        ));
-                        let frac = steps_done as f64 / total_steps as f64;
-                        status_progress_c.set_fraction(frac);
-                        status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
-                        flush_ui_events();
-                        last_ui_update = now;
-                    }
-                    log::debug!(
-                        "[Deploy] [{}/{}] Deploying '{}'",
-                        idx + 1,
-                        deploy_total,
-                        m.name
-                    );
-                    if let Err(e) = ModManager::enable_mod(&game_c, m) {
-                        errors.push(format!("{}: {}", m.name, e));
-                    } else {
-                        deployed_count += 1;
-                    }
-                    steps_done += 1;
-                }
-                let _ = db.write_plugins_txt(&game_c);
-                log::info!(
-                    "[Deploy] Deployment complete: {} mod(s) deployed successfully, {} error(s)",
-                    deployed_count,
-                    errors.len()
-                );
-                steps_done += 1;
-                let frac = steps_done as f64 / total_steps as f64;
-                status_progress_c.set_fraction(frac);
-                status_progress_c.set_text(Some(&format!("{:.0}%", frac * 100.0)));
-
-                let msg = if errors.is_empty() {
-                    format!("Deployed {deployed_count} mod(s)")
-                } else {
-                    for e in &errors {
+                let enabled_count = db.mods.iter().filter(|m| m.enabled).count();
+                status_label_c.set_text("Rebuilding deployment from enabled mod set…");
+                flush_ui_events();
+                let result = ModManager::rebuild_all(&game_c);
+                let msg = match result {
+                    Ok(()) => format!("Deployed {enabled_count} mod(s)"),
+                    Err(e) => {
                         log::error!("Deploy error: {e}");
+                        format!("Deploy failed: {e}")
                     }
-                    format!("Deploy finished with {} error(s)", errors.len())
                 };
                 status_label_c.set_text(&msg);
                 status_progress_c.set_fraction(1.0);
@@ -472,10 +369,9 @@ fn build_mod_row(
 
     row.connect_active_notify(move |switch_row| {
         let enabled = switch_row.is_active();
-        let mut db = ModDatabase::load(&game_clone);
-        if let Some(m) = db.mods.iter_mut().find(|m| m.id == mod_id) {
-            m.enabled = enabled;
-            db.save(&game_clone);
+        if let Err(e) = ModManager::set_mod_enabled(&game_clone, &mod_id, enabled) {
+            log::error!("Failed to rebuild deployment after toggle: {e}");
+            switch_row.set_active(!enabled);
         }
     });
 
@@ -511,6 +407,9 @@ fn build_mod_row(
             {
                 db.mods.swap(pos, pos - 1);
                 db.save(&game_c);
+                if let Err(e) = ModManager::rebuild_all(&game_c) {
+                    log::error!("Failed to rebuild deployment after reorder: {e}");
+                }
                 refresh_library_content_with_search(
                     &container_c,
                     &game_c,
@@ -539,6 +438,9 @@ fn build_mod_row(
             {
                 db.mods.swap(pos, pos + 1);
                 db.save(&game_c);
+                if let Err(e) = ModManager::rebuild_all(&game_c) {
+                    log::error!("Failed to rebuild deployment after reorder: {e}");
+                }
                 refresh_library_content_with_search(
                     &container_c,
                     &game_c,
@@ -595,6 +497,9 @@ fn build_mod_row(
                 let insert_pos = adjusted_insert_pos(src_pos, tgt_pos);
                 db.mods.insert(insert_pos, moved);
                 db.save(&game_drop);
+                if let Err(e) = ModManager::rebuild_all(&game_drop) {
+                    log::error!("Failed to rebuild deployment after drag reorder: {e}");
+                }
                 refresh_library_content_with_search(
                     &container_drop,
                     &game_drop,
@@ -921,6 +826,9 @@ fn build_mod_row(
                     m.enabled = true;
                 }
                 db.save(&game_enable);
+                if let Err(e) = ModManager::rebuild_all(&game_enable) {
+                    log::error!("Failed to rebuild deployment after enable all: {e}");
+                }
                 refresh_library_content_with_search(
                     &container_enable,
                     &game_enable,
@@ -945,6 +853,9 @@ fn build_mod_row(
                     m.enabled = false;
                 }
                 db.save(&game_disable);
+                if let Err(e) = ModManager::rebuild_all(&game_disable) {
+                    log::error!("Failed to rebuild deployment after disable all: {e}");
+                }
                 refresh_library_content_with_search(
                     &container_disable,
                     &game_disable,
@@ -1031,6 +942,9 @@ fn show_move_to_position_dialog_for_mod(
             let insert_pos = adjusted_insert_pos(src_pos, target_idx);
             db.mods.insert(insert_pos, m);
             db.save(&game);
+            if let Err(e) = ModManager::rebuild_all(&game) {
+                log::error!("Failed to rebuild deployment after move: {e}");
+            }
             refresh_library_content_with_search(
                 &container,
                 &game,
