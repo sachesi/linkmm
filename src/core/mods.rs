@@ -80,6 +80,10 @@ fn generate_mod_uuid() -> String {
     format!("{a:08x}-{b:04x}-{c:04x}-{d:04x}-{e:012x}")
 }
 
+fn default_deployer() -> String {
+    "assets".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
     pub id: String,
@@ -95,6 +99,8 @@ pub struct Mod {
     /// The name of the archive file this mod was installed from.
     #[serde(default)]
     pub archive_name: Option<String>,
+    #[serde(default = "default_deployer")]
+    pub deployer: String,
 }
 
 impl Mod {
@@ -111,6 +117,7 @@ impl Mod {
             source_path,
             installed_from_nexus: false,
             archive_name: None,
+            deployer: default_deployer(),
         }
     }
 }
@@ -470,35 +477,20 @@ impl ModManager {
         Self::set_mod_enabled(game, &mod_entry.id, false)
     }
 
-    /// Disable a mod without running the legacy nested Data/Data cleanup.
-    ///
-    /// Use this in batch undeploy paths, then call `purge_legacy_nested_data_dir`
-    /// once after all mods are processed to avoid repeated full-directory scans.
-    pub fn disable_mod_without_legacy_cleanup(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        Self::set_mod_enabled(game, &mod_entry.id, false)
-    }
-
-    /// Clean up legacy symlinks from game Data/Data left by older deployment logic.
-    ///
-    /// Batch deploy/undeploy flows should call this once after unlinking mods.
-    pub fn purge_legacy_nested_data_dir(game: &Game) {
-        deployment::cleanup_legacy_nested_data(game);
-    }
-
     pub fn set_mod_enabled(game: &Game, mod_id: &str, enabled: bool) -> Result<(), String> {
         let mut db = ModDatabase::load(game);
         let Some(target) = db.mods.iter_mut().find(|m| m.id == mod_id) else {
             return Err(format!("Unknown mod id: {mod_id}"));
         };
         target.enabled = enabled;
-        deployment::rebuild_deployment(game, &db)?;
+        deployment::rebuild_deployment(game, &mut db)?;
         db.save(game);
         Ok(())
     }
 
     pub fn rebuild_all(game: &Game) -> Result<(), String> {
-        let db = ModDatabase::load(game);
-        deployment::rebuild_deployment(game, &db)
+        let mut db = ModDatabase::load(game);
+        deployment::rebuild_deployment(game, &mut db)
     }
 
     pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
@@ -724,13 +716,14 @@ mod tests {
         .unwrap();
 
         // Register the mod in the database.
-        let mod_entry = crate::core::mods::Mod::new("TestMod", mod_dir.clone());
+        let mut mod_entry = crate::core::mods::Mod::new("TestMod", mod_dir.clone());
+        mod_entry.enabled = true;
         let mut db = ModDatabase::load(&game);
         db.mods.push(mod_entry.clone());
         db.save(&game);
 
-        // Deploy the mod manually so we can verify symlinks are cleaned up.
-        deployment::deploy_mod(&game, &mod_entry).unwrap();
+        // Rebuild deployment so we can verify links are cleaned up.
+        ModManager::rebuild_all(&game).unwrap();
         assert!(
             game.data_path.join("textures").join("sky.dds").is_symlink()
                 || game.data_path.join("textures").join("sky.dds").exists(),

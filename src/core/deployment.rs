@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::installer::{LinkKind, determine_link_type};
+use super::installer::{determine_link_type, LinkKind};
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase};
 
@@ -46,17 +46,15 @@ impl DeploymentState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DeployerKind {
-    Assets,
-    Plugins,
+const ASSETS_DEPLOYER_ID: &str = "assets";
+
+trait Deployer {
+    fn id(&self) -> &'static str;
+    fn rebuild(&self, game: &Game, db: &mut ModDatabase) -> Result<(), String>;
 }
 
-#[derive(Debug, Clone)]
-struct DeployerPlan {
-    kind: DeployerKind,
-    desired: HashMap<PathBuf, PathBuf>,
-}
+struct AssetsDeployer;
+struct PluginsDeployer;
 
 // ── Link Creation ─────────────────────────────────────────────────────────────
 
@@ -308,38 +306,53 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
 
 // ── High-Level Deployment ─────────────────────────────────────────────────────
 
-pub fn rebuild_deployment(game: &Game, db: &ModDatabase) -> Result<(), String> {
-    let asset_plan = build_assets_plan(db);
-    apply_assets_plan(game, asset_plan)?;
-
-    let plugins_plan = DeployerPlan {
-        kind: DeployerKind::Plugins,
-        desired: HashMap::new(),
-    };
-    apply_plugins_plan(game, db, plugins_plan)?;
+pub fn rebuild_deployment(game: &Game, db: &mut ModDatabase) -> Result<(), String> {
+    let deployers: Vec<Box<dyn Deployer>> =
+        vec![Box::new(AssetsDeployer), Box::new(PluginsDeployer)];
+    for deployer in deployers {
+        log::debug!("[Deployer:{}] Rebuilding", deployer.id());
+        deployer.rebuild(game, db)?;
+    }
     Ok(())
 }
 
-fn build_assets_plan(db: &ModDatabase) -> DeployerPlan {
+impl Deployer for AssetsDeployer {
+    fn id(&self) -> &'static str {
+        ASSETS_DEPLOYER_ID
+    }
+
+    fn rebuild(&self, game: &Game, db: &mut ModDatabase) -> Result<(), String> {
+        let desired = build_assets_plan(db, self.id());
+        apply_assets_plan(game, desired)
+    }
+}
+
+impl Deployer for PluginsDeployer {
+    fn id(&self) -> &'static str {
+        "plugins"
+    }
+
+    fn rebuild(&self, game: &Game, db: &mut ModDatabase) -> Result<(), String> {
+        db.write_plugins_txt(game)
+    }
+}
+
+fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, PathBuf> {
     let mut desired = HashMap::new();
-    for mod_entry in db.mods.iter().filter(|m| m.enabled) {
+    for mod_entry in db
+        .mods
+        .iter()
+        .filter(|m| m.enabled && m.deployer.as_str() == deployer_id)
+    {
         for (dest, src) in collect_mod_destinations(mod_entry) {
             desired.insert(dest, src);
         }
     }
-    DeployerPlan {
-        kind: DeployerKind::Assets,
-        desired,
-    }
+    desired
 }
 
-fn apply_assets_plan(game: &Game, plan: DeployerPlan) -> Result<(), String> {
-    match plan.kind {
-        DeployerKind::Assets => {}
-        DeployerKind::Plugins => return Ok(()),
-    }
+fn apply_assets_plan(game: &Game, desired: HashMap<PathBuf, PathBuf>) -> Result<(), String> {
     let mut state = DeploymentState::load(game);
-    let desired = plan.desired;
     let desired_set: HashSet<PathBuf> = desired.keys().cloned().collect();
 
     for (dest_rel, src_rel) in state.deployed.clone() {
@@ -370,13 +383,6 @@ fn apply_assets_plan(game: &Game, plan: DeployerPlan) -> Result<(), String> {
 
     restore_backups_not_in_desired(game, &mut state, &desired_set)?;
     state.save(game)
-}
-
-fn apply_plugins_plan(game: &Game, db: &ModDatabase, plan: DeployerPlan) -> Result<(), String> {
-    match plan.kind {
-        DeployerKind::Plugins => db.write_plugins_txt(game),
-        DeployerKind::Assets => Ok(()),
-    }
 }
 
 fn restore_backups_not_in_desired(
@@ -832,8 +838,12 @@ pub struct DeploymentReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::games::{Game, GameKind, UmuGameConfig};
+    use crate::core::mods::{Mod, ModDatabase};
     use std::fs::File;
     use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -914,5 +924,167 @@ mod tests {
         // Check links exist (may be symlinks or hardlinks depending on filesystem)
         assert!(dest_dir.join("file1.txt").exists());
         assert!(dest_dir.join("subdir/file2.txt").exists());
+    }
+
+    fn test_game(layout: &TempDir) -> Game {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = format!("deploy_test_{}", COUNTER.fetch_add(1, Ordering::Relaxed));
+        let root = layout.path().join("game_root");
+        let data = root.join("Data");
+        let mods_base = layout.path().join("mods_base");
+        let prefix = layout.path().join("umu_prefix");
+        let plugins_dir = prefix
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("AppData")
+            .join("Local")
+            .join(GameKind::SkyrimSE.local_app_data_folder());
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(mods_base.join("mods").join(&id)).unwrap();
+        fs::create_dir_all(&plugins_dir).unwrap();
+
+        Game {
+            id,
+            name: "Test".to_string(),
+            kind: GameKind::SkyrimSE,
+            root_path: root,
+            data_path: data,
+            mods_base_dir: Some(mods_base),
+            umu_config: Some(UmuGameConfig {
+                exe_path: PathBuf::from("game.exe"),
+                prefix_path: Some(prefix),
+                proton_path: None,
+            }),
+        }
+    }
+
+    fn add_mod(
+        game: &Game,
+        db: &mut ModDatabase,
+        name: &str,
+        rel: &str,
+        content: &[u8],
+        enabled: bool,
+    ) {
+        let mod_dir = game.mods_dir().join(name);
+        fs::create_dir_all(mod_dir.join("Data")).unwrap();
+        let path = mod_dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content).unwrap();
+        let mut m = Mod::new(name, mod_dir);
+        m.enabled = enabled;
+        db.mods.push(m);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_uses_order_for_conflict_resolution() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "a",
+            "Data/textures/file.txt",
+            b"from-a",
+            true,
+        );
+        add_mod(
+            &game,
+            &mut db,
+            "b",
+            "Data/textures/file.txt",
+            b"from-b",
+            true,
+        );
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let target_first = fs::read_link(game.data_path.join("textures/file.txt")).unwrap();
+        assert!(target_first.to_string_lossy().contains("/b/"));
+
+        db.mods.swap(0, 1);
+        rebuild_deployment(&game, &mut db).unwrap();
+        let target_second = fs::read_link(game.data_path.join("textures/file.txt")).unwrap();
+        assert!(target_second.to_string_lossy().contains("/a/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_depends_on_current_state_not_toggle_history() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "a", "Data/meshes/conflict.nif", b"a", true);
+        add_mod(&game, &mut db, "b", "Data/meshes/conflict.nif", b"b", false);
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let target = fs::read_link(game.data_path.join("meshes/conflict.nif")).unwrap();
+        assert!(target.to_string_lossy().contains("/a/"));
+
+        db.mods[1].enabled = true;
+        rebuild_deployment(&game, &mut db).unwrap();
+        db.mods[1].enabled = false;
+        rebuild_deployment(&game, &mut db).unwrap();
+
+        let final_target = fs::read_link(game.data_path.join("meshes/conflict.nif")).unwrap();
+        assert!(final_target.to_string_lossy().contains("/a/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_backs_up_and_restores_real_files() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let target = game.data_path.join("textures/original.dds");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"vanilla").unwrap();
+
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "override",
+            "Data/textures/original.dds",
+            b"modded",
+            true,
+        );
+        rebuild_deployment(&game, &mut db).unwrap();
+
+        assert!(target.is_symlink());
+        let backup = game
+            .config_dir()
+            .join("backups")
+            .join("Data")
+            .join("textures")
+            .join("original.dds");
+        assert!(backup.exists());
+
+        db.mods[0].enabled = false;
+        rebuild_deployment(&game, &mut db).unwrap();
+        let restored = fs::read(&target).unwrap();
+        assert_eq!(restored, b"vanilla");
+        assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugins_deployer_writes_plugins_txt_deterministically() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "base", "Data/Base.esm", b"m", true);
+        add_mod(&game, &mut db, "addon", "Data/Addon.esp", b"p", true);
+        db.plugin_load_order = vec!["Addon.esp".to_string(), "Base.esm".to_string()];
+        db.plugin_disabled.insert("Addon.esp".to_string());
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let plugins_txt = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
+        assert!(plugins_txt.contains("*Base.esm"));
+        assert!(plugins_txt.contains("Addon.esp"));
     }
 }
