@@ -515,8 +515,13 @@ pub fn launch_game_managed_command(
         .kind
         .steam_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
-    let mut command = std::process::Command::new("steam");
-    command.arg("-applaunch").arg(app_id.to_string());
+    // Use a shell wrapper so we can gracefully fallback when `steam` is not
+    // on PATH (common for some distro/Flatpak setups). We still prefer
+    // `steam -applaunch` for best process visibility when available.
+    let mut command = std::process::Command::new("sh");
+    command.arg("-lc").arg(format!(
+        "if command -v steam >/dev/null 2>&1; then exec steam -applaunch {app_id}; else exec xdg-open steam://run/{app_id}; fi"
+    ));
     Ok(command)
 }
 
