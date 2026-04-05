@@ -24,6 +24,9 @@
 3. While active, Play becomes Stop for that instance.
 4. Session state and live logs are shown in the main UI.
 5. On exit (natural or stopped), session state finalizes and lock state clears.
+6. On some Steam/Flatpak setups LinkMM tracks a delegated Steam session state
+   (handoff acknowledged, best-effort stop) when a stable long-lived child process
+   is not directly ownable.
 
 ## UI lock during active sessions
 
