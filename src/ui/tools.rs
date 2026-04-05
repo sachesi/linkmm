@@ -1,9 +1,6 @@
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::thread;
 
 use glib;
 use gtk4::prelude::*;
@@ -13,6 +10,7 @@ use libadwaita::prelude::*;
 use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile};
 use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::{ModDatabase, ModManager};
+use crate::core::runtime::{SessionStatus, global_runtime_manager};
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
 pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
@@ -148,8 +146,15 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         let tool_clone = tool.clone();
                         let toast_overlay_c2 = toast_overlay_c.clone();
                         let game_for_launch = game_for_rebuild.clone();
+                        let config_for_launch = Rc::clone(&config_c);
                         launch_btn.connect_clicked(move |btn| {
-                            launch_tool(&game_for_launch, &tool_clone, btn, &toast_overlay_c2);
+                            launch_tool(
+                                &game_for_launch,
+                                &tool_clone,
+                                Rc::clone(&config_for_launch),
+                                btn,
+                                &toast_overlay_c2,
+                            );
                         });
                     }
 
@@ -337,6 +342,9 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             let game_profile = game.clone();
             let rebuild_profile = Rc::clone(&rebuild);
             profile_row.connect_selected_notify(move |row| {
+                if global_runtime_manager().any_active() {
+                    return;
+                }
                 let selected = row.selected() as usize;
                 let mut cfg = config_profile.borrow_mut();
                 let selected_profile_id = {
@@ -351,6 +359,17 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                     }
                     (rebuild_profile.borrow())();
                 }
+            });
+        }
+
+        {
+            let profile_row_c = profile_row.clone();
+            let add_tool_btn_c = add_tool_btn.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                let locked = global_runtime_manager().any_active();
+                profile_row_c.set_sensitive(!locked);
+                add_tool_btn_c.set_sensitive(!locked);
+                glib::ControlFlow::Continue
             });
         }
 
@@ -617,104 +636,94 @@ fn default_profiles_for_name(name: &str) -> Vec<ToolRunProfile> {
 fn launch_tool(
     game: &Game,
     tool: &ToolConfig,
+    config: Rc<RefCell<AppConfig>>,
     btn: &gtk4::Button,
     toast_overlay: &adw::ToastOverlay,
 ) {
+    if game.launcher_source == GameLauncherSource::Steam {
+        match crate::core::steam::launch_tool_with_proton(
+            &tool.exe_path,
+            &tool.arguments,
+            tool.app_id,
+        ) {
+            Ok(_child) => {
+                toast_overlay.add_toast(adw::Toast::new("Tool launched via Steam/Proton"))
+            }
+            Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Launch failed: {e}"))),
+        }
+        return;
+    }
+
+    let manager = global_runtime_manager();
+    if let Some(active) = manager.current_tool_session(&game.id, &tool.id) {
+        if let Err(e) = manager.stop_session(active.id) {
+            toast_overlay.add_toast(adw::Toast::new(&e));
+        }
+        return;
+    }
+
+    let active_profile_id = {
+        let cfg = config.borrow();
+        cfg.game_settings
+            .get(&game.id)
+            .map(|gs| gs.active_profile_id.clone())
+            .unwrap_or_else(|| "default".to_string())
+    };
+    let profile = tool.primary_profile();
+    let (session_id, rx) = match manager.start_tool_session(
+        game.clone(),
+        active_profile_id,
+        tool.clone(),
+        profile.clone(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            toast_overlay.add_toast(adw::Toast::new(&e));
+            return;
+        }
+    };
+    log::info!("Started managed tool session {}", session_id);
     btn.set_sensitive(false);
 
-    let game_clone = game.clone();
-    let tool_clone = tool.clone();
-    let profile = tool.primary_profile();
     let btn_c = btn.clone();
+    let game_id = game.id.clone();
+    let tool_id = tool.id.clone();
+    let tool_name = tool.name.clone();
     let toast_overlay_c = toast_overlay.clone();
-
-    let (tx, rx) = mpsc::channel::<Result<String, String>>();
-
-    // Spawn a thread to launch the tool
-    thread::spawn(move || {
-        log::info!(
-            "Launching tool '{}' with managed profile '{}'",
-            tool_clone.name,
-            profile.name
-        );
-        let mut db = ModDatabase::load(&game_clone);
-        let result = crate::core::tool_runs::run_tool_with_managed_outputs(
-            &game_clone,
-            &mut db,
-            &tool_clone,
-            &profile,
-            |tool_cfg, _profile_cfg| {
-                let mut child = match game_clone.launcher_source {
-                    GameLauncherSource::Steam => crate::core::steam::launch_tool_with_proton(
-                        &tool_cfg.exe_path,
-                        &tool_cfg.arguments,
-                        tool_cfg.app_id,
-                    )?,
-                    GameLauncherSource::NonSteamUmu => {
-                        let umu_cfg = game_clone.validate_umu_setup()?;
-                        crate::core::umu::launch_with_umu(
-                            &tool_cfg.exe_path,
-                            tool_cfg.app_id,
-                            umu_cfg.prefix_path.as_deref(),
-                            umu_cfg.proton_path.as_deref(),
-                        )?
-                    }
-                };
-                if let Some(stdout) = child.stdout.take() {
-                    let reader = BufReader::new(stdout);
-                    for line in reader.lines().map_while(Result::ok) {
-                        log::info!("[{}] {}", tool_cfg.name, line);
-                    }
-                }
-                if let Some(stderr) = child.stderr.take() {
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines().map_while(Result::ok) {
-                        log::warn!("[{}] {}", tool_cfg.name, line);
-                    }
-                }
-                child
-                    .wait()
-                    .map_err(|e| format!("Failed waiting for {}: {e}", tool_cfg.name))
-            },
-        );
-        match result {
-            Ok(run) => {
-                let _ = ModManager::rebuild_all(&game_clone);
-                let msg = if let Some(pkg) = run.package_id {
-                    format!(
-                        "{} run complete; package {} ({} files: {} assets, {} plugins)",
-                        tool_clone.name, pkg, run.captured_files, run.asset_files, run.plugin_files
-                    )
-                } else {
-                    format!("{} run complete", tool_clone.name)
-                };
-                for warning in run.preflight_warnings {
-                    log::warn!("[{} preflight] {}", tool_clone.name, warning);
-                }
-                let _ = tx.send(Ok(msg));
-            }
-            Err(e) => {
-                let _ = tx.send(Err(format!("Tool run failed for {}: {e}", tool_clone.name)));
-            }
-        };
-    });
-
-    // Poll for completion
-    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+    glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+        let manager = global_runtime_manager();
+        if let Some(s) = manager.current_tool_session(&game_id, &tool_id)
+            && matches!(s.status, SessionStatus::Running | SessionStatus::Starting)
+        {
+            btn_c.set_icon_name("media-playback-stop-symbolic");
+            btn_c.set_tooltip_text(Some("Stop Tool"));
+            btn_c.set_sensitive(true);
+            return glib::ControlFlow::Continue;
+        }
         match rx.try_recv() {
-            Ok(Ok(msg)) => {
-                btn_c.set_sensitive(true);
+            Ok(Ok(run)) => {
+                let msg = if let Some(pkg) = run.package_id {
+                    format!("{} complete; generated package {}", tool_name, pkg)
+                } else {
+                    format!("{} complete", tool_name)
+                };
                 toast_overlay_c.add_toast(adw::Toast::new(&msg));
+                btn_c.set_icon_name("media-playback-start-symbolic");
+                btn_c.set_tooltip_text(Some("Launch Tool"));
+                btn_c.set_sensitive(true);
                 glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
+                toast_overlay_c.add_toast(adw::Toast::new(&format!("Tool run failed: {e}")));
+                btn_c.set_icon_name("media-playback-start-symbolic");
+                btn_c.set_tooltip_text(Some("Launch Tool"));
                 btn_c.set_sensitive(true);
-                log::error!("{}", e);
-                toast_overlay_c.add_toast(adw::Toast::new(&e));
                 glib::ControlFlow::Break
             }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                btn_c.set_icon_name("media-playback-start-symbolic");
+                btn_c.set_tooltip_text(Some("Launch Tool"));
                 btn_c.set_sensitive(true);
                 glib::ControlFlow::Break
             }
