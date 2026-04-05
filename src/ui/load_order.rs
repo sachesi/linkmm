@@ -9,6 +9,22 @@ use libadwaita::prelude::*;
 use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, PluginFile};
 
+const DRAG_EDGE_THRESHOLD_PX: f64 = 56.0;
+const DRAG_MAX_SCROLL_STEP_PX: f64 = 22.0;
+const DRAG_SCROLL_TICK_MS: u64 = 16;
+
+#[derive(Debug, Clone)]
+struct ViewportAnchor {
+    item_key: String,
+    align_ratio: f64,
+}
+
+#[derive(Debug, Default)]
+struct DragAutoScrollState {
+    step_px_per_tick: f64,
+    ticking: bool,
+}
+
 /// Build the Load Order page for `game`.
 ///
 /// Shows all `.esm` / `.esl` / `.esp` files found in the game's `Data`
@@ -53,17 +69,24 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             sort_btn.set_tooltip_text(Some("Sort plugins using LOOT load order rules"));
             let game_rc = Rc::new(g.clone());
             let search_query = Rc::new(RefCell::new(String::new()));
+            let pending_viewport_anchor = Rc::new(RefCell::new(None::<ViewportAnchor>));
+            let drag_autoscroll = Rc::new(RefCell::new(DragAutoScrollState::default()));
 
             {
                 let game_c = Rc::clone(&game_rc);
                 let container_c = content_container.clone();
                 let search_c = Rc::clone(&search_query);
+                let anchor_c = Rc::clone(&pending_viewport_anchor);
+                let drag_scroll_c = Rc::clone(&drag_autoscroll);
                 search_entry.connect_search_changed(move |entry| {
                     *search_c.borrow_mut() = entry.text().to_string();
                     refresh_load_order_content_with_search(
                         &container_c,
                         &game_c,
                         &search_c.borrow(),
+                        Rc::clone(&search_c),
+                        Rc::clone(&anchor_c),
+                        Rc::clone(&drag_scroll_c),
                     );
                 });
             }
@@ -73,6 +96,8 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 let game_c = Rc::clone(&game_rc);
                 let container_c = content_container.clone();
                 let search_c = Rc::clone(&search_query);
+                let anchor_c = Rc::clone(&pending_viewport_anchor);
+                let drag_scroll_c = Rc::clone(&drag_autoscroll);
                 sort_btn.connect_clicked(move |_| {
                     let mut db = ModDatabase::load(&game_c);
                     if db.plugin_load_order.is_empty() {
@@ -87,6 +112,9 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                         &container_c,
                         &game_c,
                         &search_c.borrow(),
+                        Rc::clone(&search_c),
+                        Rc::clone(&anchor_c),
+                        Rc::clone(&drag_scroll_c),
                     );
                 });
             }
@@ -95,6 +123,9 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 &content_container,
                 &game_rc,
                 &search_query.borrow(),
+                Rc::clone(&search_query),
+                Rc::clone(&pending_viewport_anchor),
+                Rc::clone(&drag_autoscroll),
             );
         }
     };
@@ -106,8 +137,22 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Re-populate `container` with the current plugin list for `game`.
-fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
-    refresh_load_order_content_with_search(container, game, "");
+fn refresh_load_order_content(
+    container: &gtk4::Box,
+    game: &Rc<Game>,
+    search_state: Rc<RefCell<String>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
+) {
+    let query = search_state.borrow().clone();
+    refresh_load_order_content_with_search(
+        container,
+        game,
+        &query,
+        Rc::clone(&search_state),
+        pending_viewport_anchor,
+        drag_autoscroll,
+    );
 }
 
 fn find_existing_load_order_view(
@@ -165,10 +210,77 @@ fn set_load_order_status(stack: &gtk4::Stack, status: &adw::StatusPage) {
     stack.set_visible_child_name("status");
 }
 
+fn load_order_row_key(plugin_name: &str) -> String {
+    format!("load-order:{plugin_name}")
+}
+
+fn find_row_by_key(list_box: &gtk4::ListBox, key: &str) -> Option<gtk4::Widget> {
+    let mut child = list_box.first_child();
+    while let Some(widget) = child {
+        if widget.widget_name() == key {
+            return Some(widget);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+fn widget_y_in_scrolled(widget: &gtk4::Widget, scrolled: &gtk4::ScrolledWindow) -> Option<f64> {
+    widget
+        .translate_coordinates(scrolled, 0.0, 0.0)
+        .map(|(_, y)| y as f64)
+}
+
+fn drag_scroll_step(pointer_y: f64, height: f64) -> f64 {
+    if height <= 0.0 {
+        return 0.0;
+    }
+    if pointer_y < DRAG_EDGE_THRESHOLD_PX {
+        let strength = (DRAG_EDGE_THRESHOLD_PX - pointer_y) / DRAG_EDGE_THRESHOLD_PX;
+        return -DRAG_MAX_SCROLL_STEP_PX * strength.clamp(0.0, 1.0);
+    }
+    let bottom_start = (height - DRAG_EDGE_THRESHOLD_PX).max(0.0);
+    if pointer_y > bottom_start {
+        let strength = (pointer_y - bottom_start) / DRAG_EDGE_THRESHOLD_PX;
+        return DRAG_MAX_SCROLL_STEP_PX * strength.clamp(0.0, 1.0);
+    }
+    0.0
+}
+
+fn set_drag_scroll_step(
+    scrolled: &gtk4::ScrolledWindow,
+    auto_scroll: Rc<RefCell<DragAutoScrollState>>,
+    step: f64,
+) {
+    auto_scroll.borrow_mut().step_px_per_tick = step;
+    if auto_scroll.borrow().ticking {
+        return;
+    }
+    auto_scroll.borrow_mut().ticking = true;
+    let scrolled_c = scrolled.clone();
+    gtk4::glib::timeout_add_local(
+        std::time::Duration::from_millis(DRAG_SCROLL_TICK_MS),
+        move || {
+            let step = auto_scroll.borrow().step_px_per_tick;
+            if step.abs() < f64::EPSILON {
+                auto_scroll.borrow_mut().ticking = false;
+                return gtk4::glib::ControlFlow::Break;
+            }
+            let adj = scrolled_c.vadjustment();
+            let max_value = (adj.upper() - adj.page_size()).max(0.0);
+            adj.set_value((adj.value() + step).clamp(0.0, max_value));
+            gtk4::glib::ControlFlow::Continue
+        },
+    );
+}
+
 fn refresh_load_order_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
     search_query: &str,
+    search_state: Rc<RefCell<String>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
 ) {
     let (stack, list_box, scrolled) = ensure_load_order_view(container);
     let previous_scroll = {
@@ -226,15 +338,37 @@ fn refresh_load_order_content_with_search(
     let count = filtered.len();
     let vanilla_count = filtered.iter().filter(|p| p.is_vanilla).count();
     for (idx, plugin) in filtered.iter().enumerate() {
-        let row = build_plugin_row(plugin, idx, count, vanilla_count, game, container);
+        let row = build_plugin_row(
+            plugin,
+            idx,
+            count,
+            vanilla_count,
+            game,
+            container,
+            Rc::clone(&search_state),
+            Rc::clone(&pending_viewport_anchor),
+            Rc::clone(&drag_autoscroll),
+        );
         list_box.append(&row);
     }
 
+    let anchor = pending_viewport_anchor.borrow_mut().take();
+    let list_box_clone = list_box.clone();
     let scrolled_clone = scrolled.clone();
     gtk4::glib::idle_add_local_once(move || {
         let adj = scrolled_clone.vadjustment();
         let max_value = (adj.upper() - adj.page_size()).max(0.0);
-        adj.set_value(previous_scroll.0.clamp(0.0, max_value));
+        let anchored_value = anchor.and_then(|a| {
+            find_row_by_key(&list_box_clone, &load_order_row_key(&a.item_key)).and_then(|row| {
+                widget_y_in_scrolled(&row, &scrolled_clone)
+                    .map(|row_y| (row_y - (adj.page_size() * a.align_ratio)).max(0.0))
+            })
+        });
+        adj.set_value(
+            anchored_value
+                .unwrap_or(previous_scroll.0)
+                .clamp(0.0, max_value),
+        );
     });
 }
 
@@ -245,6 +379,9 @@ fn build_plugin_row(
     vanilla_count: usize,
     game: &Rc<Game>,
     container: &gtk4::Box,
+    search_state: Rc<RefCell<String>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
 ) -> adw::ActionRow {
     // Subtitle: type label + vanilla marker
     let subtitle = if plugin.is_vanilla {
@@ -257,6 +394,7 @@ fn build_plugin_row(
         .title(&plugin.name)
         .subtitle(&subtitle)
         .build();
+    row.set_widget_name(&load_order_row_key(&plugin.name));
 
     // Drag handle (non-vanilla only) – shown at the far left to indicate draggability
     if !plugin.is_vanilla {
@@ -302,6 +440,9 @@ fn build_plugin_row(
     {
         let game_c = Rc::clone(game);
         let container_c = container.clone();
+        let search_c = Rc::clone(&search_state);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let plugin_name = plugin.name.clone();
         enabled_btn.connect_toggled(move |btn| {
             let enabled = btn.is_active();
@@ -313,7 +454,13 @@ fn build_plugin_row(
             }
             db.save(&game_c);
             let _ = db.write_plugins_txt(&game_c);
-            refresh_load_order_content(&container_c, &game_c);
+            refresh_load_order_content(
+                &container_c,
+                &game_c,
+                Rc::clone(&search_c),
+                Rc::clone(&anchor_c),
+                Rc::clone(&drag_scroll_c),
+            );
         });
     }
     row.add_suffix(&enabled_btn);
@@ -341,6 +488,9 @@ fn build_plugin_row(
     {
         let game_c = Rc::clone(game);
         let container_c = container.clone();
+        let search_c = Rc::clone(&search_state);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let plugin_name = plugin.name.clone();
         up_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
@@ -356,7 +506,17 @@ fn build_plugin_row(
                 db.set_plugin_order(&ordered);
                 db.save(&game_c);
                 let _ = db.write_plugins_txt(&game_c);
-                refresh_load_order_content(&container_c, &game_c);
+                *anchor_c.borrow_mut() = Some(ViewportAnchor {
+                    item_key: plugin_name.clone(),
+                    align_ratio: 0.35,
+                });
+                refresh_load_order_content(
+                    &container_c,
+                    &game_c,
+                    Rc::clone(&search_c),
+                    Rc::clone(&anchor_c),
+                    Rc::clone(&drag_scroll_c),
+                );
             }
         });
     }
@@ -365,6 +525,9 @@ fn build_plugin_row(
     {
         let game_c = Rc::clone(game);
         let container_c = container.clone();
+        let search_c = Rc::clone(&search_state);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let plugin_name = plugin.name.clone();
         down_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
@@ -380,7 +543,17 @@ fn build_plugin_row(
                 db.set_plugin_order(&ordered);
                 db.save(&game_c);
                 let _ = db.write_plugins_txt(&game_c);
-                refresh_load_order_content(&container_c, &game_c);
+                *anchor_c.borrow_mut() = Some(ViewportAnchor {
+                    item_key: plugin_name.clone(),
+                    align_ratio: 0.35,
+                });
+                refresh_load_order_content(
+                    &container_c,
+                    &game_c,
+                    Rc::clone(&search_c),
+                    Rc::clone(&anchor_c),
+                    Rc::clone(&drag_scroll_c),
+                );
             }
         });
     }
@@ -411,8 +584,35 @@ fn build_plugin_row(
     {
         let game_drop = Rc::clone(game);
         let container_drop = container.clone();
+        let search_drop = Rc::clone(&search_state);
+        let anchor_drop = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_drop = Rc::clone(&drag_autoscroll);
         let target_name = plugin.name.clone();
+        let row_c = row.clone();
+        let container_for_motion = container_drop.clone();
+        let drag_scroll_motion = Rc::clone(&drag_scroll_drop);
+        drop_target.connect_motion(move |_, _, y| {
+            if let Some((_, _, scrolled)) = find_existing_load_order_view(&container_for_motion)
+                && let Some((_, y_in_scrolled)) = row_c.translate_coordinates(&scrolled, 0.0, y)
+            {
+                let step = drag_scroll_step(y_in_scrolled, scrolled.height() as f64);
+                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_motion), step);
+            }
+            gdk::DragAction::MOVE
+        });
+        let container_leave = container.clone();
+        let drag_scroll_leave = Rc::clone(&drag_autoscroll);
+        drop_target.connect_leave(move |_| {
+            if let Some((_, _, scrolled)) = find_existing_load_order_view(&container_leave) {
+                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_leave), 0.0);
+            }
+        });
+        let container_for_drop = container_drop.clone();
+        let drag_scroll_drop_c = Rc::clone(&drag_scroll_drop);
         drop_target.connect_drop(move |_, value, _, _| {
+            if let Some((_, _, scrolled)) = find_existing_load_order_view(&container_for_drop) {
+                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_drop_c), 0.0);
+            }
             let Ok(source_name) = value.get::<String>() else {
                 return false;
             };
@@ -434,7 +634,17 @@ fn build_plugin_row(
                 db.set_plugin_order(&ordered);
                 db.save(&game_drop);
                 let _ = db.write_plugins_txt(&game_drop);
-                refresh_load_order_content(&container_drop, &game_drop);
+                *anchor_drop.borrow_mut() = Some(ViewportAnchor {
+                    item_key: source_name.clone(),
+                    align_ratio: 0.35,
+                });
+                refresh_load_order_content(
+                    &container_drop,
+                    &game_drop,
+                    Rc::clone(&search_drop),
+                    Rc::clone(&anchor_drop),
+                    Rc::clone(&drag_scroll_drop),
+                );
             }
             true
         });
@@ -448,6 +658,9 @@ fn build_plugin_row(
         let row_c = row.clone();
         let game_rclick = Rc::clone(game);
         let container_rclick = container.clone();
+        let search_rclick = Rc::clone(&search_state);
+        let anchor_rclick = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_rclick = Rc::clone(&drag_autoscroll);
         let plugin_name_rclick = plugin.name.clone();
         let current_idx = idx;
         let vanilla_count_rclick = vanilla_count;
@@ -495,6 +708,9 @@ fn build_plugin_row(
             let row_btn = row_c.clone();
             let game_btn = Rc::clone(&game_rclick);
             let container_btn = container_rclick.clone();
+            let search_btn = Rc::clone(&search_rclick);
+            let anchor_btn = Rc::clone(&anchor_rclick);
+            let drag_scroll_btn = Rc::clone(&drag_scroll_rclick);
             let plugin_name_btn = plugin_name_rclick.clone();
 
             move_item.connect_clicked(move |_| {
@@ -510,6 +726,9 @@ fn build_plugin_row(
                         total_rclick,
                         Rc::clone(&game_btn),
                         container_btn.clone(),
+                        Rc::clone(&search_btn),
+                        Rc::clone(&anchor_btn),
+                        Rc::clone(&drag_scroll_btn),
                     );
                 }
             });
@@ -517,18 +736,30 @@ fn build_plugin_row(
             let popover_enable = popover.clone();
             let game_enable = Rc::clone(&game_rclick);
             let container_enable = container_rclick.clone();
+            let search_enable = Rc::clone(&search_rclick);
+            let anchor_enable = Rc::clone(&anchor_rclick);
+            let drag_scroll_enable = Rc::clone(&drag_scroll_rclick);
             enable_all_item.connect_clicked(move |_| {
                 popover_enable.popdown();
                 let mut db = ModDatabase::load(&game_enable);
                 db.plugin_disabled.clear();
                 db.save(&game_enable);
                 let _ = db.write_plugins_txt(&game_enable);
-                refresh_load_order_content(&container_enable, &game_enable);
+                refresh_load_order_content(
+                    &container_enable,
+                    &game_enable,
+                    Rc::clone(&search_enable),
+                    Rc::clone(&anchor_enable),
+                    Rc::clone(&drag_scroll_enable),
+                );
             });
 
             let popover_disable = popover.clone();
             let game_disable = Rc::clone(&game_rclick);
             let container_disable = container_rclick.clone();
+            let search_disable = Rc::clone(&search_rclick);
+            let anchor_disable = Rc::clone(&anchor_rclick);
+            let drag_scroll_disable = Rc::clone(&drag_scroll_rclick);
             disable_all_item.connect_clicked(move |_| {
                 popover_disable.popdown();
                 let mut db = ModDatabase::load(&game_disable);
@@ -540,7 +771,13 @@ fn build_plugin_row(
                 }
                 db.save(&game_disable);
                 let _ = db.write_plugins_txt(&game_disable);
-                refresh_load_order_content(&container_disable, &game_disable);
+                refresh_load_order_content(
+                    &container_disable,
+                    &game_disable,
+                    Rc::clone(&search_disable),
+                    Rc::clone(&anchor_disable),
+                    Rc::clone(&drag_scroll_disable),
+                );
             });
 
             popover.popup();
@@ -590,6 +827,9 @@ fn show_move_to_position_dialog(
     total: usize,
     game: Rc<Game>,
     container: gtk4::Box,
+    search_state: Rc<RefCell<String>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
 ) {
     let min_pos = vanilla_count + 1;
 
@@ -642,7 +882,17 @@ fn show_move_to_position_dialog(
             db.set_plugin_order(&ordered);
             db.save(&game);
             let _ = db.write_plugins_txt(&game);
-            refresh_load_order_content(&container, &game);
+            *pending_viewport_anchor.borrow_mut() = Some(ViewportAnchor {
+                item_key: plugin_name.clone(),
+                align_ratio: 0.35,
+            });
+            refresh_load_order_content(
+                &container,
+                &game,
+                Rc::clone(&search_state),
+                Rc::clone(&pending_viewport_anchor),
+                Rc::clone(&drag_autoscroll),
+            );
         }
     });
 
@@ -651,7 +901,7 @@ fn show_move_to_position_dialog(
 
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_insert_pos, matches_query};
+    use super::{adjusted_insert_pos, drag_scroll_step, matches_query};
     use crate::core::mods::{PluginFile, PluginKind};
 
     #[test]
@@ -678,5 +928,13 @@ mod tests {
         assert!(matches_query("MyPatch.esp", "patch"));
         assert!(matches_query("MyPatch.esp", "  ESP  "));
         assert!(!matches_query("MyPatch.esp", "armor"));
+    }
+
+    #[test]
+    fn drag_scroll_step_accelerates_near_edges() {
+        let height = 600.0;
+        assert!(drag_scroll_step(8.0, height) < 0.0);
+        assert!(drag_scroll_step(height - 8.0, height) > 0.0);
+        assert_eq!(drag_scroll_step(height / 2.0, height), 0.0);
     }
 }

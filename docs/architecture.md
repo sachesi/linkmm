@@ -137,6 +137,12 @@ List/view update rule for Library and Load Order:
 - If a list rebuild is required, preserve user context (scroll/focus/search) and
   avoid unrelated resets/jumping.
 
+Drag/reorder UX rule for Library and Load Order:
+
+- Reorder actions must not jump the viewport back to the beginning.
+- During drag operations, lists should auto-scroll near top/bottom edges to support long-distance moves.
+- After drop/reorder, keep moved-row context visible in the current filtered/search view.
+
 Long-running operation execution rule:
 
 - Heavy deploy/rebuild work must run off the GTK main thread.

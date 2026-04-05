@@ -17,6 +17,9 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
 const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
+const DRAG_EDGE_THRESHOLD_PX: f64 = 56.0;
+const DRAG_MAX_SCROLL_STEP_PX: f64 = 22.0;
+const DRAG_SCROLL_TICK_MS: u64 = 16;
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
@@ -24,6 +27,18 @@ struct ConflictState {
     overwritten: bool,
     files: BTreeSet<String>,
     conflict_mods_by_file: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct ViewportAnchor {
+    item_key: String,
+    align_ratio: f64,
+}
+
+#[derive(Debug, Default)]
+struct DragAutoScrollState {
+    step_px_per_tick: f64,
+    ticking: bool,
 }
 
 /// Build the full Library page for `game`.
@@ -88,6 +103,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     let game_rc = Rc::new(game.clone());
     let search_query = Rc::new(RefCell::new(String::new()));
     let selected_mod_id = Rc::new(RefCell::new(None::<String>));
+    let pending_viewport_anchor = Rc::new(RefCell::new(None::<ViewportAnchor>));
+    let drag_autoscroll = Rc::new(RefCell::new(DragAutoScrollState::default()));
 
     refresh_library_content_with_search(
         &list_container,
@@ -96,6 +113,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         &search_query.borrow(),
         Rc::clone(&search_query),
         Rc::clone(&selected_mod_id),
+        Rc::clone(&pending_viewport_anchor),
+        Rc::clone(&drag_autoscroll),
         true,
     );
 
@@ -107,6 +126,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
         let selected_c = Rc::clone(&selected_mod_id);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
         search_entry.connect_search_changed(move |entry| {
             *search_c.borrow_mut() = entry.text().to_string();
             refresh_library_content_with_search(
@@ -116,6 +137,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &search_c.borrow(),
                 Rc::clone(&search_c),
                 Rc::clone(&selected_c),
+                Rc::clone(&anchor_c),
+                Rc::clone(&drag_scroll_c),
                 false,
             );
         });
@@ -128,6 +151,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
         let selected_c = Rc::clone(&selected_mod_id);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let search_entry_c = search_entry.clone();
         let deploy_btn_c = deploy_btn.clone();
         let status_label_c = status_label.clone();
@@ -190,6 +215,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                             &search_c.borrow(),
                             Rc::clone(&search_c),
                             Rc::clone(&selected_c),
+                            Rc::clone(&anchor_c),
+                            Rc::clone(&drag_scroll_c),
                             true,
                         );
                         gtk4::glib::ControlFlow::Break
@@ -273,6 +300,71 @@ fn set_library_status(stack: &gtk4::Stack, status: &adw::StatusPage) {
     stack.set_visible_child_name("status");
 }
 
+fn library_row_key(mod_id: &str) -> String {
+    format!("library:{mod_id}")
+}
+
+fn find_row_by_key(list_box: &gtk4::ListBox, key: &str) -> Option<gtk4::Widget> {
+    let mut child = list_box.first_child();
+    while let Some(widget) = child {
+        if widget.widget_name() == key {
+            return Some(widget);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+fn widget_y_in_scrolled(widget: &gtk4::Widget, scrolled: &gtk4::ScrolledWindow) -> Option<f64> {
+    widget
+        .translate_coordinates(scrolled, 0.0, 0.0)
+        .map(|(_, y)| y as f64)
+}
+
+fn drag_scroll_step(pointer_y: f64, height: f64) -> f64 {
+    if height <= 0.0 {
+        return 0.0;
+    }
+    if pointer_y < DRAG_EDGE_THRESHOLD_PX {
+        let strength = (DRAG_EDGE_THRESHOLD_PX - pointer_y) / DRAG_EDGE_THRESHOLD_PX;
+        return -DRAG_MAX_SCROLL_STEP_PX * strength.clamp(0.0, 1.0);
+    }
+    let bottom_start = (height - DRAG_EDGE_THRESHOLD_PX).max(0.0);
+    if pointer_y > bottom_start {
+        let strength = (pointer_y - bottom_start) / DRAG_EDGE_THRESHOLD_PX;
+        return DRAG_MAX_SCROLL_STEP_PX * strength.clamp(0.0, 1.0);
+    }
+    0.0
+}
+
+fn set_drag_scroll_step(
+    scrolled: &gtk4::ScrolledWindow,
+    auto_scroll: Rc<RefCell<DragAutoScrollState>>,
+    step: f64,
+) {
+    auto_scroll.borrow_mut().step_px_per_tick = step;
+    if auto_scroll.borrow().ticking {
+        return;
+    }
+    auto_scroll.borrow_mut().ticking = true;
+    let scrolled_c = scrolled.clone();
+    gtk4::glib::timeout_add_local(
+        std::time::Duration::from_millis(DRAG_SCROLL_TICK_MS),
+        move || {
+            let step = auto_scroll.borrow().step_px_per_tick;
+            if step.abs() < f64::EPSILON {
+                auto_scroll.borrow_mut().ticking = false;
+                return gtk4::glib::ControlFlow::Break;
+            }
+            let adj = scrolled_c.vadjustment();
+            let max_value = (adj.upper() - adj.page_size()).max(0.0);
+            let next = (adj.value() + step).clamp(0.0, max_value);
+            adj.set_value(next);
+            gtk4::glib::ControlFlow::Continue
+        },
+    );
+}
+
 fn refresh_library_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -280,6 +372,8 @@ fn refresh_library_content_with_search(
     search_query: &str,
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
     do_scan: bool,
 ) {
     let (stack, list_box, scrolled) = ensure_library_view(container);
@@ -347,16 +441,29 @@ fn refresh_library_content_with_search(
             Rc::clone(&config),
             Rc::clone(&search_state),
             Rc::clone(&selected_mod_id),
+            Rc::clone(&pending_viewport_anchor),
+            Rc::clone(&drag_autoscroll),
             conflict_states.get(&mod_entry.id),
         );
         list_box.append(&row);
     }
 
+    let anchor = pending_viewport_anchor.borrow_mut().take();
+    let list_box_clone = list_box.clone();
     let scrolled_clone = scrolled.clone();
     gtk4::glib::idle_add_local_once(move || {
         let adj = scrolled_clone.vadjustment();
         let max_value = (adj.upper() - adj.page_size()).max(0.0);
-        adj.set_value(previous_scroll.0.clamp(0.0, max_value));
+        let anchored_value = anchor.and_then(|a| {
+            find_row_by_key(&list_box_clone, &library_row_key(&a.item_key)).and_then(|row| {
+                widget_y_in_scrolled(&row, &scrolled_clone)
+                    .map(|row_y| (row_y - (adj.page_size() * a.align_ratio)).max(0.0))
+            })
+        });
+        let target = anchored_value
+            .unwrap_or(previous_scroll.0)
+            .clamp(0.0, max_value);
+        adj.set_value(target);
     });
 }
 
@@ -392,12 +499,15 @@ fn build_mod_row(
     config: Rc<RefCell<AppConfig>>,
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
     conflict_state: Option<&ConflictState>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title(&mod_entry.name)
         .active(mod_entry.enabled)
         .build();
+    row.set_widget_name(&library_row_key(&mod_entry.id));
 
     // Subtitle: version and Nexus source indicator
     let subtitle = match (&mod_entry.version, mod_entry.installed_from_nexus) {
@@ -467,6 +577,8 @@ fn build_mod_row(
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_state);
         let selected_c = Rc::clone(&selected_mod_id);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let mod_id_c = mod_entry.id.clone();
         up_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
@@ -478,6 +590,10 @@ fn build_mod_row(
                 if let Err(e) = ModManager::rebuild_all(&game_c) {
                     log::error!("Failed to rebuild deployment after reorder: {e}");
                 }
+                *anchor_c.borrow_mut() = Some(ViewportAnchor {
+                    item_key: mod_id_c.clone(),
+                    align_ratio: 0.35,
+                });
                 refresh_library_content_with_search(
                     &container_c,
                     &game_c,
@@ -485,6 +601,8 @@ fn build_mod_row(
                     &search_c.borrow(),
                     Rc::clone(&search_c),
                     Rc::clone(&selected_c),
+                    Rc::clone(&anchor_c),
+                    Rc::clone(&drag_scroll_c),
                     false,
                 );
             }
@@ -497,6 +615,8 @@ fn build_mod_row(
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_state);
         let selected_c = Rc::clone(&selected_mod_id);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let mod_id_c = mod_entry.id.clone();
         down_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
@@ -509,6 +629,10 @@ fn build_mod_row(
                 if let Err(e) = ModManager::rebuild_all(&game_c) {
                     log::error!("Failed to rebuild deployment after reorder: {e}");
                 }
+                *anchor_c.borrow_mut() = Some(ViewportAnchor {
+                    item_key: mod_id_c.clone(),
+                    align_ratio: 0.35,
+                });
                 refresh_library_content_with_search(
                     &container_c,
                     &game_c,
@@ -516,6 +640,8 @@ fn build_mod_row(
                     &search_c.borrow(),
                     Rc::clone(&search_c),
                     Rc::clone(&selected_c),
+                    Rc::clone(&anchor_c),
+                    Rc::clone(&drag_scroll_c),
                     false,
                 );
             }
@@ -548,8 +674,34 @@ fn build_mod_row(
         let config_drop = Rc::clone(&config);
         let search_drop = Rc::clone(&search_state);
         let selected_drop = Rc::clone(&selected_mod_id);
+        let anchor_drop = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_drop = Rc::clone(&drag_autoscroll);
         let target_id = mod_entry.id.clone();
+        let row_c = row.clone();
+        let container_for_motion = container_drop.clone();
+        let drag_scroll_motion = Rc::clone(&drag_scroll_drop);
+        drop_target.connect_motion(move |_, _, y| {
+            if let Some((_, _, scrolled)) = find_existing_library_view(&container_for_motion)
+                && let Some((_, y_in_scrolled)) = row_c.translate_coordinates(&scrolled, 0.0, y)
+            {
+                let step = drag_scroll_step(y_in_scrolled, scrolled.height() as f64);
+                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_motion), step);
+            }
+            gdk::DragAction::MOVE
+        });
+        let drag_scroll_leave = Rc::clone(&drag_autoscroll);
+        let container_leave = container.clone();
+        drop_target.connect_leave(move |_| {
+            if let Some((_, _, scrolled)) = find_existing_library_view(&container_leave) {
+                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_leave), 0.0);
+            }
+        });
+        let container_for_drop = container_drop.clone();
+        let drag_scroll_drop_c = Rc::clone(&drag_scroll_drop);
         drop_target.connect_drop(move |_, value, _, _| {
+            if let Some((_, _, scrolled)) = find_existing_library_view(&container_for_drop) {
+                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_drop_c), 0.0);
+            }
             let Ok(source_id) = value.get::<String>() else {
                 return false;
             };
@@ -568,6 +720,10 @@ fn build_mod_row(
                 if let Err(e) = ModManager::rebuild_all(&game_drop) {
                     log::error!("Failed to rebuild deployment after drag reorder: {e}");
                 }
+                *anchor_drop.borrow_mut() = Some(ViewportAnchor {
+                    item_key: source_id.clone(),
+                    align_ratio: 0.35,
+                });
                 refresh_library_content_with_search(
                     &container_drop,
                     &game_drop,
@@ -575,6 +731,8 @@ fn build_mod_row(
                     &search_drop.borrow(),
                     Rc::clone(&search_drop),
                     Rc::clone(&selected_drop),
+                    Rc::clone(&anchor_drop),
+                    Rc::clone(&drag_scroll_drop),
                     false,
                 );
             }
@@ -622,6 +780,8 @@ fn build_mod_row(
         let config_c = Rc::clone(&config_del);
         let search_c = Rc::clone(&search_del);
         let selected_c = Rc::clone(&selected_del);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
         dialog.connect_response(None, move |_, response| {
             if response != "remove" {
                 return;
@@ -666,6 +826,8 @@ fn build_mod_row(
                 &search_c.borrow(),
                 Rc::clone(&search_c),
                 Rc::clone(&selected_c),
+                Rc::clone(&anchor_c),
+                Rc::clone(&drag_scroll_c),
                 false,
             );
         });
@@ -682,6 +844,8 @@ fn build_mod_row(
         let config_sel = Rc::clone(&config);
         let search_sel = Rc::clone(&search_state);
         let selected_sel = Rc::clone(&selected_mod_id);
+        let anchor_sel = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_sel = Rc::clone(&drag_autoscroll);
         let mod_id_sel = mod_entry.id.clone();
         // Use `released` (not `pressed`) so built-in SwitchRow controls process
         // the click first; refreshing immediately on press can swallow toggle
@@ -712,6 +876,8 @@ fn build_mod_row(
                     &search_idle.borrow(),
                     Rc::clone(&search_idle),
                     Rc::clone(&selected_idle),
+                    Rc::clone(&anchor_sel),
+                    Rc::clone(&drag_scroll_sel),
                     false,
                 );
             });
@@ -731,6 +897,8 @@ fn build_mod_row(
         let config_rclick = Rc::clone(&config);
         let search_rclick = Rc::clone(&search_state);
         let selected_rclick = Rc::clone(&selected_mod_id);
+        let anchor_rclick = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_rclick = Rc::clone(&drag_autoscroll);
         let mod_id_rclick = mod_entry.id.clone();
         let conflict_entries = conflict_state
             .map(|state| {
@@ -863,6 +1031,8 @@ fn build_mod_row(
             let config_move = Rc::clone(&config_rclick);
             let search_move = Rc::clone(&search_rclick);
             let selected_move = Rc::clone(&selected_rclick);
+            let anchor_move = Rc::clone(&anchor_rclick);
+            let drag_scroll_move = Rc::clone(&drag_scroll_rclick);
             let mod_id_move = mod_id_rclick.clone();
             move_item.connect_clicked(move |_| {
                 popover_move.popdown();
@@ -877,6 +1047,8 @@ fn build_mod_row(
                         Rc::clone(&config_move),
                         Rc::clone(&search_move),
                         Rc::clone(&selected_move),
+                        Rc::clone(&anchor_move),
+                        Rc::clone(&drag_scroll_move),
                     );
                 }
             });
@@ -887,6 +1059,8 @@ fn build_mod_row(
             let config_enable = Rc::clone(&config_rclick);
             let search_enable = Rc::clone(&search_rclick);
             let selected_enable = Rc::clone(&selected_rclick);
+            let anchor_enable = Rc::clone(&anchor_rclick);
+            let drag_scroll_enable = Rc::clone(&drag_scroll_rclick);
             enable_all_item.connect_clicked(move |_| {
                 popover_enable.popdown();
                 let mut db = ModDatabase::load(&game_enable);
@@ -904,6 +1078,8 @@ fn build_mod_row(
                     &search_enable.borrow(),
                     Rc::clone(&search_enable),
                     Rc::clone(&selected_enable),
+                    Rc::clone(&anchor_enable),
+                    Rc::clone(&drag_scroll_enable),
                     false,
                 );
             });
@@ -914,6 +1090,8 @@ fn build_mod_row(
             let config_disable = Rc::clone(&config_rclick);
             let search_disable = Rc::clone(&search_rclick);
             let selected_disable = Rc::clone(&selected_rclick);
+            let anchor_disable = Rc::clone(&anchor_rclick);
+            let drag_scroll_disable = Rc::clone(&drag_scroll_rclick);
             disable_all_item.connect_clicked(move |_| {
                 popover_disable.popdown();
                 let mut db = ModDatabase::load(&game_disable);
@@ -931,6 +1109,8 @@ fn build_mod_row(
                     &search_disable.borrow(),
                     Rc::clone(&search_disable),
                     Rc::clone(&selected_disable),
+                    Rc::clone(&anchor_disable),
+                    Rc::clone(&drag_scroll_disable),
                     false,
                 );
             });
@@ -966,6 +1146,8 @@ fn show_move_to_position_dialog_for_mod(
     config: Rc<RefCell<AppConfig>>,
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
 ) {
     let db = ModDatabase::load(&game);
     let total = db.mods.len();
@@ -1013,6 +1195,10 @@ fn show_move_to_position_dialog_for_mod(
             if let Err(e) = ModManager::rebuild_all(&game) {
                 log::error!("Failed to rebuild deployment after move: {e}");
             }
+            *pending_viewport_anchor.borrow_mut() = Some(ViewportAnchor {
+                item_key: mod_id.clone(),
+                align_ratio: 0.35,
+            });
             refresh_library_content_with_search(
                 &container,
                 &game,
@@ -1020,6 +1206,8 @@ fn show_move_to_position_dialog_for_mod(
                 &search_state.borrow(),
                 Rc::clone(&search_state),
                 Rc::clone(&selected_mod_id),
+                Rc::clone(&pending_viewport_anchor),
+                Rc::clone(&drag_autoscroll),
                 false,
             );
         }
@@ -1260,7 +1448,7 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_insert_pos, compute_conflict_states, matches_query};
+    use super::{adjusted_insert_pos, compute_conflict_states, drag_scroll_step, matches_query};
     use crate::core::mods::Mod;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1290,6 +1478,14 @@ mod tests {
     fn adjusted_insert_pos_accounts_for_source_removal() {
         assert_eq!(adjusted_insert_pos(0, 2), 1);
         assert_eq!(adjusted_insert_pos(3, 1), 1);
+    }
+
+    #[test]
+    fn drag_scroll_step_accelerates_near_edges() {
+        let height = 600.0;
+        assert!(drag_scroll_step(8.0, height) < 0.0);
+        assert!(drag_scroll_step(height - 8.0, height) > 0.0);
+        assert_eq!(drag_scroll_step(height / 2.0, height), 0.0);
     }
 
     #[test]
