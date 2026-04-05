@@ -21,6 +21,7 @@ pub enum SessionKind {
 pub enum SessionStatus {
     Starting,
     Running,
+    DelegatedRunning,
     Exited,
     Failed,
     Killed,
@@ -62,6 +63,15 @@ struct SessionRecord {
     session: ManagedSession,
     logs: VecDeque<SessionLogLine>,
     control: Arc<SessionControl>,
+    delegated_stop: Option<DelegatedStopKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegatedStopKind {
+    SteamFlatpak,
+    SteamNativeOrXdg,
+    #[cfg(test)]
+    NoopTest,
 }
 
 type SessionCompletion = Box<dyn FnOnce(ExitStatus) -> Result<(), String> + Send + 'static>;
@@ -74,6 +84,7 @@ struct SessionStart {
     launcher_source: GameLauncherSource,
     command: std::process::Command,
     completion: Option<SessionCompletion>,
+    delegated_stop: Option<DelegatedStopKind>,
 }
 
 #[derive(Clone)]
@@ -97,9 +108,12 @@ impl RuntimeSessionManager {
     }
 
     pub fn any_active(&self) -> bool {
-        self.sessions()
-            .into_iter()
-            .any(|s| matches!(s.status, SessionStatus::Starting | SessionStatus::Running))
+        self.sessions().into_iter().any(|s| {
+            matches!(
+                s.status,
+                SessionStatus::Starting | SessionStatus::Running | SessionStatus::DelegatedRunning
+            )
+        })
     }
 
     pub fn sessions(&self) -> Vec<ManagedSession> {
@@ -129,7 +143,12 @@ impl RuntimeSessionManager {
         self.sessions().into_iter().find(|s| {
             s.kind == SessionKind::Game
                 && s.game_id == game_id
-                && matches!(s.status, SessionStatus::Starting | SessionStatus::Running)
+                && matches!(
+                    s.status,
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::DelegatedRunning
+                )
         })
     }
 
@@ -138,18 +157,37 @@ impl RuntimeSessionManager {
             s.kind == SessionKind::Tool
                 && s.game_id == game_id
                 && s.tool_id.as_deref() == Some(tool_id)
-                && matches!(s.status, SessionStatus::Starting | SessionStatus::Running)
+                && matches!(
+                    s.status,
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::DelegatedRunning
+                )
         })
     }
 
     pub fn stop_session(&self, id: u64) -> Result<(), String> {
-        let control = {
+        let (control, delegated_stop, status) = {
             let sessions = self.inner.sessions.lock().expect("sessions lock poisoned");
-            sessions
+            let rec = sessions
                 .get(&id)
-                .map(|s| Arc::clone(&s.control))
-                .ok_or_else(|| format!("Session {id} was not found"))?
+                .ok_or_else(|| format!("Session {id} was not found"))?;
+            (
+                Arc::clone(&rec.control),
+                rec.delegated_stop,
+                rec.session.status.clone(),
+            )
         };
+        if matches!(status, SessionStatus::DelegatedRunning)
+            && let Some(kind) = delegated_stop
+        {
+            self.stop_delegated_session(kind)?;
+            let mut sessions = self.inner.sessions.lock().expect("sessions lock poisoned");
+            if let Some(rec) = sessions.get_mut(&id) {
+                rec.session.status = SessionStatus::Killed;
+            }
+            return Ok(());
+        }
         control.stop_requested.store(true, Ordering::SeqCst);
         let mut child_guard = control.child.lock().expect("child lock poisoned");
         if let Some(child) = child_guard.as_mut() {
@@ -157,6 +195,29 @@ impl RuntimeSessionManager {
                 .kill()
                 .map_err(|e| format!("Failed to stop session {id}: {e}"))?;
         }
+        Ok(())
+    }
+
+    fn stop_delegated_session(&self, kind: DelegatedStopKind) -> Result<(), String> {
+        let mut command = match kind {
+            DelegatedStopKind::SteamFlatpak => {
+                let mut cmd = std::process::Command::new("flatpak");
+                cmd.arg("run")
+                    .arg("com.valvesoftware.Steam")
+                    .arg("-shutdown");
+                cmd
+            }
+            DelegatedStopKind::SteamNativeOrXdg => {
+                let mut cmd = std::process::Command::new("steam");
+                cmd.arg("-shutdown");
+                cmd
+            }
+            #[cfg(test)]
+            DelegatedStopKind::NoopTest => return Ok(()),
+        };
+        command
+            .spawn()
+            .map_err(|e| format!("Failed issuing delegated Steam stop command: {e}"))?;
         Ok(())
     }
 
@@ -182,6 +243,18 @@ impl RuntimeSessionManager {
                 )?
             }
         };
+        let delegated_stop = if game.launcher_source == GameLauncherSource::Steam {
+            let program = command.get_program().to_string_lossy();
+            if program == "flatpak" {
+                Some(DelegatedStopKind::SteamFlatpak)
+            } else if program == "xdg-open" {
+                Some(DelegatedStopKind::SteamNativeOrXdg)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         self.spawn_managed_session(SessionStart {
             kind: SessionKind::Game,
@@ -191,6 +264,7 @@ impl RuntimeSessionManager {
             launcher_source: game.launcher_source,
             command,
             completion: None,
+            delegated_stop,
         })
         .map(|(id, _)| id)
     }
@@ -238,6 +312,7 @@ impl RuntimeSessionManager {
                 launcher_source: game.launcher_source,
                 command,
                 completion: Some(completion),
+                delegated_stop: None,
             })
             .map(|(id, _)| id)?;
 
@@ -305,6 +380,7 @@ impl RuntimeSessionManager {
                     },
                     logs: VecDeque::new(),
                     control: Arc::clone(&control),
+                    delegated_stop: start.delegated_stop,
                 },
             );
         }
@@ -361,6 +437,17 @@ impl RuntimeSessionManager {
                     SessionStatus::Failed
                 } else if stop_requested {
                     SessionStatus::Killed
+                } else if self
+                    .inner
+                    .sessions
+                    .lock()
+                    .expect("sessions lock poisoned")
+                    .get(&id)
+                    .and_then(|r| r.delegated_stop)
+                    .is_some()
+                    && status.success()
+                {
+                    SessionStatus::DelegatedRunning
                 } else if status.success() {
                     SessionStatus::Exited
                 } else {
@@ -442,6 +529,7 @@ mod tests {
                 launcher_source: GameLauncherSource::Steam,
                 command: cmd,
                 completion: None,
+                delegated_stop: None,
             })
             .unwrap();
         assert!(manager.any_active());
@@ -468,11 +556,58 @@ mod tests {
                 launcher_source: GameLauncherSource::Steam,
                 command: cmd,
                 completion: None,
+                delegated_stop: None,
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let logs = manager.session_logs(id);
         assert!(logs.iter().any(|l| l.message.contains("out")));
         assert!(logs.iter().any(|l| l.message.contains("err")));
+    }
+
+    #[test]
+    fn delegated_session_stays_active_after_wrapper_exit() {
+        let manager = RuntimeSessionManager::new();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("echo delegated");
+        let (id, _) = manager
+            .spawn_managed_session(SessionStart {
+                kind: SessionKind::Game,
+                game_id: "g".to_string(),
+                profile_id: None,
+                tool_id: None,
+                launcher_source: GameLauncherSource::Steam,
+                command: cmd,
+                completion: None,
+                delegated_stop: Some(DelegatedStopKind::NoopTest),
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let s = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.status, SessionStatus::DelegatedRunning);
+        assert!(manager.current_game_session("g").is_some());
+    }
+
+    #[test]
+    fn stopping_delegated_session_marks_killed() {
+        let manager = RuntimeSessionManager::new();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("true");
+        let (id, _) = manager
+            .spawn_managed_session(SessionStart {
+                kind: SessionKind::Game,
+                game_id: "g".to_string(),
+                profile_id: None,
+                tool_id: None,
+                launcher_source: GameLauncherSource::Steam,
+                command: cmd,
+                completion: None,
+                delegated_stop: Some(DelegatedStopKind::NoopTest),
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        manager.stop_session(id).unwrap();
+        let s = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.status, SessionStatus::Killed);
     }
 }
