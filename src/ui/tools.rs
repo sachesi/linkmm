@@ -8,7 +8,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile};
-use crate::core::games::Game;
+use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::{ModDatabase, ModManager};
 use crate::core::runtime::{SessionStatus, global_runtime_manager};
 
@@ -640,6 +640,20 @@ fn launch_tool(
     btn: &gtk4::Button,
     toast_overlay: &adw::ToastOverlay,
 ) {
+    if game.launcher_source == GameLauncherSource::Steam {
+        match crate::core::steam::launch_tool_with_proton(
+            &tool.exe_path,
+            &tool.arguments,
+            tool.app_id,
+        ) {
+            Ok(_child) => {
+                toast_overlay.add_toast(adw::Toast::new("Tool launched via Steam/Proton"))
+            }
+            Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Launch failed: {e}"))),
+        }
+        return;
+    }
+
     let manager = global_runtime_manager();
     if let Some(active) = manager.current_tool_session(&game.id, &tool.id) {
         if let Err(e) = manager.stop_session(active.id) {
@@ -679,10 +693,7 @@ fn launch_tool(
     glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
         let manager = global_runtime_manager();
         if let Some(s) = manager.current_tool_session(&game_id, &tool_id)
-            && matches!(
-                s.status,
-                SessionStatus::Running | SessionStatus::Starting | SessionStatus::DelegatedRunning
-            )
+            && matches!(s.status, SessionStatus::Running | SessionStatus::Starting)
         {
             btn_c.set_icon_name("media-playback-stop-symbolic");
             btn_c.set_tooltip_text(Some("Stop Tool"));
