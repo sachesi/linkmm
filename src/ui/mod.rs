@@ -12,7 +12,7 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
-use crate::core::runtime::global_runtime_manager;
+use crate::core::runtime::{SessionRunMode, global_runtime_manager};
 
 pub mod downloads;
 pub mod library;
@@ -258,10 +258,10 @@ fn build_main_window(
                     game.kind.steam_app_id().is_some()
                         || game.launcher_source == GameLauncherSource::NonSteamUmu,
                 );
-                play_btn_t.set_label(if game_session.is_some() {
-                    "Stop"
-                } else {
-                    "Play"
+                play_btn_t.set_label(match game_session {
+                    Some(s) if s.run_mode == SessionRunMode::SteamDelegated => "Stop Tracking",
+                    Some(_) => "Stop",
+                    None => "Play",
                 });
                 play_btn_t.set_sensitive(true);
             }
