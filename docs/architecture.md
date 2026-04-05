@@ -98,6 +98,8 @@ Steam sessions can be either:
 
 - direct child managed (`Running`) when LinkMM owns a stable process handle
 - delegated (`DelegatedRunning`) when Steam handoff succeeds but the launcher wrapper is short-lived
+- best-effort PID-tracked (`SteamPidTracked`) when delegated Steam handoff is later upgraded by
+  runtime heuristics that identify a likely real game process
 
 ## 8. Stop semantics
 
@@ -108,3 +110,5 @@ Steam sessions can be either:
   - Flatpak Steam installs: `flatpak run com.valvesoftware.Steam -applaunch <app_id>`
 - Stop targets the spawned Steam wrapper process. Steam can re-parent the real game process, so
   stop/kill visibility for both native and Flatpak Steam sessions is inherently best-effort.
+- For PID-tracked Steam sessions, LinkMM attempts game-tree termination (`SIGTERM` then `SIGKILL`)
+  on the tracked process tree. This remains heuristic under Flatpak/pressure-vessel.
