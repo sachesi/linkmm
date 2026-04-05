@@ -100,7 +100,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     let search_query = Rc::new(RefCell::new(String::new()));
     let selected_mod_id = Rc::new(RefCell::new(None::<String>));
     let pending_viewport_anchor = Rc::new(RefCell::new(None::<ViewportAnchor>));
-    let drag_autoscroll = Rc::new(RefCell::new(DragAutoScrollState::default()));
+    let drag_autoscroll = Rc::new(RefCell::new(EdgeAutoScrollState::default()));
 
     refresh_library_content_with_search(
         &list_container,
@@ -334,7 +334,7 @@ fn refresh_library_content_with_search(
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
-    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
     do_scan: bool,
 ) {
     let (stack, list_box, scrolled) = ensure_library_view(container, Rc::clone(&drag_autoscroll));
@@ -461,7 +461,7 @@ fn build_mod_row(
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
-    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
     conflict_state: Option<&ConflictState>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
@@ -1089,7 +1089,7 @@ fn show_move_to_position_dialog_for_mod(
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
-    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) {
     let db = ModDatabase::load(&game);
     let total = db.mods.len();

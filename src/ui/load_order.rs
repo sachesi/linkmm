@@ -65,7 +65,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             let game_rc = Rc::new(g.clone());
             let search_query = Rc::new(RefCell::new(String::new()));
             let pending_viewport_anchor = Rc::new(RefCell::new(None::<ViewportAnchor>));
-            let drag_autoscroll = Rc::new(RefCell::new(DragAutoScrollState::default()));
+            let drag_autoscroll = Rc::new(RefCell::new(EdgeAutoScrollState::default()));
 
             {
                 let game_c = Rc::clone(&game_rc);
@@ -137,7 +137,7 @@ fn refresh_load_order_content(
     game: &Rc<Game>,
     search_state: Rc<RefCell<String>>,
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
-    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) {
     let query = search_state.borrow().clone();
     refresh_load_order_content_with_search(
@@ -239,7 +239,7 @@ fn refresh_load_order_content_with_search(
     search_query: &str,
     search_state: Rc<RefCell<String>>,
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
-    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) {
     let (stack, list_box, scrolled) =
         ensure_load_order_view(container, Rc::clone(&drag_autoscroll));
@@ -341,7 +341,7 @@ fn build_plugin_row(
     container: &gtk4::Box,
     search_state: Rc<RefCell<String>>,
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
-    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) -> adw::ActionRow {
     // Subtitle: type label + vanilla marker
     let subtitle = if plugin.is_vanilla {
@@ -766,7 +766,7 @@ fn show_move_to_position_dialog(
     container: gtk4::Box,
     search_state: Rc<RefCell<String>>,
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
-    drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) {
     let min_pos = vanilla_count + 1;
 
