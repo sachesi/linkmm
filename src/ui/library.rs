@@ -7,6 +7,7 @@ use std::thread;
 
 use gio;
 use gtk4::gdk;
+use gtk4::graphene;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -176,6 +177,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let status_progress_c = status_progress_c.clone();
             let status_revealer_c = status_revealer_c.clone();
             let btn = btn.clone();
+            let anchor_for_timeout = Rc::clone(&anchor_c);
+            let drag_scroll_for_timeout = Rc::clone(&drag_scroll_c);
 
             status_label_c.set_text("Rebuilding deployment from enabled mod set…");
             status_progress_c.pulse();
@@ -215,8 +218,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                             &search_c.borrow(),
                             Rc::clone(&search_c),
                             Rc::clone(&selected_c),
-                            Rc::clone(&anchor_c),
-                            Rc::clone(&drag_scroll_c),
+                            Rc::clone(&anchor_for_timeout),
+                            Rc::clone(&drag_scroll_for_timeout),
                             true,
                         );
                         gtk4::glib::ControlFlow::Break
@@ -317,8 +320,8 @@ fn find_row_by_key(list_box: &gtk4::ListBox, key: &str) -> Option<gtk4::Widget> 
 
 fn widget_y_in_scrolled(widget: &gtk4::Widget, scrolled: &gtk4::ScrolledWindow) -> Option<f64> {
     widget
-        .translate_coordinates(scrolled, 0.0, 0.0)
-        .map(|(_, y)| y as f64)
+        .compute_point(scrolled, &graphene::Point::new(0.0, 0.0))
+        .map(|point| point.y() as f64)
 }
 
 fn drag_scroll_step(pointer_y: f64, height: f64) -> f64 {
@@ -682,9 +685,10 @@ fn build_mod_row(
         let drag_scroll_motion = Rc::clone(&drag_scroll_drop);
         drop_target.connect_motion(move |_, _, y| {
             if let Some((_, _, scrolled)) = find_existing_library_view(&container_for_motion)
-                && let Some((_, y_in_scrolled)) = row_c.translate_coordinates(&scrolled, 0.0, y)
+                && let Some(point) =
+                    row_c.compute_point(&scrolled, &graphene::Point::new(0.0, y as f32))
             {
-                let step = drag_scroll_step(y_in_scrolled, scrolled.height() as f64);
+                let step = drag_scroll_step(point.y() as f64, scrolled.height() as f64);
                 set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_motion), step);
             }
             gdk::DragAction::MOVE
@@ -756,6 +760,8 @@ fn build_mod_row(
     let config_del = Rc::clone(&config);
     let search_del = Rc::clone(&search_state);
     let selected_del = Rc::clone(&selected_mod_id);
+    let anchor_for_delete = Rc::clone(&pending_viewport_anchor);
+    let drag_scroll_for_delete = Rc::clone(&drag_autoscroll);
 
     delete_btn.connect_clicked(move |btn| {
         let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
@@ -780,8 +786,8 @@ fn build_mod_row(
         let config_c = Rc::clone(&config_del);
         let search_c = Rc::clone(&search_del);
         let selected_c = Rc::clone(&selected_del);
-        let anchor_c = Rc::clone(&pending_viewport_anchor);
-        let drag_scroll_c = Rc::clone(&drag_autoscroll);
+        let anchor_c = Rc::clone(&anchor_for_delete);
+        let drag_scroll_c = Rc::clone(&drag_scroll_for_delete);
         dialog.connect_response(None, move |_, response| {
             if response != "remove" {
                 return;
@@ -868,6 +874,8 @@ fn build_mod_row(
             let config_idle = Rc::clone(&config_sel);
             let search_idle = Rc::clone(&search_sel);
             let selected_idle = Rc::clone(&selected_sel);
+            let anchor_idle = Rc::clone(&anchor_sel);
+            let drag_scroll_idle = Rc::clone(&drag_scroll_sel);
             gtk4::glib::idle_add_local_once(move || {
                 refresh_library_content_with_search(
                     &container_idle,
@@ -876,8 +884,8 @@ fn build_mod_row(
                     &search_idle.borrow(),
                     Rc::clone(&search_idle),
                     Rc::clone(&selected_idle),
-                    Rc::clone(&anchor_sel),
-                    Rc::clone(&drag_scroll_sel),
+                    Rc::clone(&anchor_idle),
+                    Rc::clone(&drag_scroll_idle),
                     false,
                 );
             });

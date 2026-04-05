@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4::gdk;
+use gtk4::graphene;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -227,8 +228,8 @@ fn find_row_by_key(list_box: &gtk4::ListBox, key: &str) -> Option<gtk4::Widget> 
 
 fn widget_y_in_scrolled(widget: &gtk4::Widget, scrolled: &gtk4::ScrolledWindow) -> Option<f64> {
     widget
-        .translate_coordinates(scrolled, 0.0, 0.0)
-        .map(|(_, y)| y as f64)
+        .compute_point(scrolled, &graphene::Point::new(0.0, 0.0))
+        .map(|point| point.y() as f64)
 }
 
 fn drag_scroll_step(pointer_y: f64, height: f64) -> f64 {
@@ -593,9 +594,10 @@ fn build_plugin_row(
         let drag_scroll_motion = Rc::clone(&drag_scroll_drop);
         drop_target.connect_motion(move |_, _, y| {
             if let Some((_, _, scrolled)) = find_existing_load_order_view(&container_for_motion)
-                && let Some((_, y_in_scrolled)) = row_c.translate_coordinates(&scrolled, 0.0, y)
+                && let Some(point) =
+                    row_c.compute_point(&scrolled, &graphene::Point::new(0.0, y as f32))
             {
-                let step = drag_scroll_step(y_in_scrolled, scrolled.height() as f64);
+                let step = drag_scroll_step(point.y() as f64, scrolled.height() as f64);
                 set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_motion), step);
             }
             gdk::DragAction::MOVE
