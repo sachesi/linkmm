@@ -346,6 +346,18 @@ pub fn launch_with_umu(
     prefix_path: Option<&Path>,
     proton_path: Option<&Path>,
 ) -> Result<std::process::Child, String> {
+    let mut command = build_umu_command(exe_path, steam_app_id, prefix_path, proton_path)?;
+    command
+        .spawn()
+        .map_err(|e| format!("Failed to spawn umu-run: {e}"))
+}
+
+pub fn build_umu_command(
+    exe_path: &Path,
+    steam_app_id: u32,
+    prefix_path: Option<&Path>,
+    proton_path: Option<&Path>,
+) -> Result<std::process::Command, String> {
     if !is_umu_available() {
         return Err(
             "umu-run is not installed. Configure a non-Steam game first to trigger the download."
@@ -375,15 +387,15 @@ pub fn launch_with_umu(
     log::debug!("  STORE      = none");
     log::debug!("  UMU_LOG    = 1");
 
-    std::process::Command::new(umu_run_path())
+    let mut command = std::process::Command::new(umu_run_path());
+    command
         .arg(exe_path)
         .env("WINEPREFIX", &wineprefix)
         .env("GAMEID", &game_id)
         .env("PROTONPATH", proton_path_str.as_ref())
         .env("STORE", "none")
-        .env("UMU_LOG", "1")
-        .spawn()
-        .map_err(|e| format!("Failed to spawn umu-run: {e}"))
+        .env("UMU_LOG", "1");
+    Ok(command)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

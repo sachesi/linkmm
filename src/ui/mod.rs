@@ -12,6 +12,7 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
+use crate::core::runtime::global_runtime_manager;
 
 pub mod downloads;
 pub mod library;
@@ -153,27 +154,26 @@ fn build_main_window(
         play_btn.connect_clicked(move |_| {
             let game = config_c.borrow().current_game().cloned();
             let Some(g) = game else { return };
-
-            match g.launcher_source {
-                GameLauncherSource::NonSteamUmu => {
-                    let app_id = g.kind.steam_app_id().unwrap_or(0);
-                    match g.validate_umu_setup().and_then(|umu_cfg| {
-                        crate::core::umu::launch_with_umu(
-                            &umu_cfg.exe_path,
-                            app_id,
-                            umu_cfg.prefix_path.as_deref(),
-                            umu_cfg.proton_path.as_deref(),
-                        )
-                    }) {
-                        Ok(_) => log::info!("Launched {} via umu-run", g.name),
-                        Err(e) => log::warn!("Could not launch {} via umu-run: {e}", g.name),
-                    }
+            if g.launcher_source == GameLauncherSource::Steam {
+                if let Err(e) = crate::core::steam::launch_game(&g) {
+                    log::warn!("Could not launch {}: {e}", g.name);
                 }
-                GameLauncherSource::Steam => {
-                    if let Err(e) = crate::core::steam::launch_game(&g) {
-                        log::warn!("Could not launch {}: {e}", g.name);
-                    }
+                return;
+            }
+            let manager = global_runtime_manager();
+            if let Some(session) = manager.current_game_session(&g.id) {
+                if let Err(e) = manager.stop_session(session.id) {
+                    log::error!("Failed stopping game session: {e}");
                 }
+                return;
+            }
+            let profile_id = config_c
+                .borrow()
+                .game_settings
+                .get(&g.id)
+                .map(|gs| gs.active_profile_id.clone());
+            if let Err(e) = manager.start_game_session(g.clone(), profile_id) {
+                log::warn!("Could not launch {}: {e}", g.name);
             }
         });
     }
@@ -246,6 +246,37 @@ fn build_main_window(
         });
     }
 
+    {
+        let config_t = Rc::clone(&config);
+        let play_btn_t = play_btn.clone();
+        let active_game_row_t = active_game_row.clone();
+        let nav_list_t = nav_list.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            let manager = global_runtime_manager();
+            let active_any = manager.any_active();
+            nav_list_t.set_sensitive(!active_any);
+            active_game_row_t.set_sensitive(!active_any);
+
+            let current_game = config_t.borrow().current_game().cloned();
+            if let Some(game) = current_game {
+                let game_session = manager.current_game_session(&game.id);
+                play_btn_t.set_visible(
+                    game.kind.steam_app_id().is_some()
+                        || game.launcher_source == GameLauncherSource::NonSteamUmu,
+                );
+                play_btn_t.set_label(if game.launcher_source == GameLauncherSource::Steam {
+                    "Launch"
+                } else if game_session.is_some() {
+                    "Stop"
+                } else {
+                    "Play"
+                });
+                play_btn_t.set_sensitive(true);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     let sidebar_scroll = gtk4::ScrolledWindow::new();
     sidebar_scroll.set_vexpand(true);
     sidebar_scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
@@ -259,12 +290,12 @@ fn build_main_window(
         .build();
     split_view.set_sidebar(Some(&sidebar_page));
 
-    // Create the nav-lock callback.  Grays out the entire sidebar content
-    // (navigation, game picker, play button) during mod installation so the
-    // user cannot navigate away while a long archive is being extracted.
-    let sidebar_box_for_lock = sidebar_box.clone();
+    // Lock callback used by long-running tasks (downloads/install).
+    let nav_list_for_lock = nav_list.clone();
+    let active_game_row_for_lock = active_game_row.clone();
     let nav_lock: Rc<dyn Fn(bool)> = Rc::new(move |locked: bool| {
-        sidebar_box_for_lock.set_sensitive(!locked);
+        nav_list_for_lock.set_sensitive(!locked);
+        active_game_row_for_lock.set_sensitive(!locked);
     });
 
     // ── Content area ──────────────────────────────────────────────────────

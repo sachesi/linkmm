@@ -11,6 +11,7 @@ pub mod core {
     pub mod mods;
     pub mod nexus;
     pub mod nxm;
+    pub mod runtime;
     pub mod steam;
     pub mod tool_adapters;
     pub mod tool_runs;
