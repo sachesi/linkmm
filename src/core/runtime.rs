@@ -72,6 +72,7 @@ struct SessionRecord {
     logs: VecDeque<SessionLogLine>,
     control: Arc<SessionControl>,
     steam_app_id: Option<u32>,
+    expected_executables: Vec<String>,
 }
 
 type SessionCompletion = Box<dyn FnOnce(ExitStatus) -> Result<(), String> + Send + 'static>;
@@ -86,6 +87,7 @@ struct SessionStart {
     completion: Option<SessionCompletion>,
     run_mode: SessionRunMode,
     steam_app_id: Option<u32>,
+    expected_executables: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -246,6 +248,15 @@ impl RuntimeSessionManager {
         } else {
             None
         };
+        let expected_executables = if game.launcher_source == GameLauncherSource::Steam {
+            game.kind
+                .expected_executable_names()
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         self.spawn_managed_session(SessionStart {
             kind: SessionKind::Game,
@@ -257,6 +268,7 @@ impl RuntimeSessionManager {
             completion: None,
             run_mode,
             steam_app_id,
+            expected_executables,
         })
         .map(|(id, _)| id)
     }
@@ -306,6 +318,7 @@ impl RuntimeSessionManager {
                 completion: Some(completion),
                 run_mode: SessionRunMode::FullyManaged,
                 steam_app_id: None,
+                expected_executables: Vec::new(),
             })
             .map(|(id, _)| id)?;
 
@@ -375,6 +388,7 @@ impl RuntimeSessionManager {
                     logs: VecDeque::new(),
                     control: Arc::clone(&control),
                     steam_app_id: start.steam_app_id,
+                    expected_executables: start.expected_executables,
                 },
             );
         }
@@ -421,7 +435,7 @@ impl RuntimeSessionManager {
     ) {
         let mut next_status = SessionStatus::Failed;
         let mut exit_code = None;
-        let mut should_start_pid_tracking = None;
+        let mut should_start_pid_tracking: Option<(u32, Vec<String>)> = None;
 
         match status_result {
             Ok(status) => {
@@ -448,7 +462,10 @@ impl RuntimeSessionManager {
                         .lock()
                         .expect("sessions lock poisoned")
                         .get(&id)
-                        .and_then(|r| r.steam_app_id);
+                        .and_then(|r| {
+                            r.steam_app_id
+                                .map(|appid| (appid, r.expected_executables.clone()))
+                        });
                     SessionStatus::DelegatedRunning
                 } else if status.success() {
                     SessionStatus::Exited
@@ -467,16 +484,16 @@ impl RuntimeSessionManager {
             record.session.exit_code = exit_code;
         }
         drop(sessions);
-        if let Some(app_id) = should_start_pid_tracking {
-            self.spawn_steam_pid_tracking(id, app_id);
+        if let Some((app_id, expected_executables)) = should_start_pid_tracking {
+            self.spawn_steam_pid_tracking(id, app_id, expected_executables);
         }
     }
 
-    fn spawn_steam_pid_tracking(&self, id: u64, app_id: u32) {
+    fn spawn_steam_pid_tracking(&self, id: u64, app_id: u32, expected_executables: Vec<String>) {
         let manager = self.clone();
         std::thread::spawn(move || {
             for _ in 0..20 {
-                if let Some(pid) = find_steam_game_pid(app_id) {
+                if let Some(pid) = find_steam_game_pid(app_id, &expected_executables) {
                     let mut sessions = manager
                         .inner
                         .sessions
@@ -536,38 +553,106 @@ impl RuntimeSessionManager {
     }
 }
 
-fn find_steam_game_pid(app_id: u32) -> Option<u32> {
+#[derive(Debug, Clone)]
+struct ProcCandidate {
+    cmdline: String,
+    exe_name: String,
+    cwd: String,
+    ppid: Option<u32>,
+}
+
+fn find_steam_game_pid(app_id: u32, expected_executables: &[String]) -> Option<u32> {
     let needle = app_id.to_string();
     let proc_root = std::path::Path::new("/proc");
     let entries = std::fs::read_dir(proc_root).ok()?;
+    let mut best: Option<(u32, i32)> = None;
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let Ok(pid) = file_name.to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let cmdline_path = entry.path().join("cmdline");
-        let Ok(cmd_bytes) = std::fs::read(&cmdline_path) else {
-            continue;
-        };
-        if cmd_bytes.is_empty() {
-            continue;
-        }
-        let cmd = String::from_utf8_lossy(&cmd_bytes).replace('\0', " ");
-        let low = cmd.to_lowercase();
-        if low.contains(&format!("compatdata/{needle}"))
-            || low.contains(&format!("steam_appid={needle}"))
-            || low.contains(&needle)
-        {
-            if low.contains("steam ")
-                || low.contains("steamwebhelper")
-                || low.contains("pressure-vessel-wrap")
-            {
-                continue;
+        if let Some(candidate) = read_proc_candidate(&entry.path()) {
+            let score = score_candidate(&candidate, &needle, expected_executables);
+            if score >= 60 {
+                if let Some((_, best_score)) = best {
+                    if score > best_score {
+                        best = Some((pid, score));
+                    }
+                } else {
+                    best = Some((pid, score));
+                }
             }
-            return Some(pid);
         }
     }
-    None
+    best.map(|(pid, _)| pid)
+}
+
+fn read_proc_candidate(proc_dir: &std::path::Path) -> Option<ProcCandidate> {
+    let cmd_bytes = std::fs::read(proc_dir.join("cmdline")).ok()?;
+    if cmd_bytes.is_empty() {
+        return None;
+    }
+    let cmdline = String::from_utf8_lossy(&cmd_bytes).replace('\0', " ");
+    let exe_name = std::fs::read_link(proc_dir.join("exe"))
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    let cwd = std::fs::read_link(proc_dir.join("cwd"))
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ppid = read_ppid_from_stat(proc_dir.join("stat"));
+    Some(ProcCandidate {
+        cmdline,
+        exe_name,
+        cwd,
+        ppid,
+    })
+}
+
+fn score_candidate(
+    candidate: &ProcCandidate,
+    app_id: &str,
+    expected_executables: &[String],
+) -> i32 {
+    let mut score = 0;
+    let cmd = candidate.cmdline.to_lowercase();
+    let exe = candidate.exe_name.to_lowercase();
+    let cwd = candidate.cwd.to_lowercase();
+    if cmd.contains(&format!("compatdata/{app_id}")) {
+        score += 25;
+    }
+    if cmd.contains(&format!("steam_appid={app_id}")) || cmd.contains(&format!("appid {app_id}")) {
+        score += 30;
+    }
+    if cwd.contains(&format!("compatdata/{app_id}")) {
+        score += 18;
+    }
+    if expected_executables
+        .iter()
+        .any(|n| exe == *n || cmd.contains(n))
+    {
+        score += 45;
+    }
+    if cmd.contains("proton") || cmd.contains("pressure-vessel") {
+        score += 10;
+    }
+    if cmd.contains("steamwebhelper") || cmd.contains("gamescope-session") {
+        score -= 40;
+    }
+    if cmd.starts_with("steam ") || exe == "steam" {
+        score -= 20;
+    }
+    if candidate.ppid.is_some() {
+        score += 3;
+    }
+    score
+}
+
+fn read_ppid_from_stat(stat_path: std::path::PathBuf) -> Option<u32> {
+    let stat = std::fs::read_to_string(stat_path).ok()?;
+    let parts: Vec<&str> = stat.split_whitespace().collect();
+    parts.get(3).and_then(|v| v.parse::<u32>().ok())
 }
 
 fn terminate_process_tree(root_pid: u32) -> Result<(), String> {
@@ -663,6 +748,7 @@ mod tests {
                 completion: None,
                 run_mode: SessionRunMode::FullyManaged,
                 steam_app_id: None,
+                expected_executables: Vec::new(),
             })
             .unwrap();
         assert!(manager.any_active());
@@ -691,6 +777,7 @@ mod tests {
                 completion: None,
                 run_mode: SessionRunMode::FullyManaged,
                 steam_app_id: None,
+                expected_executables: Vec::new(),
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -715,6 +802,7 @@ mod tests {
                 completion: None,
                 run_mode: SessionRunMode::SteamDelegated,
                 steam_app_id: Some(489830),
+                expected_executables: vec!["skyrimse.exe".to_string()],
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -739,6 +827,7 @@ mod tests {
                 completion: None,
                 run_mode: SessionRunMode::SteamDelegated,
                 steam_app_id: Some(489830),
+                expected_executables: vec!["skyrimse.exe".to_string()],
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -763,11 +852,45 @@ mod tests {
                 completion: None,
                 run_mode: SessionRunMode::SteamPidTracked,
                 steam_app_id: Some(489830),
+                expected_executables: vec!["skyrimse.exe".to_string()],
             })
             .unwrap();
         manager.stop_session(id).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let s = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(s.status, SessionStatus::Killed);
+    }
+
+    #[test]
+    fn scoring_prefers_expected_game_executable_name() {
+        let good = ProcCandidate {
+            cmdline: "/game/SkyrimSE.exe -arg".to_string(),
+            exe_name: "SkyrimSE.exe".to_string(),
+            cwd: "/prefix/compatdata/489830/pfx".to_string(),
+            ppid: Some(1),
+        };
+        let bad = ProcCandidate {
+            cmdline: "/game/Fallout4.exe".to_string(),
+            exe_name: "Fallout4.exe".to_string(),
+            cwd: "/prefix/compatdata/489830/pfx".to_string(),
+            ppid: Some(1),
+        };
+        let expected = vec!["skyrimse.exe".to_string(), "skse64_loader.exe".to_string()];
+        assert!(
+            score_candidate(&good, "489830", &expected)
+                > score_candidate(&bad, "489830", &expected)
+        );
+    }
+
+    #[test]
+    fn wrong_game_executable_is_not_high_confidence() {
+        let wrong = ProcCandidate {
+            cmdline: "/game/Fallout4.exe".to_string(),
+            exe_name: "Fallout4.exe".to_string(),
+            cwd: "/tmp".to_string(),
+            ppid: Some(1),
+        };
+        let expected = vec!["skyrimse.exe".to_string(), "skse64_loader.exe".to_string()];
+        assert!(score_candidate(&wrong, "489830", &expected) < 60);
     }
 }
