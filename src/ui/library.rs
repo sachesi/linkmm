@@ -340,6 +340,71 @@ fn capture_row_offset_in_viewport(container: &gtk4::Box, row_key: &str) -> Optio
     widget_y_in_scrolled(&row, &scrolled)
 }
 
+fn update_library_row_positions_in_place(list_box: &gtk4::ListBox) {
+    let mut idx = 0usize;
+    let mut child = list_box.first_child();
+    while let Some(widget) = child {
+        idx += 1;
+        let mut inner = widget.first_child();
+        while let Some(desc) = inner {
+            if let Ok(label) = desc.clone().downcast::<gtk4::Label>()
+                && label.has_css_class("numeric")
+            {
+                label.set_text(&idx.to_string());
+                break;
+            }
+            inner = desc.next_sibling();
+        }
+        child = widget.next_sibling();
+    }
+}
+
+fn move_library_row_in_place(container: &gtk4::Box, source_id: &str, target_id: &str) -> bool {
+    let Some((_, list_box, _)) = find_existing_library_view(container) else {
+        return false;
+    };
+    let source_key = library_row_key(source_id);
+    let target_key = library_row_key(target_id);
+    let Some(source_row) = find_row_by_key(&list_box, &source_key) else {
+        return false;
+    };
+    let Some(target_row) = find_row_by_key(&list_box, &target_key) else {
+        return false;
+    };
+    let src_pos = source_row
+        .prev_sibling()
+        .map(|_| {
+            let mut count = 0usize;
+            let mut c = list_box.first_child();
+            while let Some(w) = c {
+                if w == source_row {
+                    break;
+                }
+                count += 1;
+                c = w.next_sibling();
+            }
+            count
+        })
+        .unwrap_or(0);
+    let tgt_pos = {
+        let mut count = 0usize;
+        let mut c = list_box.first_child();
+        while let Some(w) = c {
+            if w == target_row {
+                break;
+            }
+            count += 1;
+            c = w.next_sibling();
+        }
+        count
+    };
+    let insert_pos = adjusted_insert_pos(src_pos, tgt_pos) as i32;
+    list_box.remove(&source_row);
+    list_box.insert(&source_row, insert_pos);
+    update_library_row_positions_in_place(&list_box);
+    true
+}
+
 fn refresh_library_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -681,17 +746,19 @@ fn build_mod_row(
                     align_ratio: 0.35,
                     preferred_row_offset: row_offset_before_drop,
                 });
-                refresh_library_content_with_search(
-                    &container_drop,
-                    &game_drop,
-                    Rc::clone(&config_drop),
-                    &search_drop.borrow(),
-                    Rc::clone(&search_drop),
-                    Rc::clone(&selected_drop),
-                    Rc::clone(&anchor_drop),
-                    Rc::clone(&drag_scroll_drop),
-                    false,
-                );
+                if !move_library_row_in_place(&container_drop, &source_id, &target_id) {
+                    refresh_library_content_with_search(
+                        &container_drop,
+                        &game_drop,
+                        Rc::clone(&config_drop),
+                        &search_drop.borrow(),
+                        Rc::clone(&search_drop),
+                        Rc::clone(&selected_drop),
+                        Rc::clone(&anchor_drop),
+                        Rc::clone(&drag_scroll_drop),
+                        false,
+                    );
+                }
             }
             true
         });

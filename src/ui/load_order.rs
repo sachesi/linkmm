@@ -247,6 +247,72 @@ fn capture_row_offset_in_viewport(container: &gtk4::Box, row_key: &str) -> Optio
     widget_y_in_scrolled(&row, &scrolled)
 }
 
+fn update_load_order_row_positions_in_place(list_box: &gtk4::ListBox) {
+    let mut idx = 0usize;
+    let mut child = list_box.first_child();
+    while let Some(widget) = child {
+        idx += 1;
+        let mut inner = widget.first_child();
+        while let Some(desc) = inner {
+            if let Ok(label) = desc.clone().downcast::<gtk4::Label>()
+                && label.has_css_class("numeric")
+            {
+                label.set_text(&idx.to_string());
+                break;
+            }
+            inner = desc.next_sibling();
+        }
+        child = widget.next_sibling();
+    }
+}
+
+fn move_load_order_row_in_place(
+    container: &gtk4::Box,
+    source_name: &str,
+    target_name: &str,
+) -> bool {
+    let Some((_, list_box, _)) = find_existing_load_order_view(container) else {
+        return false;
+    };
+    let source_key = load_order_row_key(source_name);
+    let target_key = load_order_row_key(target_name);
+    let Some(source_row) = find_row_by_key(&list_box, &source_key) else {
+        return false;
+    };
+    let Some(target_row) = find_row_by_key(&list_box, &target_key) else {
+        return false;
+    };
+    let src_pos = {
+        let mut count = 0usize;
+        let mut c = list_box.first_child();
+        while let Some(w) = c {
+            if w == source_row {
+                break;
+            }
+            count += 1;
+            c = w.next_sibling();
+        }
+        count
+    };
+    let tgt_pos = {
+        let mut count = 0usize;
+        let mut c = list_box.first_child();
+        while let Some(w) = c {
+            if w == target_row {
+                break;
+            }
+            count += 1;
+            c = w.next_sibling();
+        }
+        count
+    };
+    let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &[]) as i32;
+    list_box.remove(&source_row);
+    list_box.insert(&source_row, insert_pos);
+    update_load_order_row_positions_in_place(&list_box);
+    true
+}
+
 fn refresh_load_order_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -594,13 +660,15 @@ fn build_plugin_row(
                     align_ratio: 0.35,
                     preferred_row_offset: row_offset_before_drop,
                 });
-                refresh_load_order_content(
-                    &container_drop,
-                    &game_drop,
-                    Rc::clone(&search_drop),
-                    Rc::clone(&anchor_drop),
-                    Rc::clone(&drag_scroll_drop),
-                );
+                if !move_load_order_row_in_place(&container_drop, &source_name, &target_name) {
+                    refresh_load_order_content(
+                        &container_drop,
+                        &game_drop,
+                        Rc::clone(&search_drop),
+                        Rc::clone(&anchor_drop),
+                        Rc::clone(&drag_scroll_drop),
+                    );
+                }
             }
             true
         });
