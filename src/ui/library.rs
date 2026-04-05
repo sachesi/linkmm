@@ -198,6 +198,14 @@ fn refresh_library_content_with_search(
     selected_mod_id: Rc<RefCell<Option<String>>>,
     do_scan: bool,
 ) {
+    let previous_scroll = container
+        .first_child()
+        .and_then(|child| child.downcast::<gtk4::ScrolledWindow>().ok())
+        .map(|scrolled| {
+            let adj = scrolled.vadjustment();
+            (adj.value(), adj.upper(), adj.page_size())
+        });
+
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
@@ -275,12 +283,14 @@ fn refresh_library_content_with_search(
         scrolled.set_child(Some(&clamp));
 
         container.append(&scrolled);
-
-        let scrolled_clone = scrolled.clone();
-        gtk4::glib::idle_add_local_once(move || {
-            let adj = scrolled_clone.vadjustment();
-            adj.set_value(adj.upper() - adj.page_size());
-        });
+        if let Some((value, _, _)) = previous_scroll {
+            let scrolled_clone = scrolled.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                let adj = scrolled_clone.vadjustment();
+                let max_value = (adj.upper() - adj.page_size()).max(0.0);
+                adj.set_value(value.clamp(0.0, max_value));
+            });
+        }
     }
 }
 
