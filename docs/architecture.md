@@ -106,3 +106,32 @@ It also owns per-session rolling log buffers for stdout/stderr capture.
   - native Steam installs: `steam -applaunch <app_id>`
   - Flatpak Steam installs: `flatpak run com.valvesoftware.Steam -applaunch <app_id>`
 - Steam Stop semantics are intentionally not exposed as exact process ownership in LinkMM runtime.
+
+## 9. UI state ownership and page lifecycle
+
+LinkMM UI now treats navigation pages as long-lived widgets instead of recreating
+them on every tab switch.
+
+- Main navigation uses a stable `gtk4::Stack` with cached page instances.
+- Tab switching changes visible child only; it must not rebuild full page trees.
+- Expensive refreshes (scan/reload) are explicit page actions, not implicit side effects of navigation.
+
+State ownership contract:
+
+- **App-global/shared state**
+  - long-running operation status (install busy / navigation lock)
+  - whether navigation/game switching actions are allowed
+  - global status surfaces that remain truthful regardless of current tab
+- **Page-local state**
+  - search text, scroll position, local selection/focus for list interactions
+  - transient row-level controls and expansion/selection context
+
+Long-running operations (install/deploy/runtime) must never rely solely on an
+ephemeral page instance. If a status is critical for safety or user trust, it
+must be represented in shared state and rendered consistently across navigation.
+
+List/view update rule for Library and Load Order:
+
+- Prefer targeted state updates where possible.
+- If a list rebuild is required, preserve user context (scroll/focus/search) and
+  avoid unrelated resets/jumping.

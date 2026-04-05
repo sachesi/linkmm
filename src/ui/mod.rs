@@ -290,20 +290,25 @@ fn build_main_window(
         .build();
     split_view.set_sidebar(Some(&sidebar_page));
 
-    // Lock callback used by long-running tasks (downloads/install).
-    let nav_list_for_lock = nav_list.clone();
-    let active_game_row_for_lock = active_game_row.clone();
-    let nav_lock: Rc<dyn Fn(bool)> = Rc::new(move |locked: bool| {
-        nav_list_for_lock.set_sensitive(!locked);
-        active_game_row_for_lock.set_sensitive(!locked);
-    });
-
     // ── Content area ──────────────────────────────────────────────────────
+    let install_lock_revealer = gtk4::Revealer::new();
+    install_lock_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    install_lock_revealer.set_reveal_child(false);
+
+    let install_lock_banner = adw::Banner::new(
+        "Installing mod archive… navigation is temporarily locked. You can cancel from Downloads.",
+    );
+    install_lock_banner.set_revealed(true);
+    install_lock_banner.set_button_label(None::<&str>);
+    install_lock_revealer.set_child(Some(&install_lock_banner));
 
     let content_stack = gtk4::Stack::new();
     content_stack.set_transition_type(gtk4::StackTransitionType::None);
     content_stack.set_vexpand(true);
     content_stack.set_hexpand(true);
+    let content_layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content_layout.append(&install_lock_revealer);
+    content_layout.append(&content_stack);
 
     let current_game = {
         let cfg = config.borrow();
@@ -343,7 +348,7 @@ fn build_main_window(
 
     let content_page = adw::NavigationPage::builder()
         .title("Library")
-        .child(&content_stack)
+        .child(&content_layout)
         .build();
     split_view.set_content(Some(&content_page));
 
@@ -365,76 +370,57 @@ fn build_main_window(
     nav_list.select_row(nav_list.row_at_index(NAV_LIBRARY).as_ref());
 
     // ── Navigation signal ─────────────────────────────────────────────────
+    let install_locked = Rc::new(RefCell::new(false));
+    // Lock callback used by long-running tasks (downloads/install).
+    let nav_list_for_lock = nav_list.clone();
+    let active_game_row_for_lock = active_game_row.clone();
+    let play_btn_for_lock = play_btn.clone();
+    let content_stack_for_lock = content_stack.clone();
+    let content_page_for_lock = content_page.clone();
+    let install_lock_revealer_for_lock = install_lock_revealer.clone();
+    let install_locked_for_cb = Rc::clone(&install_locked);
+    let nav_lock: Rc<dyn Fn(bool)> = Rc::new(move |locked: bool| {
+        *install_locked_for_cb.borrow_mut() = locked;
+        nav_list_for_lock.set_sensitive(!locked);
+        active_game_row_for_lock.set_sensitive(!locked);
+        play_btn_for_lock.set_sensitive(!locked);
+        install_lock_revealer_for_lock.set_reveal_child(locked);
+        if locked {
+            // Safety: keep Downloads visible while install work is in flight.
+            content_page_for_lock.set_title("Downloads");
+            content_stack_for_lock.set_visible_child_name("downloads");
+            nav_list_for_lock.select_row(nav_list_for_lock.row_at_index(NAV_DOWNLOADS).as_ref());
+        }
+    });
+
     {
         let content_stack_c = content_stack.clone();
         let content_page_c = content_page.clone();
-        let config_c = Rc::clone(&config);
-        let nav_lock_c = Rc::clone(&nav_lock);
-        let window_c = window.clone();
+        let install_locked_c = Rc::clone(&install_locked);
 
         nav_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
-            let game_info = {
-                let cfg = config_c.borrow();
-                cfg.current_game().cloned()
-            };
+            if *install_locked_c.borrow() {
+                return;
+            }
             match row.index() {
                 NAV_LIBRARY => {
-                    let new_library: gtk4::Widget = match &game_info {
-                        Some(g) => library::build_library_page(g, Rc::clone(&config_c)),
-                        None => build_no_game_page(
-                            "No Game Selected",
-                            "Select or add a game to manage its mods.",
-                        ),
-                    };
-                    if let Some(old) = content_stack_c.child_by_name("library") {
-                        content_stack_c.remove(&old);
-                    }
-                    content_stack_c.add_named(&new_library, Some("library"));
                     content_page_c.set_title("Library");
                     content_stack_c.set_visible_child_name("library");
                 }
                 NAV_LOAD_ORDER => {
-                    let new_load_order = load_order::build_load_order_page(game_info.as_ref());
-                    if let Some(old) = content_stack_c.child_by_name("load_order") {
-                        content_stack_c.remove(&old);
-                    }
-                    content_stack_c.add_named(&new_load_order, Some("load_order"));
                     content_page_c.set_title("Load Order");
                     content_stack_c.set_visible_child_name("load_order");
                 }
                 NAV_DOWNLOADS => {
-                    let new_downloads = downloads::build_downloads_page(
-                        game_info.as_ref(),
-                        Rc::clone(&config_c),
-                        Rc::clone(&nav_lock_c),
-                    );
-                    if let Some(old) = content_stack_c.child_by_name("downloads") {
-                        content_stack_c.remove(&old);
-                    }
-                    content_stack_c.add_named(&new_downloads, Some("downloads"));
                     content_page_c.set_title("Downloads");
                     content_stack_c.set_visible_child_name("downloads");
                 }
                 NAV_TOOLS => {
-                    let new_tools =
-                        tools::build_tools_page(game_info.as_ref(), Rc::clone(&config_c));
-                    if let Some(old) = content_stack_c.child_by_name("tools") {
-                        content_stack_c.remove(&old);
-                    }
-                    content_stack_c.add_named(&new_tools, Some("tools"));
                     content_page_c.set_title("Tools");
                     content_stack_c.set_visible_child_name("tools");
                 }
                 NAV_PREFERENCES => {
-                    let new_prefs = settings::build_settings_page(
-                        Rc::clone(&config_c),
-                        &window_c.clone().upcast::<gtk4::Window>(),
-                    );
-                    if let Some(old) = content_stack_c.child_by_name("preferences") {
-                        content_stack_c.remove(&old);
-                    }
-                    content_stack_c.add_named(&new_prefs, Some("preferences"));
                     content_page_c.set_title("Preferences");
                     content_stack_c.set_visible_child_name("preferences");
                 }
@@ -554,6 +540,41 @@ fn build_main_window(
 
     let on_setup_done_final = Rc::clone(&on_setup_done_rc);
     (window, move || on_setup_done_final())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NAV_DOWNLOADS, NAV_LIBRARY, NAV_LOAD_ORDER, NAV_PREFERENCES, NAV_TOOLS};
+
+    fn page_for_nav(index: i32) -> Option<(&'static str, &'static str)> {
+        match index {
+            NAV_LIBRARY => Some(("Library", "library")),
+            NAV_LOAD_ORDER => Some(("Load Order", "load_order")),
+            NAV_DOWNLOADS => Some(("Downloads", "downloads")),
+            NAV_TOOLS => Some(("Tools", "tools")),
+            NAV_PREFERENCES => Some(("Preferences", "preferences")),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn nav_index_maps_to_stable_stack_pages() {
+        assert_eq!(page_for_nav(NAV_LIBRARY), Some(("Library", "library")));
+        assert_eq!(
+            page_for_nav(NAV_LOAD_ORDER),
+            Some(("Load Order", "load_order"))
+        );
+        assert_eq!(
+            page_for_nav(NAV_DOWNLOADS),
+            Some(("Downloads", "downloads"))
+        );
+        assert_eq!(page_for_nav(NAV_TOOLS), Some(("Tools", "tools")));
+        assert_eq!(
+            page_for_nav(NAV_PREFERENCES),
+            Some(("Preferences", "preferences"))
+        );
+        assert_eq!(page_for_nav(999), None);
+    }
 }
 
 // ── Helper widgets ─────────────────────────────────────────────────────────
