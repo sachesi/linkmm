@@ -35,6 +35,7 @@ struct ConflictState {
 struct ViewportAnchor {
     item_key: String,
     align_ratio: f64,
+    preferred_row_offset: Option<f64>,
 }
 
 /// Build the full Library page for `game`.
@@ -326,6 +327,19 @@ fn widget_y_in_scrolled(widget: &gtk4::Widget, scrolled: &gtk4::ScrolledWindow) 
         .map(|point| point.y() as f64)
 }
 
+fn anchored_scroll_target(row_y: f64, page_size: f64, anchor: &ViewportAnchor) -> f64 {
+    match anchor.preferred_row_offset {
+        Some(offset) => (row_y - offset).max(0.0),
+        None => (row_y - (page_size * anchor.align_ratio)).max(0.0),
+    }
+}
+
+fn capture_row_offset_in_viewport(container: &gtk4::Box, row_key: &str) -> Option<f64> {
+    let (_, list_box, scrolled) = find_existing_library_view(container)?;
+    let row = find_row_by_key(&list_box, row_key)?;
+    widget_y_in_scrolled(&row, &scrolled)
+}
+
 fn refresh_library_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -418,7 +432,7 @@ fn refresh_library_content_with_search(
         let anchored_value = anchor.and_then(|a| {
             find_row_by_key(&list_box_clone, &library_row_key(&a.item_key)).and_then(|row| {
                 widget_y_in_scrolled(&row, &scrolled_clone)
-                    .map(|row_y| (row_y - (adj.page_size() * a.align_ratio)).max(0.0))
+                    .map(|row_y| anchored_scroll_target(row_y, adj.page_size(), &a))
             })
         });
         let target = anchored_value
@@ -554,6 +568,7 @@ fn build_mod_row(
                 *anchor_c.borrow_mut() = Some(ViewportAnchor {
                     item_key: mod_id_c.clone(),
                     align_ratio: 0.35,
+                    preferred_row_offset: None,
                 });
                 refresh_library_content_with_search(
                     &container_c,
@@ -593,6 +608,7 @@ fn build_mod_row(
                 *anchor_c.borrow_mut() = Some(ViewportAnchor {
                     item_key: mod_id_c.clone(),
                     align_ratio: 0.35,
+                    preferred_row_offset: None,
                 });
                 refresh_library_content_with_search(
                     &container_c,
@@ -646,6 +662,8 @@ fn build_mod_row(
             if source_id == target_id {
                 return false;
             }
+            let row_offset_before_drop =
+                capture_row_offset_in_viewport(&container_drop, &library_row_key(&source_id));
             let mut db = ModDatabase::load(&game_drop);
             if let (Some(src_pos), Some(tgt_pos)) = (
                 db.mods.iter().position(|m| m.id == source_id),
@@ -661,6 +679,7 @@ fn build_mod_row(
                 *anchor_drop.borrow_mut() = Some(ViewportAnchor {
                     item_key: source_id.clone(),
                     align_ratio: 0.35,
+                    preferred_row_offset: row_offset_before_drop,
                 });
                 refresh_library_content_with_search(
                     &container_drop,
@@ -1140,6 +1159,7 @@ fn show_move_to_position_dialog_for_mod(
             *pending_viewport_anchor.borrow_mut() = Some(ViewportAnchor {
                 item_key: mod_id.clone(),
                 align_ratio: 0.35,
+                preferred_row_offset: None,
             });
             refresh_library_content_with_search(
                 &container,
@@ -1390,7 +1410,10 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_insert_pos, compute_conflict_states, matches_query};
+    use super::{
+        ViewportAnchor, adjusted_insert_pos, anchored_scroll_target, compute_conflict_states,
+        matches_query,
+    };
     use crate::core::mods::Mod;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1420,6 +1443,26 @@ mod tests {
     fn adjusted_insert_pos_accounts_for_source_removal() {
         assert_eq!(adjusted_insert_pos(0, 2), 1);
         assert_eq!(adjusted_insert_pos(3, 1), 1);
+    }
+
+    #[test]
+    fn anchored_scroll_target_prefers_explicit_row_offset() {
+        let anchor = ViewportAnchor {
+            item_key: "mod-a".to_string(),
+            align_ratio: 0.35,
+            preferred_row_offset: Some(120.0),
+        };
+        assert_eq!(anchored_scroll_target(220.0, 400.0, &anchor), 100.0);
+    }
+
+    #[test]
+    fn anchored_scroll_target_falls_back_to_ratio() {
+        let anchor = ViewportAnchor {
+            item_key: "mod-a".to_string(),
+            align_ratio: 0.25,
+            preferred_row_offset: None,
+        };
+        assert_eq!(anchored_scroll_target(320.0, 400.0, &anchor), 220.0);
     }
 
     #[test]

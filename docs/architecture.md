@@ -143,6 +143,7 @@ Drag/reorder UX rule for Library and Load Order:
 - During drag operations, lists should auto-scroll near top/bottom edges to support long-distance moves.
 - Edge auto-scroll should be driven from the active `ScrolledWindow` viewport position, not only per-row targets.
 - After drop/reorder, keep moved-row context visible in the current filtered/search view.
+- Post-drop restore should prefer moved-item identity + in-viewport row offset capture over raw adjustment restore alone.
 
 Long-running operation execution rule:
 

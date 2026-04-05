@@ -18,6 +18,7 @@ use crate::ui::drag_autoscroll::{
 struct ViewportAnchor {
     item_key: String,
     align_ratio: f64,
+    preferred_row_offset: Option<f64>,
 }
 
 /// Build the Load Order page for `game`.
@@ -233,6 +234,19 @@ fn widget_y_in_scrolled(widget: &gtk4::Widget, scrolled: &gtk4::ScrolledWindow) 
         .map(|point| point.y() as f64)
 }
 
+fn anchored_scroll_target(row_y: f64, page_size: f64, anchor: &ViewportAnchor) -> f64 {
+    match anchor.preferred_row_offset {
+        Some(offset) => (row_y - offset).max(0.0),
+        None => (row_y - (page_size * anchor.align_ratio)).max(0.0),
+    }
+}
+
+fn capture_row_offset_in_viewport(container: &gtk4::Box, row_key: &str) -> Option<f64> {
+    let (_, list_box, scrolled) = find_existing_load_order_view(container)?;
+    let row = find_row_by_key(&list_box, row_key)?;
+    widget_y_in_scrolled(&row, &scrolled)
+}
+
 fn refresh_load_order_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -321,7 +335,7 @@ fn refresh_load_order_content_with_search(
         let anchored_value = anchor.and_then(|a| {
             find_row_by_key(&list_box_clone, &load_order_row_key(&a.item_key)).and_then(|row| {
                 widget_y_in_scrolled(&row, &scrolled_clone)
-                    .map(|row_y| (row_y - (adj.page_size() * a.align_ratio)).max(0.0))
+                    .map(|row_y| anchored_scroll_target(row_y, adj.page_size(), &a))
             })
         });
         adj.set_value(
@@ -469,6 +483,7 @@ fn build_plugin_row(
                 *anchor_c.borrow_mut() = Some(ViewportAnchor {
                     item_key: plugin_name.clone(),
                     align_ratio: 0.35,
+                    preferred_row_offset: None,
                 });
                 refresh_load_order_content(
                     &container_c,
@@ -506,6 +521,7 @@ fn build_plugin_row(
                 *anchor_c.borrow_mut() = Some(ViewportAnchor {
                     item_key: plugin_name.clone(),
                     align_ratio: 0.35,
+                    preferred_row_offset: None,
                 });
                 refresh_load_order_content(
                     &container_c,
@@ -556,6 +572,8 @@ fn build_plugin_row(
             if source_name == target_name {
                 return false;
             }
+            let row_offset_before_drop =
+                capture_row_offset_in_viewport(&container_drop, &load_order_row_key(&source_name));
             let mut db = ModDatabase::load(&game_drop);
             let mut ordered = db.get_ordered_plugins(&game_drop);
             if let (Some(src_pos), Some(tgt_pos)) = (
@@ -574,6 +592,7 @@ fn build_plugin_row(
                 *anchor_drop.borrow_mut() = Some(ViewportAnchor {
                     item_key: source_name.clone(),
                     align_ratio: 0.35,
+                    preferred_row_offset: row_offset_before_drop,
                 });
                 refresh_load_order_content(
                     &container_drop,
@@ -822,6 +841,7 @@ fn show_move_to_position_dialog(
             *pending_viewport_anchor.borrow_mut() = Some(ViewportAnchor {
                 item_key: plugin_name.clone(),
                 align_ratio: 0.35,
+                preferred_row_offset: None,
             });
             refresh_load_order_content(
                 &container,
@@ -838,7 +858,7 @@ fn show_move_to_position_dialog(
 
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_insert_pos, matches_query};
+    use super::{ViewportAnchor, adjusted_insert_pos, anchored_scroll_target, matches_query};
     use crate::core::mods::{PluginFile, PluginKind};
 
     #[test]
@@ -865,5 +885,25 @@ mod tests {
         assert!(matches_query("MyPatch.esp", "patch"));
         assert!(matches_query("MyPatch.esp", "  ESP  "));
         assert!(!matches_query("MyPatch.esp", "armor"));
+    }
+
+    #[test]
+    fn anchored_scroll_target_prefers_explicit_row_offset() {
+        let anchor = ViewportAnchor {
+            item_key: "A.esp".to_string(),
+            align_ratio: 0.35,
+            preferred_row_offset: Some(90.0),
+        };
+        assert_eq!(anchored_scroll_target(210.0, 400.0, &anchor), 120.0);
+    }
+
+    #[test]
+    fn anchored_scroll_target_falls_back_to_ratio() {
+        let anchor = ViewportAnchor {
+            item_key: "A.esp".to_string(),
+            align_ratio: 0.25,
+            preferred_row_offset: None,
+        };
+        assert_eq!(anchored_scroll_target(300.0, 400.0, &anchor), 200.0);
     }
 }
