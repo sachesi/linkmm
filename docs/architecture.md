@@ -132,6 +132,13 @@ must be represented in shared state and rendered consistently across navigation.
 
 List/view update rule for Library and Load Order:
 
-- Prefer targeted state updates where possible.
+- Keep the page-local list scaffold stable (search entry, scroller, and list container remain mounted).
+- Prefer targeted row/model updates where possible; avoid clearing/recreating entire page trees.
 - If a list rebuild is required, preserve user context (scroll/focus/search) and
   avoid unrelated resets/jumping.
+
+Long-running operation execution rule:
+
+- Heavy deploy/rebuild work must run off the GTK main thread.
+- UI status/progress surfaces should be updated from shared, durable operation state instead of
+  relying on `idle_add` + manual event flushing to appear responsive.

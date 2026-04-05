@@ -110,25 +110,73 @@ fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
     refresh_load_order_content_with_search(container, game, "");
 }
 
+fn find_existing_load_order_view(
+    container: &gtk4::Box,
+) -> Option<(gtk4::Stack, gtk4::ListBox, gtk4::ScrolledWindow)> {
+    let stack = container
+        .first_child()
+        .and_then(|c| c.downcast::<gtk4::Stack>().ok())?;
+    let list_page = stack.child_by_name("list")?;
+    let scrolled = list_page.downcast::<gtk4::ScrolledWindow>().ok()?;
+    let clamp = scrolled.child()?.downcast::<adw::Clamp>().ok()?;
+    let list_box = clamp.child()?.downcast::<gtk4::ListBox>().ok()?;
+    Some((stack, list_box, scrolled))
+}
+
+fn ensure_load_order_view(
+    container: &gtk4::Box,
+) -> (gtk4::Stack, gtk4::ListBox, gtk4::ScrolledWindow) {
+    if let Some(existing) = find_existing_load_order_view(container) {
+        return existing;
+    }
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
+    let list_box = gtk4::ListBox::new();
+    list_box.add_css_class("boxed-list");
+    list_box.set_selection_mode(gtk4::SelectionMode::None);
+
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(900);
+    clamp.set_child(Some(&list_box));
+    clamp.set_margin_top(12);
+    clamp.set_margin_bottom(12);
+    clamp.set_margin_start(12);
+    clamp.set_margin_end(12);
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    scrolled.set_child(Some(&clamp));
+
+    let stack = gtk4::Stack::new();
+    stack.set_vexpand(true);
+    stack.add_named(&scrolled, Some("list"));
+    container.append(&stack);
+    (stack, list_box, scrolled)
+}
+
+fn set_load_order_status(stack: &gtk4::Stack, status: &adw::StatusPage) {
+    if let Some(existing) = stack.child_by_name("status") {
+        stack.remove(&existing);
+    }
+    stack.add_named(status, Some("status"));
+    stack.set_visible_child_name("status");
+}
+
 fn refresh_load_order_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
     search_query: &str,
 ) {
-    let previous_scroll = container
-        .first_child()
-        .and_then(|child| child.downcast::<gtk4::ScrolledWindow>().ok())
-        .map(|scrolled| {
-            let adj = scrolled.vadjustment();
-            (adj.value(), adj.upper(), adj.page_size())
-        });
-
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
+    let (stack, list_box, scrolled) = ensure_load_order_view(container);
+    let previous_scroll = {
+        let adj = scrolled.vadjustment();
+        (adj.value(), adj.upper(), adj.page_size())
+    };
 
     let mut db = ModDatabase::load(game);
-    // Initialise from plugins.txt if we have no saved order yet
     if db.plugin_load_order.is_empty() {
         db.sync_from_plugins_txt(game);
     }
@@ -138,13 +186,13 @@ fn refresh_load_order_content_with_search(
         let status = adw::StatusPage::builder()
             .title("No Plugins Found")
             .description(
-                "No .esm / .esl / .esp files were found in the game's Data directory.\n\
+                "No .esm / .esl / .esp files were found in the game's Data directory.
                  Install and deploy mods first, or check that the game path is correct.",
             )
             .icon_name("format-justify-left-symbolic")
             .build();
         status.set_vexpand(true);
-        container.append(&status);
+        set_load_order_status(&stack, &status);
         return;
     }
 
@@ -162,43 +210,32 @@ fn refresh_load_order_content_with_search(
             .icon_name("system-search-symbolic")
             .build();
         status.set_vexpand(true);
-        container.append(&status);
+        set_load_order_status(&stack, &status);
         return;
+    }
+
+    if let Some(status_child) = stack.child_by_name("status") {
+        stack.remove(&status_child);
+    }
+    stack.set_visible_child_name("list");
+
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
     }
 
     let count = filtered.len();
     let vanilla_count = filtered.iter().filter(|p| p.is_vanilla).count();
-    let list_box = gtk4::ListBox::new();
-    list_box.add_css_class("boxed-list");
-    list_box.set_selection_mode(gtk4::SelectionMode::None);
-
     for (idx, plugin) in filtered.iter().enumerate() {
         let row = build_plugin_row(plugin, idx, count, vanilla_count, game, container);
         list_box.append(&row);
     }
 
-    let clamp = adw::Clamp::new();
-    clamp.set_maximum_size(900);
-    clamp.set_child(Some(&list_box));
-    clamp.set_margin_top(12);
-    clamp.set_margin_bottom(12);
-    clamp.set_margin_start(12);
-    clamp.set_margin_end(12);
-
-    let scrolled = gtk4::ScrolledWindow::new();
-    scrolled.set_vexpand(true);
-    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    scrolled.set_child(Some(&clamp));
-
-    container.append(&scrolled);
-    if let Some((value, _, _)) = previous_scroll {
-        let scrolled_clone = scrolled.clone();
-        gtk4::glib::idle_add_local_once(move || {
-            let adj = scrolled_clone.vadjustment();
-            let max_value = (adj.upper() - adj.page_size()).max(0.0);
-            adj.set_value(value.clamp(0.0, max_value));
-        });
-    }
+    let scrolled_clone = scrolled.clone();
+    gtk4::glib::idle_add_local_once(move || {
+        let adj = scrolled_clone.vadjustment();
+        let max_value = (adj.upper() - adj.page_size()).max(0.0);
+        adj.set_value(previous_scroll.0.clamp(0.0, max_value));
+    });
 }
 
 fn build_plugin_row(

@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
 
 use gio;
 use gtk4::gdk;
@@ -138,9 +140,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             status_progress_c.set_fraction(0.0);
             status_progress_c.set_text(Some("0%"));
 
-            // Defer the blocking deploy work to the next idle opportunity so
-            // the Revealer slide-down animation can start on this frame before
-            // the main thread is occupied.
             let game_c = Rc::clone(&game_c);
             let container_c = container_c.clone();
             let config_c = Rc::clone(&config_c);
@@ -152,34 +151,62 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let status_progress_c = status_progress_c.clone();
             let status_revealer_c = status_revealer_c.clone();
             let btn = btn.clone();
-            gtk4::glib::idle_add_local_once(move || {
-                let db = ModDatabase::load(&game_c);
+
+            status_label_c.set_text("Rebuilding deployment from enabled mod set…");
+            status_progress_c.pulse();
+            status_progress_c.set_text(Some("Working…"));
+
+            let (tx, rx) = mpsc::channel::<Result<usize, String>>();
+            let game_bg = (*game_c).clone();
+            thread::spawn(move || {
+                let db = ModDatabase::load(&game_bg);
                 let enabled_count = db.mods.iter().filter(|m| m.enabled).count();
-                status_label_c.set_text("Rebuilding deployment from enabled mod set…");
-                flush_ui_events();
-                let result = ModManager::rebuild_all(&game_c);
-                let msg = match result {
-                    Ok(()) => format!("Deployed {enabled_count} mod(s)"),
-                    Err(e) => {
-                        log::error!("Deploy error: {e}");
-                        format!("Deploy failed: {e}")
+                let result = ModManager::rebuild_all(&game_bg)
+                    .map(|()| enabled_count)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            });
+
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        let msg = match result {
+                            Ok(enabled_count) => format!("Deployed {enabled_count} mod(s)"),
+                            Err(e) => {
+                                log::error!("Deploy error: {e}");
+                                format!("Deploy failed: {e}")
+                            }
+                        };
+                        status_label_c.set_text(&msg);
+                        status_progress_c.set_fraction(1.0);
+                        status_progress_c.set_text(Some("100%"));
+                        set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
+                        hide_status_popup_later(status_revealer_c.clone());
+                        show_toast(btn.upcast_ref(), &msg);
+                        refresh_library_content_with_search(
+                            &container_c,
+                            &game_c,
+                            Rc::clone(&config_c),
+                            &search_c.borrow(),
+                            Rc::clone(&search_c),
+                            Rc::clone(&selected_c),
+                            true,
+                        );
+                        gtk4::glib::ControlFlow::Break
                     }
-                };
-                status_label_c.set_text(&msg);
-                status_progress_c.set_fraction(1.0);
-                status_progress_c.set_text(Some("100%"));
-                set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
-                hide_status_popup_later(status_revealer_c.clone());
-                show_toast(btn.upcast_ref(), &msg);
-                refresh_library_content_with_search(
-                    &container_c,
-                    &game_c,
-                    Rc::clone(&config_c),
-                    &search_c.borrow(),
-                    Rc::clone(&search_c),
-                    Rc::clone(&selected_c),
-                    true,
-                );
+                    Err(mpsc::TryRecvError::Empty) => {
+                        status_progress_c.pulse();
+                        gtk4::glib::ControlFlow::Continue
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        status_label_c.set_text("Deploy failed: background task disconnected");
+                        status_progress_c.set_fraction(1.0);
+                        status_progress_c.set_text(Some("Failed"));
+                        set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
+                        hide_status_popup_later(status_revealer_c.clone());
+                        gtk4::glib::ControlFlow::Break
+                    }
+                }
             });
         });
     }
@@ -188,6 +215,63 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn find_existing_library_view(
+    container: &gtk4::Box,
+) -> Option<(gtk4::Stack, gtk4::ListBox, gtk4::ScrolledWindow)> {
+    let stack = container
+        .first_child()
+        .and_then(|child| child.downcast::<gtk4::Stack>().ok())?;
+    let list_page = stack.child_by_name("list")?;
+    let scrolled = list_page.downcast::<gtk4::ScrolledWindow>().ok()?;
+    let clamp = scrolled.child()?.downcast::<adw::Clamp>().ok()?;
+    let list_box = clamp.child()?.downcast::<gtk4::ListBox>().ok()?;
+    Some((stack, list_box, scrolled))
+}
+
+fn ensure_library_view(
+    container: &gtk4::Box,
+) -> (gtk4::Stack, gtk4::ListBox, gtk4::ScrolledWindow) {
+    if let Some(view) = find_existing_library_view(container) {
+        return view;
+    }
+
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
+    let list_box = gtk4::ListBox::new();
+    list_box.add_css_class("boxed-list");
+    list_box.set_selection_mode(gtk4::SelectionMode::None);
+
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(900);
+    clamp.set_child(Some(&list_box));
+    clamp.set_margin_top(12);
+    clamp.set_margin_bottom(12);
+    clamp.set_margin_start(12);
+    clamp.set_margin_end(12);
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    scrolled.set_child(Some(&clamp));
+
+    let stack = gtk4::Stack::new();
+    stack.set_vexpand(true);
+    stack.add_named(&scrolled, Some("list"));
+
+    container.append(&stack);
+    (stack, list_box, scrolled)
+}
+
+fn set_library_status(stack: &gtk4::Stack, status: &adw::StatusPage) {
+    if let Some(existing) = stack.child_by_name("status") {
+        stack.remove(&existing);
+    }
+    stack.add_named(status, Some("status"));
+    stack.set_visible_child_name("status");
+}
 
 fn refresh_library_content_with_search(
     container: &gtk4::Box,
@@ -198,17 +282,11 @@ fn refresh_library_content_with_search(
     selected_mod_id: Rc<RefCell<Option<String>>>,
     do_scan: bool,
 ) {
-    let previous_scroll = container
-        .first_child()
-        .and_then(|child| child.downcast::<gtk4::ScrolledWindow>().ok())
-        .map(|scrolled| {
-            let adj = scrolled.vadjustment();
-            (adj.value(), adj.upper(), adj.page_size())
-        });
-
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
+    let (stack, list_box, scrolled) = ensure_library_view(container);
+    let previous_scroll = {
+        let adj = scrolled.vadjustment();
+        (adj.value(), adj.upper(), adj.page_size())
+    };
 
     let mut db = ModDatabase::load(game);
     if do_scan {
@@ -230,68 +308,56 @@ fn refresh_library_content_with_search(
         .collect();
 
     if visible_mods.is_empty() {
-        if !search_query.trim().is_empty() && !db.mods.is_empty() {
-            let status = adw::StatusPage::builder()
+        let status = if !search_query.trim().is_empty() && !db.mods.is_empty() {
+            adw::StatusPage::builder()
                 .title("No Matching Mods")
                 .description("No installed mods match your search.")
                 .icon_name("system-search-symbolic")
-                .build();
-            status.set_vexpand(true);
-            container.append(&status);
-            return;
-        }
-        let status = adw::StatusPage::builder()
-            .title("No Mods Installed")
-            .icon_name("package-x-generic-symbolic")
-            .build();
+                .build()
+        } else {
+            adw::StatusPage::builder()
+                .title("No Mods Installed")
+                .icon_name("package-x-generic-symbolic")
+                .build()
+        };
         status.set_vexpand(true);
-        container.append(&status);
-    } else {
-        let selected = selected_mod_id.borrow().clone();
-        let conflict_states = compute_conflict_states(&db.mods, selected.as_deref());
-
-        let list_box = gtk4::ListBox::new();
-        list_box.add_css_class("boxed-list");
-        list_box.set_selection_mode(gtk4::SelectionMode::None);
-
-        for (idx, mod_entry) in visible_mods.iter().enumerate() {
-            let row = build_mod_row(
-                mod_entry,
-                idx,
-                visible_mods.len(),
-                game,
-                container,
-                Rc::clone(&config),
-                Rc::clone(&search_state),
-                Rc::clone(&selected_mod_id),
-                conflict_states.get(&mod_entry.id),
-            );
-            list_box.append(&row);
-        }
-
-        let clamp = adw::Clamp::new();
-        clamp.set_maximum_size(900);
-        clamp.set_child(Some(&list_box));
-        clamp.set_margin_top(12);
-        clamp.set_margin_bottom(12);
-        clamp.set_margin_start(12);
-        clamp.set_margin_end(12);
-
-        let scrolled = gtk4::ScrolledWindow::new();
-        scrolled.set_vexpand(true);
-        scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-        scrolled.set_child(Some(&clamp));
-
-        container.append(&scrolled);
-        if let Some((value, _, _)) = previous_scroll {
-            let scrolled_clone = scrolled.clone();
-            gtk4::glib::idle_add_local_once(move || {
-                let adj = scrolled_clone.vadjustment();
-                let max_value = (adj.upper() - adj.page_size()).max(0.0);
-                adj.set_value(value.clamp(0.0, max_value));
-            });
-        }
+        set_library_status(&stack, &status);
+        return;
     }
+
+    if let Some(status) = stack.child_by_name("status") {
+        stack.remove(&status);
+    }
+    stack.set_visible_child_name("list");
+
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
+    }
+
+    let selected = selected_mod_id.borrow().clone();
+    let conflict_states = compute_conflict_states(&db.mods, selected.as_deref());
+
+    for (idx, mod_entry) in visible_mods.iter().enumerate() {
+        let row = build_mod_row(
+            mod_entry,
+            idx,
+            visible_mods.len(),
+            game,
+            container,
+            Rc::clone(&config),
+            Rc::clone(&search_state),
+            Rc::clone(&selected_mod_id),
+            conflict_states.get(&mod_entry.id),
+        );
+        list_box.append(&row);
+    }
+
+    let scrolled_clone = scrolled.clone();
+    gtk4::glib::idle_add_local_once(move || {
+        let adj = scrolled_clone.vadjustment();
+        let max_value = (adj.upper() - adj.page_size()).max(0.0);
+        adj.set_value(previous_scroll.0.clamp(0.0, max_value));
+    });
 }
 
 /// Toggle interactivity for Library controls during long deploy operations.
@@ -305,14 +371,6 @@ fn set_library_busy(
     search_entry.set_sensitive(sensitive);
     deploy_btn.set_sensitive(sensitive);
     content_container.set_sensitive(sensitive);
-}
-
-/// Process pending GTK events so status text updates are shown during long loops.
-fn flush_ui_events() {
-    let context = gtk4::glib::MainContext::default();
-    while context.pending() {
-        context.iteration(false);
-    }
 }
 
 fn hide_status_popup_later(status_revealer: gtk4::Revealer) {
