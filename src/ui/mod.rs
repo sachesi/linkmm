@@ -310,6 +310,35 @@ fn build_main_window(
     content_layout.append(&install_lock_revealer);
     content_layout.append(&content_stack);
 
+    let content_page = adw::NavigationPage::builder()
+        .title("Library")
+        .child(&content_layout)
+        .build();
+    split_view.set_content(Some(&content_page));
+
+    let install_locked = Rc::new(RefCell::new(false));
+    // Lock callback used by long-running tasks (downloads/install).
+    let nav_list_for_lock = nav_list.clone();
+    let active_game_row_for_lock = active_game_row.clone();
+    let play_btn_for_lock = play_btn.clone();
+    let content_stack_for_lock = content_stack.clone();
+    let content_page_for_lock = content_page.clone();
+    let install_lock_revealer_for_lock = install_lock_revealer.clone();
+    let install_locked_for_cb = Rc::clone(&install_locked);
+    let nav_lock: Rc<dyn Fn(bool)> = Rc::new(move |locked: bool| {
+        *install_locked_for_cb.borrow_mut() = locked;
+        nav_list_for_lock.set_sensitive(!locked);
+        active_game_row_for_lock.set_sensitive(!locked);
+        play_btn_for_lock.set_sensitive(!locked);
+        install_lock_revealer_for_lock.set_reveal_child(locked);
+        if locked {
+            // Safety: keep Downloads visible while install work is in flight.
+            content_page_for_lock.set_title("Downloads");
+            content_stack_for_lock.set_visible_child_name("downloads");
+            nav_list_for_lock.select_row(nav_list_for_lock.row_at_index(NAV_DOWNLOADS).as_ref());
+        }
+    });
+
     let current_game = {
         let cfg = config.borrow();
         cfg.current_game().cloned()
@@ -346,12 +375,6 @@ fn build_main_window(
         settings::build_settings_page(Rc::clone(&config), window.upcast_ref::<gtk4::Window>());
     content_stack.add_named(&preferences_widget, Some("preferences"));
 
-    let content_page = adw::NavigationPage::builder()
-        .title("Library")
-        .child(&content_layout)
-        .build();
-    split_view.set_content(Some(&content_page));
-
     // Allow mobile-like narrow layouts: collapse the sidebar when the window is small.
     split_view.add_tick_callback(|sv, _| {
         let should_collapse = sv.width() < 860;
@@ -370,29 +393,6 @@ fn build_main_window(
     nav_list.select_row(nav_list.row_at_index(NAV_LIBRARY).as_ref());
 
     // ── Navigation signal ─────────────────────────────────────────────────
-    let install_locked = Rc::new(RefCell::new(false));
-    // Lock callback used by long-running tasks (downloads/install).
-    let nav_list_for_lock = nav_list.clone();
-    let active_game_row_for_lock = active_game_row.clone();
-    let play_btn_for_lock = play_btn.clone();
-    let content_stack_for_lock = content_stack.clone();
-    let content_page_for_lock = content_page.clone();
-    let install_lock_revealer_for_lock = install_lock_revealer.clone();
-    let install_locked_for_cb = Rc::clone(&install_locked);
-    let nav_lock: Rc<dyn Fn(bool)> = Rc::new(move |locked: bool| {
-        *install_locked_for_cb.borrow_mut() = locked;
-        nav_list_for_lock.set_sensitive(!locked);
-        active_game_row_for_lock.set_sensitive(!locked);
-        play_btn_for_lock.set_sensitive(!locked);
-        install_lock_revealer_for_lock.set_reveal_child(locked);
-        if locked {
-            // Safety: keep Downloads visible while install work is in flight.
-            content_page_for_lock.set_title("Downloads");
-            content_stack_for_lock.set_visible_child_name("downloads");
-            nav_list_for_lock.select_row(nav_list_for_lock.row_at_index(NAV_DOWNLOADS).as_ref());
-        }
-    });
-
     {
         let content_stack_c = content_stack.clone();
         let content_page_c = content_page.clone();
