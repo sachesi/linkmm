@@ -12,7 +12,7 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
-use crate::core::runtime::{SessionRunMode, global_runtime_manager};
+use crate::core::runtime::global_runtime_manager;
 
 pub mod downloads;
 pub mod library;
@@ -154,6 +154,12 @@ fn build_main_window(
         play_btn.connect_clicked(move |_| {
             let game = config_c.borrow().current_game().cloned();
             let Some(g) = game else { return };
+            if g.launcher_source == GameLauncherSource::Steam {
+                if let Err(e) = crate::core::steam::launch_game(&g) {
+                    log::warn!("Could not launch {}: {e}", g.name);
+                }
+                return;
+            }
             let manager = global_runtime_manager();
             if let Some(session) = manager.current_game_session(&g.id) {
                 if let Err(e) = manager.stop_session(session.id) {
@@ -258,10 +264,12 @@ fn build_main_window(
                     game.kind.steam_app_id().is_some()
                         || game.launcher_source == GameLauncherSource::NonSteamUmu,
                 );
-                play_btn_t.set_label(match game_session {
-                    Some(s) if s.run_mode == SessionRunMode::SteamDelegated => "Stop Tracking",
-                    Some(_) => "Stop",
-                    None => "Play",
+                play_btn_t.set_label(if game.launcher_source == GameLauncherSource::Steam {
+                    "Launch"
+                } else if game_session.is_some() {
+                    "Stop"
+                } else {
+                    "Play"
                 });
                 play_btn_t.set_sensitive(true);
             }

@@ -21,7 +21,6 @@ pub enum SessionKind {
 pub enum SessionStatus {
     Starting,
     Running,
-    DelegatedRunning,
     Exited,
     Failed,
     Killed,
@@ -31,6 +30,11 @@ pub enum SessionStatus {
 pub enum SessionStream {
     Stdout,
     Stderr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRunMode {
+    FullyManaged,
 }
 
 #[derive(Debug, Clone)]
@@ -55,13 +59,6 @@ pub struct ManagedSession {
     pub run_mode: SessionRunMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionRunMode {
-    FullyManaged,
-    SteamDelegated,
-    SteamPidTracked,
-}
-
 struct SessionControl {
     child: Mutex<Option<Child>>,
     stop_requested: AtomicBool,
@@ -71,8 +68,6 @@ struct SessionRecord {
     session: ManagedSession,
     logs: VecDeque<SessionLogLine>,
     control: Arc<SessionControl>,
-    steam_app_id: Option<u32>,
-    expected_executables: Vec<String>,
 }
 
 type SessionCompletion = Box<dyn FnOnce(ExitStatus) -> Result<(), String> + Send + 'static>;
@@ -85,9 +80,6 @@ struct SessionStart {
     launcher_source: GameLauncherSource,
     command: std::process::Command,
     completion: Option<SessionCompletion>,
-    run_mode: SessionRunMode,
-    steam_app_id: Option<u32>,
-    expected_executables: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -111,12 +103,9 @@ impl RuntimeSessionManager {
     }
 
     pub fn any_active(&self) -> bool {
-        self.sessions().into_iter().any(|s| {
-            matches!(
-                s.status,
-                SessionStatus::Starting | SessionStatus::Running | SessionStatus::DelegatedRunning
-            )
-        })
+        self.sessions()
+            .into_iter()
+            .any(|s| matches!(s.status, SessionStatus::Starting | SessionStatus::Running))
     }
 
     pub fn sessions(&self) -> Vec<ManagedSession> {
@@ -146,12 +135,7 @@ impl RuntimeSessionManager {
         self.sessions().into_iter().find(|s| {
             s.kind == SessionKind::Game
                 && s.game_id == game_id
-                && matches!(
-                    s.status,
-                    SessionStatus::Starting
-                        | SessionStatus::Running
-                        | SessionStatus::DelegatedRunning
-                )
+                && matches!(s.status, SessionStatus::Starting | SessionStatus::Running)
         })
     }
 
@@ -160,52 +144,18 @@ impl RuntimeSessionManager {
             s.kind == SessionKind::Tool
                 && s.game_id == game_id
                 && s.tool_id.as_deref() == Some(tool_id)
-                && matches!(
-                    s.status,
-                    SessionStatus::Starting
-                        | SessionStatus::Running
-                        | SessionStatus::DelegatedRunning
-                )
+                && matches!(s.status, SessionStatus::Starting | SessionStatus::Running)
         })
     }
 
     pub fn stop_session(&self, id: u64) -> Result<(), String> {
-        let (control, status, mode, pid) = {
+        let control = {
             let sessions = self.inner.sessions.lock().expect("sessions lock poisoned");
-            let rec = sessions
+            sessions
                 .get(&id)
-                .ok_or_else(|| format!("Session {id} was not found"))?;
-            (
-                Arc::clone(&rec.control),
-                rec.session.status.clone(),
-                rec.session.run_mode.clone(),
-                rec.session.pid,
-            )
+                .map(|s| Arc::clone(&s.control))
+                .ok_or_else(|| format!("Session {id} was not found"))?
         };
-        if matches!(
-            status,
-            SessionStatus::DelegatedRunning | SessionStatus::Running
-        ) && matches!(mode, SessionRunMode::SteamPidTracked)
-            && let Some(root_pid) = pid
-        {
-            let _ = terminate_process_tree(root_pid);
-            let mut sessions = self.inner.sessions.lock().expect("sessions lock poisoned");
-            if let Some(rec) = sessions.get_mut(&id) {
-                rec.session.status = SessionStatus::Killed;
-            }
-            return Ok(());
-        }
-        if matches!(status, SessionStatus::DelegatedRunning)
-            && matches!(mode, SessionRunMode::SteamDelegated)
-        {
-            // Delegated Steam session without a confidently tracked game PID.
-            // Stop here means "stop tracking" rather than exact process termination.
-            let mut sessions = self.inner.sessions.lock().expect("sessions lock poisoned");
-            if let Some(rec) = sessions.get_mut(&id) {
-                rec.session.status = SessionStatus::Killed;
-            }
-            return Ok(());
-        }
         control.stop_requested.store(true, Ordering::SeqCst);
         let mut child_guard = control.child.lock().expect("child lock poisoned");
         if let Some(child) = child_guard.as_mut() {
@@ -221,42 +171,23 @@ impl RuntimeSessionManager {
         game: Game,
         profile_id: Option<String>,
     ) -> Result<u64, String> {
+        if game.launcher_source == GameLauncherSource::Steam {
+            return Err(
+                "Steam launches are launch-only and are not managed runtime sessions".to_string(),
+            );
+        }
         if self.current_game_session(&game.id).is_some() {
             return Err("A game session is already active for this game instance".to_string());
         }
 
-        let command = match game.launcher_source {
-            GameLauncherSource::Steam => crate::core::steam::launch_game_managed_command(&game)?,
-            GameLauncherSource::NonSteamUmu => {
-                let umu = game.validate_umu_setup()?;
-                let app_id = game.kind.steam_app_id().unwrap_or(0);
-                crate::core::umu::build_umu_command(
-                    &umu.exe_path,
-                    app_id,
-                    umu.prefix_path.as_deref(),
-                    umu.proton_path.as_deref(),
-                )?
-            }
-        };
-        let run_mode = if game.launcher_source == GameLauncherSource::Steam {
-            SessionRunMode::SteamDelegated
-        } else {
-            SessionRunMode::FullyManaged
-        };
-        let steam_app_id = if game.launcher_source == GameLauncherSource::Steam {
-            game.kind.steam_app_id()
-        } else {
-            None
-        };
-        let expected_executables = if game.launcher_source == GameLauncherSource::Steam {
-            game.kind
-                .expected_executable_names()
-                .iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let umu = game.validate_umu_setup()?;
+        let app_id = game.kind.steam_app_id().unwrap_or(0);
+        let command = crate::core::umu::build_umu_command(
+            &umu.exe_path,
+            app_id,
+            umu.prefix_path.as_deref(),
+            umu.proton_path.as_deref(),
+        )?;
 
         self.spawn_managed_session(SessionStart {
             kind: SessionKind::Game,
@@ -266,9 +197,6 @@ impl RuntimeSessionManager {
             launcher_source: game.launcher_source,
             command,
             completion: None,
-            run_mode,
-            steam_app_id,
-            expected_executables,
         })
         .map(|(id, _)| id)
     }
@@ -280,6 +208,9 @@ impl RuntimeSessionManager {
         tool: ToolConfig,
         run_profile: ToolRunProfile,
     ) -> Result<(u64, mpsc::Receiver<Result<ToolRunResult, String>>), String> {
+        if game.launcher_source == GameLauncherSource::Steam {
+            return Err("Steam tool launches are launch-only and not managed sessions".to_string());
+        }
         if self.current_tool_session(&game.id, &tool.id).is_some() {
             return Err(format!("Tool {} is already running", tool.name));
         }
@@ -305,7 +236,13 @@ impl RuntimeSessionManager {
             result.map(|_| ())
         });
 
-        let command = self.tool_command(&game, &tool)?;
+        let umu = game.validate_umu_setup()?;
+        let command = crate::core::umu::build_umu_command(
+            &tool.exe_path,
+            tool.app_id,
+            umu.prefix_path.as_deref(),
+            umu.proton_path.as_deref(),
+        )?;
 
         let id = self
             .spawn_managed_session(SessionStart {
@@ -316,34 +253,10 @@ impl RuntimeSessionManager {
                 launcher_source: game.launcher_source,
                 command,
                 completion: Some(completion),
-                run_mode: SessionRunMode::FullyManaged,
-                steam_app_id: None,
-                expected_executables: Vec::new(),
             })
             .map(|(id, _)| id)?;
 
         Ok((id, done_rx))
-    }
-
-    fn tool_command(
-        &self,
-        game: &Game,
-        tool: &ToolConfig,
-    ) -> Result<std::process::Command, String> {
-        match game.launcher_source {
-            GameLauncherSource::Steam => {
-                crate::core::steam::build_tool_command(&tool.exe_path, &tool.arguments, tool.app_id)
-            }
-            GameLauncherSource::NonSteamUmu => {
-                let umu = game.validate_umu_setup()?;
-                crate::core::umu::build_umu_command(
-                    &tool.exe_path,
-                    tool.app_id,
-                    umu.prefix_path.as_deref(),
-                    umu.proton_path.as_deref(),
-                )
-            }
-        }
     }
 
     fn spawn_managed_session(
@@ -383,12 +296,10 @@ impl RuntimeSessionManager {
                         started_at: SystemTime::now(),
                         status: SessionStatus::Running,
                         exit_code: None,
-                        run_mode: start.run_mode.clone(),
+                        run_mode: SessionRunMode::FullyManaged,
                     },
                     logs: VecDeque::new(),
                     control: Arc::clone(&control),
-                    steam_app_id: start.steam_app_id,
-                    expected_executables: start.expected_executables,
                 },
             );
         }
@@ -435,38 +346,16 @@ impl RuntimeSessionManager {
     ) {
         let mut next_status = SessionStatus::Failed;
         let mut exit_code = None;
-        let mut should_start_pid_tracking: Option<(u32, Vec<String>)> = None;
 
         match status_result {
             Ok(status) => {
                 exit_code = status.code();
                 let completion_result: Result<(), String> =
                     completion.map(|done| done(status)).unwrap_or(Ok(()));
-                let run_mode = self
-                    .inner
-                    .sessions
-                    .lock()
-                    .expect("sessions lock poisoned")
-                    .get(&id)
-                    .map(|r| r.session.run_mode.clone());
                 next_status = if completion_result.is_err() {
                     SessionStatus::Failed
                 } else if stop_requested {
                     SessionStatus::Killed
-                } else if matches!(run_mode, Some(SessionRunMode::SteamDelegated))
-                    && status.success()
-                {
-                    should_start_pid_tracking = self
-                        .inner
-                        .sessions
-                        .lock()
-                        .expect("sessions lock poisoned")
-                        .get(&id)
-                        .and_then(|r| {
-                            r.steam_app_id
-                                .map(|appid| (appid, r.expected_executables.clone()))
-                        });
-                    SessionStatus::DelegatedRunning
                 } else if status.success() {
                     SessionStatus::Exited
                 } else {
@@ -483,40 +372,6 @@ impl RuntimeSessionManager {
             record.session.status = next_status;
             record.session.exit_code = exit_code;
         }
-        drop(sessions);
-        if let Some((app_id, expected_executables)) = should_start_pid_tracking {
-            self.spawn_steam_pid_tracking(id, app_id, expected_executables);
-        }
-    }
-
-    fn spawn_steam_pid_tracking(&self, id: u64, app_id: u32, expected_executables: Vec<String>) {
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            for _ in 0..20 {
-                if let Some(pid) = find_steam_game_pid(app_id, &expected_executables) {
-                    let mut sessions = manager
-                        .inner
-                        .sessions
-                        .lock()
-                        .expect("sessions lock poisoned");
-                    if let Some(rec) = sessions.get_mut(&id)
-                        && rec.session.status == SessionStatus::DelegatedRunning
-                    {
-                        rec.session.pid = Some(pid);
-                        rec.session.run_mode = SessionRunMode::SteamPidTracked;
-                        rec.logs.push_back(SessionLogLine {
-                            stream: SessionStream::Stdout,
-                            at: SystemTime::now(),
-                            message: format!(
-                                "Upgraded delegated Steam session to PID-tracked mode (pid {pid})"
-                            ),
-                        });
-                    }
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        });
     }
 
     fn spawn_log_reader<R: std::io::Read + Send + 'static>(
@@ -553,170 +408,6 @@ impl RuntimeSessionManager {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ProcCandidate {
-    cmdline: String,
-    exe_name: String,
-    cwd: String,
-    ppid: Option<u32>,
-}
-
-fn find_steam_game_pid(app_id: u32, expected_executables: &[String]) -> Option<u32> {
-    let needle = app_id.to_string();
-    let proc_root = std::path::Path::new("/proc");
-    let entries = std::fs::read_dir(proc_root).ok()?;
-    let mut best: Option<(u32, i32)> = None;
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Ok(pid) = file_name.to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        if let Some(candidate) = read_proc_candidate(&entry.path()) {
-            let score = score_candidate(&candidate, &needle, expected_executables);
-            if score >= 60 {
-                if let Some((_, best_score)) = best {
-                    if score > best_score {
-                        best = Some((pid, score));
-                    }
-                } else {
-                    best = Some((pid, score));
-                }
-            }
-        }
-    }
-    best.map(|(pid, _)| pid)
-}
-
-fn read_proc_candidate(proc_dir: &std::path::Path) -> Option<ProcCandidate> {
-    let cmd_bytes = std::fs::read(proc_dir.join("cmdline")).ok()?;
-    if cmd_bytes.is_empty() {
-        return None;
-    }
-    let cmdline = String::from_utf8_lossy(&cmd_bytes).replace('\0', " ");
-    let exe_name = std::fs::read_link(proc_dir.join("exe"))
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .unwrap_or_default();
-    let cwd = std::fs::read_link(proc_dir.join("cwd"))
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let ppid = read_ppid_from_stat(proc_dir.join("stat"));
-    Some(ProcCandidate {
-        cmdline,
-        exe_name,
-        cwd,
-        ppid,
-    })
-}
-
-fn score_candidate(
-    candidate: &ProcCandidate,
-    app_id: &str,
-    expected_executables: &[String],
-) -> i32 {
-    let mut score = 0;
-    let cmd = candidate.cmdline.to_lowercase();
-    let exe = candidate.exe_name.to_lowercase();
-    let cwd = candidate.cwd.to_lowercase();
-    if cmd.contains(&format!("compatdata/{app_id}")) {
-        score += 25;
-    }
-    if cmd.contains(&format!("steam_appid={app_id}")) || cmd.contains(&format!("appid {app_id}")) {
-        score += 30;
-    }
-    if cwd.contains(&format!("compatdata/{app_id}")) {
-        score += 18;
-    }
-    if expected_executables
-        .iter()
-        .any(|n| exe == *n || cmd.contains(n))
-    {
-        score += 45;
-    }
-    if cmd.contains("proton") || cmd.contains("pressure-vessel") {
-        score += 10;
-    }
-    if cmd.contains("steamwebhelper") || cmd.contains("gamescope-session") {
-        score -= 40;
-    }
-    if cmd.starts_with("steam ") || exe == "steam" {
-        score -= 20;
-    }
-    if candidate.ppid.is_some() {
-        score += 3;
-    }
-    score
-}
-
-fn read_ppid_from_stat(stat_path: std::path::PathBuf) -> Option<u32> {
-    let stat = std::fs::read_to_string(stat_path).ok()?;
-    let parts: Vec<&str> = stat.split_whitespace().collect();
-    parts.get(3).and_then(|v| v.parse::<u32>().ok())
-}
-
-fn terminate_process_tree(root_pid: u32) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        let mut pids = collect_descendants(root_pid);
-        pids.push(root_pid);
-        for pid in &pids {
-            let _ = std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .status();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        for pid in &pids {
-            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                let _ = std::process::Command::new("kill")
-                    .arg("-KILL")
-                    .arg(pid.to_string())
-                    .status();
-            }
-        }
-        return Ok(());
-    }
-    #[allow(unreachable_code)]
-    Err("Process-tree termination is not implemented on this platform".to_string())
-}
-
-fn collect_descendants(root_pid: u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut stack = vec![root_pid];
-    while let Some(parent) = stack.pop() {
-        for child in children_of(parent) {
-            out.push(child);
-            stack.push(child);
-        }
-    }
-    out
-}
-
-fn children_of(parent_pid: u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let stat_path = entry.path().join("stat");
-        let Ok(stat) = std::fs::read_to_string(stat_path) else {
-            continue;
-        };
-        let parts: Vec<&str> = stat.split_whitespace().collect();
-        if parts.len() > 4
-            && let Ok(ppid) = parts[3].parse::<u32>()
-            && ppid == parent_pid
-        {
-            out.push(pid);
-        }
-    }
-    out
-}
-
 impl Default for RuntimeSessionManager {
     fn default() -> Self {
         Self::new()
@@ -743,12 +434,9 @@ mod tests {
                 game_id: "g".to_string(),
                 profile_id: Some("p".to_string()),
                 tool_id: Some("t".to_string()),
-                launcher_source: GameLauncherSource::Steam,
+                launcher_source: GameLauncherSource::NonSteamUmu,
                 command: cmd,
                 completion: None,
-                run_mode: SessionRunMode::FullyManaged,
-                steam_app_id: None,
-                expected_executables: Vec::new(),
             })
             .unwrap();
         assert!(manager.any_active());
@@ -772,12 +460,9 @@ mod tests {
                 game_id: "g".to_string(),
                 profile_id: None,
                 tool_id: None,
-                launcher_source: GameLauncherSource::Steam,
+                launcher_source: GameLauncherSource::NonSteamUmu,
                 command: cmd,
                 completion: None,
-                run_mode: SessionRunMode::FullyManaged,
-                steam_app_id: None,
-                expected_executables: Vec::new(),
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -787,110 +472,10 @@ mod tests {
     }
 
     #[test]
-    fn delegated_session_stays_active_after_wrapper_exit() {
+    fn steam_launches_are_not_managed_sessions() {
         let manager = RuntimeSessionManager::new();
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg("echo delegated");
-        let (id, _) = manager
-            .spawn_managed_session(SessionStart {
-                kind: SessionKind::Game,
-                game_id: "g".to_string(),
-                profile_id: None,
-                tool_id: None,
-                launcher_source: GameLauncherSource::Steam,
-                command: cmd,
-                completion: None,
-                run_mode: SessionRunMode::SteamDelegated,
-                steam_app_id: Some(489830),
-                expected_executables: vec!["skyrimse.exe".to_string()],
-            })
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        let s = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
-        assert_eq!(s.status, SessionStatus::DelegatedRunning);
-        assert!(manager.current_game_session("g").is_some());
-    }
-
-    #[test]
-    fn stopping_delegated_session_marks_killed() {
-        let manager = RuntimeSessionManager::new();
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg("true");
-        let (id, _) = manager
-            .spawn_managed_session(SessionStart {
-                kind: SessionKind::Game,
-                game_id: "g".to_string(),
-                profile_id: None,
-                tool_id: None,
-                launcher_source: GameLauncherSource::Steam,
-                command: cmd,
-                completion: None,
-                run_mode: SessionRunMode::SteamDelegated,
-                steam_app_id: Some(489830),
-                expected_executables: vec!["skyrimse.exe".to_string()],
-            })
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        manager.stop_session(id).unwrap();
-        let s = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
-        assert_eq!(s.status, SessionStatus::Killed);
-    }
-
-    #[test]
-    fn stop_on_pid_tracked_session_uses_process_kill_path() {
-        let manager = RuntimeSessionManager::new();
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg("sleep 20");
-        let (id, _) = manager
-            .spawn_managed_session(SessionStart {
-                kind: SessionKind::Game,
-                game_id: "g".to_string(),
-                profile_id: None,
-                tool_id: None,
-                launcher_source: GameLauncherSource::Steam,
-                command: cmd,
-                completion: None,
-                run_mode: SessionRunMode::SteamPidTracked,
-                steam_app_id: Some(489830),
-                expected_executables: vec!["skyrimse.exe".to_string()],
-            })
-            .unwrap();
-        manager.stop_session(id).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let s = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
-        assert_eq!(s.status, SessionStatus::Killed);
-    }
-
-    #[test]
-    fn scoring_prefers_expected_game_executable_name() {
-        let good = ProcCandidate {
-            cmdline: "/game/SkyrimSE.exe -arg".to_string(),
-            exe_name: "SkyrimSE.exe".to_string(),
-            cwd: "/prefix/compatdata/489830/pfx".to_string(),
-            ppid: Some(1),
-        };
-        let bad = ProcCandidate {
-            cmdline: "/game/Fallout4.exe".to_string(),
-            exe_name: "Fallout4.exe".to_string(),
-            cwd: "/prefix/compatdata/489830/pfx".to_string(),
-            ppid: Some(1),
-        };
-        let expected = vec!["skyrimse.exe".to_string(), "skse64_loader.exe".to_string()];
-        assert!(
-            score_candidate(&good, "489830", &expected)
-                > score_candidate(&bad, "489830", &expected)
-        );
-    }
-
-    #[test]
-    fn wrong_game_executable_is_not_high_confidence() {
-        let wrong = ProcCandidate {
-            cmdline: "/game/Fallout4.exe".to_string(),
-            exe_name: "Fallout4.exe".to_string(),
-            cwd: "/tmp".to_string(),
-            ppid: Some(1),
-        };
-        let expected = vec!["skyrimse.exe".to_string(), "skse64_loader.exe".to_string()];
-        assert!(score_candidate(&wrong, "489830", &expected) < 60);
+        let game = Game::new_steam(crate::core::games::GameKind::SkyrimSE, "/tmp/game".into());
+        let err = manager.start_game_session(game, None).unwrap_err();
+        assert!(err.contains("launch-only"));
     }
 }

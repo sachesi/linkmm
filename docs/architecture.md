@@ -76,9 +76,12 @@ This source drives:
 
 No launch behavior is inferred from optional fields alone.
 
-## 7. Managed runtime sessions
+## 7. Managed runtime sessions (UMU/direct only)
 
-Game launches and tool launches now run through `core::runtime::RuntimeSessionManager`.
+Only directly-owned launches run through `core::runtime::RuntimeSessionManager`:
+
+- Non-Steam UMU game launches
+- Non-Steam UMU tool launches
 
 The manager is the single source of truth for launch state and stores:
 
@@ -94,21 +97,12 @@ The manager is the single source of truth for launch state and stores:
 - exit code
 
 It also owns per-session rolling log buffers for stdout/stderr capture.
-Steam sessions can be either:
-
-- direct child managed (`Running`) when LinkMM owns a stable process handle
-- delegated (`DelegatedRunning`) when Steam handoff succeeds but the launcher wrapper is short-lived
-- best-effort PID-tracked (`SteamPidTracked`) when delegated Steam handoff is later upgraded by
-  runtime heuristics that identify a likely real game process
 
 ## 8. Stop semantics
 
 - Tool sessions are launched as tracked child processes and can be stopped from LinkMM.
 - Non-Steam UMU game sessions are launched as tracked child processes and can be stopped from LinkMM.
-- Steam game sessions use backend-specific managed commands:
+- Steam game sessions are launch-only (not runtime-owned) with backend-specific launch commands:
   - native Steam installs: `steam -applaunch <app_id>`
   - Flatpak Steam installs: `flatpak run com.valvesoftware.Steam -applaunch <app_id>`
-- Stop targets the spawned Steam wrapper process. Steam can re-parent the real game process, so
-  stop/kill visibility for both native and Flatpak Steam sessions is inherently best-effort.
-- For PID-tracked Steam sessions, LinkMM attempts game-tree termination (`SIGTERM` then `SIGKILL`)
-  on the tracked process tree. This remains heuristic under Flatpak/pressure-vessel.
+- Steam Stop semantics are intentionally not exposed as exact process ownership in LinkMM runtime.
