@@ -341,19 +341,36 @@ fn capture_row_offset_in_viewport(container: &gtk4::Box, row_key: &str) -> Optio
 }
 
 fn update_library_row_positions_in_place(list_box: &gtk4::ListBox) {
+    let mut total = 0usize;
+    let mut cursor = list_box.first_child();
+    while let Some(widget) = cursor {
+        total += 1;
+        cursor = widget.next_sibling();
+    }
+
     let mut idx = 0usize;
     let mut child = list_box.first_child();
     while let Some(widget) = child {
         idx += 1;
-        let mut inner = widget.first_child();
-        while let Some(desc) = inner {
-            if let Ok(label) = desc.clone().downcast::<gtk4::Label>()
+        let mut stack = vec![widget.clone()];
+        while let Some(node) = stack.pop() {
+            if let Ok(label) = node.clone().downcast::<gtk4::Label>()
                 && label.has_css_class("numeric")
             {
                 label.set_text(&idx.to_string());
-                break;
             }
-            inner = desc.next_sibling();
+            if let Ok(button) = node.clone().downcast::<gtk4::Button>() {
+                match button.tooltip_text().as_deref() {
+                    Some("Move up") => button.set_sensitive(idx > 1),
+                    Some("Move down") => button.set_sensitive(idx < total),
+                    _ => {}
+                }
+            }
+            let mut inner = node.first_child();
+            while let Some(desc) = inner {
+                stack.push(desc.clone());
+                inner = desc.next_sibling();
+            }
         }
         child = widget.next_sibling();
     }
@@ -403,6 +420,23 @@ fn move_library_row_in_place(container: &gtk4::Box, source_id: &str, target_id: 
     list_box.insert(&source_row, insert_pos);
     update_library_row_positions_in_place(&list_box);
     true
+}
+
+fn visible_neighbor_mod_id(container: &gtk4::Box, mod_id: &str, delta: i32) -> Option<String> {
+    let (_, list_box, _) = find_existing_library_view(container)?;
+    let row = find_row_by_key(&list_box, &library_row_key(mod_id))?;
+    let mut pos = 0i32;
+    let mut child = list_box.first_child();
+    while let Some(widget) = child {
+        if widget == row {
+            break;
+        }
+        pos += 1;
+        child = widget.next_sibling();
+    }
+    let target = list_box.row_at_index(pos + delta)?;
+    let key = target.widget_name();
+    key.strip_prefix("library:").map(|s| s.to_string())
 }
 
 fn refresh_library_content_with_search(
@@ -621,6 +655,7 @@ fn build_mod_row(
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let mod_id_c = mod_entry.id.clone();
         up_btn.connect_clicked(move |_| {
+            let target_visible = visible_neighbor_mod_id(&container_c, &mod_id_c, -1);
             let mut db = ModDatabase::load(&game_c);
             if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
                 && pos > 0
@@ -635,17 +670,23 @@ fn build_mod_row(
                     align_ratio: 0.35,
                     preferred_row_offset: None,
                 });
-                refresh_library_content_with_search(
-                    &container_c,
-                    &game_c,
-                    Rc::clone(&config_c),
-                    &search_c.borrow(),
-                    Rc::clone(&search_c),
-                    Rc::clone(&selected_c),
-                    Rc::clone(&anchor_c),
-                    Rc::clone(&drag_scroll_c),
-                    false,
-                );
+                let did_move = target_visible
+                    .as_deref()
+                    .map(|target| move_library_row_in_place(&container_c, &mod_id_c, target))
+                    .unwrap_or(false);
+                if !did_move {
+                    refresh_library_content_with_search(
+                        &container_c,
+                        &game_c,
+                        Rc::clone(&config_c),
+                        &search_c.borrow(),
+                        Rc::clone(&search_c),
+                        Rc::clone(&selected_c),
+                        Rc::clone(&anchor_c),
+                        Rc::clone(&drag_scroll_c),
+                        false,
+                    );
+                }
             }
         });
     }
@@ -660,6 +701,7 @@ fn build_mod_row(
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let mod_id_c = mod_entry.id.clone();
         down_btn.connect_clicked(move |_| {
+            let target_visible = visible_neighbor_mod_id(&container_c, &mod_id_c, 1);
             let mut db = ModDatabase::load(&game_c);
             let len = db.mods.len();
             if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
@@ -675,17 +717,23 @@ fn build_mod_row(
                     align_ratio: 0.35,
                     preferred_row_offset: None,
                 });
-                refresh_library_content_with_search(
-                    &container_c,
-                    &game_c,
-                    Rc::clone(&config_c),
-                    &search_c.borrow(),
-                    Rc::clone(&search_c),
-                    Rc::clone(&selected_c),
-                    Rc::clone(&anchor_c),
-                    Rc::clone(&drag_scroll_c),
-                    false,
-                );
+                let did_move = target_visible
+                    .as_deref()
+                    .map(|target| move_library_row_in_place(&container_c, &mod_id_c, target))
+                    .unwrap_or(false);
+                if !did_move {
+                    refresh_library_content_with_search(
+                        &container_c,
+                        &game_c,
+                        Rc::clone(&config_c),
+                        &search_c.borrow(),
+                        Rc::clone(&search_c),
+                        Rc::clone(&selected_c),
+                        Rc::clone(&anchor_c),
+                        Rc::clone(&drag_scroll_c),
+                        false,
+                    );
+                }
             }
         });
     }
