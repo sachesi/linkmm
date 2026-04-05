@@ -16,8 +16,8 @@ use crate::core::config::AppConfig;
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 use crate::ui::drag_autoscroll::{
-    DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, attach_viewport_drag_autoscroll,
-    stop_drag_autoscroll,
+    DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction,
+    attach_viewport_drag_autoscroll, stop_drag_autoscroll,
 };
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
@@ -376,8 +376,13 @@ fn update_library_row_positions_in_place(list_box: &gtk4::ListBox) {
     }
 }
 
-fn move_library_row_in_place(container: &gtk4::Box, source_id: &str, target_id: &str) -> bool {
-    let Some((_, list_box, _)) = find_existing_library_view(container) else {
+fn move_library_row_in_place(
+    container: &gtk4::Box,
+    source_id: &str,
+    target_id: &str,
+    desired_row_offset: Option<f64>,
+) -> bool {
+    let Some((_, list_box, scrolled)) = find_existing_library_view(container) else {
         return false;
     };
     let source_key = library_row_key(source_id);
@@ -419,6 +424,20 @@ fn move_library_row_in_place(container: &gtk4::Box, source_id: &str, target_id: 
     list_box.remove(&source_row);
     list_box.insert(&source_row, insert_pos);
     update_library_row_positions_in_place(&list_box);
+    if let Some(desired_offset) = desired_row_offset
+        && let Some(moved_row) = find_row_by_key(&list_box, &source_key)
+        && let Some(current_row_y) = widget_y_in_scrolled(&moved_row, &scrolled)
+    {
+        let adj = scrolled.vadjustment();
+        let corrected = apply_row_offset_correction(
+            adj.value(),
+            adj.upper(),
+            adj.page_size(),
+            current_row_y,
+            desired_offset,
+        );
+        adj.set_value(corrected);
+    }
     true
 }
 
@@ -656,6 +675,8 @@ fn build_mod_row(
         let mod_id_c = mod_entry.id.clone();
         up_btn.connect_clicked(move |_| {
             let target_visible = visible_neighbor_mod_id(&container_c, &mod_id_c, -1);
+            let row_offset_before_move =
+                capture_row_offset_in_viewport(&container_c, &library_row_key(&mod_id_c));
             let mut db = ModDatabase::load(&game_c);
             if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
                 && pos > 0
@@ -672,7 +693,14 @@ fn build_mod_row(
                 });
                 let did_move = target_visible
                     .as_deref()
-                    .map(|target| move_library_row_in_place(&container_c, &mod_id_c, target))
+                    .map(|target| {
+                        move_library_row_in_place(
+                            &container_c,
+                            &mod_id_c,
+                            target,
+                            row_offset_before_move,
+                        )
+                    })
                     .unwrap_or(false);
                 if !did_move {
                     refresh_library_content_with_search(
@@ -702,6 +730,8 @@ fn build_mod_row(
         let mod_id_c = mod_entry.id.clone();
         down_btn.connect_clicked(move |_| {
             let target_visible = visible_neighbor_mod_id(&container_c, &mod_id_c, 1);
+            let row_offset_before_move =
+                capture_row_offset_in_viewport(&container_c, &library_row_key(&mod_id_c));
             let mut db = ModDatabase::load(&game_c);
             let len = db.mods.len();
             if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
@@ -719,7 +749,14 @@ fn build_mod_row(
                 });
                 let did_move = target_visible
                     .as_deref()
-                    .map(|target| move_library_row_in_place(&container_c, &mod_id_c, target))
+                    .map(|target| {
+                        move_library_row_in_place(
+                            &container_c,
+                            &mod_id_c,
+                            target,
+                            row_offset_before_move,
+                        )
+                    })
                     .unwrap_or(false);
                 if !did_move {
                     refresh_library_content_with_search(
@@ -794,7 +831,12 @@ fn build_mod_row(
                     align_ratio: 0.35,
                     preferred_row_offset: row_offset_before_drop,
                 });
-                if !move_library_row_in_place(&container_drop, &source_id, &target_id) {
+                if !move_library_row_in_place(
+                    &container_drop,
+                    &source_id,
+                    &target_id,
+                    row_offset_before_drop,
+                ) {
                     refresh_library_content_with_search(
                         &container_drop,
                         &game_drop,

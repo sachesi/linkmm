@@ -53,6 +53,17 @@ pub fn apply_scroll_step(current_value: f64, upper: f64, page_size: f64, step: f
     (current_value + step).clamp(0.0, max_value)
 }
 
+pub fn apply_row_offset_correction(
+    current_value: f64,
+    upper: f64,
+    page_size: f64,
+    current_row_y: f64,
+    desired_row_y: f64,
+) -> f64 {
+    let delta = current_row_y - desired_row_y;
+    apply_scroll_step(current_value, upper, page_size, delta)
+}
+
 pub fn stop_drag_autoscroll(state: &Rc<RefCell<EdgeAutoScrollState>>) {
     state.borrow_mut().step_px_per_tick = 0.0;
 }
@@ -108,8 +119,8 @@ pub fn attach_viewport_drag_autoscroll(
 #[cfg(test)]
 mod tests {
     use super::{
-        EdgeAutoScrollConfig, EdgeAutoScrollState, apply_scroll_step, compute_edge_scroll_step,
-        stop_drag_autoscroll,
+        EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction, apply_scroll_step,
+        compute_edge_scroll_step, stop_drag_autoscroll,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -146,5 +157,17 @@ mod tests {
         }));
         stop_drag_autoscroll(&state);
         assert_eq!(state.borrow().step_px_per_tick, 0.0);
+    }
+
+    #[test]
+    fn row_offset_correction_applies_delta_and_clamps() {
+        assert_eq!(
+            apply_row_offset_correction(50.0, 400.0, 100.0, 220.0, 180.0),
+            90.0
+        );
+        assert_eq!(
+            apply_row_offset_correction(5.0, 120.0, 100.0, 20.0, 80.0),
+            0.0
+        );
     }
 }

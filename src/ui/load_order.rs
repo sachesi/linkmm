@@ -10,8 +10,8 @@ use libadwaita::prelude::*;
 use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, PluginFile};
 use crate::ui::drag_autoscroll::{
-    DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, attach_viewport_drag_autoscroll,
-    stop_drag_autoscroll,
+    DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction,
+    attach_viewport_drag_autoscroll, stop_drag_autoscroll,
 };
 
 #[derive(Debug, Clone)]
@@ -287,8 +287,9 @@ fn move_load_order_row_in_place(
     container: &gtk4::Box,
     source_name: &str,
     target_name: &str,
+    desired_row_offset: Option<f64>,
 ) -> bool {
-    let Some((_, list_box, _)) = find_existing_load_order_view(container) else {
+    let Some((_, list_box, scrolled)) = find_existing_load_order_view(container) else {
         return false;
     };
     let source_key = load_order_row_key(source_name);
@@ -327,6 +328,20 @@ fn move_load_order_row_in_place(
     list_box.remove(&source_row);
     list_box.insert(&source_row, insert_pos);
     update_load_order_row_positions_in_place(&list_box);
+    if let Some(desired_offset) = desired_row_offset
+        && let Some(moved_row) = find_row_by_key(&list_box, &source_key)
+        && let Some(current_row_y) = widget_y_in_scrolled(&moved_row, &scrolled)
+    {
+        let adj = scrolled.vadjustment();
+        let corrected = apply_row_offset_correction(
+            adj.value(),
+            adj.upper(),
+            adj.page_size(),
+            current_row_y,
+            desired_offset,
+        );
+        adj.set_value(corrected);
+    }
     true
 }
 
@@ -574,6 +589,8 @@ fn build_plugin_row(
         let plugin_name = plugin.name.clone();
         up_btn.connect_clicked(move |_| {
             let target_visible = visible_neighbor_plugin_name(&container_c, &plugin_name, -1);
+            let row_offset_before_move =
+                capture_row_offset_in_viewport(&container_c, &load_order_row_key(&plugin_name));
             let mut db = ModDatabase::load(&game_c);
             let mut ordered = db.get_ordered_plugins(&game_c);
             // Only move within the non-vanilla section
@@ -594,7 +611,14 @@ fn build_plugin_row(
                 });
                 let did_move = target_visible
                     .as_deref()
-                    .map(|target| move_load_order_row_in_place(&container_c, &plugin_name, target))
+                    .map(|target| {
+                        move_load_order_row_in_place(
+                            &container_c,
+                            &plugin_name,
+                            target,
+                            row_offset_before_move,
+                        )
+                    })
                     .unwrap_or(false);
                 if !did_move {
                     refresh_load_order_content(
@@ -619,6 +643,8 @@ fn build_plugin_row(
         let plugin_name = plugin.name.clone();
         down_btn.connect_clicked(move |_| {
             let target_visible = visible_neighbor_plugin_name(&container_c, &plugin_name, 1);
+            let row_offset_before_move =
+                capture_row_offset_in_viewport(&container_c, &load_order_row_key(&plugin_name));
             let mut db = ModDatabase::load(&game_c);
             let mut ordered = db.get_ordered_plugins(&game_c);
             let len = ordered.len();
@@ -639,7 +665,14 @@ fn build_plugin_row(
                 });
                 let did_move = target_visible
                     .as_deref()
-                    .map(|target| move_load_order_row_in_place(&container_c, &plugin_name, target))
+                    .map(|target| {
+                        move_load_order_row_in_place(
+                            &container_c,
+                            &plugin_name,
+                            target,
+                            row_offset_before_move,
+                        )
+                    })
                     .unwrap_or(false);
                 if !did_move {
                     refresh_load_order_content(
@@ -714,7 +747,12 @@ fn build_plugin_row(
                     align_ratio: 0.35,
                     preferred_row_offset: row_offset_before_drop,
                 });
-                if !move_load_order_row_in_place(&container_drop, &source_name, &target_name) {
+                if !move_load_order_row_in_place(
+                    &container_drop,
+                    &source_name,
+                    &target_name,
+                    row_offset_before_drop,
+                ) {
                     refresh_load_order_content(
                         &container_drop,
                         &game_drop,
