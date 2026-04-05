@@ -640,7 +640,7 @@ fn show_install_dialog(
     status_ctx.revealer.set_reveal_child(true);
     status_ctx
         .label
-        .set_text("Extracting archive to mods directory…");
+        .set_text("Extracting archive to mods directory… Navigation is locked until install finishes or is canceled.");
     status_ctx.progress.set_fraction(0.0);
     status_ctx.progress.set_text(Some("Extracting…"));
 
