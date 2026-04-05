@@ -15,6 +15,7 @@ use crate::core::mods::ModDatabase;
 use crate::core::runtime::global_runtime_manager;
 
 pub mod downloads;
+pub mod drag_autoscroll;
 pub mod library;
 pub mod load_order;
 pub mod logs;

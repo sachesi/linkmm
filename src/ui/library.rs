@@ -15,12 +15,13 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
+use crate::ui::drag_autoscroll::{
+    DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, attach_viewport_drag_autoscroll,
+    stop_drag_autoscroll,
+};
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
 const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
-const DRAG_EDGE_THRESHOLD_PX: f64 = 56.0;
-const DRAG_MAX_SCROLL_STEP_PX: f64 = 22.0;
-const DRAG_SCROLL_TICK_MS: u64 = 16;
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
@@ -34,12 +35,6 @@ struct ConflictState {
 struct ViewportAnchor {
     item_key: String,
     align_ratio: f64,
-}
-
-#[derive(Debug, Default)]
-struct DragAutoScrollState {
-    step_px_per_tick: f64,
-    ticking: bool,
 }
 
 /// Build the full Library page for `game`.
@@ -261,6 +256,7 @@ fn find_existing_library_view(
 
 fn ensure_library_view(
     container: &gtk4::Box,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) -> (gtk4::Stack, gtk4::ListBox, gtk4::ScrolledWindow) {
     if let Some(view) = find_existing_library_view(container) {
         return view;
@@ -286,6 +282,12 @@ fn ensure_library_view(
     scrolled.set_vexpand(true);
     scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
     scrolled.set_child(Some(&clamp));
+    attach_viewport_drag_autoscroll(
+        &scrolled,
+        drag_autoscroll,
+        EdgeAutoScrollConfig::default(),
+        DEFAULT_TICK_MS,
+    );
 
     let stack = gtk4::Stack::new();
     stack.set_vexpand(true);
@@ -324,50 +326,6 @@ fn widget_y_in_scrolled(widget: &gtk4::Widget, scrolled: &gtk4::ScrolledWindow) 
         .map(|point| point.y() as f64)
 }
 
-fn drag_scroll_step(pointer_y: f64, height: f64) -> f64 {
-    if height <= 0.0 {
-        return 0.0;
-    }
-    if pointer_y < DRAG_EDGE_THRESHOLD_PX {
-        let strength = (DRAG_EDGE_THRESHOLD_PX - pointer_y) / DRAG_EDGE_THRESHOLD_PX;
-        return -DRAG_MAX_SCROLL_STEP_PX * strength.clamp(0.0, 1.0);
-    }
-    let bottom_start = (height - DRAG_EDGE_THRESHOLD_PX).max(0.0);
-    if pointer_y > bottom_start {
-        let strength = (pointer_y - bottom_start) / DRAG_EDGE_THRESHOLD_PX;
-        return DRAG_MAX_SCROLL_STEP_PX * strength.clamp(0.0, 1.0);
-    }
-    0.0
-}
-
-fn set_drag_scroll_step(
-    scrolled: &gtk4::ScrolledWindow,
-    auto_scroll: Rc<RefCell<DragAutoScrollState>>,
-    step: f64,
-) {
-    auto_scroll.borrow_mut().step_px_per_tick = step;
-    if auto_scroll.borrow().ticking {
-        return;
-    }
-    auto_scroll.borrow_mut().ticking = true;
-    let scrolled_c = scrolled.clone();
-    gtk4::glib::timeout_add_local(
-        std::time::Duration::from_millis(DRAG_SCROLL_TICK_MS),
-        move || {
-            let step = auto_scroll.borrow().step_px_per_tick;
-            if step.abs() < f64::EPSILON {
-                auto_scroll.borrow_mut().ticking = false;
-                return gtk4::glib::ControlFlow::Break;
-            }
-            let adj = scrolled_c.vadjustment();
-            let max_value = (adj.upper() - adj.page_size()).max(0.0);
-            let next = (adj.value() + step).clamp(0.0, max_value);
-            adj.set_value(next);
-            gtk4::glib::ControlFlow::Continue
-        },
-    );
-}
-
 fn refresh_library_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -379,7 +337,7 @@ fn refresh_library_content_with_search(
     drag_autoscroll: Rc<RefCell<DragAutoScrollState>>,
     do_scan: bool,
 ) {
-    let (stack, list_box, scrolled) = ensure_library_view(container);
+    let (stack, list_box, scrolled) = ensure_library_view(container, Rc::clone(&drag_autoscroll));
     let previous_scroll = {
         let adj = scrolled.vadjustment();
         (adj.value(), adj.upper(), adj.page_size())
@@ -680,32 +638,8 @@ fn build_mod_row(
         let anchor_drop = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_drop = Rc::clone(&drag_autoscroll);
         let target_id = mod_entry.id.clone();
-        let row_c = row.clone();
-        let container_for_motion = container_drop.clone();
-        let drag_scroll_motion = Rc::clone(&drag_scroll_drop);
-        drop_target.connect_motion(move |_, _, y| {
-            if let Some((_, _, scrolled)) = find_existing_library_view(&container_for_motion)
-                && let Some(point) =
-                    row_c.compute_point(&scrolled, &graphene::Point::new(0.0, y as f32))
-            {
-                let step = drag_scroll_step(point.y() as f64, scrolled.height() as f64);
-                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_motion), step);
-            }
-            gdk::DragAction::MOVE
-        });
-        let drag_scroll_leave = Rc::clone(&drag_autoscroll);
-        let container_leave = container.clone();
-        drop_target.connect_leave(move |_| {
-            if let Some((_, _, scrolled)) = find_existing_library_view(&container_leave) {
-                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_leave), 0.0);
-            }
-        });
-        let container_for_drop = container_drop.clone();
-        let drag_scroll_drop_c = Rc::clone(&drag_scroll_drop);
         drop_target.connect_drop(move |_, value, _, _| {
-            if let Some((_, _, scrolled)) = find_existing_library_view(&container_for_drop) {
-                set_drag_scroll_step(&scrolled, Rc::clone(&drag_scroll_drop_c), 0.0);
-            }
+            stop_drag_autoscroll(&drag_scroll_drop);
             let Ok(source_id) = value.get::<String>() else {
                 return false;
             };
@@ -1456,7 +1390,7 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_insert_pos, compute_conflict_states, drag_scroll_step, matches_query};
+    use super::{adjusted_insert_pos, compute_conflict_states, matches_query};
     use crate::core::mods::Mod;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1486,14 +1420,6 @@ mod tests {
     fn adjusted_insert_pos_accounts_for_source_removal() {
         assert_eq!(adjusted_insert_pos(0, 2), 1);
         assert_eq!(adjusted_insert_pos(3, 1), 1);
-    }
-
-    #[test]
-    fn drag_scroll_step_accelerates_near_edges() {
-        let height = 600.0;
-        assert!(drag_scroll_step(8.0, height) < 0.0);
-        assert!(drag_scroll_step(height - 8.0, height) > 0.0);
-        assert_eq!(drag_scroll_step(height / 2.0, height), 0.0);
     }
 
     #[test]
