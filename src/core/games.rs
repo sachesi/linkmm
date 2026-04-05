@@ -205,6 +205,27 @@ impl GameKind {
             _ => None,
         }
     }
+
+    /// Canonical game and common loader executable names for this game kind.
+    pub fn expected_executable_names(&self) -> &'static [&'static str] {
+        match self {
+            GameKind::SkyrimSE => &["SkyrimSE.exe", "SkyrimSELauncher.exe", "skse64_loader.exe"],
+            GameKind::SkyrimVR => &["SkyrimVR.exe", "sksevr_loader.exe"],
+            GameKind::SkyrimLE => &["TESV.exe", "SkyrimLauncher.exe", "skse_loader.exe"],
+            GameKind::Oblivion => &["Oblivion.exe", "OblivionLauncher.exe", "obse_loader.exe"],
+            GameKind::Morrowind => &["Morrowind.exe", "Morrowind Launcher.exe", "MWSE.exe"],
+            GameKind::Fallout4 => &["Fallout4.exe", "Fallout4Launcher.exe", "f4se_loader.exe"],
+            GameKind::Fallout4VR => &["Fallout4VR.exe", "f4sevr_loader.exe"],
+            GameKind::FalloutNV => &[
+                "FalloutNV.exe",
+                "FalloutNVLauncher.exe",
+                "nvse_loader.exe",
+                "xnvse_loader.exe",
+            ],
+            GameKind::Fallout3 => &["Fallout3.exe", "FalloutLauncher.exe", "fose_loader.exe"],
+            GameKind::Starfield => &["Starfield.exe", "sfse_loader.exe"],
+        }
+    }
 }
 
 /// Configuration for launching a game through umu-launcher (non-Steam).
@@ -552,5 +573,16 @@ mod tests {
             },
         );
         assert_eq!(game.plugins_txt_dir(), Some(target));
+    }
+
+    #[test]
+    fn expected_executable_names_include_script_extender_loaders() {
+        let skyrim = GameKind::SkyrimSE.expected_executable_names();
+        assert!(skyrim.contains(&"SkyrimSE.exe"));
+        assert!(skyrim.contains(&"skse64_loader.exe"));
+
+        let fallout4 = GameKind::Fallout4.expected_executable_names();
+        assert!(fallout4.contains(&"Fallout4.exe"));
+        assert!(fallout4.contains(&"f4se_loader.exe"));
     }
 }
