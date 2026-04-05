@@ -891,7 +891,7 @@ fn build_mod_row(
             } else {
                 sync_library_reorder_async(
                     source_id,
-                    target_id,
+                    target_id.clone(),
                     Rc::clone(&game_drop),
                     container_drop.clone(),
                     Rc::clone(&config_drop),

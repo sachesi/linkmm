@@ -788,7 +788,7 @@ fn build_plugin_row(
             } else {
                 sync_load_order_reorder_async(
                     source_name,
-                    target_name,
+                    target_name.clone(),
                     Rc::clone(&game_drop),
                     container_drop.clone(),
                     Rc::clone(&search_drop),
