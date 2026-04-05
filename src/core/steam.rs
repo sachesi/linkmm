@@ -515,7 +515,7 @@ pub fn launch_game_managed_command(
         .kind
         .steam_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
-    let command = match select_managed_steam_backend(is_steam_flatpak(), steam_binary_on_path()) {
+    let command = match select_managed_steam_backend(is_steam_flatpak(), detect_steam_path_kind()) {
         ManagedSteamBackend::Flatpak => launch_game_managed_flatpak_command(app_id),
         ManagedSteamBackend::Native => launch_game_managed_native_command(app_id),
         ManagedSteamBackend::XdgOpenFallback => {
@@ -534,20 +534,47 @@ enum ManagedSteamBackend {
     XdgOpenFallback,
 }
 
-fn select_managed_steam_backend(is_flatpak: bool, steam_on_path: bool) -> ManagedSteamBackend {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteamPathKind {
+    Native,
+    FlatpakWrapper,
+    Missing,
+}
+
+fn select_managed_steam_backend(is_flatpak: bool, path_kind: SteamPathKind) -> ManagedSteamBackend {
     if is_flatpak {
         ManagedSteamBackend::Flatpak
-    } else if steam_on_path {
-        ManagedSteamBackend::Native
     } else {
-        ManagedSteamBackend::XdgOpenFallback
+        match path_kind {
+            SteamPathKind::Native => ManagedSteamBackend::Native,
+            SteamPathKind::FlatpakWrapper => ManagedSteamBackend::Flatpak,
+            SteamPathKind::Missing => ManagedSteamBackend::XdgOpenFallback,
+        }
     }
 }
 
-fn steam_binary_on_path() -> bool {
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join("steam").is_file()))
-        .unwrap_or(false)
+fn detect_steam_path_kind() -> SteamPathKind {
+    let Some(path_env) = std::env::var_os("PATH") else {
+        return SteamPathKind::Missing;
+    };
+    for dir in std::env::split_paths(&path_env) {
+        let steam = dir.join("steam");
+        if !steam.is_file() {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(&steam).unwrap_or(steam.clone());
+        let canonical_str = canonical.to_string_lossy().to_lowercase();
+        if canonical_str.contains("flatpak") {
+            return SteamPathKind::FlatpakWrapper;
+        }
+        if let Ok(contents) = std::fs::read_to_string(&steam)
+            && contents.contains("com.valvesoftware.Steam")
+        {
+            return SteamPathKind::FlatpakWrapper;
+        }
+        return SteamPathKind::Native;
+    }
+    SteamPathKind::Missing
 }
 
 fn launch_game_managed_native_command(app_id: u32) -> std::process::Command {
@@ -977,11 +1004,11 @@ mod tests {
     #[test]
     fn managed_backend_selection_prefers_flatpak_when_detected() {
         assert_eq!(
-            select_managed_steam_backend(true, true),
+            select_managed_steam_backend(true, SteamPathKind::Native),
             ManagedSteamBackend::Flatpak
         );
         assert_eq!(
-            select_managed_steam_backend(true, false),
+            select_managed_steam_backend(true, SteamPathKind::Missing),
             ManagedSteamBackend::Flatpak
         );
     }
@@ -989,7 +1016,7 @@ mod tests {
     #[test]
     fn managed_backend_selection_uses_native_when_available() {
         assert_eq!(
-            select_managed_steam_backend(false, true),
+            select_managed_steam_backend(false, SteamPathKind::Native),
             ManagedSteamBackend::Native
         );
     }
@@ -997,8 +1024,16 @@ mod tests {
     #[test]
     fn managed_backend_selection_uses_xdg_open_only_as_last_resort() {
         assert_eq!(
-            select_managed_steam_backend(false, false),
+            select_managed_steam_backend(false, SteamPathKind::Missing),
             ManagedSteamBackend::XdgOpenFallback
+        );
+    }
+
+    #[test]
+    fn managed_backend_selection_uses_flatpak_for_flatpak_wrapper_on_path() {
+        assert_eq!(
+            select_managed_steam_backend(false, SteamPathKind::FlatpakWrapper),
+            ManagedSteamBackend::Flatpak
         );
     }
 
@@ -1032,10 +1067,7 @@ mod tests {
     #[test]
     fn split_launch_arguments_preserves_quoted_spaces() {
         let args = split_launch_arguments(r#"-flag "value one" --path '/tmp/tool dir'"#).unwrap();
-        assert_eq!(
-            args,
-            vec!["-flag", "value one", "--path", "/tmp/tool dir"]
-        );
+        assert_eq!(args, vec!["-flag", "value one", "--path", "/tmp/tool dir"]);
     }
 
     #[test]

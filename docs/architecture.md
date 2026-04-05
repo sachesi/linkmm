@@ -94,6 +94,10 @@ The manager is the single source of truth for launch state and stores:
 - exit code
 
 It also owns per-session rolling log buffers for stdout/stderr capture.
+Steam sessions can be either:
+
+- direct child managed (`Running`) when LinkMM owns a stable process handle
+- delegated (`DelegatedRunning`) when Steam handoff succeeds but the launcher wrapper is short-lived
 
 ## 8. Stop semantics
 

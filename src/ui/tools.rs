@@ -679,7 +679,10 @@ fn launch_tool(
     glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
         let manager = global_runtime_manager();
         if let Some(s) = manager.current_tool_session(&game_id, &tool_id)
-            && matches!(s.status, SessionStatus::Running | SessionStatus::Starting)
+            && matches!(
+                s.status,
+                SessionStatus::Running | SessionStatus::Starting | SessionStatus::DelegatedRunning
+            )
         {
             btn_c.set_icon_name("media-playback-stop-symbolic");
             btn_c.set_tooltip_text(Some("Stop Tool"));
