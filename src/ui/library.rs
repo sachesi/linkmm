@@ -458,6 +458,61 @@ fn visible_neighbor_mod_id(container: &gtk4::Box, mod_id: &str, delta: i32) -> O
     key.strip_prefix("library:").map(|s| s.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn sync_library_reorder_async(
+    source_id: String,
+    target_id: String,
+    game: Rc<Game>,
+    container: gtk4::Box,
+    config: Rc<RefCell<AppConfig>>,
+    search_state: Rc<RefCell<String>>,
+    selected_mod_id: Rc<RefCell<Option<String>>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
+) {
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    let game_bg = (*game).clone();
+    thread::spawn(move || {
+        let mut db = ModDatabase::load(&game_bg);
+        let res = if let (Some(src_pos), Some(tgt_pos)) = (
+            db.mods.iter().position(|m| m.id == source_id),
+            db.mods.iter().position(|m| m.id == target_id),
+        ) {
+            let moved = db.mods.remove(src_pos);
+            let insert_pos = adjusted_insert_pos(src_pos, tgt_pos);
+            db.mods.insert(insert_pos, moved);
+            db.save(&game_bg);
+            ModManager::rebuild_all(&game_bg).map_err(|e| e.to_string())
+        } else {
+            Err("reorder target not found".to_string())
+        };
+        let _ = tx.send(res);
+    });
+
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
+        match rx.try_recv() {
+            Ok(Ok(())) => gtk4::glib::ControlFlow::Break,
+            Ok(Err(err)) => {
+                log::error!("Library reorder sync failed: {err}");
+                refresh_library_content_with_search(
+                    &container,
+                    &game,
+                    Rc::clone(&config),
+                    &search_state.borrow(),
+                    Rc::clone(&search_state),
+                    Rc::clone(&selected_mod_id),
+                    Rc::clone(&pending_viewport_anchor),
+                    Rc::clone(&drag_autoscroll),
+                    false,
+                );
+                gtk4::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => gtk4::glib::ControlFlow::Break,
+        }
+    });
+}
+
 fn refresh_library_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -677,31 +732,18 @@ fn build_mod_row(
             let target_visible = visible_neighbor_mod_id(&container_c, &mod_id_c, -1);
             let row_offset_before_move =
                 capture_row_offset_in_viewport(&container_c, &library_row_key(&mod_id_c));
-            let mut db = ModDatabase::load(&game_c);
-            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
-                && pos > 0
-            {
-                db.mods.swap(pos, pos - 1);
-                db.save(&game_c);
-                if let Err(e) = ModManager::rebuild_all(&game_c) {
-                    log::error!("Failed to rebuild deployment after reorder: {e}");
-                }
+            if let Some(target_id) = target_visible {
                 *anchor_c.borrow_mut() = Some(ViewportAnchor {
                     item_key: mod_id_c.clone(),
                     align_ratio: 0.35,
                     preferred_row_offset: None,
                 });
-                let did_move = target_visible
-                    .as_deref()
-                    .map(|target| {
-                        move_library_row_in_place(
-                            &container_c,
-                            &mod_id_c,
-                            target,
-                            row_offset_before_move,
-                        )
-                    })
-                    .unwrap_or(false);
+                let did_move = move_library_row_in_place(
+                    &container_c,
+                    &mod_id_c,
+                    &target_id,
+                    row_offset_before_move,
+                );
                 if !did_move {
                     refresh_library_content_with_search(
                         &container_c,
@@ -713,6 +755,18 @@ fn build_mod_row(
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         false,
+                    );
+                } else {
+                    sync_library_reorder_async(
+                        mod_id_c.clone(),
+                        target_id,
+                        Rc::clone(&game_c),
+                        container_c.clone(),
+                        Rc::clone(&config_c),
+                        Rc::clone(&search_c),
+                        Rc::clone(&selected_c),
+                        Rc::clone(&anchor_c),
+                        Rc::clone(&drag_scroll_c),
                     );
                 }
             }
@@ -732,32 +786,18 @@ fn build_mod_row(
             let target_visible = visible_neighbor_mod_id(&container_c, &mod_id_c, 1);
             let row_offset_before_move =
                 capture_row_offset_in_viewport(&container_c, &library_row_key(&mod_id_c));
-            let mut db = ModDatabase::load(&game_c);
-            let len = db.mods.len();
-            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
-                && pos + 1 < len
-            {
-                db.mods.swap(pos, pos + 1);
-                db.save(&game_c);
-                if let Err(e) = ModManager::rebuild_all(&game_c) {
-                    log::error!("Failed to rebuild deployment after reorder: {e}");
-                }
+            if let Some(target_id) = target_visible {
                 *anchor_c.borrow_mut() = Some(ViewportAnchor {
                     item_key: mod_id_c.clone(),
                     align_ratio: 0.35,
                     preferred_row_offset: None,
                 });
-                let did_move = target_visible
-                    .as_deref()
-                    .map(|target| {
-                        move_library_row_in_place(
-                            &container_c,
-                            &mod_id_c,
-                            target,
-                            row_offset_before_move,
-                        )
-                    })
-                    .unwrap_or(false);
+                let did_move = move_library_row_in_place(
+                    &container_c,
+                    &mod_id_c,
+                    &target_id,
+                    row_offset_before_move,
+                );
                 if !did_move {
                     refresh_library_content_with_search(
                         &container_c,
@@ -769,6 +809,18 @@ fn build_mod_row(
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         false,
+                    );
+                } else {
+                    sync_library_reorder_async(
+                        mod_id_c.clone(),
+                        target_id,
+                        Rc::clone(&game_c),
+                        container_c.clone(),
+                        Rc::clone(&config_c),
+                        Rc::clone(&search_c),
+                        Rc::clone(&selected_c),
+                        Rc::clone(&anchor_c),
+                        Rc::clone(&drag_scroll_c),
                     );
                 }
             }
@@ -814,41 +866,40 @@ fn build_mod_row(
             }
             let row_offset_before_drop =
                 capture_row_offset_in_viewport(&container_drop, &library_row_key(&source_id));
-            let mut db = ModDatabase::load(&game_drop);
-            if let (Some(src_pos), Some(tgt_pos)) = (
-                db.mods.iter().position(|m| m.id == source_id),
-                db.mods.iter().position(|m| m.id == target_id),
+            *anchor_drop.borrow_mut() = Some(ViewportAnchor {
+                item_key: source_id.clone(),
+                align_ratio: 0.35,
+                preferred_row_offset: row_offset_before_drop,
+            });
+            if !move_library_row_in_place(
+                &container_drop,
+                &source_id,
+                &target_id,
+                row_offset_before_drop,
             ) {
-                let moved = db.mods.remove(src_pos);
-                let insert_pos = adjusted_insert_pos(src_pos, tgt_pos);
-                db.mods.insert(insert_pos, moved);
-                db.save(&game_drop);
-                if let Err(e) = ModManager::rebuild_all(&game_drop) {
-                    log::error!("Failed to rebuild deployment after drag reorder: {e}");
-                }
-                *anchor_drop.borrow_mut() = Some(ViewportAnchor {
-                    item_key: source_id.clone(),
-                    align_ratio: 0.35,
-                    preferred_row_offset: row_offset_before_drop,
-                });
-                if !move_library_row_in_place(
+                refresh_library_content_with_search(
                     &container_drop,
-                    &source_id,
-                    &target_id,
-                    row_offset_before_drop,
-                ) {
-                    refresh_library_content_with_search(
-                        &container_drop,
-                        &game_drop,
-                        Rc::clone(&config_drop),
-                        &search_drop.borrow(),
-                        Rc::clone(&search_drop),
-                        Rc::clone(&selected_drop),
-                        Rc::clone(&anchor_drop),
-                        Rc::clone(&drag_scroll_drop),
-                        false,
-                    );
-                }
+                    &game_drop,
+                    Rc::clone(&config_drop),
+                    &search_drop.borrow(),
+                    Rc::clone(&search_drop),
+                    Rc::clone(&selected_drop),
+                    Rc::clone(&anchor_drop),
+                    Rc::clone(&drag_scroll_drop),
+                    false,
+                );
+            } else {
+                sync_library_reorder_async(
+                    source_id,
+                    target_id,
+                    Rc::clone(&game_drop),
+                    container_drop.clone(),
+                    Rc::clone(&config_drop),
+                    Rc::clone(&search_drop),
+                    Rc::clone(&selected_drop),
+                    Rc::clone(&anchor_drop),
+                    Rc::clone(&drag_scroll_drop),
+                );
             }
             true
         });

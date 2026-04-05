@@ -368,6 +368,60 @@ fn visible_neighbor_plugin_name(
         .map(|s| s.to_string())
 }
 
+fn sync_load_order_reorder_async(
+    source_name: String,
+    target_name: String,
+    game: Rc<Game>,
+    container: gtk4::Box,
+    search_state: Rc<RefCell<String>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let game_bg = (*game).clone();
+    std::thread::spawn(move || {
+        let mut db = ModDatabase::load(&game_bg);
+        let result = if let (Some(src_pos), Some(tgt_pos)) = (
+            db.get_ordered_plugins(&game_bg)
+                .iter()
+                .position(|p| p.name == source_name),
+            db.get_ordered_plugins(&game_bg)
+                .iter()
+                .position(|p| p.name == target_name),
+        ) {
+            let mut ordered = db.get_ordered_plugins(&game_bg);
+            let plugin = ordered.remove(src_pos);
+            let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &ordered);
+            ordered.insert(insert_pos, plugin);
+            db.set_plugin_order(&ordered);
+            db.save(&game_bg);
+            db.write_plugins_txt(&game_bg).map_err(|e| e.to_string())
+        } else {
+            Err("reorder target not found".to_string())
+        };
+        let _ = tx.send(result.map(|_| ()));
+    });
+
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
+        match rx.try_recv() {
+            Ok(Ok(())) => gtk4::glib::ControlFlow::Break,
+            Ok(Err(err)) => {
+                log::error!("Load order reorder sync failed: {err}");
+                refresh_load_order_content(
+                    &container,
+                    &game,
+                    Rc::clone(&search_state),
+                    Rc::clone(&pending_viewport_anchor),
+                    Rc::clone(&drag_autoscroll),
+                );
+                gtk4::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => gtk4::glib::ControlFlow::Break,
+        }
+    });
+}
+
 fn refresh_load_order_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -591,39 +645,32 @@ fn build_plugin_row(
             let target_visible = visible_neighbor_plugin_name(&container_c, &plugin_name, -1);
             let row_offset_before_move =
                 capture_row_offset_in_viewport(&container_c, &load_order_row_key(&plugin_name));
-            let mut db = ModDatabase::load(&game_c);
-            let mut ordered = db.get_ordered_plugins(&game_c);
-            // Only move within the non-vanilla section
-            if let Some(pos) = ordered
-                .iter()
-                .position(|p| p.name == plugin_name && !p.is_vanilla)
-                && pos > 0
-                && !ordered[pos - 1].is_vanilla
-            {
-                ordered.swap(pos, pos - 1);
-                db.set_plugin_order(&ordered);
-                db.save(&game_c);
-                let _ = db.write_plugins_txt(&game_c);
+            if let Some(target_name) = target_visible {
                 *anchor_c.borrow_mut() = Some(ViewportAnchor {
                     item_key: plugin_name.clone(),
                     align_ratio: 0.35,
                     preferred_row_offset: None,
                 });
-                let did_move = target_visible
-                    .as_deref()
-                    .map(|target| {
-                        move_load_order_row_in_place(
-                            &container_c,
-                            &plugin_name,
-                            target,
-                            row_offset_before_move,
-                        )
-                    })
-                    .unwrap_or(false);
+                let did_move = move_load_order_row_in_place(
+                    &container_c,
+                    &plugin_name,
+                    &target_name,
+                    row_offset_before_move,
+                );
                 if !did_move {
                     refresh_load_order_content(
                         &container_c,
                         &game_c,
+                        Rc::clone(&search_c),
+                        Rc::clone(&anchor_c),
+                        Rc::clone(&drag_scroll_c),
+                    );
+                } else {
+                    sync_load_order_reorder_async(
+                        plugin_name.clone(),
+                        target_name,
+                        Rc::clone(&game_c),
+                        container_c.clone(),
                         Rc::clone(&search_c),
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
@@ -645,39 +692,32 @@ fn build_plugin_row(
             let target_visible = visible_neighbor_plugin_name(&container_c, &plugin_name, 1);
             let row_offset_before_move =
                 capture_row_offset_in_viewport(&container_c, &load_order_row_key(&plugin_name));
-            let mut db = ModDatabase::load(&game_c);
-            let mut ordered = db.get_ordered_plugins(&game_c);
-            let len = ordered.len();
-            if let Some(pos) = ordered
-                .iter()
-                .position(|p| p.name == plugin_name && !p.is_vanilla)
-                && pos + 1 < len
-                && !ordered[pos + 1].is_vanilla
-            {
-                ordered.swap(pos, pos + 1);
-                db.set_plugin_order(&ordered);
-                db.save(&game_c);
-                let _ = db.write_plugins_txt(&game_c);
+            if let Some(target_name) = target_visible {
                 *anchor_c.borrow_mut() = Some(ViewportAnchor {
                     item_key: plugin_name.clone(),
                     align_ratio: 0.35,
                     preferred_row_offset: None,
                 });
-                let did_move = target_visible
-                    .as_deref()
-                    .map(|target| {
-                        move_load_order_row_in_place(
-                            &container_c,
-                            &plugin_name,
-                            target,
-                            row_offset_before_move,
-                        )
-                    })
-                    .unwrap_or(false);
+                let did_move = move_load_order_row_in_place(
+                    &container_c,
+                    &plugin_name,
+                    &target_name,
+                    row_offset_before_move,
+                );
                 if !did_move {
                     refresh_load_order_content(
                         &container_c,
                         &game_c,
+                        Rc::clone(&search_c),
+                        Rc::clone(&anchor_c),
+                        Rc::clone(&drag_scroll_c),
+                    );
+                } else {
+                    sync_load_order_reorder_async(
+                        plugin_name.clone(),
+                        target_name,
+                        Rc::clone(&game_c),
+                        container_c.clone(),
                         Rc::clone(&search_c),
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
@@ -727,40 +767,34 @@ fn build_plugin_row(
             }
             let row_offset_before_drop =
                 capture_row_offset_in_viewport(&container_drop, &load_order_row_key(&source_name));
-            let mut db = ModDatabase::load(&game_drop);
-            let mut ordered = db.get_ordered_plugins(&game_drop);
-            if let (Some(src_pos), Some(tgt_pos)) = (
-                ordered.iter().position(|p| p.name == source_name),
-                ordered.iter().position(|p| p.name == target_name),
-            ) && !ordered[src_pos].is_vanilla
-                && !ordered[tgt_pos].is_vanilla
-            {
-                let plugin_to_move = ordered.remove(src_pos);
-                // After removal the indices above src_pos shift down by one
-                let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &ordered);
-                ordered.insert(insert_pos, plugin_to_move);
-                db.set_plugin_order(&ordered);
-                db.save(&game_drop);
-                let _ = db.write_plugins_txt(&game_drop);
-                *anchor_drop.borrow_mut() = Some(ViewportAnchor {
-                    item_key: source_name.clone(),
-                    align_ratio: 0.35,
-                    preferred_row_offset: row_offset_before_drop,
-                });
-                if !move_load_order_row_in_place(
+            *anchor_drop.borrow_mut() = Some(ViewportAnchor {
+                item_key: source_name.clone(),
+                align_ratio: 0.35,
+                preferred_row_offset: row_offset_before_drop,
+            });
+            if !move_load_order_row_in_place(
+                &container_drop,
+                &source_name,
+                &target_name,
+                row_offset_before_drop,
+            ) {
+                refresh_load_order_content(
                     &container_drop,
-                    &source_name,
-                    &target_name,
-                    row_offset_before_drop,
-                ) {
-                    refresh_load_order_content(
-                        &container_drop,
-                        &game_drop,
-                        Rc::clone(&search_drop),
-                        Rc::clone(&anchor_drop),
-                        Rc::clone(&drag_scroll_drop),
-                    );
-                }
+                    &game_drop,
+                    Rc::clone(&search_drop),
+                    Rc::clone(&anchor_drop),
+                    Rc::clone(&drag_scroll_drop),
+                );
+            } else {
+                sync_load_order_reorder_async(
+                    source_name,
+                    target_name,
+                    Rc::clone(&game_drop),
+                    container_drop.clone(),
+                    Rc::clone(&search_drop),
+                    Rc::clone(&anchor_drop),
+                    Rc::clone(&drag_scroll_drop),
+                );
             }
             true
         });
