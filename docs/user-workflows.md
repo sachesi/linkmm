@@ -27,6 +27,7 @@
 6. On some Steam/Flatpak setups LinkMM tracks a delegated Steam session state
    (handoff acknowledged, best-effort stop) when a stable long-lived child process
    is not directly ownable.
+7. If delegated Steam tracking is active, the control is shown as “Stop Tracking”.
 
 ## UI lock during active sessions
 

@@ -52,6 +52,14 @@ pub struct ManagedSession {
     pub started_at: SystemTime,
     pub status: SessionStatus,
     pub exit_code: Option<i32>,
+    pub run_mode: SessionRunMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRunMode {
+    FullyManaged,
+    SteamDelegated,
+    SteamPidTracked,
 }
 
 struct SessionControl {
@@ -63,15 +71,7 @@ struct SessionRecord {
     session: ManagedSession,
     logs: VecDeque<SessionLogLine>,
     control: Arc<SessionControl>,
-    delegated_stop: Option<DelegatedStopKind>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DelegatedStopKind {
-    SteamFlatpak,
-    SteamNativeOrXdg,
-    #[cfg(test)]
-    NoopTest,
+    steam_app_id: Option<u32>,
 }
 
 type SessionCompletion = Box<dyn FnOnce(ExitStatus) -> Result<(), String> + Send + 'static>;
@@ -84,7 +84,8 @@ struct SessionStart {
     launcher_source: GameLauncherSource,
     command: std::process::Command,
     completion: Option<SessionCompletion>,
-    delegated_stop: Option<DelegatedStopKind>,
+    run_mode: SessionRunMode,
+    steam_app_id: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -167,21 +168,36 @@ impl RuntimeSessionManager {
     }
 
     pub fn stop_session(&self, id: u64) -> Result<(), String> {
-        let (control, delegated_stop, status) = {
+        let (control, status, mode, pid) = {
             let sessions = self.inner.sessions.lock().expect("sessions lock poisoned");
             let rec = sessions
                 .get(&id)
                 .ok_or_else(|| format!("Session {id} was not found"))?;
             (
                 Arc::clone(&rec.control),
-                rec.delegated_stop,
                 rec.session.status.clone(),
+                rec.session.run_mode.clone(),
+                rec.session.pid,
             )
         };
-        if matches!(status, SessionStatus::DelegatedRunning)
-            && let Some(kind) = delegated_stop
+        if matches!(
+            status,
+            SessionStatus::DelegatedRunning | SessionStatus::Running
+        ) && matches!(mode, SessionRunMode::SteamPidTracked)
+            && let Some(root_pid) = pid
         {
-            self.stop_delegated_session(kind)?;
+            let _ = terminate_process_tree(root_pid);
+            let mut sessions = self.inner.sessions.lock().expect("sessions lock poisoned");
+            if let Some(rec) = sessions.get_mut(&id) {
+                rec.session.status = SessionStatus::Killed;
+            }
+            return Ok(());
+        }
+        if matches!(status, SessionStatus::DelegatedRunning)
+            && matches!(mode, SessionRunMode::SteamDelegated)
+        {
+            // Delegated Steam session without a confidently tracked game PID.
+            // Stop here means "stop tracking" rather than exact process termination.
             let mut sessions = self.inner.sessions.lock().expect("sessions lock poisoned");
             if let Some(rec) = sessions.get_mut(&id) {
                 rec.session.status = SessionStatus::Killed;
@@ -195,29 +211,6 @@ impl RuntimeSessionManager {
                 .kill()
                 .map_err(|e| format!("Failed to stop session {id}: {e}"))?;
         }
-        Ok(())
-    }
-
-    fn stop_delegated_session(&self, kind: DelegatedStopKind) -> Result<(), String> {
-        let mut command = match kind {
-            DelegatedStopKind::SteamFlatpak => {
-                let mut cmd = std::process::Command::new("flatpak");
-                cmd.arg("run")
-                    .arg("com.valvesoftware.Steam")
-                    .arg("-shutdown");
-                cmd
-            }
-            DelegatedStopKind::SteamNativeOrXdg => {
-                let mut cmd = std::process::Command::new("steam");
-                cmd.arg("-shutdown");
-                cmd
-            }
-            #[cfg(test)]
-            DelegatedStopKind::NoopTest => return Ok(()),
-        };
-        command
-            .spawn()
-            .map_err(|e| format!("Failed issuing delegated Steam stop command: {e}"))?;
         Ok(())
     }
 
@@ -243,15 +236,13 @@ impl RuntimeSessionManager {
                 )?
             }
         };
-        let delegated_stop = if game.launcher_source == GameLauncherSource::Steam {
-            let program = command.get_program().to_string_lossy();
-            if program == "flatpak" {
-                Some(DelegatedStopKind::SteamFlatpak)
-            } else if program == "xdg-open" {
-                Some(DelegatedStopKind::SteamNativeOrXdg)
-            } else {
-                None
-            }
+        let run_mode = if game.launcher_source == GameLauncherSource::Steam {
+            SessionRunMode::SteamDelegated
+        } else {
+            SessionRunMode::FullyManaged
+        };
+        let steam_app_id = if game.launcher_source == GameLauncherSource::Steam {
+            game.kind.steam_app_id()
         } else {
             None
         };
@@ -264,7 +255,8 @@ impl RuntimeSessionManager {
             launcher_source: game.launcher_source,
             command,
             completion: None,
-            delegated_stop,
+            run_mode,
+            steam_app_id,
         })
         .map(|(id, _)| id)
     }
@@ -312,7 +304,8 @@ impl RuntimeSessionManager {
                 launcher_source: game.launcher_source,
                 command,
                 completion: Some(completion),
-                delegated_stop: None,
+                run_mode: SessionRunMode::FullyManaged,
+                steam_app_id: None,
             })
             .map(|(id, _)| id)?;
 
@@ -377,10 +370,11 @@ impl RuntimeSessionManager {
                         started_at: SystemTime::now(),
                         status: SessionStatus::Running,
                         exit_code: None,
+                        run_mode: start.run_mode.clone(),
                     },
                     logs: VecDeque::new(),
                     control: Arc::clone(&control),
-                    delegated_stop: start.delegated_stop,
+                    steam_app_id: start.steam_app_id,
                 },
             );
         }
@@ -427,26 +421,34 @@ impl RuntimeSessionManager {
     ) {
         let mut next_status = SessionStatus::Failed;
         let mut exit_code = None;
+        let mut should_start_pid_tracking = None;
 
         match status_result {
             Ok(status) => {
                 exit_code = status.code();
                 let completion_result: Result<(), String> =
                     completion.map(|done| done(status)).unwrap_or(Ok(()));
-                next_status = if completion_result.is_err() {
-                    SessionStatus::Failed
-                } else if stop_requested {
-                    SessionStatus::Killed
-                } else if self
+                let run_mode = self
                     .inner
                     .sessions
                     .lock()
                     .expect("sessions lock poisoned")
                     .get(&id)
-                    .and_then(|r| r.delegated_stop)
-                    .is_some()
+                    .map(|r| r.session.run_mode.clone());
+                next_status = if completion_result.is_err() {
+                    SessionStatus::Failed
+                } else if stop_requested {
+                    SessionStatus::Killed
+                } else if matches!(run_mode, Some(SessionRunMode::SteamDelegated))
                     && status.success()
                 {
+                    should_start_pid_tracking = self
+                        .inner
+                        .sessions
+                        .lock()
+                        .expect("sessions lock poisoned")
+                        .get(&id)
+                        .and_then(|r| r.steam_app_id);
                     SessionStatus::DelegatedRunning
                 } else if status.success() {
                     SessionStatus::Exited
@@ -464,6 +466,40 @@ impl RuntimeSessionManager {
             record.session.status = next_status;
             record.session.exit_code = exit_code;
         }
+        drop(sessions);
+        if let Some(app_id) = should_start_pid_tracking {
+            self.spawn_steam_pid_tracking(id, app_id);
+        }
+    }
+
+    fn spawn_steam_pid_tracking(&self, id: u64, app_id: u32) {
+        let manager = self.clone();
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                if let Some(pid) = find_steam_game_pid(app_id) {
+                    let mut sessions = manager
+                        .inner
+                        .sessions
+                        .lock()
+                        .expect("sessions lock poisoned");
+                    if let Some(rec) = sessions.get_mut(&id)
+                        && rec.session.status == SessionStatus::DelegatedRunning
+                    {
+                        rec.session.pid = Some(pid);
+                        rec.session.run_mode = SessionRunMode::SteamPidTracked;
+                        rec.logs.push_back(SessionLogLine {
+                            stream: SessionStream::Stdout,
+                            at: SystemTime::now(),
+                            message: format!(
+                                "Upgraded delegated Steam session to PID-tracked mode (pid {pid})"
+                            ),
+                        });
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
     }
 
     fn spawn_log_reader<R: std::io::Read + Send + 'static>(
@@ -500,6 +536,102 @@ impl RuntimeSessionManager {
     }
 }
 
+fn find_steam_game_pid(app_id: u32) -> Option<u32> {
+    let needle = app_id.to_string();
+    let proc_root = std::path::Path::new("/proc");
+    let entries = std::fs::read_dir(proc_root).ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Ok(pid) = file_name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(cmd_bytes) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        if cmd_bytes.is_empty() {
+            continue;
+        }
+        let cmd = String::from_utf8_lossy(&cmd_bytes).replace('\0', " ");
+        let low = cmd.to_lowercase();
+        if low.contains(&format!("compatdata/{needle}"))
+            || low.contains(&format!("steam_appid={needle}"))
+            || low.contains(&needle)
+        {
+            if low.contains("steam ")
+                || low.contains("steamwebhelper")
+                || low.contains("pressure-vessel-wrap")
+            {
+                continue;
+            }
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn terminate_process_tree(root_pid: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut pids = collect_descendants(root_pid);
+        pids.push(root_pid);
+        for pid in &pids {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        for pid in &pids {
+            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                let _ = std::process::Command::new("kill")
+                    .arg("-KILL")
+                    .arg(pid.to_string())
+                    .status();
+            }
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err("Process-tree termination is not implemented on this platform".to_string())
+}
+
+fn collect_descendants(root_pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut stack = vec![root_pid];
+    while let Some(parent) = stack.pop() {
+        for child in children_of(parent) {
+            out.push(child);
+            stack.push(child);
+        }
+    }
+    out
+}
+
+fn children_of(parent_pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let stat_path = entry.path().join("stat");
+        let Ok(stat) = std::fs::read_to_string(stat_path) else {
+            continue;
+        };
+        let parts: Vec<&str> = stat.split_whitespace().collect();
+        if parts.len() > 4
+            && let Ok(ppid) = parts[3].parse::<u32>()
+            && ppid == parent_pid
+        {
+            out.push(pid);
+        }
+    }
+    out
+}
+
 impl Default for RuntimeSessionManager {
     fn default() -> Self {
         Self::new()
@@ -529,7 +661,8 @@ mod tests {
                 launcher_source: GameLauncherSource::Steam,
                 command: cmd,
                 completion: None,
-                delegated_stop: None,
+                run_mode: SessionRunMode::FullyManaged,
+                steam_app_id: None,
             })
             .unwrap();
         assert!(manager.any_active());
@@ -556,7 +689,8 @@ mod tests {
                 launcher_source: GameLauncherSource::Steam,
                 command: cmd,
                 completion: None,
-                delegated_stop: None,
+                run_mode: SessionRunMode::FullyManaged,
+                steam_app_id: None,
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -579,7 +713,8 @@ mod tests {
                 launcher_source: GameLauncherSource::Steam,
                 command: cmd,
                 completion: None,
-                delegated_stop: Some(DelegatedStopKind::NoopTest),
+                run_mode: SessionRunMode::SteamDelegated,
+                steam_app_id: Some(489830),
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -602,11 +737,36 @@ mod tests {
                 launcher_source: GameLauncherSource::Steam,
                 command: cmd,
                 completion: None,
-                delegated_stop: Some(DelegatedStopKind::NoopTest),
+                run_mode: SessionRunMode::SteamDelegated,
+                steam_app_id: Some(489830),
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         manager.stop_session(id).unwrap();
+        let s = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(s.status, SessionStatus::Killed);
+    }
+
+    #[test]
+    fn stop_on_pid_tracked_session_uses_process_kill_path() {
+        let manager = RuntimeSessionManager::new();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 20");
+        let (id, _) = manager
+            .spawn_managed_session(SessionStart {
+                kind: SessionKind::Game,
+                game_id: "g".to_string(),
+                profile_id: None,
+                tool_id: None,
+                launcher_source: GameLauncherSource::Steam,
+                command: cmd,
+                completion: None,
+                run_mode: SessionRunMode::SteamPidTracked,
+                steam_app_id: Some(489830),
+            })
+            .unwrap();
+        manager.stop_session(id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
         let s = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(s.status, SessionStatus::Killed);
     }
