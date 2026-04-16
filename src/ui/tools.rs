@@ -11,6 +11,7 @@ use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile}
 use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::{ModDatabase, ModManager};
 use crate::core::runtime::{SessionStatus, global_runtime_manager};
+use crate::ui::toast::show_toast as show_app_toast;
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
 pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
@@ -248,9 +249,15 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                                         &files,
                                     ) {
                                         log::error!("Failed adopting unmanaged outputs: {e}");
+                                        show_app_toast(&format!(
+                                            "Failed adopting generated output: {e}"
+                                        ));
                                     }
                                 }
-                                Err(e) => log::error!("Unmanaged output detection failed: {e}"),
+                                Err(e) => {
+                                    log::error!("Unmanaged output detection failed: {e}");
+                                    show_app_toast(&format!("Generated-output scan failed: {e}"));
+                                }
                             }
                             if let Some(rb) = rebuild_adopt.upgrade() {
                                 (rb.borrow())();
@@ -297,8 +304,14 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                                 )
                             {
                                 log::error!("Failed to remove generated output package: {e}");
+                                show_app_toast(&format!("Failed to remove generated output: {e}"));
                             }
-                            let _ = ModManager::rebuild_all(&game_for_remove);
+                            if let Err(e) = ModManager::rebuild_all(&game_for_remove) {
+                                log::error!("Failed to rebuild after output removal: {e}");
+                                show_app_toast(&format!(
+                                    "Rebuild failed after removing output: {e}"
+                                ));
+                            }
                             if let Some(rb) = rebuild_remove.upgrade() {
                                 (rb.borrow())();
                             }
@@ -328,11 +341,17 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             let rebuild_cleanup = Rc::clone(&rebuild);
             cleanup_generated_btn.connect_clicked(move |_| {
                 let mut db = ModDatabase::load(&game_cleanup);
-                crate::core::generated_outputs::cleanup_stale_generated_outputs(
+                if let Err(e) = crate::core::generated_outputs::cleanup_stale_generated_outputs(
                     &game_cleanup,
                     &mut db,
-                );
-                let _ = ModManager::rebuild_all(&game_cleanup);
+                ) {
+                    log::error!("Generated-output cleanup failed: {e}");
+                    show_app_toast(&format!("Generated-output cleanup failed: {e}"));
+                }
+                if let Err(e) = ModManager::rebuild_all(&game_cleanup) {
+                    log::error!("Failed rebuild after cleanup: {e}");
+                    show_app_toast(&format!("Rebuild failed after cleanup: {e}"));
+                }
                 (rebuild_cleanup.borrow())();
             });
         }

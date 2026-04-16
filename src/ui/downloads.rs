@@ -19,6 +19,8 @@ use crate::core::installer::{
     install_mod_from_archive_with_nexus, install_mod_from_extracted, parse_fomod_from_extracted,
     read_images_from_extracted,
 };
+use crate::ui::app_state::update_global_state;
+use crate::ui::toast::show_toast as show_app_toast;
 
 // ── Archive extensions ────────────────────────────────────────────────────────
 
@@ -58,8 +60,6 @@ pub(crate) struct InstallStatusCtx {
     cancel_flag: Arc<AtomicBool>,
     /// The "Cancel" button shown inside the status popup during extraction.
     cancel_btn: gtk4::Button,
-    /// Callback that locks/unlocks the sidebar navigation.
-    nav_lock: Rc<dyn Fn(bool)>,
 }
 
 // ── Public entry-point ────────────────────────────────────────────────────────
@@ -70,11 +70,7 @@ pub(crate) struct InstallStatusCtx {
 /// Archives arrive here either by manual placement or via NXM link handling
 /// from the browser.  Provides actions to install, hide already-installed
 /// archives, and clean the cache.
-pub fn build_downloads_page(
-    game: Option<&Game>,
-    config: Rc<RefCell<AppConfig>>,
-    nav_lock: Rc<dyn Fn(bool)>,
-) -> gtk4::Widget {
+pub fn build_downloads_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
@@ -175,7 +171,6 @@ pub fn build_downloads_page(
         active_progress_bars: Rc::new(RefCell::new(HashMap::new())),
         cancel_flag: Arc::clone(&cancel_flag),
         cancel_btn: cancel_btn.clone(),
-        nav_lock,
     };
 
     let hide_installed = Rc::new(RefCell::new(false));
@@ -351,6 +346,67 @@ pub fn build_downloads_page(
 
 // ── Content rendering ─────────────────────────────────────────────────────────
 
+fn find_existing_downloads_view(
+    container: &gtk4::Box,
+) -> Option<(gtk4::Stack, gtk4::ListBox, gtk4::ScrolledWindow)> {
+    let stack = container
+        .first_child()
+        .and_then(|child| child.downcast::<gtk4::Stack>().ok())?;
+    let list_page = stack.child_by_name("list")?;
+    let scrolled = list_page.downcast::<gtk4::ScrolledWindow>().ok()?;
+    let clamp = scrolled.child()?.downcast::<adw::Clamp>().ok()?;
+    let list_box = clamp.child()?.downcast::<gtk4::ListBox>().ok()?;
+    Some((stack, list_box, scrolled))
+}
+
+fn ensure_downloads_view(
+    container: &gtk4::Box,
+) -> (gtk4::Stack, gtk4::ListBox, gtk4::ScrolledWindow) {
+    if let Some(existing) = find_existing_downloads_view(container) {
+        return existing;
+    }
+
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
+    let list_box = gtk4::ListBox::new();
+    list_box.add_css_class("boxed-list");
+    list_box.set_selection_mode(gtk4::SelectionMode::None);
+
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(900);
+    clamp.set_child(Some(&list_box));
+    clamp.set_margin_top(12);
+    clamp.set_margin_bottom(12);
+    clamp.set_margin_start(12);
+    clamp.set_margin_end(12);
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    scrolled.set_child(Some(&clamp));
+
+    let stack = gtk4::Stack::new();
+    stack.set_vexpand(true);
+    stack.add_named(&scrolled, Some("list"));
+    container.append(&stack);
+    (stack, list_box, scrolled)
+}
+
+fn set_downloads_status(stack: &gtk4::Stack, status: &adw::StatusPage) {
+    if let Some(existing) = stack.child_by_name("status") {
+        stack.remove(&existing);
+    }
+    stack.add_named(status, Some("status"));
+    stack.set_visible_child_name("status");
+}
+
+fn clamped_scroll_target(previous_value: f64, upper: f64, page_size: f64) -> f64 {
+    let max_value = (upper - page_size).max(0.0);
+    previous_value.clamp(0.0, max_value)
+}
+
 fn refresh_content_with_search(
     container: &gtk4::Box,
     config: &Rc<RefCell<AppConfig>>,
@@ -359,9 +415,11 @@ fn refresh_content_with_search(
     search_query: &str,
     status_ctx: &InstallStatusCtx,
 ) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
+    let (stack, list_box, scrolled) = ensure_downloads_view(container);
+    let previous_scroll = {
+        let adj = scrolled.vadjustment();
+        (adj.value(), adj.upper(), adj.page_size())
+    };
     // Discard stale bar references; they will be repopulated below.
     status_ctx.active_progress_bars.borrow_mut().clear();
 
@@ -380,7 +438,7 @@ fn refresh_content_with_search(
             .icon_name("folder-download-symbolic")
             .build();
         status.set_vexpand(true);
-        container.append(&status);
+        set_downloads_status(&stack, &status);
         return;
     }
 
@@ -425,13 +483,18 @@ fn refresh_content_with_search(
         });
         status.set_child(Some(&open_btn));
         status.set_vexpand(true);
-        container.append(&status);
+        set_downloads_status(&stack, &status);
         return;
     }
 
-    let list_box = gtk4::ListBox::new();
-    list_box.add_css_class("boxed-list");
-    list_box.set_selection_mode(gtk4::SelectionMode::None);
+    if let Some(status) = stack.child_by_name("status") {
+        stack.remove(&status);
+    }
+    stack.set_visible_child_name("list");
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
+    }
+
     {
         let mut bars = status_ctx.active_progress_bars.borrow_mut();
         for (download_id, active) in active_downloads.iter().rev() {
@@ -453,20 +516,12 @@ fn refresh_content_with_search(
         );
         list_box.append(&row);
     }
-
-    let clamp = adw::Clamp::new();
-    clamp.set_maximum_size(900);
-    clamp.set_child(Some(&list_box));
-    clamp.set_margin_top(12);
-    clamp.set_margin_bottom(12);
-    clamp.set_margin_start(12);
-    clamp.set_margin_end(12);
-
-    let scrolled = gtk4::ScrolledWindow::new();
-    scrolled.set_vexpand(true);
-    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    scrolled.set_child(Some(&clamp));
-    container.append(&scrolled);
+    let adj = scrolled.vadjustment();
+    adj.set_value(clamped_scroll_target(
+        previous_scroll.0,
+        adj.upper(),
+        adj.page_size(),
+    ));
 }
 
 fn build_active_download_row(
@@ -832,10 +887,7 @@ fn show_install_dialog(
                 status_ctx_c.cancel_btn.set_visible(false);
                 set_downloads_busy(&status_ctx_c, false);
                 hide_status_popup_later(status_ctx_c.revealer.clone());
-                show_toast(
-                    status_ctx_c.list_container.upcast_ref(),
-                    &format!("Error: {e}"),
-                );
+                show_app_toast(&format!("Error: {e}"));
             }
             Err(_) => {
                 // Blocking task panicked.
@@ -1146,7 +1198,7 @@ fn on_install_complete(
                 ctx.progress.set_text(Some("100%"));
                 set_downloads_busy(ctx, false);
                 hide_status_popup_later(ctx.revealer.clone());
-                show_toast(ctx.list_container.upcast_ref(), &msg);
+                show_app_toast(&msg);
                 refresh_content_with_search(
                     &ctx.list_container,
                     config,
@@ -1156,7 +1208,7 @@ fn on_install_complete(
                     ctx,
                 );
             } else {
-                show_toast(container.upcast_ref(), &msg);
+                show_app_toast(&msg);
             }
         }
         Err(e) => {
@@ -1168,9 +1220,9 @@ fn on_install_complete(
                 ctx.progress.set_text(Some("Error"));
                 set_downloads_busy(ctx, false);
                 hide_status_popup_later(ctx.revealer.clone());
-                show_toast(ctx.list_container.upcast_ref(), &msg);
+                show_app_toast(&msg);
             } else {
-                show_toast(container.upcast_ref(), &msg);
+                show_app_toast(&msg);
             }
         }
     }
@@ -1344,20 +1396,6 @@ fn open_in_file_manager(path: &Path) {
     let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
 }
 
-fn show_toast(widget: &gtk4::Widget, message: &str) {
-    let mut ancestor: Option<gtk4::Widget> = Some(widget.clone());
-    while let Some(current) = ancestor {
-        if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
-            let toast = adw::Toast::new(message);
-            toast.set_timeout(3);
-            overlay.add_toast(toast);
-            return;
-        }
-        ancestor = current.parent();
-    }
-    log::info!("{message}");
-}
-
 /// Disable all interactive Downloads controls while an install is in progress,
 /// visually indicating to the user that the UI is locked.
 fn set_downloads_busy(ctx: &InstallStatusCtx, busy: bool) {
@@ -1368,8 +1406,15 @@ fn set_downloads_busy(ctx: &InstallStatusCtx, busy: bool) {
     ctx.clean_btn.set_sensitive(sensitive);
     ctx.refresh_btn.set_sensitive(sensitive);
     ctx.list_container.set_sensitive(sensitive);
-    // Lock/unlock sidebar navigation.
-    (ctx.nav_lock)(busy);
+    update_global_state(|state| {
+        state.install_active = busy;
+        if busy {
+            state.message =
+                Some("Install active: destructive actions are temporarily disabled.".to_string());
+        } else if !state.deploy_active && !state.runtime_session_active {
+            state.message = None;
+        }
+    });
     // Cancel button is managed separately (shown only during extraction).
 }
 
@@ -1405,6 +1450,14 @@ mod tests {
         assert!(matches_query("MyCoolMod.zip", ""));
         assert!(matches_query("MyCoolMod.zip", "  cool "));
         assert!(!matches_query("MyCoolMod.zip", "armor"));
+    }
+
+    #[test]
+    fn clamped_scroll_target_clamps_within_adjustment_bounds() {
+        assert_eq!(clamped_scroll_target(25.0, 200.0, 100.0), 25.0);
+        assert_eq!(clamped_scroll_target(250.0, 200.0, 100.0), 100.0);
+        assert_eq!(clamped_scroll_target(-5.0, 200.0, 100.0), 0.0);
+        assert_eq!(clamped_scroll_target(10.0, 50.0, 100.0), 0.0);
     }
 
     #[test]

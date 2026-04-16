@@ -10,10 +10,12 @@ use libadwaita::prelude::*;
 
 use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, PluginFile};
+use crate::ui::app_state::{derive_lock_policy, global_state_snapshot};
 use crate::ui::drag_autoscroll::{
     DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction,
     attach_viewport_drag_autoscroll, stop_drag_autoscroll,
 };
+use crate::ui::toast::show_toast as show_app_toast;
 
 #[derive(Debug, Clone)]
 struct ViewportAnchor {
@@ -96,6 +98,12 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 let anchor_c = Rc::clone(&pending_viewport_anchor);
                 let drag_scroll_c = Rc::clone(&drag_autoscroll);
                 sort_btn.connect_clicked(move |_| {
+                    if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
+                        show_app_toast(
+                            "Load-order edits are disabled while runtime/install/deploy is active.",
+                        );
+                        return;
+                    }
                     let mut db = ModDatabase::load(&game_c);
                     if db.plugin_load_order.is_empty() {
                         db.sync_from_plugins_txt(&game_c);
@@ -401,6 +409,7 @@ fn sync_load_order_reorder_async(
 
         if let Err(err) = result {
             log::error!("Load order reorder sync failed: {err}");
+            show_app_toast(&format!("Load-order reorder failed: {err}"));
             refresh_load_order_content(
                 &container,
                 &game,
@@ -610,15 +619,18 @@ fn build_plugin_row(
     up_btn.set_valign(gtk4::Align::Center);
     up_btn.add_css_class("flat");
     up_btn.set_tooltip_text(Some("Move up"));
-    // Disable when this is the first non-vanilla plugin (can't move into vanilla territory)
-    up_btn.set_sensitive(idx > vanilla_count);
+    up_btn.set_sensitive(
+        idx > vanilla_count && derive_lock_policy(&global_state_snapshot()).allow_reorder,
+    );
 
     let down_btn = gtk4::Button::new();
     down_btn.set_icon_name("go-down-symbolic");
     down_btn.set_valign(gtk4::Align::Center);
     down_btn.add_css_class("flat");
     down_btn.set_tooltip_text(Some("Move down"));
-    down_btn.set_sensitive(idx + 1 < total);
+    down_btn.set_sensitive(
+        idx + 1 < total && derive_lock_policy(&global_state_snapshot()).allow_reorder,
+    );
 
     row.add_suffix(&up_btn);
     row.add_suffix(&down_btn);
@@ -632,6 +644,12 @@ fn build_plugin_row(
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let plugin_name = plugin.name.clone();
         up_btn.connect_clicked(move |_| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
+                show_app_toast(
+                    "Load-order edits are disabled while runtime/install/deploy is active.",
+                );
+                return;
+            }
             let target_visible = visible_neighbor_plugin_name(&container_c, &plugin_name, -1);
             let row_offset_before_move =
                 capture_row_offset_in_viewport(&container_c, &load_order_row_key(&plugin_name));
@@ -679,6 +697,12 @@ fn build_plugin_row(
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let plugin_name = plugin.name.clone();
         down_btn.connect_clicked(move |_| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
+                show_app_toast(
+                    "Load-order edits are disabled while runtime/install/deploy is active.",
+                );
+                return;
+            }
             let target_visible = visible_neighbor_plugin_name(&container_c, &plugin_name, 1);
             let row_offset_before_move =
                 capture_row_offset_in_viewport(&container_c, &load_order_row_key(&plugin_name));
@@ -748,6 +772,12 @@ fn build_plugin_row(
         let drag_scroll_drop = Rc::clone(&drag_autoscroll);
         let target_name = plugin.name.clone();
         drop_target.connect_drop(move |_, value, _, _| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
+                show_app_toast(
+                    "Load-order edits are disabled while runtime/install/deploy is active.",
+                );
+                return false;
+            }
             stop_drag_autoscroll(&drag_scroll_drop);
             let Ok(source_name) = value.get::<String>() else {
                 return false;

@@ -119,8 +119,9 @@ them on every tab switch.
 State ownership contract:
 
 - **App-global/shared state**
-  - long-running operation status (install busy / navigation lock)
-  - whether navigation/game switching actions are allowed
+  - long-running operation status (`install_active`, `deploy_active`, `runtime_session_active`)
+  - coarse lock-policy derivation for destructive/context-breaking actions
+    (game/profile switching, deploy/rebuild, reorder, destructive mutations)
   - global status surfaces that remain truthful regardless of current tab
 - **Page-local state**
   - search text, scroll position, local selection/focus for list interactions
@@ -129,6 +130,15 @@ State ownership contract:
 Long-running operations (install/deploy/runtime) must never rely solely on an
 ephemeral page instance. If a status is critical for safety or user trust, it
 must be represented in shared state and rendered consistently across navigation.
+
+Global feedback contract:
+
+- The main window owns one shared `adw::ToastOverlay` used by all pages and
+  top-level handlers (downloads, NXM, library, tools, load-order failures).
+- Toast dispatch should go through a shared helper instead of ad-hoc widget-tree
+  traversal.
+- Async success/failure paths must produce visible user feedback (toast/banner),
+  not log-only errors.
 
 List/view update rule for Library and Load Order:
 

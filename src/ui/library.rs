@@ -15,12 +15,13 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
+use crate::ui::app_state::{derive_lock_policy, global_state_snapshot, update_global_state};
 use crate::ui::drag_autoscroll::{
     DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction,
     attach_viewport_drag_autoscroll, stop_drag_autoscroll,
 };
+use crate::ui::toast::show_toast as show_app_toast;
 
-const TOAST_TIMEOUT_SECONDS: u32 = 3;
 const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
 
 #[derive(Debug, Clone, Default)]
@@ -156,6 +157,16 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let status_progress_c = status_progress.clone();
         let status_revealer_c = status_revealer.clone();
         deploy_btn.connect_clicked(move |btn| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_deploy_rebuild {
+                show_app_toast(
+                    "Deploy is unavailable while a runtime/install operation is active.",
+                );
+                return;
+            }
+            update_global_state(|state| {
+                state.deploy_active = true;
+                state.message = Some("Deploy/rebuild in progress…".to_string());
+            });
             set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, true);
             status_revealer_c.set_reveal_child(true);
             status_label_c.set_text("Preparing deployment…");
@@ -204,9 +215,15 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 status_progress_c.set_fraction(1.0);
                 status_progress_c.set_text(Some("100%"));
                 deploy_done.store(true, Ordering::Relaxed);
+                update_global_state(|state| {
+                    state.deploy_active = false;
+                    if !state.install_active && !state.runtime_session_active {
+                        state.message = None;
+                    }
+                });
                 set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
                 hide_status_popup_later(status_revealer_c.clone());
-                show_toast(btn.upcast_ref(), &msg);
+                show_app_toast(&msg);
                 refresh_library_content_with_search(
                     &container_c,
                     &game_c,
@@ -485,6 +502,7 @@ fn sync_library_reorder_async(
 
         if let Err(err) = result {
             log::error!("Library reorder sync failed: {err}");
+            show_app_toast(&format!("Library reorder failed: {err}"));
             refresh_library_content_with_search(
                 &container,
                 &game,
@@ -496,6 +514,9 @@ fn sync_library_reorder_async(
                 Rc::clone(&drag_autoscroll),
                 false,
             );
+            update_global_state(|state| {
+                state.message = Some("Reorder failed; view refreshed.".to_string());
+            });
         }
     });
 }
@@ -694,6 +715,7 @@ fn build_mod_row(
     up_btn.set_valign(gtk4::Align::Center);
     up_btn.add_css_class("flat");
     up_btn.set_tooltip_text(Some("Move up"));
+    up_btn.set_sensitive(derive_lock_policy(&global_state_snapshot()).allow_reorder);
     up_btn.set_sensitive(idx > 0);
 
     let down_btn = gtk4::Button::new();
@@ -701,6 +723,7 @@ fn build_mod_row(
     down_btn.set_valign(gtk4::Align::Center);
     down_btn.add_css_class("flat");
     down_btn.set_tooltip_text(Some("Move down"));
+    down_btn.set_sensitive(derive_lock_policy(&global_state_snapshot()).allow_reorder);
     down_btn.set_sensitive(idx + 1 < total);
 
     row.add_suffix(&up_btn);
@@ -716,6 +739,10 @@ fn build_mod_row(
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let mod_id_c = mod_entry.id.clone();
         up_btn.connect_clicked(move |_| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
+                show_app_toast("Reordering is disabled while runtime/install/deploy is active.");
+                return;
+            }
             let target_visible = visible_neighbor_mod_id(&container_c, &mod_id_c, -1);
             let row_offset_before_move =
                 capture_row_offset_in_viewport(&container_c, &library_row_key(&mod_id_c));
@@ -770,6 +797,10 @@ fn build_mod_row(
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let mod_id_c = mod_entry.id.clone();
         down_btn.connect_clicked(move |_| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
+                show_app_toast("Reordering is disabled while runtime/install/deploy is active.");
+                return;
+            }
             let target_visible = visible_neighbor_mod_id(&container_c, &mod_id_c, 1);
             let row_offset_before_move =
                 capture_row_offset_in_viewport(&container_c, &library_row_key(&mod_id_c));
@@ -844,6 +875,10 @@ fn build_mod_row(
         let drag_scroll_drop = Rc::clone(&drag_autoscroll);
         let target_id = mod_entry.id.clone();
         drop_target.connect_drop(move |_, value, _, _| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
+                show_app_toast("Reordering is disabled while runtime/install/deploy is active.");
+                return false;
+            }
             stop_drag_autoscroll(&drag_scroll_drop);
             let Ok(source_id) = value.get::<String>() else {
                 return false;
@@ -1584,23 +1619,6 @@ fn open_in_file_manager(path: &Path) {
     let file = gio::File::for_path(path);
     let uri = file.uri();
     let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-}
-
-/// Show a brief in-app toast notification anchored to `widget`.
-fn show_toast(widget: &gtk4::Widget, message: &str) {
-    // Walk up to the nearest AdwToastOverlay
-    let mut ancestor: Option<gtk4::Widget> = Some(widget.clone());
-    while let Some(current) = ancestor {
-        if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
-            let toast = adw::Toast::new(message);
-            toast.set_timeout(TOAST_TIMEOUT_SECONDS);
-            overlay.add_toast(toast);
-            return;
-        }
-        ancestor = current.parent();
-    }
-    // Fallback: log to stderr
-    log::info!("{message}");
 }
 
 #[cfg(test)]

@@ -13,7 +13,13 @@ use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
 use crate::core::runtime::global_runtime_manager;
+use crate::ui::app_state::{
+    AppOperationState, derive_lock_policy, global_state_snapshot, register_global_app_state,
+    update_global_state,
+};
+use crate::ui::toast::{register_root_toast_overlay, show_toast as show_app_toast};
 
+pub mod app_state;
 pub mod downloads;
 pub mod drag_autoscroll;
 pub mod library;
@@ -22,6 +28,7 @@ pub mod logs;
 pub mod mod_list;
 pub mod settings;
 pub mod setup_wizard;
+pub mod toast;
 pub mod tools;
 
 pub fn build_ui(app: &libadwaita::Application) {
@@ -77,6 +84,11 @@ fn build_main_window(
     // Register app-level About action
     register_about_action(app, &window);
     register_logs_action(app, &window, Rc::clone(&config));
+
+    let root_toast_overlay = adw::ToastOverlay::new();
+    register_root_toast_overlay(&root_toast_overlay);
+    let op_state = Rc::new(AppOperationState::new());
+    register_global_app_state(&op_state);
 
     let split_view = adw::NavigationSplitView::new();
     split_view.set_min_sidebar_width(200.0);
@@ -251,12 +263,23 @@ fn build_main_window(
         let config_t = Rc::clone(&config);
         let play_btn_t = play_btn.clone();
         let active_game_row_t = active_game_row.clone();
-        let nav_list_t = nav_list.clone();
+        let op_state_t = Rc::clone(&op_state);
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             let manager = global_runtime_manager();
             let active_any = manager.any_active();
-            nav_list_t.set_sensitive(!active_any);
-            active_game_row_t.set_sensitive(!active_any);
+            update_global_state(|state| {
+                state.runtime_session_active = active_any;
+                if active_any {
+                    state.message = Some(
+                        "Runtime session active: game/profile/deploy/reorder actions are locked."
+                            .to_string(),
+                    );
+                } else if !state.install_active && !state.deploy_active {
+                    state.message = None;
+                }
+            });
+            active_game_row_t
+                .set_sensitive(derive_lock_policy(&op_state_t.snapshot()).allow_game_switch);
 
             let current_game = config_t.borrow().current_game().cloned();
             if let Some(game) = current_game {
@@ -296,9 +319,7 @@ fn build_main_window(
     install_lock_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
     install_lock_revealer.set_reveal_child(false);
 
-    let install_lock_banner = adw::Banner::new(
-        "Installing mod archive… navigation is temporarily locked. You can cancel from Downloads.",
-    );
+    let install_lock_banner = adw::Banner::new("");
     install_lock_banner.set_revealed(true);
     install_lock_banner.set_button_label(None::<&str>);
     install_lock_revealer.set_child(Some(&install_lock_banner));
@@ -317,29 +338,32 @@ fn build_main_window(
         .build();
     split_view.set_content(Some(&content_page));
 
-    let install_locked = Rc::new(RefCell::new(false));
-    // Lock callback used by long-running tasks (downloads/install).
-    let nav_list_for_lock = nav_list.clone();
-    let active_game_row_for_lock = active_game_row.clone();
-    let play_btn_for_lock = play_btn.clone();
-    let content_stack_for_lock = content_stack.clone();
-    let content_page_for_lock = content_page.clone();
-    let install_lock_revealer_for_lock = install_lock_revealer.clone();
-    let install_locked_for_cb = Rc::clone(&install_locked);
-    let nav_lock: Rc<dyn Fn(bool)> = Rc::new(move |locked: bool| {
-        *install_locked_for_cb.borrow_mut() = locked;
-        nav_list_for_lock.set_sensitive(!locked);
-        active_game_row_for_lock.set_sensitive(!locked);
-        play_btn_for_lock.set_sensitive(!locked);
-        install_lock_revealer_for_lock.set_reveal_child(locked);
-        if locked {
-            // Safety: keep Downloads visible while install work is in flight.
-            content_page_for_lock.set_title("Downloads");
-            content_stack_for_lock.set_visible_child_name("downloads");
-            nav_list_for_lock.select_row(nav_list_for_lock.row_at_index(NAV_DOWNLOADS).as_ref());
-        }
-    });
+    {
+        let install_lock_revealer_c = install_lock_revealer.clone();
+        let install_lock_banner_c = install_lock_banner.clone();
+        let active_game_row_c = active_game_row.clone();
+        op_state.subscribe(move |state| {
+            let policy = derive_lock_policy(state);
+            active_game_row_c.set_sensitive(policy.allow_game_switch);
+            if let Some(msg) = &state.message {
+                install_lock_banner_c.set_title(msg);
+                install_lock_revealer_c.set_reveal_child(policy.is_read_only());
+            } else {
+                install_lock_revealer_c.set_reveal_child(false);
+            }
+        });
+    }
 
+    {
+        let content_stack_for_lock = content_stack.clone();
+        let content_page_for_lock = content_page.clone();
+        op_state.subscribe(move |state| {
+            if state.install_active {
+                content_page_for_lock.set_title("Downloads");
+                content_stack_for_lock.set_visible_child_name("downloads");
+            }
+        });
+    }
     let current_game = {
         let cfg = config.borrow();
         cfg.current_game().cloned()
@@ -360,11 +384,8 @@ fn build_main_window(
     content_stack.add_named(&load_order_widget, Some("load_order"));
 
     // Downloads
-    let downloads_widget = downloads::build_downloads_page(
-        current_game.as_ref(),
-        Rc::clone(&config),
-        Rc::clone(&nav_lock),
-    );
+    let downloads_widget =
+        downloads::build_downloads_page(current_game.as_ref(), Rc::clone(&config));
     content_stack.add_named(&downloads_widget, Some("downloads"));
 
     // Tools
@@ -388,7 +409,8 @@ fn build_main_window(
         glib::ControlFlow::Continue
     });
 
-    window.set_content(Some(&split_view));
+    root_toast_overlay.set_child(Some(&split_view));
+    window.set_content(Some(&root_toast_overlay));
 
     // Select Library by default
     nav_list.select_row(nav_list.row_at_index(NAV_LIBRARY).as_ref());
@@ -397,13 +419,8 @@ fn build_main_window(
     {
         let content_stack_c = content_stack.clone();
         let content_page_c = content_page.clone();
-        let install_locked_c = Rc::clone(&install_locked);
-
         nav_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
-            if *install_locked_c.borrow() {
-                return;
-            }
             match row.index() {
                 NAV_LIBRARY => {
                     content_page_c.set_title("Library");
@@ -439,7 +456,6 @@ fn build_main_window(
     let config_r = Rc::clone(&config);
     let nav_list_r = nav_list.clone();
     let play_btn_r = play_btn.clone();
-    let nav_lock_r = Rc::clone(&nav_lock);
     let window_r = window.clone();
 
     let on_setup_done_rc: Rc<dyn Fn()> = Rc::new(move || {
@@ -486,11 +502,8 @@ fn build_main_window(
         content_stack_r.add_named(&new_load_order, Some("load_order"));
 
         // Rebuild Downloads page
-        let new_downloads = downloads::build_downloads_page(
-            game_info.as_ref(),
-            Rc::clone(&config_r),
-            Rc::clone(&nav_lock_r),
-        );
+        let new_downloads =
+            downloads::build_downloads_page(game_info.as_ref(), Rc::clone(&config_r));
         if let Some(old) = content_stack_r.child_by_name("downloads") {
             content_stack_r.remove(&old);
         }
@@ -529,6 +542,12 @@ fn build_main_window(
         let on_finish_c = Rc::clone(&on_setup_done_rc);
 
         active_game_row.connect_activated(move |_| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_game_switch {
+                show_app_toast(
+                    "Cannot switch game while runtime/install/deploy operation is active.",
+                );
+                return;
+            }
             let has_games = !config_c.borrow().games.is_empty();
             if !has_games {
                 let f = Rc::clone(&on_finish_c);
@@ -1089,23 +1108,7 @@ fn start_nxm_download(
     });
 }
 
-fn show_nxm_toast(window: &gtk4::Window, message: &str) {
-    // Try to find a ToastOverlay in the window hierarchy
-    if let Some(child) = window.child() {
-        walk_for_toast_overlay(&child, message);
-    }
+fn show_nxm_toast(_window: &gtk4::Window, message: &str) {
+    show_app_toast(message);
     log::info!("NXM: {message}");
-}
-
-fn walk_for_toast_overlay(widget: &gtk4::Widget, message: &str) {
-    if let Ok(overlay) = widget.clone().downcast::<adw::ToastOverlay>() {
-        let toast = adw::Toast::new(message);
-        toast.set_timeout(4);
-        overlay.add_toast(toast);
-        return;
-    }
-    // Try first child recursively
-    if let Some(child) = widget.first_child() {
-        walk_for_toast_overlay(&child, message);
-    }
 }
