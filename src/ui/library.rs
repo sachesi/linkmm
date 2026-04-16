@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::thread;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gio;
 use gtk4::gdk;
@@ -180,58 +180,52 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             status_progress_c.pulse();
             status_progress_c.set_text(Some("Working…"));
 
-            let (tx, rx) = mpsc::channel::<Result<usize, String>>();
+            let deploy_done = Arc::new(AtomicBool::new(false));
+            let deploy_done_ui = Arc::clone(&deploy_done);
             let game_bg = (*game_c).clone();
-            thread::spawn(move || {
-                let db = ModDatabase::load(&game_bg);
-                let enabled_count = db.mods.iter().filter(|m| m.enabled).count();
-                let result = ModManager::rebuild_all(&game_bg)
-                    .map(|()| enabled_count)
-                    .map_err(|e| e.to_string());
-                let _ = tx.send(result);
+            gtk4::glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || {
+                    let db = ModDatabase::load(&game_bg);
+                    let enabled_count = db.mods.iter().filter(|m| m.enabled).count();
+                    ModManager::rebuild_all(&game_bg)
+                        .map(|()| enabled_count)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+
+                let msg = match result {
+                    Ok(enabled_count) => format!("Deployed {enabled_count} mod(s)"),
+                    Err(e) => {
+                        log::error!("Deploy error: {e}");
+                        format!("Deploy failed: {e}")
+                    }
+                };
+                status_label_c.set_text(&msg);
+                status_progress_c.set_fraction(1.0);
+                status_progress_c.set_text(Some("100%"));
+                deploy_done.store(true, Ordering::Relaxed);
+                set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
+                hide_status_popup_later(status_revealer_c.clone());
+                show_toast(btn.upcast_ref(), &msg);
+                refresh_library_content_with_search(
+                    &container_c,
+                    &game_c,
+                    Rc::clone(&config_c),
+                    &search_c.borrow(),
+                    Rc::clone(&search_c),
+                    Rc::clone(&selected_c),
+                    Rc::clone(&anchor_for_timeout),
+                    Rc::clone(&drag_scroll_for_timeout),
+                    true,
+                );
             });
 
             gtk4::glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
-                match rx.try_recv() {
-                    Ok(result) => {
-                        let msg = match result {
-                            Ok(enabled_count) => format!("Deployed {enabled_count} mod(s)"),
-                            Err(e) => {
-                                log::error!("Deploy error: {e}");
-                                format!("Deploy failed: {e}")
-                            }
-                        };
-                        status_label_c.set_text(&msg);
-                        status_progress_c.set_fraction(1.0);
-                        status_progress_c.set_text(Some("100%"));
-                        set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
-                        hide_status_popup_later(status_revealer_c.clone());
-                        show_toast(btn.upcast_ref(), &msg);
-                        refresh_library_content_with_search(
-                            &container_c,
-                            &game_c,
-                            Rc::clone(&config_c),
-                            &search_c.borrow(),
-                            Rc::clone(&search_c),
-                            Rc::clone(&selected_c),
-                            Rc::clone(&anchor_for_timeout),
-                            Rc::clone(&drag_scroll_for_timeout),
-                            true,
-                        );
-                        gtk4::glib::ControlFlow::Break
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        status_progress_c.pulse();
-                        gtk4::glib::ControlFlow::Continue
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        status_label_c.set_text("Deploy failed: background task disconnected");
-                        status_progress_c.set_fraction(1.0);
-                        status_progress_c.set_text(Some("Failed"));
-                        set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
-                        hide_status_popup_later(status_revealer_c.clone());
-                        gtk4::glib::ControlFlow::Break
-                    }
+                if deploy_done_ui.load(Ordering::Relaxed) {
+                    gtk4::glib::ControlFlow::Break
+                } else {
+                    status_progress_c.pulse();
+                    gtk4::glib::ControlFlow::Continue
                 }
             });
         });
@@ -470,45 +464,38 @@ fn sync_library_reorder_async(
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) {
-    let (tx, rx) = mpsc::channel::<Result<(), String>>();
     let game_bg = (*game).clone();
-    thread::spawn(move || {
-        let mut db = ModDatabase::load(&game_bg);
-        let res = if let (Some(src_pos), Some(tgt_pos)) = (
-            db.mods.iter().position(|m| m.id == source_id),
-            db.mods.iter().position(|m| m.id == target_id),
-        ) {
-            let moved = db.mods.remove(src_pos);
-            let insert_pos = adjusted_insert_pos(src_pos, tgt_pos);
-            db.mods.insert(insert_pos, moved);
-            db.save(&game_bg);
-            ModManager::rebuild_all(&game_bg).map_err(|e| e.to_string())
-        } else {
-            Err("reorder target not found".to_string())
-        };
-        let _ = tx.send(res);
-    });
-
-    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
-        match rx.try_recv() {
-            Ok(Ok(())) => gtk4::glib::ControlFlow::Break,
-            Ok(Err(err)) => {
-                log::error!("Library reorder sync failed: {err}");
-                refresh_library_content_with_search(
-                    &container,
-                    &game,
-                    Rc::clone(&config),
-                    &search_state.borrow(),
-                    Rc::clone(&search_state),
-                    Rc::clone(&selected_mod_id),
-                    Rc::clone(&pending_viewport_anchor),
-                    Rc::clone(&drag_autoscroll),
-                    false,
-                );
-                gtk4::glib::ControlFlow::Break
+    gtk4::glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            let mut db = ModDatabase::load(&game_bg);
+            if let (Some(src_pos), Some(tgt_pos)) = (
+                db.mods.iter().position(|m| m.id == source_id),
+                db.mods.iter().position(|m| m.id == target_id),
+            ) {
+                let moved = db.mods.remove(src_pos);
+                let insert_pos = adjusted_insert_pos(src_pos, tgt_pos);
+                db.mods.insert(insert_pos, moved);
+                db.save(&game_bg);
+                ModManager::rebuild_all(&game_bg).map_err(|e| e.to_string())
+            } else {
+                Err("reorder target not found".to_string())
             }
-            Err(mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => gtk4::glib::ControlFlow::Break,
+        })
+        .await;
+
+        if let Err(err) = result {
+            log::error!("Library reorder sync failed: {err}");
+            refresh_library_content_with_search(
+                &container,
+                &game,
+                Rc::clone(&config),
+                &search_state.borrow(),
+                Rc::clone(&search_state),
+                Rc::clone(&selected_mod_id),
+                Rc::clone(&pending_viewport_anchor),
+                Rc::clone(&drag_autoscroll),
+                false,
+            );
         }
     });
 }

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gio;
 use gtk4::gdk;
 use gtk4::graphene;
 use gtk4::prelude::*;
@@ -377,47 +378,36 @@ fn sync_load_order_reorder_async(
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) {
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let game_bg = (*game).clone();
-    std::thread::spawn(move || {
-        let mut db = ModDatabase::load(&game_bg);
-        let result = if let (Some(src_pos), Some(tgt_pos)) = (
-            db.get_ordered_plugins(&game_bg)
-                .iter()
-                .position(|p| p.name == source_name),
-            db.get_ordered_plugins(&game_bg)
-                .iter()
-                .position(|p| p.name == target_name),
-        ) {
+    gtk4::glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            let mut db = ModDatabase::load(&game_bg);
             let mut ordered = db.get_ordered_plugins(&game_bg);
-            let plugin = ordered.remove(src_pos);
-            let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &ordered);
-            ordered.insert(insert_pos, plugin);
-            db.set_plugin_order(&ordered);
-            db.save(&game_bg);
-            db.write_plugins_txt(&game_bg).map_err(|e| e.to_string())
-        } else {
-            Err("reorder target not found".to_string())
-        };
-        let _ = tx.send(result.map(|_| ()));
-    });
-
-    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
-        match rx.try_recv() {
-            Ok(Ok(())) => gtk4::glib::ControlFlow::Break,
-            Ok(Err(err)) => {
-                log::error!("Load order reorder sync failed: {err}");
-                refresh_load_order_content(
-                    &container,
-                    &game,
-                    Rc::clone(&search_state),
-                    Rc::clone(&pending_viewport_anchor),
-                    Rc::clone(&drag_autoscroll),
-                );
-                gtk4::glib::ControlFlow::Break
+            if let (Some(src_pos), Some(tgt_pos)) = (
+                ordered.iter().position(|p| p.name == source_name),
+                ordered.iter().position(|p| p.name == target_name),
+            ) {
+                let plugin = ordered.remove(src_pos);
+                let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &ordered);
+                ordered.insert(insert_pos, plugin);
+                db.set_plugin_order(&ordered);
+                db.save(&game_bg);
+                db.write_plugins_txt(&game_bg).map_err(|e| e.to_string())
+            } else {
+                Err("reorder target not found".to_string())
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => gtk4::glib::ControlFlow::Break,
+        })
+        .await;
+
+        if let Err(err) = result {
+            log::error!("Load order reorder sync failed: {err}");
+            refresh_load_order_content(
+                &container,
+                &game,
+                Rc::clone(&search_state),
+                Rc::clone(&pending_viewport_anchor),
+                Rc::clone(&drag_autoscroll),
+            );
         }
     });
 }
