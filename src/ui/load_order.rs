@@ -81,6 +81,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 let anchor_c = Rc::clone(&pending_viewport_anchor);
                 let drag_scroll_c = Rc::clone(&drag_autoscroll);
                 let active_drag_source_name_search = Rc::clone(&active_drag_source_name);
+                let hovered_drop_target_index_search = Rc::clone(&hovered_drop_target_index);
                 search_entry.connect_search_changed(move |entry| {
                     *search_c.borrow_mut() = entry.text().to_string();
                     refresh_load_order_content_with_search(
@@ -91,7 +92,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         Rc::clone(&active_drag_source_name_search),
-                        Rc::clone(&hovered_drop_target_index),
+                        Rc::clone(&hovered_drop_target_index_search),
                     );
                 });
             }
@@ -104,6 +105,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 let anchor_c = Rc::clone(&pending_viewport_anchor);
                 let drag_scroll_c = Rc::clone(&drag_autoscroll);
                 let active_drag_source_name_sort = Rc::clone(&active_drag_source_name);
+                let hovered_drop_target_index_sort = Rc::clone(&hovered_drop_target_index);
                 sort_btn.connect_clicked(move |_| {
                     if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
                         show_app_toast(
@@ -128,7 +130,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         Rc::clone(&active_drag_source_name_sort),
-                        Rc::clone(&hovered_drop_target_index),
+                        Rc::clone(&hovered_drop_target_index_sort),
                     );
                 });
             }
