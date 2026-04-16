@@ -91,6 +91,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         Rc::clone(&active_drag_source_name_search),
+                        Rc::clone(&hovered_drop_target_index),
                     );
                 });
             }
@@ -127,6 +128,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         Rc::clone(&active_drag_source_name_sort),
+                        Rc::clone(&hovered_drop_target_index),
                     );
                 });
             }
@@ -139,6 +141,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 Rc::clone(&pending_viewport_anchor),
                 Rc::clone(&drag_autoscroll),
                 Rc::clone(&active_drag_source_name),
+                Rc::clone(&hovered_drop_target_index),
             );
             if let Some((_, list_box, scrolled)) = find_existing_load_order_view(&content_container)
             {
@@ -181,6 +184,7 @@ fn refresh_load_order_content(
         pending_viewport_anchor,
         drag_autoscroll,
         active_drag_source_name,
+        Rc::new(RefCell::new(None)),
     );
 }
 
@@ -325,15 +329,19 @@ fn attach_load_order_central_drop_controller(
             }
         });
         motion.connect_motion(move |_, _, y| {
+            let viewport_y = list_box_c
+                .compute_point(&scrolled_c, &graphene::Point::new(0.0, y as f32))
+                .map(|p| p.y() as f64)
+                .unwrap_or(y);
             let step = compute_edge_scroll_step(
-                y,
+                viewport_y,
                 scrolled_c.height() as f64,
                 EdgeAutoScrollConfig::default(),
             );
             drag_autoscroll_c.borrow_mut().step_px_per_tick = step;
-            *pointer_y_state_c.borrow_mut() = Some(y);
+            *pointer_y_state_c.borrow_mut() = Some(viewport_y);
             *hovered_drop_target_index_c.borrow_mut() =
-                target_plugin_index_for_pointer_y(&list_box_c, &scrolled_c, y);
+                target_plugin_index_for_pointer_y(&list_box_c, &scrolled_c, viewport_y);
             ensure_drag_autoscroll_tick(
                 &scrolled_c,
                 Rc::clone(&drag_autoscroll_c),
@@ -353,7 +361,7 @@ fn attach_load_order_central_drop_controller(
             reset_drag_state(&active_drag_source_name_c, &hovered_drop_target_index_c);
         });
     }
-    scrolled.add_controller(motion);
+    list_box.add_controller(motion);
 
     let drop_target = gtk4::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
     {
@@ -382,11 +390,13 @@ fn attach_load_order_central_drop_controller(
             let Some(source_name) = source_name else {
                 return false;
             };
-            let target_index = target_state
-                .borrow()
-                .as_ref()
-                .copied()
-                .or_else(|| target_plugin_index_for_pointer_y(&list_box_c, &scrolled_c, y));
+            let target_index = target_state.borrow().as_ref().copied().or_else(|| {
+                let viewport_y = list_box_c
+                    .compute_point(&scrolled_c, &graphene::Point::new(0.0, y as f32))
+                    .map(|p| p.y() as f64)
+                    .unwrap_or(y);
+                target_plugin_index_for_pointer_y(&list_box_c, &scrolled_c, viewport_y)
+            });
             let Some(target_index) = target_index else {
                 return false;
             };
@@ -440,7 +450,7 @@ fn attach_load_order_central_drop_controller(
             true
         });
     }
-    scrolled.add_controller(drop_target);
+    list_box.add_controller(drop_target);
 }
 
 fn update_load_order_row_positions_in_place(list_box: &gtk4::ListBox) {
@@ -623,6 +633,7 @@ fn refresh_load_order_content_with_search(
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
     active_drag_source_name: Rc<RefCell<Option<String>>>,
+    hovered_drop_target_index: Rc<RefCell<Option<usize>>>,
 ) {
     let (stack, list_box, scrolled) =
         ensure_load_order_view(container, Rc::clone(&drag_autoscroll));
@@ -692,6 +703,7 @@ fn refresh_load_order_content_with_search(
             Rc::clone(&pending_viewport_anchor),
             Rc::clone(&drag_autoscroll),
             Rc::clone(&active_drag_source_name),
+            Rc::clone(&hovered_drop_target_index),
         );
         list_box.append(&row);
     }
@@ -727,6 +739,7 @@ fn build_plugin_row(
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
     active_drag_source_name: Rc<RefCell<Option<String>>>,
+    hovered_drop_target_index: Rc<RefCell<Option<usize>>>,
 ) -> adw::ActionRow {
     // Subtitle: type label + vanilla marker
     let subtitle = if plugin.is_vanilla {
@@ -959,11 +972,18 @@ fn build_plugin_row(
     {
         let row_c = row.clone();
         let active_drag_source_name_c = Rc::clone(&active_drag_source_name);
+        let hovered_drop_target_index_c = Rc::clone(&hovered_drop_target_index);
+        let drag_autoscroll_c = Rc::clone(&drag_autoscroll);
         let plugin_name_drag = plugin.name.clone();
         drag_source.connect_drag_begin(move |src, _| {
             let paintable = gtk4::WidgetPaintable::new(Some(&row_c));
             src.set_icon(Some(&paintable), 0, 0);
             *active_drag_source_name_c.borrow_mut() = Some(plugin_name_drag.clone());
+        });
+        let active_drag_source_name_end = Rc::clone(&active_drag_source_name);
+        drag_source.connect_drag_end(move |_, _, _| {
+            stop_drag_autoscroll(&drag_autoscroll_c);
+            reset_drag_state(&active_drag_source_name_end, &hovered_drop_target_index_c);
         });
     }
     row.add_controller(drag_source);

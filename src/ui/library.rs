@@ -118,6 +118,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         Rc::clone(&drag_autoscroll),
         true,
         Rc::clone(&active_drag_source_id),
+        Rc::clone(&hovered_drop_target_index),
     );
 
     if let Some((_, list_box, scrolled)) = find_existing_library_view(&list_container) {
@@ -159,6 +160,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 Rc::clone(&drag_scroll_c),
                 false,
                 Rc::clone(&active_drag_source_id),
+                Rc::clone(&hovered_drop_target_index),
             );
         });
     }
@@ -425,15 +427,19 @@ fn attach_library_central_drop_controller(
             }
         });
         motion.connect_motion(move |_, _, y| {
+            let viewport_y = list_box_c
+                .compute_point(&scrolled_c, &graphene::Point::new(0.0, y as f32))
+                .map(|p| p.y() as f64)
+                .unwrap_or(y);
             let step = compute_edge_scroll_step(
-                y,
+                viewport_y,
                 scrolled_c.height() as f64,
                 EdgeAutoScrollConfig::default(),
             );
             drag_autoscroll_c.borrow_mut().step_px_per_tick = step;
-            *pointer_y_state_c.borrow_mut() = Some(y);
+            *pointer_y_state_c.borrow_mut() = Some(viewport_y);
             *hovered_drop_target_index_c.borrow_mut() =
-                target_mod_index_for_pointer_y(&list_box_c, &scrolled_c, y);
+                target_mod_index_for_pointer_y(&list_box_c, &scrolled_c, viewport_y);
             ensure_drag_autoscroll_tick(
                 &scrolled_c,
                 Rc::clone(&drag_autoscroll_c),
@@ -453,7 +459,7 @@ fn attach_library_central_drop_controller(
             reset_drag_state(&active_drag_source_id_c, &hovered_drop_target_index_c);
         });
     }
-    scrolled.add_controller(motion);
+    list_box.add_controller(motion);
 
     let drop_target = gtk4::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
     {
@@ -482,11 +488,13 @@ fn attach_library_central_drop_controller(
             let Some(source_id) = source_id else {
                 return false;
             };
-            let target_index = target_state
-                .borrow()
-                .as_ref()
-                .copied()
-                .or_else(|| target_mod_index_for_pointer_y(&list_box_c, &scrolled_c, y));
+            let target_index = target_state.borrow().as_ref().copied().or_else(|| {
+                let viewport_y = list_box_c
+                    .compute_point(&scrolled_c, &graphene::Point::new(0.0, y as f32))
+                    .map(|p| p.y() as f64)
+                    .unwrap_or(y);
+                target_mod_index_for_pointer_y(&list_box_c, &scrolled_c, viewport_y)
+            });
             let Some(target_index) = target_index else {
                 return false;
             };
@@ -527,6 +535,7 @@ fn attach_library_central_drop_controller(
                     Rc::clone(&drag_scroll_c),
                     false,
                     Rc::clone(&source_state),
+                    Rc::clone(&target_state),
                 );
             } else {
                 sync_library_reorder_async(
@@ -546,7 +555,7 @@ fn attach_library_central_drop_controller(
             true
         });
     }
-    scrolled.add_controller(drop_target);
+    list_box.add_controller(drop_target);
 }
 
 fn update_library_row_positions_in_place(list_box: &gtk4::ListBox) {
@@ -737,6 +746,7 @@ fn refresh_library_content_with_search(
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
     do_scan: bool,
     active_drag_source_id: Rc<RefCell<Option<String>>>,
+    hovered_drop_target_index: Rc<RefCell<Option<usize>>>,
 ) {
     let (stack, list_box, scrolled) = ensure_library_view(container, Rc::clone(&drag_autoscroll));
     let previous_scroll = {
@@ -806,6 +816,7 @@ fn refresh_library_content_with_search(
             Rc::clone(&pending_viewport_anchor),
             Rc::clone(&drag_autoscroll),
             Rc::clone(&active_drag_source_id),
+            Rc::clone(&hovered_drop_target_index),
             conflict_states.get(&mod_entry.id),
         );
         list_box.append(&row);
@@ -865,6 +876,7 @@ fn build_mod_row(
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
     active_drag_source_id: Rc<RefCell<Option<String>>>,
+    hovered_drop_target_index: Rc<RefCell<Option<usize>>>,
     conflict_state: Option<&ConflictState>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
@@ -946,6 +958,7 @@ fn build_mod_row(
         let anchor_c = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let active_drag_source_id_up = Rc::clone(&active_drag_source_id);
+        let hovered_drop_target_index_up = Rc::clone(&hovered_drop_target_index);
         let mod_id_c = mod_entry.id.clone();
         up_btn.connect_clicked(move |_| {
             if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
@@ -979,6 +992,7 @@ fn build_mod_row(
                         Rc::clone(&drag_scroll_c),
                         false,
                         Rc::clone(&active_drag_source_id_up),
+                        Rc::clone(&hovered_drop_target_index_up),
                     );
                 } else {
                     sync_library_reorder_async(
@@ -1006,6 +1020,7 @@ fn build_mod_row(
         let anchor_c = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let active_drag_source_id_down = Rc::clone(&active_drag_source_id);
+        let hovered_drop_target_index_down = Rc::clone(&hovered_drop_target_index);
         let mod_id_c = mod_entry.id.clone();
         down_btn.connect_clicked(move |_| {
             if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
@@ -1039,6 +1054,7 @@ fn build_mod_row(
                         Rc::clone(&drag_scroll_c),
                         false,
                         Rc::clone(&active_drag_source_id_down),
+                        Rc::clone(&hovered_drop_target_index_down),
                     );
                 } else {
                     sync_library_reorder_async(
@@ -1070,11 +1086,18 @@ fn build_mod_row(
     {
         let row_c = row.clone();
         let active_drag_source_id_c = Rc::clone(&active_drag_source_id);
+        let hovered_drop_target_index_c = Rc::clone(&hovered_drop_target_index);
+        let drag_autoscroll_c = Rc::clone(&drag_autoscroll);
         let mod_id_drag = mod_entry.id.clone();
         drag_source.connect_drag_begin(move |src, _| {
             let paintable = gtk4::WidgetPaintable::new(Some(&row_c));
             src.set_icon(Some(&paintable), 0, 0);
             *active_drag_source_id_c.borrow_mut() = Some(mod_id_drag.clone());
+        });
+        let active_drag_source_id_end = Rc::clone(&active_drag_source_id);
+        drag_source.connect_drag_end(move |_, _, _| {
+            stop_drag_autoscroll(&drag_autoscroll_c);
+            reset_drag_state(&active_drag_source_id_end, &hovered_drop_target_index_c);
         });
     }
     row.add_controller(drag_source);
@@ -1123,6 +1146,7 @@ fn build_mod_row(
         let anchor_c = Rc::clone(&anchor_for_delete);
         let drag_scroll_c = Rc::clone(&drag_scroll_for_delete);
         let active_drag_source_id_dialog = Rc::clone(&active_drag_source_id);
+        let hovered_drop_target_index_dialog = Rc::clone(&hovered_drop_target_index);
         dialog.connect_response(None, move |_, response| {
             if response != "remove" {
                 return;
@@ -1171,6 +1195,7 @@ fn build_mod_row(
                 Rc::clone(&drag_scroll_c),
                 false,
                 Rc::clone(&active_drag_source_id_dialog),
+                Rc::clone(&hovered_drop_target_index_dialog),
             );
         });
 
