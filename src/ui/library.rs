@@ -262,6 +262,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     Rc::clone(&drag_scroll_for_timeout),
                     true,
                     Rc::new(RefCell::new(None)),
+                    Rc::new(RefCell::new(None)),
                 );
             });
 
@@ -726,6 +727,7 @@ fn sync_library_reorder_async(
                 Rc::clone(&pending_viewport_anchor),
                 Rc::clone(&drag_autoscroll),
                 false,
+                Rc::new(RefCell::new(None)),
                 Rc::new(RefCell::new(None)),
             );
             update_global_state(|state| {
@@ -1249,6 +1251,7 @@ fn build_mod_row(
                     Rc::clone(&drag_scroll_idle),
                     false,
                     Rc::new(RefCell::new(None)),
+                    Rc::new(RefCell::new(None)),
                 );
             });
         });
@@ -1452,6 +1455,7 @@ fn build_mod_row(
                     Rc::clone(&drag_scroll_enable),
                     false,
                     Rc::new(RefCell::new(None)),
+                    Rc::new(RefCell::new(None)),
                 );
             });
 
@@ -1483,6 +1487,7 @@ fn build_mod_row(
                     Rc::clone(&anchor_disable),
                     Rc::clone(&drag_scroll_disable),
                     false,
+                    Rc::new(RefCell::new(None)),
                     Rc::new(RefCell::new(None)),
                 );
             });
@@ -1578,6 +1583,7 @@ fn show_move_to_position_dialog_for_mod(
                 Rc::clone(&pending_viewport_anchor),
                 Rc::clone(&drag_autoscroll),
                 false,
+                Rc::new(RefCell::new(None)),
                 Rc::new(RefCell::new(None)),
             );
         }
