@@ -407,9 +407,15 @@ fn sync_load_order_reorder_async(
         })
         .await;
 
-        if let Err(err) = result {
-            log::error!("Load order reorder sync failed: {err}");
-            show_app_toast(&format!("Load-order reorder failed: {err}"));
+        let err_msg = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(err),
+            Err(err) => Some(format!("background task panicked: {:?}", err)),
+        };
+
+        if let Some(err_msg) = err_msg {
+            log::error!("Load order reorder sync failed: {err_msg}");
+            show_app_toast(&format!("Load-order reorder failed: {err_msg}"));
             refresh_load_order_content(
                 &container,
                 &game,

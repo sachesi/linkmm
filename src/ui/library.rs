@@ -205,10 +205,14 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 .await;
 
                 let msg = match result {
-                    Ok(enabled_count) => format!("Deployed {enabled_count} mod(s)"),
-                    Err(e) => {
+                    Ok(Ok(enabled_count)) => format!("Deployed {enabled_count} mod(s)"),
+                    Ok(Err(e)) => {
                         log::error!("Deploy error: {e}");
                         format!("Deploy failed: {e}")
+                    }
+                    Err(e) => {
+                        log::error!("Deploy task panicked: {:?}", e);
+                        "Deploy failed: background task panicked".to_string()
                     }
                 };
                 status_label_c.set_text(&msg);
@@ -500,9 +504,15 @@ fn sync_library_reorder_async(
         })
         .await;
 
-        if let Err(err) = result {
-            log::error!("Library reorder sync failed: {err}");
-            show_app_toast(&format!("Library reorder failed: {err}"));
+        let err_msg = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(err),
+            Err(err) => Some(format!("background task panicked: {:?}", err)),
+        };
+
+        if let Some(err_msg) = err_msg {
+            log::error!("Library reorder sync failed: {err_msg}");
+            show_app_toast(&format!("Library reorder failed: {err_msg}"));
             refresh_library_content_with_search(
                 &container,
                 &game,
