@@ -181,7 +181,7 @@ impl RuntimeSessionManager {
         }
 
         let umu = game.validate_umu_setup()?;
-        let app_id = game.kind.steam_app_id().unwrap_or(0);
+        let app_id = game.kind.primary_steam_app_id().unwrap_or(0);
         let command = crate::core::umu::build_umu_command(
             &umu.exe_path,
             app_id,

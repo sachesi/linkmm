@@ -374,8 +374,11 @@ fn tools_match_version(tool1: &str, tool2: &str) -> bool {
 }
 
 pub fn find_game_path(app_id: u32) -> Option<PathBuf> {
-    let libraries = find_steam_libraries();
-    for lib in &libraries {
+    find_game_path_in_libraries(app_id, &find_steam_libraries())
+}
+
+fn find_game_path_in_libraries(app_id: u32, libraries: &[SteamLibrary]) -> Option<PathBuf> {
+    for lib in libraries {
         let manifest_path = lib.path.join(format!("appmanifest_{app_id}.acf"));
         if manifest_path.exists()
             && let Ok(contents) = std::fs::read_to_string(&manifest_path)
@@ -391,10 +394,16 @@ pub fn find_game_path(app_id: u32) -> Option<PathBuf> {
 }
 
 pub fn detect_games() -> Vec<(GameKind, PathBuf)> {
+    detect_games_in_libraries(&find_steam_libraries())
+}
+
+fn detect_games_in_libraries(libraries: &[SteamLibrary]) -> Vec<(GameKind, PathBuf)> {
     let mut found = Vec::new();
     for kind in GameKind::all() {
-        if let Some(app_id) = kind.steam_app_id()
-            && let Some(path) = find_game_path(app_id)
+        if let Some(path) = kind
+            .steam_app_ids()
+            .iter()
+            .find_map(|&app_id| find_game_path_in_libraries(app_id, libraries))
         {
             found.push((kind, path));
         }
@@ -493,7 +502,7 @@ pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
 pub fn launch_game(game: &crate::core::games::Game) -> Result<(), String> {
     let app_id = game
         .kind
-        .steam_app_id()
+        .primary_steam_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
 
     std::process::Command::new("xdg-open")
@@ -513,7 +522,7 @@ pub fn launch_game_managed_command(
 ) -> Result<std::process::Command, String> {
     let app_id = game
         .kind
-        .steam_app_id()
+        .primary_steam_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
     let command = match select_managed_steam_backend(is_steam_flatpak(), detect_steam_path_kind()) {
         ManagedSteamBackend::Flatpak => launch_game_managed_flatpak_command(app_id),
@@ -949,6 +958,7 @@ fn split_launch_arguments(arguments: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn launch_game_fails_without_steam_app_id() {
@@ -1035,6 +1045,39 @@ mod tests {
             select_managed_steam_backend(false, SteamPathKind::FlatpakWrapper),
             ManagedSteamBackend::Flatpak
         );
+    }
+
+    #[test]
+    fn detect_games_recognizes_fallout_nv_alias_without_duplicates() {
+        let tmp = TempDir::new().expect("tempdir");
+        let steamapps = tmp.path().join("steamapps");
+        let common = steamapps.join("common");
+        let game_dir = common.join("Fallout New Vegas PCR");
+        std::fs::create_dir_all(&game_dir).expect("create game dir");
+
+        let manifest = steamapps.join("appmanifest_22490.acf");
+        let manifest_body = r#"
+            "AppState"
+            {
+                "appid"      "22490"
+                "installdir" "Fallout New Vegas PCR"
+            }
+        "#;
+        std::fs::create_dir_all(&steamapps).expect("create steamapps");
+        std::fs::write(&manifest, manifest_body).expect("write manifest");
+
+        let libraries = vec![SteamLibrary {
+            path: steamapps,
+            apps: vec![22490],
+        }];
+
+        let detected = detect_games_in_libraries(&libraries);
+        let fallout_nv: Vec<_> = detected
+            .iter()
+            .filter(|(kind, _)| *kind == GameKind::FalloutNV)
+            .collect();
+        assert_eq!(fallout_nv.len(), 1);
+        assert_eq!(fallout_nv[0].1, game_dir);
     }
 
     #[test]
