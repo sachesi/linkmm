@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use gtk4::glib;
+use gtk4::glib::clone::Downgrade;
 use libadwaita as adw;
 
 thread_local! {

@@ -1177,7 +1177,7 @@ fn on_install_complete(
     search_query: &str,
     game_rc: &Rc<Option<Game>>,
     status_ctx: Option<&InstallStatusCtx>,
-    container: &gtk4::Box,
+    _container: &gtk4::Box,
 ) {
     match result {
         Ok(_) => {

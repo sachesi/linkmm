@@ -341,13 +341,10 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             let rebuild_cleanup = Rc::clone(&rebuild);
             cleanup_generated_btn.connect_clicked(move |_| {
                 let mut db = ModDatabase::load(&game_cleanup);
-                if let Err(e) = crate::core::generated_outputs::cleanup_stale_generated_outputs(
+                crate::core::generated_outputs::cleanup_stale_generated_outputs(
                     &game_cleanup,
                     &mut db,
-                ) {
-                    log::error!("Generated-output cleanup failed: {e}");
-                    show_app_toast(&format!("Generated-output cleanup failed: {e}"));
-                }
+                );
                 if let Err(e) = ModManager::rebuild_all(&game_cleanup) {
                     log::error!("Failed rebuild after cleanup: {e}");
                     show_app_toast(&format!("Rebuild failed after cleanup: {e}"));

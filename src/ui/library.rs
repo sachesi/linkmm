@@ -183,7 +183,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let status_label_c = status_label_c.clone();
             let status_progress_c = status_progress_c.clone();
             let status_revealer_c = status_revealer_c.clone();
-            let btn = btn.clone();
             let anchor_for_timeout = Rc::clone(&anchor_c);
             let drag_scroll_for_timeout = Rc::clone(&drag_scroll_c);
 
@@ -194,6 +193,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let deploy_done = Arc::new(AtomicBool::new(false));
             let deploy_done_ui = Arc::clone(&deploy_done);
             let game_bg = (*game_c).clone();
+            let status_progress_for_async = status_progress_c.clone();
             gtk4::glib::spawn_future_local(async move {
                 let result = gio::spawn_blocking(move || {
                     let db = ModDatabase::load(&game_bg);
@@ -216,8 +216,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     }
                 };
                 status_label_c.set_text(&msg);
-                status_progress_c.set_fraction(1.0);
-                status_progress_c.set_text(Some("100%"));
+                status_progress_for_async.set_fraction(1.0);
+                status_progress_for_async.set_text(Some("100%"));
                 deploy_done.store(true, Ordering::Relaxed);
                 update_global_state(|state| {
                     state.deploy_active = false;
@@ -241,11 +241,12 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 );
             });
 
+            let status_progress_for_pulse = status_progress_c.clone();
             gtk4::glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
                 if deploy_done_ui.load(Ordering::Relaxed) {
                     gtk4::glib::ControlFlow::Break
                 } else {
-                    status_progress_c.pulse();
+                    status_progress_for_pulse.pulse();
                     gtk4::glib::ControlFlow::Continue
                 }
             });
