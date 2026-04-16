@@ -79,6 +79,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 let search_c = Rc::clone(&search_query);
                 let anchor_c = Rc::clone(&pending_viewport_anchor);
                 let drag_scroll_c = Rc::clone(&drag_autoscroll);
+                let active_drag_source_name_search = Rc::clone(&active_drag_source_name);
                 search_entry.connect_search_changed(move |entry| {
                     *search_c.borrow_mut() = entry.text().to_string();
                     refresh_load_order_content_with_search(
@@ -88,7 +89,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                         Rc::clone(&search_c),
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
-                        Rc::clone(&active_drag_source_name),
+                        Rc::clone(&active_drag_source_name_search),
                     );
                 });
             }
@@ -100,6 +101,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 let search_c = Rc::clone(&search_query);
                 let anchor_c = Rc::clone(&pending_viewport_anchor);
                 let drag_scroll_c = Rc::clone(&drag_autoscroll);
+                let active_drag_source_name_sort = Rc::clone(&active_drag_source_name);
                 sort_btn.connect_clicked(move |_| {
                     if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
                         show_app_toast(
@@ -123,7 +125,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                         Rc::clone(&search_c),
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
-                        Rc::clone(&active_drag_source_name),
+                        Rc::clone(&active_drag_source_name_sort),
                     );
                 });
             }
@@ -758,6 +760,7 @@ fn build_plugin_row(
         let search_c = Rc::clone(&search_state);
         let anchor_c = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
+        let active_drag_source_name_enabled = Rc::clone(&active_drag_source_name);
         let plugin_name = plugin.name.clone();
         enabled_btn.connect_toggled(move |btn| {
             let enabled = btn.is_active();
@@ -775,7 +778,7 @@ fn build_plugin_row(
                 Rc::clone(&search_c),
                 Rc::clone(&anchor_c),
                 Rc::clone(&drag_scroll_c),
-                Rc::clone(&active_drag_source_name),
+                Rc::clone(&active_drag_source_name_enabled),
             );
         });
     }
@@ -810,6 +813,7 @@ fn build_plugin_row(
         let search_c = Rc::clone(&search_state);
         let anchor_c = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
+        let active_drag_source_name_up = Rc::clone(&active_drag_source_name);
         let plugin_name = plugin.name.clone();
         up_btn.connect_clicked(move |_| {
             if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
@@ -840,7 +844,7 @@ fn build_plugin_row(
                         Rc::clone(&search_c),
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
-                        Rc::clone(&active_drag_source_name),
+                        Rc::clone(&active_drag_source_name_up),
                     );
                 } else {
                     sync_load_order_reorder_async(
@@ -864,6 +868,7 @@ fn build_plugin_row(
         let search_c = Rc::clone(&search_state);
         let anchor_c = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
+        let active_drag_source_name_down = Rc::clone(&active_drag_source_name);
         let plugin_name = plugin.name.clone();
         down_btn.connect_clicked(move |_| {
             if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
@@ -894,7 +899,7 @@ fn build_plugin_row(
                         Rc::clone(&search_c),
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
-                        Rc::clone(&active_drag_source_name),
+                        Rc::clone(&active_drag_source_name_down),
                     );
                 } else {
                     sync_load_order_reorder_async(

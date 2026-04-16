@@ -176,7 +176,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let status_label_c = status_label.clone();
         let status_progress_c = status_progress.clone();
         let status_revealer_c = status_revealer.clone();
-        deploy_btn.connect_clicked(move |btn| {
+        deploy_btn.connect_clicked(move |_btn| {
             if !derive_lock_policy(&global_state_snapshot()).allow_deploy_rebuild {
                 show_app_toast(
                     "Deploy is unavailable while a runtime/install operation is active.",
@@ -917,6 +917,7 @@ fn build_mod_row(
         let selected_c = Rc::clone(&selected_mod_id);
         let anchor_c = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
+        let active_drag_source_id_up = Rc::clone(&active_drag_source_id);
         let mod_id_c = mod_entry.id.clone();
         up_btn.connect_clicked(move |_| {
             if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
@@ -949,7 +950,7 @@ fn build_mod_row(
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         false,
-                        Rc::clone(&active_drag_source_id),
+                        Rc::clone(&active_drag_source_id_up),
                     );
                 } else {
                     sync_library_reorder_async(
@@ -976,6 +977,7 @@ fn build_mod_row(
         let selected_c = Rc::clone(&selected_mod_id);
         let anchor_c = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
+        let active_drag_source_id_down = Rc::clone(&active_drag_source_id);
         let mod_id_c = mod_entry.id.clone();
         down_btn.connect_clicked(move |_| {
             if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
@@ -1008,7 +1010,7 @@ fn build_mod_row(
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         false,
-                        Rc::clone(&active_drag_source_id),
+                        Rc::clone(&active_drag_source_id_down),
                     );
                 } else {
                     sync_library_reorder_async(
@@ -1092,6 +1094,7 @@ fn build_mod_row(
         let selected_c = Rc::clone(&selected_del);
         let anchor_c = Rc::clone(&anchor_for_delete);
         let drag_scroll_c = Rc::clone(&drag_scroll_for_delete);
+        let active_drag_source_id_dialog = Rc::clone(&active_drag_source_id);
         dialog.connect_response(None, move |_, response| {
             if response != "remove" {
                 return;
@@ -1139,7 +1142,7 @@ fn build_mod_row(
                 Rc::clone(&anchor_c),
                 Rc::clone(&drag_scroll_c),
                 false,
-                Rc::clone(&active_drag_source_id),
+                Rc::clone(&active_drag_source_id_dialog),
             );
         });
 
