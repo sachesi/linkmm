@@ -18,7 +18,7 @@ use crate::core::mods::{Mod, ModDatabase, ModManager};
 use crate::ui::app_state::{derive_lock_policy, global_state_snapshot, update_global_state};
 use crate::ui::drag_autoscroll::{
     DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction,
-    attach_viewport_drag_autoscroll, stop_drag_autoscroll,
+    compute_edge_scroll_step, ensure_drag_autoscroll_tick, stop_drag_autoscroll,
 };
 use crate::ui::toast::show_toast as show_app_toast;
 
@@ -103,6 +103,8 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     let selected_mod_id = Rc::new(RefCell::new(None::<String>));
     let pending_viewport_anchor = Rc::new(RefCell::new(None::<ViewportAnchor>));
     let drag_autoscroll = Rc::new(RefCell::new(EdgeAutoScrollState::default()));
+    let active_drag_source_id = Rc::new(RefCell::new(None::<String>));
+    let hovered_drop_target_id = Rc::new(RefCell::new(None::<String>));
 
     refresh_library_content_with_search(
         &list_container,
@@ -114,7 +116,24 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         Rc::clone(&pending_viewport_anchor),
         Rc::clone(&drag_autoscroll),
         true,
+        Rc::clone(&active_drag_source_id),
     );
+
+    if let Some((_, list_box, scrolled)) = find_existing_library_view(&list_container) {
+        attach_library_central_drop_controller(
+            &list_box,
+            &scrolled,
+            Rc::clone(&game_rc),
+            list_container.clone(),
+            Rc::clone(&config),
+            Rc::clone(&search_query),
+            Rc::clone(&selected_mod_id),
+            Rc::clone(&pending_viewport_anchor),
+            Rc::clone(&drag_autoscroll),
+            Rc::clone(&active_drag_source_id),
+            Rc::clone(&hovered_drop_target_id),
+        );
+    }
 
     toolbar_view.set_content(Some(&content_container));
 
@@ -138,6 +157,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 Rc::clone(&anchor_c),
                 Rc::clone(&drag_scroll_c),
                 false,
+                Rc::clone(&active_drag_source_id),
             );
         });
     }
@@ -238,6 +258,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     Rc::clone(&anchor_for_timeout),
                     Rc::clone(&drag_scroll_for_timeout),
                     true,
+                    Rc::new(RefCell::new(None)),
                 );
             });
 
@@ -273,7 +294,7 @@ fn find_existing_library_view(
 
 fn ensure_library_view(
     container: &gtk4::Box,
-    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
+    _drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
 ) -> (gtk4::Stack, gtk4::ListBox, gtk4::ScrolledWindow) {
     if let Some(view) = find_existing_library_view(container) {
         return view;
@@ -299,12 +320,6 @@ fn ensure_library_view(
     scrolled.set_vexpand(true);
     scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
     scrolled.set_child(Some(&clamp));
-    attach_viewport_drag_autoscroll(
-        &scrolled,
-        drag_autoscroll,
-        EdgeAutoScrollConfig::default(),
-        DEFAULT_TICK_MS,
-    );
 
     let stack = gtk4::Stack::new();
     stack.set_vexpand(true);
@@ -354,6 +369,156 @@ fn capture_row_offset_in_viewport(container: &gtk4::Box, row_key: &str) -> Optio
     let (_, list_box, scrolled) = find_existing_library_view(container)?;
     let row = find_row_by_key(&list_box, row_key)?;
     widget_y_in_scrolled(&row, &scrolled)
+}
+
+fn target_mod_id_for_pointer_y(
+    list_box: &gtk4::ListBox,
+    scrolled: &gtk4::ScrolledWindow,
+    pointer_y: f64,
+) -> Option<String> {
+    let mut child = list_box.first_child();
+    while let Some(widget) = child {
+        if let Some(row_y) = widget_y_in_scrolled(&widget, scrolled) {
+            let height = widget.height() as f64;
+            if pointer_y <= row_y + (height * 0.5) {
+                let key = widget.widget_name();
+                return key.strip_prefix("library:").map(|s| s.to_string());
+            }
+        }
+        child = widget.next_sibling();
+    }
+    list_box.last_child().and_then(|row| {
+        row.widget_name()
+            .strip_prefix("library:")
+            .map(|s| s.to_string())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_library_central_drop_controller(
+    list_box: &gtk4::ListBox,
+    scrolled: &gtk4::ScrolledWindow,
+    game: Rc<Game>,
+    container: gtk4::Box,
+    config: Rc<RefCell<AppConfig>>,
+    search_state: Rc<RefCell<String>>,
+    selected_mod_id: Rc<RefCell<Option<String>>>,
+    pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
+    drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
+    active_drag_source_id: Rc<RefCell<Option<String>>>,
+    hovered_drop_target_id: Rc<RefCell<Option<String>>>,
+) {
+    let motion = gtk4::DropControllerMotion::new();
+    {
+        let scrolled_c = scrolled.clone();
+        let list_box_c = list_box.clone();
+        let drag_autoscroll_c = Rc::clone(&drag_autoscroll);
+        let hovered_drop_target_id_c = Rc::clone(&hovered_drop_target_id);
+        motion.connect_motion(move |_, _, y| {
+            let step = compute_edge_scroll_step(
+                y,
+                scrolled_c.height() as f64,
+                EdgeAutoScrollConfig::default(),
+            );
+            drag_autoscroll_c.borrow_mut().step_px_per_tick = step;
+            ensure_drag_autoscroll_tick(
+                &scrolled_c,
+                Rc::clone(&drag_autoscroll_c),
+                DEFAULT_TICK_MS,
+            );
+            *hovered_drop_target_id_c.borrow_mut() =
+                target_mod_id_for_pointer_y(&list_box_c, &scrolled_c, y);
+        });
+    }
+    {
+        let drag_autoscroll_c = Rc::clone(&drag_autoscroll);
+        let hovered_drop_target_id_c = Rc::clone(&hovered_drop_target_id);
+        motion.connect_leave(move |_| {
+            stop_drag_autoscroll(&drag_autoscroll_c);
+            *hovered_drop_target_id_c.borrow_mut() = None;
+        });
+    }
+    scrolled.add_controller(motion);
+
+    let drop_target = gtk4::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+    {
+        let scrolled_c = scrolled.clone();
+        let list_box_c = list_box.clone();
+        let game_c = Rc::clone(&game);
+        let container_c = container.clone();
+        let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_state);
+        let selected_c = Rc::clone(&selected_mod_id);
+        let anchor_c = Rc::clone(&pending_viewport_anchor);
+        let drag_scroll_c = Rc::clone(&drag_autoscroll);
+        let source_state = Rc::clone(&active_drag_source_id);
+        let target_state = Rc::clone(&hovered_drop_target_id);
+        drop_target.connect_drop(move |_, value, _, y| {
+            if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
+                show_app_toast("Reordering is disabled while runtime/install/deploy is active.");
+                return false;
+            }
+            stop_drag_autoscroll(&drag_scroll_c);
+            let source_id = source_state
+                .borrow()
+                .clone()
+                .or_else(|| value.get::<String>().ok());
+            let Some(source_id) = source_id else {
+                return false;
+            };
+            let target_id = target_state
+                .borrow()
+                .clone()
+                .or_else(|| target_mod_id_for_pointer_y(&list_box_c, &scrolled_c, y));
+            let Some(target_id) = target_id else {
+                return false;
+            };
+            if source_id == target_id {
+                return false;
+            }
+            let row_offset_before_drop =
+                capture_row_offset_in_viewport(&container_c, &library_row_key(&source_id));
+            *anchor_c.borrow_mut() = Some(ViewportAnchor {
+                item_key: source_id.clone(),
+                align_ratio: 0.35,
+                preferred_row_offset: row_offset_before_drop,
+            });
+            if !move_library_row_in_place(
+                &container_c,
+                &source_id,
+                &target_id,
+                row_offset_before_drop,
+            ) {
+                refresh_library_content_with_search(
+                    &container_c,
+                    &game_c,
+                    Rc::clone(&config_c),
+                    &search_c.borrow(),
+                    Rc::clone(&search_c),
+                    Rc::clone(&selected_c),
+                    Rc::clone(&anchor_c),
+                    Rc::clone(&drag_scroll_c),
+                    false,
+                    Rc::clone(&source_state),
+                );
+            } else {
+                sync_library_reorder_async(
+                    source_id,
+                    target_id,
+                    Rc::clone(&game_c),
+                    container_c.clone(),
+                    Rc::clone(&config_c),
+                    Rc::clone(&search_c),
+                    Rc::clone(&selected_c),
+                    Rc::clone(&anchor_c),
+                    Rc::clone(&drag_scroll_c),
+                );
+            }
+            *source_state.borrow_mut() = None;
+            true
+        });
+    }
+    scrolled.add_controller(drop_target);
 }
 
 fn update_library_row_positions_in_place(list_box: &gtk4::ListBox) {
@@ -524,6 +689,7 @@ fn sync_library_reorder_async(
                 Rc::clone(&pending_viewport_anchor),
                 Rc::clone(&drag_autoscroll),
                 false,
+                Rc::new(RefCell::new(None)),
             );
             update_global_state(|state| {
                 state.message = Some("Reorder failed; view refreshed.".to_string());
@@ -542,6 +708,7 @@ fn refresh_library_content_with_search(
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
     do_scan: bool,
+    active_drag_source_id: Rc<RefCell<Option<String>>>,
 ) {
     let (stack, list_box, scrolled) = ensure_library_view(container, Rc::clone(&drag_autoscroll));
     let previous_scroll = {
@@ -610,6 +777,7 @@ fn refresh_library_content_with_search(
             Rc::clone(&selected_mod_id),
             Rc::clone(&pending_viewport_anchor),
             Rc::clone(&drag_autoscroll),
+            Rc::clone(&active_drag_source_id),
             conflict_states.get(&mod_entry.id),
         );
         list_box.append(&row);
@@ -668,6 +836,7 @@ fn build_mod_row(
     selected_mod_id: Rc<RefCell<Option<String>>>,
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
+    active_drag_source_id: Rc<RefCell<Option<String>>>,
     conflict_state: Option<&ConflictState>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
@@ -780,6 +949,7 @@ fn build_mod_row(
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         false,
+                        Rc::clone(&active_drag_source_id),
                     );
                 } else {
                     sync_library_reorder_async(
@@ -838,6 +1008,7 @@ fn build_mod_row(
                         Rc::clone(&anchor_c),
                         Rc::clone(&drag_scroll_c),
                         false,
+                        Rc::clone(&active_drag_source_id),
                     );
                 } else {
                     sync_library_reorder_async(
@@ -868,76 +1039,15 @@ fn build_mod_row(
     }
     {
         let row_c = row.clone();
+        let active_drag_source_id_c = Rc::clone(&active_drag_source_id);
+        let mod_id_drag = mod_entry.id.clone();
         drag_source.connect_drag_begin(move |src, _| {
             let paintable = gtk4::WidgetPaintable::new(Some(&row_c));
             src.set_icon(Some(&paintable), 0, 0);
+            *active_drag_source_id_c.borrow_mut() = Some(mod_id_drag.clone());
         });
     }
     row.add_controller(drag_source);
-
-    let drop_target = gtk4::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
-    {
-        let game_drop = Rc::clone(game);
-        let container_drop = container.clone();
-        let config_drop = Rc::clone(&config);
-        let search_drop = Rc::clone(&search_state);
-        let selected_drop = Rc::clone(&selected_mod_id);
-        let anchor_drop = Rc::clone(&pending_viewport_anchor);
-        let drag_scroll_drop = Rc::clone(&drag_autoscroll);
-        let target_id = mod_entry.id.clone();
-        drop_target.connect_drop(move |_, value, _, _| {
-            if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
-                show_app_toast("Reordering is disabled while runtime/install/deploy is active.");
-                return false;
-            }
-            stop_drag_autoscroll(&drag_scroll_drop);
-            let Ok(source_id) = value.get::<String>() else {
-                return false;
-            };
-            if source_id == target_id {
-                return false;
-            }
-            let row_offset_before_drop =
-                capture_row_offset_in_viewport(&container_drop, &library_row_key(&source_id));
-            *anchor_drop.borrow_mut() = Some(ViewportAnchor {
-                item_key: source_id.clone(),
-                align_ratio: 0.35,
-                preferred_row_offset: row_offset_before_drop,
-            });
-            if !move_library_row_in_place(
-                &container_drop,
-                &source_id,
-                &target_id,
-                row_offset_before_drop,
-            ) {
-                refresh_library_content_with_search(
-                    &container_drop,
-                    &game_drop,
-                    Rc::clone(&config_drop),
-                    &search_drop.borrow(),
-                    Rc::clone(&search_drop),
-                    Rc::clone(&selected_drop),
-                    Rc::clone(&anchor_drop),
-                    Rc::clone(&drag_scroll_drop),
-                    false,
-                );
-            } else {
-                sync_library_reorder_async(
-                    source_id,
-                    target_id.clone(),
-                    Rc::clone(&game_drop),
-                    container_drop.clone(),
-                    Rc::clone(&config_drop),
-                    Rc::clone(&search_drop),
-                    Rc::clone(&selected_drop),
-                    Rc::clone(&anchor_drop),
-                    Rc::clone(&drag_scroll_drop),
-                );
-            }
-            true
-        });
-    }
-    row.add_controller(drop_target);
 
     // ── Uninstall button ─────────────────────────────────────────────────────
     let delete_btn = gtk4::Button::new();
@@ -1029,6 +1139,7 @@ fn build_mod_row(
                 Rc::clone(&anchor_c),
                 Rc::clone(&drag_scroll_c),
                 false,
+                Rc::clone(&active_drag_source_id),
             );
         });
 
@@ -1081,6 +1192,7 @@ fn build_mod_row(
                     Rc::clone(&anchor_idle),
                     Rc::clone(&drag_scroll_idle),
                     false,
+                    Rc::new(RefCell::new(None)),
                 );
             });
         });
@@ -1283,6 +1395,7 @@ fn build_mod_row(
                     Rc::clone(&anchor_enable),
                     Rc::clone(&drag_scroll_enable),
                     false,
+                    Rc::new(RefCell::new(None)),
                 );
             });
 
@@ -1314,6 +1427,7 @@ fn build_mod_row(
                     Rc::clone(&anchor_disable),
                     Rc::clone(&drag_scroll_disable),
                     false,
+                    Rc::new(RefCell::new(None)),
                 );
             });
 
@@ -1412,6 +1526,7 @@ fn show_move_to_position_dialog_for_mod(
                 Rc::clone(&pending_viewport_anchor),
                 Rc::clone(&drag_autoscroll),
                 false,
+                Rc::new(RefCell::new(None)),
             );
         }
     });

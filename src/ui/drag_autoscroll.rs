@@ -64,6 +64,22 @@ pub fn apply_row_offset_correction(
     apply_scroll_step(current_value, upper, page_size, delta)
 }
 
+pub fn target_index_from_pointer_y(
+    pointer_y: f64,
+    row_tops: &[f64],
+    row_heights: &[f64],
+) -> Option<usize> {
+    if row_tops.len() != row_heights.len() || row_tops.is_empty() {
+        return None;
+    }
+    for (idx, (top, height)) in row_tops.iter().zip(row_heights.iter()).enumerate() {
+        if pointer_y <= *top + (*height * 0.5) {
+            return Some(idx);
+        }
+    }
+    Some(row_tops.len().saturating_sub(1))
+}
+
 pub fn stop_drag_autoscroll(state: &Rc<RefCell<EdgeAutoScrollState>>) {
     state.borrow_mut().step_px_per_tick = 0.0;
 }
@@ -120,7 +136,7 @@ pub fn attach_viewport_drag_autoscroll(
 mod tests {
     use super::{
         EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction, apply_scroll_step,
-        compute_edge_scroll_step, stop_drag_autoscroll,
+        compute_edge_scroll_step, stop_drag_autoscroll, target_index_from_pointer_y,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -169,5 +185,15 @@ mod tests {
             apply_row_offset_correction(5.0, 120.0, 100.0, 20.0, 80.0),
             0.0
         );
+    }
+
+    #[test]
+    fn target_index_mapping_uses_row_midpoints() {
+        let tops = [0.0, 30.0, 60.0];
+        let heights = [30.0, 30.0, 30.0];
+        assert_eq!(target_index_from_pointer_y(2.0, &tops, &heights), Some(0));
+        assert_eq!(target_index_from_pointer_y(20.0, &tops, &heights), Some(1));
+        assert_eq!(target_index_from_pointer_y(55.0, &tops, &heights), Some(2));
+        assert_eq!(target_index_from_pointer_y(200.0, &tops, &heights), Some(2));
     }
 }
