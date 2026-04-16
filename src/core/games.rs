@@ -42,7 +42,8 @@ impl GameKind {
         }
     }
 
-    pub fn steam_app_id(&self) -> Option<u32> {
+    /// Canonical Steam App ID used for launching and runtime integration.
+    pub fn primary_steam_app_id(&self) -> Option<u32> {
         match self {
             GameKind::SkyrimSE => Some(489830),
             GameKind::SkyrimVR => Some(611670),
@@ -55,6 +56,39 @@ impl GameKind {
             GameKind::Morrowind => Some(22320),
             GameKind::Starfield => Some(1716740),
         }
+    }
+
+    /// All recognized Steam App IDs for detection/library scanning.
+    ///
+    /// The first ID is always the canonical launch App ID returned by
+    /// [`Self::primary_steam_app_id`].
+    pub fn steam_app_ids(&self) -> &'static [u32] {
+        match self {
+            GameKind::SkyrimSE => &[489830],
+            GameKind::SkyrimVR => &[611670],
+            GameKind::SkyrimLE => &[72850],
+            GameKind::Fallout4 => &[377160],
+            GameKind::Fallout4VR => &[611660],
+            GameKind::Fallout3 => &[22300],
+            // 22490 is Fallout: New Vegas PCR (regional SKU) and maps to the
+            // same managed game kind as canonical app 22380.
+            GameKind::FalloutNV => &[22380, 22490],
+            GameKind::Oblivion => &[22330],
+            GameKind::Morrowind => &[22320],
+            GameKind::Starfield => &[1716740],
+        }
+    }
+
+    /// Backwards-compatible alias for the canonical Steam App ID.
+    pub fn steam_app_id(&self) -> Option<u32> {
+        self.primary_steam_app_id()
+    }
+
+    /// Resolve a known Steam App ID to a supported game kind.
+    pub fn from_steam_app_id(app_id: u32) -> Option<GameKind> {
+        Self::all()
+            .into_iter()
+            .find(|kind| kind.steam_app_ids().contains(&app_id))
     }
 
     pub fn default_data_subdir(&self) -> &str {
@@ -169,7 +203,7 @@ impl GameKind {
     pub fn umu_game_id(&self) -> String {
         format!(
             "umu-{}",
-            self.steam_app_id()
+            self.primary_steam_app_id()
                 .expect("all GameKind variants have a Steam App ID")
         )
     }
@@ -380,7 +414,7 @@ impl Game {
                 None
             }
             GameLauncherSource::Steam => {
-                let app_id = self.kind.steam_app_id()?;
+                let app_id = self.kind.primary_steam_app_id()?;
                 let compatdata = crate::core::steam::find_compatdata_path(app_id)?;
                 let path = compatdata
                     .join("pfx")
@@ -584,5 +618,23 @@ mod tests {
         let fallout4 = GameKind::Fallout4.expected_executable_names();
         assert!(fallout4.contains(&"Fallout4.exe"));
         assert!(fallout4.contains(&"f4se_loader.exe"));
+    }
+
+    #[test]
+    fn fallout_nv_alias_app_id_maps_to_same_game_kind() {
+        assert_eq!(
+            GameKind::from_steam_app_id(22380),
+            Some(GameKind::FalloutNV)
+        );
+        assert_eq!(
+            GameKind::from_steam_app_id(22490),
+            Some(GameKind::FalloutNV)
+        );
+    }
+
+    #[test]
+    fn primary_steam_app_id_remains_canonical_for_fallout_nv() {
+        assert_eq!(GameKind::FalloutNV.primary_steam_app_id(), Some(22380));
+        assert_eq!(GameKind::FalloutNV.steam_app_ids(), &[22380, 22490]);
     }
 }
