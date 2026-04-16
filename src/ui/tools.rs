@@ -472,7 +472,7 @@ fn show_tool_dialog(
     let app_id: u32 = {
         let cfg = config.borrow();
         cfg.current_game()
-            .and_then(|g| g.kind.steam_app_id())
+            .and_then(|g| g.kind.primary_steam_app_id())
             .unwrap_or(0)
     };
 
