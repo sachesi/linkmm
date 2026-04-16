@@ -84,10 +84,27 @@ pub fn stop_drag_autoscroll(state: &Rc<RefCell<EdgeAutoScrollState>>) {
     state.borrow_mut().step_px_per_tick = 0.0;
 }
 
+pub fn adjusted_insert_index(source_idx: usize, target_idx: usize) -> usize {
+    if source_idx < target_idx {
+        target_idx.saturating_sub(1)
+    } else {
+        target_idx
+    }
+}
+
+pub fn reset_drag_state<T>(
+    active_item: &Rc<RefCell<Option<T>>>,
+    hovered_index: &Rc<RefCell<Option<usize>>>,
+) {
+    *active_item.borrow_mut() = None;
+    *hovered_index.borrow_mut() = None;
+}
+
 pub fn ensure_drag_autoscroll_tick(
     scrolled: &gtk4::ScrolledWindow,
     state: Rc<RefCell<EdgeAutoScrollState>>,
     tick_ms: u64,
+    on_tick: Option<Rc<dyn Fn()>>,
 ) {
     if state.borrow().ticking {
         return;
@@ -103,6 +120,9 @@ pub fn ensure_drag_autoscroll_tick(
         let adj = scrolled_c.vadjustment();
         let next = apply_scroll_step(adj.value(), adj.upper(), adj.page_size(), step);
         adj.set_value(next);
+        if let Some(cb) = on_tick.as_ref() {
+            cb();
+        }
         gtk4::glib::ControlFlow::Continue
     });
 }
@@ -120,7 +140,7 @@ pub fn attach_viewport_drag_autoscroll(
         controller.connect_motion(move |_, _, y| {
             let step = compute_edge_scroll_step(y, scrolled_c.height() as f64, cfg);
             state_c.borrow_mut().step_px_per_tick = step;
-            ensure_drag_autoscroll_tick(&scrolled_c, Rc::clone(&state_c), tick_ms);
+            ensure_drag_autoscroll_tick(&scrolled_c, Rc::clone(&state_c), tick_ms, None);
         });
     }
     {
@@ -135,8 +155,9 @@ pub fn attach_viewport_drag_autoscroll(
 #[cfg(test)]
 mod tests {
     use super::{
-        EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction, apply_scroll_step,
-        compute_edge_scroll_step, stop_drag_autoscroll, target_index_from_pointer_y,
+        EdgeAutoScrollConfig, EdgeAutoScrollState, adjusted_insert_index,
+        apply_row_offset_correction, apply_scroll_step, compute_edge_scroll_step, reset_drag_state,
+        stop_drag_autoscroll, target_index_from_pointer_y,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -195,5 +216,21 @@ mod tests {
         assert_eq!(target_index_from_pointer_y(20.0, &tops, &heights), Some(1));
         assert_eq!(target_index_from_pointer_y(55.0, &tops, &heights), Some(2));
         assert_eq!(target_index_from_pointer_y(200.0, &tops, &heights), Some(2));
+    }
+
+    #[test]
+    fn adjusted_insert_index_handles_forward_and_backward_moves() {
+        assert_eq!(adjusted_insert_index(1, 4), 3);
+        assert_eq!(adjusted_insert_index(4, 1), 1);
+        assert_eq!(adjusted_insert_index(2, 2), 2);
+    }
+
+    #[test]
+    fn reset_drag_state_clears_source_and_target() {
+        let source = Rc::new(RefCell::new(Some("abc".to_string())));
+        let hovered = Rc::new(RefCell::new(Some(3usize)));
+        reset_drag_state(&source, &hovered);
+        assert!(source.borrow().is_none());
+        assert!(hovered.borrow().is_none());
     }
 }

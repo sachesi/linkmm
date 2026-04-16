@@ -12,8 +12,9 @@ use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, PluginFile};
 use crate::ui::app_state::{derive_lock_policy, global_state_snapshot};
 use crate::ui::drag_autoscroll::{
-    DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, apply_row_offset_correction,
-    compute_edge_scroll_step, ensure_drag_autoscroll_tick, stop_drag_autoscroll,
+    DEFAULT_TICK_MS, EdgeAutoScrollConfig, EdgeAutoScrollState, adjusted_insert_index,
+    apply_row_offset_correction, compute_edge_scroll_step, ensure_drag_autoscroll_tick,
+    reset_drag_state, stop_drag_autoscroll, target_index_from_pointer_y,
 };
 use crate::ui::toast::show_toast as show_app_toast;
 
@@ -71,7 +72,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             let pending_viewport_anchor = Rc::new(RefCell::new(None::<ViewportAnchor>));
             let drag_autoscroll = Rc::new(RefCell::new(EdgeAutoScrollState::default()));
             let active_drag_source_name = Rc::new(RefCell::new(None::<String>));
-            let hovered_drop_target_name = Rc::new(RefCell::new(None::<String>));
+            let hovered_drop_target_index = Rc::new(RefCell::new(None::<usize>));
 
             {
                 let game_c = Rc::clone(&game_rc);
@@ -150,7 +151,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                     Rc::clone(&pending_viewport_anchor),
                     Rc::clone(&drag_autoscroll),
                     Rc::clone(&active_drag_source_name),
-                    Rc::clone(&hovered_drop_target_name),
+                    Rc::clone(&hovered_drop_target_index),
                 );
             }
         }
@@ -273,27 +274,22 @@ fn capture_row_offset_in_viewport(container: &gtk4::Box, row_key: &str) -> Optio
     widget_y_in_scrolled(&row, &scrolled)
 }
 
-fn target_plugin_name_for_pointer_y(
+fn target_plugin_index_for_pointer_y(
     list_box: &gtk4::ListBox,
     scrolled: &gtk4::ScrolledWindow,
     pointer_y: f64,
-) -> Option<String> {
+) -> Option<usize> {
+    let mut tops = Vec::new();
+    let mut heights = Vec::new();
     let mut child = list_box.first_child();
     while let Some(widget) = child {
         if let Some(row_y) = widget_y_in_scrolled(&widget, scrolled) {
-            let height = widget.height() as f64;
-            if pointer_y <= row_y + (height * 0.5) {
-                let key = widget.widget_name();
-                return key.strip_prefix("load-order:").map(|s| s.to_string());
-            }
+            tops.push(row_y);
+            heights.push(widget.height() as f64);
         }
         child = widget.next_sibling();
     }
-    list_box.last_child().and_then(|row| {
-        row.widget_name()
-            .strip_prefix("load-order:")
-            .map(|s| s.to_string())
-    })
+    target_index_from_pointer_y(pointer_y, &tops, &heights)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -306,14 +302,28 @@ fn attach_load_order_central_drop_controller(
     pending_viewport_anchor: Rc<RefCell<Option<ViewportAnchor>>>,
     drag_autoscroll: Rc<RefCell<EdgeAutoScrollState>>,
     active_drag_source_name: Rc<RefCell<Option<String>>>,
-    hovered_drop_target_name: Rc<RefCell<Option<String>>>,
+    hovered_drop_target_index: Rc<RefCell<Option<usize>>>,
 ) {
     let motion = gtk4::DropControllerMotion::new();
+    let pointer_y_state = Rc::new(RefCell::new(None::<f64>));
     {
         let scrolled_c = scrolled.clone();
         let list_box_c = list_box.clone();
         let drag_autoscroll_c = Rc::clone(&drag_autoscroll);
-        let hovered_drop_target_name_c = Rc::clone(&hovered_drop_target_name);
+        let hovered_drop_target_index_c = Rc::clone(&hovered_drop_target_index);
+        let pointer_y_state_c = Rc::clone(&pointer_y_state);
+        let retarget_cb: Rc<dyn Fn()> = Rc::new({
+            let list_box_c = list_box_c.clone();
+            let scrolled_c = scrolled_c.clone();
+            let hovered_drop_target_index_c = Rc::clone(&hovered_drop_target_index_c);
+            let pointer_y_state_c = Rc::clone(&pointer_y_state_c);
+            move || {
+                if let Some(pointer_y) = *pointer_y_state_c.borrow() {
+                    *hovered_drop_target_index_c.borrow_mut() =
+                        target_plugin_index_for_pointer_y(&list_box_c, &scrolled_c, pointer_y);
+                }
+            }
+        });
         motion.connect_motion(move |_, _, y| {
             let step = compute_edge_scroll_step(
                 y,
@@ -321,21 +331,26 @@ fn attach_load_order_central_drop_controller(
                 EdgeAutoScrollConfig::default(),
             );
             drag_autoscroll_c.borrow_mut().step_px_per_tick = step;
+            *pointer_y_state_c.borrow_mut() = Some(y);
+            *hovered_drop_target_index_c.borrow_mut() =
+                target_plugin_index_for_pointer_y(&list_box_c, &scrolled_c, y);
             ensure_drag_autoscroll_tick(
                 &scrolled_c,
                 Rc::clone(&drag_autoscroll_c),
                 DEFAULT_TICK_MS,
+                Some(Rc::clone(&retarget_cb)),
             );
-            *hovered_drop_target_name_c.borrow_mut() =
-                target_plugin_name_for_pointer_y(&list_box_c, &scrolled_c, y);
         });
     }
     {
         let drag_autoscroll_c = Rc::clone(&drag_autoscroll);
-        let hovered_drop_target_name_c = Rc::clone(&hovered_drop_target_name);
+        let hovered_drop_target_index_c = Rc::clone(&hovered_drop_target_index);
+        let pointer_y_state_c = Rc::clone(&pointer_y_state);
+        let active_drag_source_name_c = Rc::clone(&active_drag_source_name);
         motion.connect_leave(move |_| {
             stop_drag_autoscroll(&drag_autoscroll_c);
-            *hovered_drop_target_name_c.borrow_mut() = None;
+            *pointer_y_state_c.borrow_mut() = None;
+            reset_drag_state(&active_drag_source_name_c, &hovered_drop_target_index_c);
         });
     }
     scrolled.add_controller(motion);
@@ -350,7 +365,8 @@ fn attach_load_order_central_drop_controller(
         let anchor_c = Rc::clone(&pending_viewport_anchor);
         let drag_scroll_c = Rc::clone(&drag_autoscroll);
         let source_state = Rc::clone(&active_drag_source_name);
-        let target_state = Rc::clone(&hovered_drop_target_name);
+        let target_state = Rc::clone(&hovered_drop_target_index);
+        let pointer_y_state_c = Rc::clone(&pointer_y_state);
         drop_target.connect_drop(move |_, value, _, y| {
             if !derive_lock_policy(&global_state_snapshot()).allow_reorder {
                 show_app_toast(
@@ -366,10 +382,21 @@ fn attach_load_order_central_drop_controller(
             let Some(source_name) = source_name else {
                 return false;
             };
-            let target_name = target_state
+            let target_index = target_state
                 .borrow()
-                .clone()
-                .or_else(|| target_plugin_name_for_pointer_y(&list_box_c, &scrolled_c, y));
+                .as_ref()
+                .copied()
+                .or_else(|| target_plugin_index_for_pointer_y(&list_box_c, &scrolled_c, y));
+            let Some(target_index) = target_index else {
+                return false;
+            };
+            let Some(target_row) = list_box_c.row_at_index(target_index as i32) else {
+                return false;
+            };
+            let target_name = target_row
+                .widget_name()
+                .strip_prefix("load-order:")
+                .map(|s| s.to_string());
             let Some(target_name) = target_name else {
                 return false;
             };
@@ -408,7 +435,8 @@ fn attach_load_order_central_drop_controller(
                     Rc::clone(&drag_scroll_c),
                 );
             }
-            *source_state.borrow_mut() = None;
+            *pointer_y_state_c.borrow_mut() = None;
+            reset_drag_state(&source_state, &target_state);
             true
         });
     }
@@ -1087,11 +1115,7 @@ fn build_plugin_row(
 /// returned `insert_pos` maps the original `target_idx` to its correct
 /// post-removal slot, clamped so it never falls inside the vanilla region.
 fn adjusted_insert_pos(src_pos: usize, target_idx: usize, ordered: &[PluginFile]) -> usize {
-    let raw = if src_pos < target_idx {
-        target_idx - 1
-    } else {
-        target_idx
-    };
+    let raw = adjusted_insert_index(src_pos, target_idx);
     let first_non_vanilla = ordered
         .iter()
         .position(|p| !p.is_vanilla)
