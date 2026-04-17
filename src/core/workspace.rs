@@ -4,9 +4,20 @@ use crate::core::runtime_scan::RuntimeScanReport;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 
 const WORKSPACE_BASELINE_FILE: &str = "workspace_baseline.toml";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceEvent {
+    ProfileStateChanged { game_id: String, profile_id: String },
+    WorkspaceStateChanged { game_id: String, profile_id: String },
+    DeployStarted { game_id: String, profile_id: String },
+    DeployFinished { game_id: String, profile_id: String },
+    DeployFailed { game_id: String, profile_id: String },
+    ProfileSwitched { game_id: String, profile_id: String },
+    RevertCompleted { game_id: String, profile_id: String },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeploymentState {
@@ -159,9 +170,30 @@ impl Default for WorkspaceRuntimeState {
 
 static RUNTIME_STATE: OnceLock<Mutex<HashMap<WorkspaceRuntimeKey, WorkspaceRuntimeState>>> =
     OnceLock::new();
+static WORKSPACE_SUBSCRIBERS: OnceLock<Mutex<Vec<mpsc::Sender<WorkspaceEvent>>>> = OnceLock::new();
 
 fn runtime_state_map() -> &'static Mutex<HashMap<WorkspaceRuntimeKey, WorkspaceRuntimeState>> {
     RUNTIME_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn subscriber_list() -> &'static Mutex<Vec<mpsc::Sender<WorkspaceEvent>>> {
+    WORKSPACE_SUBSCRIBERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn subscribe_events() -> mpsc::Receiver<WorkspaceEvent> {
+    let (tx, rx) = mpsc::channel();
+    subscriber_list()
+        .lock()
+        .expect("workspace subscribers lock poisoned")
+        .push(tx);
+    rx
+}
+
+pub fn emit_event(event: WorkspaceEvent) {
+    let mut subscribers = subscriber_list()
+        .lock()
+        .expect("workspace subscribers lock poisoned");
+    subscribers.retain(|tx| tx.send(event.clone()).is_ok());
 }
 
 fn runtime_key(game_id: &str, profile_id: &str) -> WorkspaceRuntimeKey {
@@ -283,6 +315,16 @@ pub fn mark_operation(game_id: &str, profile_id: &str, op: WorkspaceOperation) {
     map.entry(runtime_key(game_id, profile_id))
         .or_default()
         .operation = op;
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
+    if op == WorkspaceOperation::Deploy {
+        emit_event(WorkspaceEvent::DeployStarted {
+            game_id: game_id.to_string(),
+            profile_id: profile_id.to_string(),
+        });
+    }
 }
 
 pub fn set_status(
@@ -295,6 +337,10 @@ pub fn set_status(
     let state = map.entry(runtime_key(game_id, profile_id)).or_default();
     state.severity = severity;
     state.status_message = Some(message.into());
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
 }
 
 pub fn clear_status(game_id: &str, profile_id: &str) {
@@ -303,6 +349,10 @@ pub fn clear_status(game_id: &str, profile_id: &str) {
         state.status_message = None;
         state.severity = StatusSeverity::Info;
     }
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
 }
 
 pub fn mark_unmanaged_runtime_changes(game_id: &str, profile_id: &str, changed: bool) {
@@ -310,6 +360,10 @@ pub fn mark_unmanaged_runtime_changes(game_id: &str, profile_id: &str, changed: 
     map.entry(runtime_key(game_id, profile_id))
         .or_default()
         .unmanaged_runtime_changed = changed;
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
 }
 
 pub fn update_runtime_scan_status(game_id: &str, profile_id: &str, report: &RuntimeScanReport) {
@@ -321,6 +375,10 @@ pub fn update_runtime_scan_status(game_id: &str, profile_id: &str, report: &Runt
         adoptable_count: report.adoptable_count(),
         unknown_count: report.unknown_count(),
     };
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
 }
 
 pub fn mark_deploy_failure(game_id: &str, profile_id: &str, message: impl Into<String>) {
@@ -330,6 +388,14 @@ pub fn mark_deploy_failure(game_id: &str, profile_id: &str, message: impl Into<S
     state.severity = StatusSeverity::Error;
     state.status_message = Some(message.into());
     state.operation = WorkspaceOperation::None;
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
+    emit_event(WorkspaceEvent::DeployFailed {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
 }
 
 pub fn mark_deployed_clean(game: &Game, db: &ModDatabase) -> Result<(), String> {
@@ -349,6 +415,14 @@ pub fn mark_deployed_clean(game: &Game, db: &ModDatabase) -> Result<(), String> 
     state.runtime_scan = RuntimeScanStatus::default();
     state.status_message = Some("Deployment is up to date".to_string());
     state.severity = StatusSeverity::Info;
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game.id.clone(),
+        profile_id: db.active_profile_id.clone(),
+    });
+    emit_event(WorkspaceEvent::DeployFinished {
+        game_id: game.id.clone(),
+        profile_id: db.active_profile_id.clone(),
+    });
     Ok(())
 }
 
@@ -417,6 +491,17 @@ pub fn has_profile_baseline(game: &Game, profile_id: &str) -> bool {
     load_baseline(game, profile_id).is_some()
 }
 
+pub fn notify_profile_state_changed(game_id: &str, profile_id: &str) {
+    emit_event(WorkspaceEvent::ProfileStateChanged {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    });
+}
+
 pub fn revert_active_profile_to_baseline(game: &Game) -> Result<(), String> {
     let mut db = ModDatabase::load(game);
     let profile_id = db.active_profile_id.clone();
@@ -479,6 +564,10 @@ pub fn revert_active_profile_to_baseline(game: &Game) -> Result<(), String> {
         StatusSeverity::Info,
         "Discarded staged edits; profile state restored to deployed baseline",
     );
+    emit_event(WorkspaceEvent::RevertCompleted {
+        game_id: game.id.clone(),
+        profile_id,
+    });
     Ok(())
 }
 
@@ -989,5 +1078,46 @@ mod tests {
         db.save(&game);
         let err = revert_active_profile_to_baseline(&game).unwrap_err();
         assert!(err.contains("No deployed baseline"));
+    }
+
+    #[test]
+    fn workspace_event_subscribers_receive_notifications() {
+        let rx = subscribe_events();
+        emit_event(WorkspaceEvent::DeployStarted {
+            game_id: "g".to_string(),
+            profile_id: "p".to_string(),
+        });
+        let ev = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(
+            ev,
+            WorkspaceEvent::DeployStarted {
+                game_id: "g".to_string(),
+                profile_id: "p".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn notify_profile_state_changed_emits_profile_and_workspace_events() {
+        let rx = subscribe_events();
+        notify_profile_state_changed("g2", "p2");
+        let first = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        let second = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        assert!(matches!(
+            first,
+            WorkspaceEvent::ProfileStateChanged { .. }
+                | WorkspaceEvent::WorkspaceStateChanged { .. }
+        ));
+        assert!(matches!(
+            second,
+            WorkspaceEvent::ProfileStateChanged { .. }
+                | WorkspaceEvent::WorkspaceStateChanged { .. }
+        ));
     }
 }

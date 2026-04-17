@@ -62,6 +62,27 @@ const NAV_DOWNLOADS: i32 = 2;
 const NAV_TOOLS: i32 = 3;
 const NAV_PREFERENCES: i32 = 4;
 
+fn attach_workspace_event_listener<F>(mut on_event: F)
+where
+    F: FnMut(workspace::WorkspaceEvent) + 'static,
+{
+    let rx = workspace::subscribe_events();
+    let (tx_ui, rx_ui) = std::sync::mpsc::channel::<workspace::WorkspaceEvent>();
+    std::thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            if tx_ui.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    glib::idle_add_local(move || {
+        while let Ok(event) = rx_ui.try_recv() {
+            on_event(event);
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
 // ── Main window ────────────────────────────────────────────────────────────
 
 fn build_main_window(
@@ -428,7 +449,7 @@ fn build_main_window(
         let config_t = Rc::clone(&config);
         let workspace_banner_t = workspace_banner.clone();
         let workspace_revealer_t = workspace_revealer.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
+        let refresh_banner = move || {
             let game = config_t.borrow().current_game().cloned();
             if let Some(game) = game {
                 let state = workspace::workspace_state_for_game(&game);
@@ -439,7 +460,20 @@ fn build_main_window(
                 workspace_banner_t.set_title("Select a game to view workspace status");
                 workspace_revealer_t.set_reveal_child(true);
             }
-            glib::ControlFlow::Continue
+        };
+        refresh_banner();
+        attach_workspace_event_listener(move |event| {
+            if matches!(
+                event,
+                workspace::WorkspaceEvent::WorkspaceStateChanged { .. }
+                    | workspace::WorkspaceEvent::ProfileStateChanged { .. }
+                    | workspace::WorkspaceEvent::ProfileSwitched { .. }
+                    | workspace::WorkspaceEvent::DeployFinished { .. }
+                    | workspace::WorkspaceEvent::DeployFailed { .. }
+                    | workspace::WorkspaceEvent::RevertCompleted { .. }
+            ) {
+                refresh_banner();
+            }
         });
     }
 

@@ -13,6 +13,27 @@ use crate::core::mods::{ModDatabase, ModManager};
 use crate::core::runtime::{SessionStatus, global_runtime_manager};
 use crate::core::workspace::{self, ProfileSwitchPolicy};
 
+fn attach_workspace_event_listener<F>(mut on_event: F)
+where
+    F: FnMut(workspace::WorkspaceEvent) + 'static,
+{
+    let rx = workspace::subscribe_events();
+    let (tx_ui, rx_ui) = std::sync::mpsc::channel::<workspace::WorkspaceEvent>();
+    std::thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            if tx_ui.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    glib::idle_add_local(move || {
+        while let Ok(event) = rx_ui.try_recv() {
+            on_event(event);
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
 fn preview_examples<T: ToString>(items: &[T]) -> String {
     if items.is_empty() {
         return "None".to_string();
@@ -1001,11 +1022,45 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         {
             let game_workspace = game.clone();
             let workspace_row_c = workspace_row.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
+            let refresh_workspace_row = move || {
                 let state = workspace::workspace_state_for_game(&game_workspace);
                 let summary = workspace::format_workspace_compact_summary(&state);
                 workspace_row_c.set_subtitle(&summary);
-                glib::ControlFlow::Continue
+            };
+            refresh_workspace_row();
+            attach_workspace_event_listener(move |event| {
+                if matches!(
+                    event,
+                    workspace::WorkspaceEvent::WorkspaceStateChanged { .. }
+                        | workspace::WorkspaceEvent::ProfileStateChanged { .. }
+                        | workspace::WorkspaceEvent::ProfileSwitched { .. }
+                        | workspace::WorkspaceEvent::DeployFinished { .. }
+                        | workspace::WorkspaceEvent::DeployFailed { .. }
+                        | workspace::WorkspaceEvent::RevertCompleted { .. }
+                ) {
+                    refresh_workspace_row();
+                }
+            });
+        }
+
+        {
+            let game_events = game.clone();
+            let rebuild_events = Rc::downgrade(&rebuild);
+            attach_workspace_event_listener(move |event| {
+                let relevant = match event {
+                    workspace::WorkspaceEvent::ProfileStateChanged { game_id, .. }
+                    | workspace::WorkspaceEvent::DeployFinished { game_id, .. }
+                    | workspace::WorkspaceEvent::DeployFailed { game_id, .. }
+                    | workspace::WorkspaceEvent::RevertCompleted { game_id, .. }
+                    | workspace::WorkspaceEvent::ProfileSwitched { game_id, .. } => {
+                        game_id == game_events.id
+                    }
+                    workspace::WorkspaceEvent::DeployStarted { .. }
+                    | workspace::WorkspaceEvent::WorkspaceStateChanged { .. } => false,
+                };
+                if relevant && let Some(rb) = rebuild_events.upgrade() {
+                    (rb.borrow())();
+                }
             });
         }
 

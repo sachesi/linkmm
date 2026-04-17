@@ -357,6 +357,32 @@ Pending-removal semantics on revert:
 - payloads are not deleted by revert
 - deletion/final cleanup still happens only after successful explicit redeploy
 
+## 16. Workspace event-driven UI refresh model
+
+LinkMM now uses a lightweight workspace event notifier for shared UI truth:
+
+- `workspace::subscribe_events()` registers listeners
+- state-changing paths emit typed `WorkspaceEvent` values (`ProfileStateChanged`,
+  `WorkspaceStateChanged`, `DeployStarted|Finished|Failed`, `ProfileSwitched`,
+  `RevertCompleted`)
+- `ModDatabase::save` emits profile/workspace refresh notifications so staged
+  profile edits invalidate summaries without per-page manual wiring
+
+UI refresh behavior:
+
+- main workspace banner refreshes from workspace events rather than periodic
+  polling
+- Tools workspace summary and deploy/review surface refresh from workspace
+  events for profile/deploy/revert changes
+- cached pages remain stable; updates target shared summaries and relevant page
+  surfaces without full-window rebuilds
+
+Intentional remaining polling:
+
+- short timers still exist for operational concerns (for example runtime-session
+  lock toggles and download/progress plumbing) where event-driven replacement is
+  out of scope for workspace/deploy/output summary truth
+
 Backup hygiene:
 
 - restored payload files are removed from backup storage

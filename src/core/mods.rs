@@ -1,5 +1,6 @@
 use crate::core::deployment;
 use crate::core::games::Game;
+use crate::core::workspace;
 use libloot::{Game as LootGame, GameType as LootGameType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -393,6 +394,8 @@ impl ModDatabase {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {
                     log::error!("Failed to write mods database: {e}");
+                } else {
+                    workspace::notify_profile_state_changed(&game.id, &self.active_profile_id);
                 }
             }
             Err(e) => {
@@ -735,6 +738,10 @@ impl ModManager {
         let mut db = ModDatabase::load(game);
         db.switch_active_profile(profile_id);
         db.save(game);
+        workspace::emit_event(workspace::WorkspaceEvent::ProfileSwitched {
+            game_id: game.id.clone(),
+            profile_id: profile_id.to_string(),
+        });
         Ok(())
     }
 
