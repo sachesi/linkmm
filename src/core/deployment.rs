@@ -17,6 +17,14 @@ use crate::core::mods::{Mod, ModDatabase};
 use crate::core::workspace;
 
 const DEPLOY_STATE_FILE: &str = "deployment_state.toml";
+const LEGACY_BACKUP_PREFIX: &str = "backups";
+
+#[derive(Debug, Clone)]
+pub struct DeploymentBackupStatus {
+    pub backup_root: PathBuf,
+    pub backup_entries: usize,
+    pub existing_payload_files: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DeploymentState {
@@ -50,6 +58,37 @@ impl DeploymentState {
             .map_err(|e| format!("Failed to write deployment state: {e}"))?;
         Ok(())
     }
+}
+
+fn backup_payload_root(game: &Game, profile_id: &str) -> PathBuf {
+    game.mods_dir()
+        .join("profiles")
+        .join(profile_id)
+        .join("deployment_backups")
+}
+
+fn resolve_backup_payload_path(game: &Game, profile_id: &str, recorded: &str) -> PathBuf {
+    let recorded_path = PathBuf::from(recorded);
+    if recorded_path.is_absolute() {
+        return recorded_path;
+    }
+    let legacy = game.config_dir().join(&recorded_path);
+    if legacy.exists() {
+        return legacy;
+    }
+    let normalized = if recorded.starts_with(LEGACY_BACKUP_PREFIX) {
+        recorded_path
+            .strip_prefix(LEGACY_BACKUP_PREFIX)
+            .map(Path::to_path_buf)
+            .unwrap_or(recorded_path)
+    } else {
+        recorded_path
+    };
+    backup_payload_root(game, profile_id).join(normalized)
+}
+
+fn backup_record_value(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 const ASSETS_DEPLOYER_ID: &str = "assets";
@@ -338,7 +377,57 @@ pub fn rebuild_deployment(game: &Game, db: &mut ModDatabase) -> Result<(), Strin
         }
     }
     workspace::mark_deployed_clean(game, db)?;
+    let backup_status = deployment_backup_status(game, &db.active_profile_id)?;
+    workspace::set_status(
+        &game.id,
+        &db.active_profile_id,
+        workspace::StatusSeverity::Info,
+        if backup_status.backup_entries > 0 {
+            format!(
+                "Deployment is up to date; preserved {} original file(s) in backup storage",
+                backup_status.backup_entries
+            )
+        } else {
+            "Deployment is up to date; no preserved original files pending restore".to_string()
+        },
+    );
     Ok(())
+}
+
+pub fn deployment_backup_status(
+    game: &Game,
+    profile_id: &str,
+) -> Result<DeploymentBackupStatus, String> {
+    let state = DeploymentState::load(game, profile_id);
+    let backup_root = backup_payload_root(game, profile_id);
+    let mut existing_payload_files = 0usize;
+    for recorded in state.backups.values() {
+        let path = resolve_backup_payload_path(game, profile_id, recorded);
+        if path.is_file() {
+            existing_payload_files += 1;
+        }
+    }
+    Ok(DeploymentBackupStatus {
+        backup_root,
+        backup_entries: state.backups.len(),
+        existing_payload_files,
+    })
+}
+
+pub fn cleanup_stale_backup_payloads(game: &Game, profile_id: &str) -> Result<usize, String> {
+    let state = DeploymentState::load(game, profile_id);
+    let live: HashSet<PathBuf> = state
+        .backups
+        .values()
+        .map(|recorded| resolve_backup_payload_path(game, profile_id, recorded))
+        .collect();
+    let root = backup_payload_root(game, profile_id);
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    cleanup_stale_recursive(&root, &live, &mut removed)?;
+    Ok(removed)
 }
 
 impl Deployer for AssetsDeployer {
@@ -424,7 +513,7 @@ fn apply_assets_plan(
 
     for (dest_rel, entry) in &desired {
         let dest = game.root_path.join(dest_rel);
-        ensure_path_ready_for_link(game, &mut state, &dest)?;
+        ensure_path_ready_for_link(game, profile_id, &mut state, &dest)?;
         if remove_link_if_matches(&entry.source, &dest).is_err()
             && (dest.exists() || dest.is_symlink())
         {
@@ -441,12 +530,15 @@ fn apply_assets_plan(
         );
     }
 
-    restore_backups_not_in_desired(game, &mut state, &desired_set)?;
-    state.save(game, profile_id)
+    restore_backups_not_in_desired(game, profile_id, &mut state, &desired_set)?;
+    state.save(game, profile_id)?;
+    let _ = cleanup_stale_backup_payloads(game, profile_id);
+    Ok(())
 }
 
 fn restore_backups_not_in_desired(
     game: &Game,
+    profile_id: &str,
     state: &mut DeploymentState,
     desired: &HashSet<PathBuf>,
 ) -> Result<(), String> {
@@ -460,13 +552,15 @@ fn restore_backups_not_in_desired(
             let _ = fs::remove_file(&dest);
         }
         if let Some(backup_rel) = state.backups.remove(&dest_rel) {
-            let backup_path = game.config_dir().join(backup_rel);
+            let backup_path = resolve_backup_payload_path(game, profile_id, &backup_rel);
             if backup_path.exists() {
                 move_file_with_cross_fs_fallback(
                     &backup_path,
                     &dest,
                     &format!("restore backup for {}", dest.display()),
                 )?;
+                let stop = backup_payload_root(game, profile_id);
+                cleanup_empty_parents(&backup_path, &stop);
             }
         }
     }
@@ -475,6 +569,7 @@ fn restore_backups_not_in_desired(
 
 fn ensure_path_ready_for_link(
     game: &Game,
+    profile_id: &str,
     state: &mut DeploymentState,
     dest: &Path,
 ) -> Result<(), String> {
@@ -501,8 +596,7 @@ fn ensure_path_ready_for_link(
             .map_err(|e| format!("Failed to remove existing file {}: {e}", dest.display()))?;
         return Ok(());
     }
-    let backup_rel = PathBuf::from("backups").join(&rel);
-    let backup_path = game.config_dir().join(&backup_rel);
+    let backup_path = backup_payload_root(game, &profile_id).join(&rel);
     if let Some(parent) = backup_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create backup directory: {e}"))?;
@@ -514,7 +608,7 @@ fn ensure_path_ready_for_link(
     )?;
     state
         .backups
-        .insert(rel_s, backup_rel.to_string_lossy().into_owned());
+        .insert(rel_s, backup_record_value(&backup_path));
     Ok(())
 }
 
@@ -542,6 +636,39 @@ fn move_file_with_cross_fs_fallback(src: &Path, dest: &Path, action: &str) -> Re
         }
         Err(err) => Err(format!("Failed to {action}: {err}")),
     }
+}
+
+fn cleanup_empty_parents(path: &Path, stop_at: &Path) {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(stop_at) || dir == stop_at {
+            break;
+        }
+        match fs::remove_dir(dir) {
+            Ok(()) => current = dir.parent(),
+            Err(_) => break,
+        }
+    }
+}
+
+fn cleanup_stale_recursive(
+    dir: &Path,
+    live: &HashSet<PathBuf>,
+    removed: &mut usize,
+) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| format!("Failed reading {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("Failed reading entry in {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            cleanup_stale_recursive(&path, live, removed)?;
+            let _ = fs::remove_dir(&path);
+        } else if path.is_file() && !live.contains(&path) {
+            fs::remove_file(&path)
+                .map_err(|e| format!("Failed removing stale backup {}: {e}", path.display()))?;
+            *removed += 1;
+        }
+    }
+    Ok(())
 }
 
 fn is_cross_device_link_error(err: &io::Error) -> bool {
@@ -1196,8 +1323,10 @@ mod tests {
 
         assert!(target.exists());
         let backup = game
-            .config_dir()
-            .join("backups")
+            .mods_dir()
+            .join("profiles")
+            .join(&db.active_profile_id)
+            .join("deployment_backups")
             .join("Data")
             .join("textures")
             .join("original.dds");
@@ -1208,6 +1337,86 @@ mod tests {
         let restored = fs::read(&target).unwrap();
         assert_eq!(restored, b"vanilla");
         assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_works_with_legacy_config_backup_record() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        let target = game.data_path.join("textures/legacy.dds");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"legacy").unwrap();
+        let legacy_backup = game
+            .config_dir()
+            .join("backups")
+            .join("Data")
+            .join("textures")
+            .join("legacy.dds");
+        fs::create_dir_all(legacy_backup.parent().unwrap()).unwrap();
+        fs::rename(&target, &legacy_backup).unwrap();
+
+        let state = DeploymentState {
+            backups: HashMap::from([(
+                "Data/textures/legacy.dds".to_string(),
+                "backups/Data/textures/legacy.dds".to_string(),
+            )]),
+            deployed: HashMap::new(),
+            owners: HashMap::new(),
+        };
+        state.save(&game, &db.active_profile_id).unwrap();
+        rebuild_deployment(&game, &mut db).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"legacy");
+        assert!(!legacy_backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_payloads_are_profile_isolated() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let target = game.data_path.join("textures/profile.dds");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"original").unwrap();
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "override",
+            "Data/textures/profile.dds",
+            b"new",
+            true,
+        );
+        rebuild_deployment(&game, &mut db).unwrap();
+        let default_backup =
+            backup_payload_root(&game, &db.active_profile_id).join("Data/textures/profile.dds");
+        assert!(default_backup.exists());
+
+        db.switch_active_profile("second");
+        db.mods[0].enabled = false;
+        rebuild_deployment(&game, &mut db).unwrap();
+        fs::write(&target, b"second-profile").unwrap();
+        db.mods[0].enabled = true;
+        rebuild_deployment(&game, &mut db).unwrap();
+        let second_backup = backup_payload_root(&game, "second").join("Data/textures/profile.dds");
+        assert!(second_backup.exists());
+        assert_ne!(default_backup, second_backup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_stale_backups_removes_unreferenced_payloads() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let profile = "default";
+        let root = backup_payload_root(&game, profile);
+        let stale = root.join("Data/stale.txt");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"x").unwrap();
+        let removed = cleanup_stale_backup_payloads(&game, profile).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!stale.exists());
     }
 
     #[cfg(unix)]

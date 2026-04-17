@@ -241,3 +241,34 @@ Workflow integration:
   behavior deterministic/profile-scoped.
 - Scan summaries feed workspace runtime-review state so redeploy guidance can
   distinguish “redeploy now” vs “review runtime items first.”
+
+## 13. Deployment backup payload storage and restore truth
+
+Deployment keeps metadata/state in config (for example `deployment_state.toml`
+under per-profile config), but backup payload files are now stored in manager-
+owned profile data paths:
+
+- backup payload root: `<mods_dir>/profiles/<profile>/deployment_backups/`
+- config keeps backup mappings/ownership metadata only
+
+Restore semantics are unchanged:
+
+- if deployment must replace a real game file, LinkMM moves that original file
+  into profile backup storage
+- once no managed deployment entry owns that destination, LinkMM restores the
+  original file from backup storage
+- cross-filesystem move fallback (copy + remove) remains in place
+
+Backup hygiene:
+
+- restored payload files are removed from backup storage
+- empty backup directories are pruned where practical
+- stale unreferenced backup payload files can be cleaned safely without touching
+  referenced backups
+
+UI/Workspace surfacing:
+
+- Outputs & Runtime Changes now includes a deployment backup status row
+  (backup entry count, payload file count)
+- users can reveal backup directory and run safe stale-backup cleanup
+- redeploy status messaging includes whether preserved originals currently exist

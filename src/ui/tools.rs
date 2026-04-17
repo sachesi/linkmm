@@ -376,6 +376,52 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                 redeploy_row.add_suffix(&redeploy_btn);
                 generated_list_c.append(&redeploy_row);
 
+                if let Ok(backup_status) = crate::core::deployment::deployment_backup_status(
+                    &game_for_generated,
+                    &db.active_profile_id,
+                ) {
+                    let subtitle = format!(
+                        "Preserved originals: {} entry/entries ({} payload file(s))",
+                        backup_status.backup_entries, backup_status.existing_payload_files
+                    );
+                    let backup_row = adw::ActionRow::builder()
+                        .title("Deployment Backups")
+                        .subtitle(&subtitle)
+                        .build();
+                    let reveal_backup_btn = gtk4::Button::with_label("Reveal");
+                    {
+                        let backup_root = backup_status.backup_root.clone();
+                        reveal_backup_btn.connect_clicked(move |_| {
+                            let file = gio::File::for_path(&backup_root);
+                            let _ = gio::AppInfo::launch_default_for_uri(
+                                &file.uri(),
+                                None::<&gio::AppLaunchContext>,
+                            );
+                        });
+                    }
+                    backup_row.add_suffix(&reveal_backup_btn);
+                    let cleanup_backup_btn = gtk4::Button::with_label("Cleanup stale");
+                    cleanup_backup_btn.set_sensitive(backup_status.backup_entries > 0);
+                    {
+                        let game_cleanup = game_for_generated.clone();
+                        let profile_cleanup = db.active_profile_id.clone();
+                        let rebuild_cleanup = rebuild_w_for_generated.clone();
+                        cleanup_backup_btn.connect_clicked(move |_| {
+                            if let Err(e) = crate::core::deployment::cleanup_stale_backup_payloads(
+                                &game_cleanup,
+                                &profile_cleanup,
+                            ) {
+                                log::error!("Backup cleanup failed: {e}");
+                            }
+                            if let Some(rb) = rebuild_cleanup.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                    }
+                    backup_row.add_suffix(&cleanup_backup_btn);
+                    generated_list_c.append(&backup_row);
+                }
+
                 let runtime_subtitle = if scan_report.has_unresolved_changes() {
                     "Runtime scan found unresolved changes. Review/adopt/ignore before redeploying."
                 } else {
