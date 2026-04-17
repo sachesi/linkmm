@@ -472,7 +472,13 @@ fn show_tool_dialog(
     let app_id: u32 = {
         let cfg = config.borrow();
         cfg.current_game()
-            .and_then(|g| g.kind.steam_app_id())
+            .and_then(|g| {
+                if g.launcher_source == GameLauncherSource::Steam {
+                    g.steam_instance_app_id()
+                } else {
+                    g.kind.primary_steam_app_id()
+                }
+            })
             .unwrap_or(0)
     };
 
@@ -641,11 +647,8 @@ fn launch_tool(
     toast_overlay: &adw::ToastOverlay,
 ) {
     if game.launcher_source == GameLauncherSource::Steam {
-        match crate::core::steam::launch_tool_with_proton(
-            &tool.exe_path,
-            &tool.arguments,
-            tool.app_id,
-        ) {
+        let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
+        match crate::core::steam::launch_tool_with_proton(&tool.exe_path, &tool.arguments, app_id) {
             Ok(_child) => {
                 toast_overlay.add_toast(adw::Toast::new("Tool launched via Steam/Proton"))
             }

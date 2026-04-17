@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GameKind {
     SkyrimSE,
     SkyrimVR,
@@ -42,7 +42,8 @@ impl GameKind {
         }
     }
 
-    pub fn steam_app_id(&self) -> Option<u32> {
+    /// Canonical Steam App ID used for launching and runtime integration.
+    pub fn primary_steam_app_id(&self) -> Option<u32> {
         match self {
             GameKind::SkyrimSE => Some(489830),
             GameKind::SkyrimVR => Some(611670),
@@ -55,6 +56,39 @@ impl GameKind {
             GameKind::Morrowind => Some(22320),
             GameKind::Starfield => Some(1716740),
         }
+    }
+
+    /// All recognized Steam App IDs for detection/library scanning.
+    ///
+    /// The first ID is always the canonical launch App ID returned by
+    /// [`Self::primary_steam_app_id`].
+    pub fn steam_app_ids(&self) -> &'static [u32] {
+        match self {
+            GameKind::SkyrimSE => &[489830],
+            GameKind::SkyrimVR => &[611670],
+            GameKind::SkyrimLE => &[72850],
+            GameKind::Fallout4 => &[377160],
+            GameKind::Fallout4VR => &[611660],
+            GameKind::Fallout3 => &[22300],
+            // 22490 is Fallout: New Vegas PCR (regional SKU) and maps to the
+            // same managed game kind as canonical app 22380.
+            GameKind::FalloutNV => &[22380, 22490],
+            GameKind::Oblivion => &[22330],
+            GameKind::Morrowind => &[22320],
+            GameKind::Starfield => &[1716740],
+        }
+    }
+
+    /// Backwards-compatible alias for the canonical Steam App ID.
+    pub fn steam_app_id(&self) -> Option<u32> {
+        self.primary_steam_app_id()
+    }
+
+    /// Resolve a known Steam App ID to a supported game kind.
+    pub fn from_steam_app_id(app_id: u32) -> Option<GameKind> {
+        Self::all()
+            .into_iter()
+            .find(|kind| kind.steam_app_ids().contains(&app_id))
     }
 
     pub fn default_data_subdir(&self) -> &str {
@@ -169,7 +203,7 @@ impl GameKind {
     pub fn umu_game_id(&self) -> String {
         format!(
             "umu-{}",
-            self.steam_app_id()
+            self.primary_steam_app_id()
                 .expect("all GameKind variants have a Steam App ID")
         )
     }
@@ -255,6 +289,13 @@ pub struct Game {
     pub kind: GameKind,
     #[serde(default = "default_launcher_source")]
     pub launcher_source: GameLauncherSource,
+    /// Actual Steam App ID for this specific Steam game instance.
+    ///
+    /// This may differ from [`GameKind::primary_steam_app_id`] for alternate
+    /// Steam SKUs (for example Fallout NV PCR / 22490).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steam_app_id: Option<u32>,
     pub root_path: PathBuf,
     /// Always computed from `root_path` at load time; never persisted to JSON
     /// so it stays in sync even when the user changes the game root path.
@@ -279,6 +320,13 @@ struct NxmEntry {
 
 impl Game {
     pub fn new_steam(kind: GameKind, root_path: PathBuf) -> Self {
+        let app_id = kind
+            .primary_steam_app_id()
+            .expect("all managed Steam game kinds have a canonical Steam App ID");
+        Self::new_steam_with_app_id(kind, root_path, app_id)
+    }
+
+    pub fn new_steam_with_app_id(kind: GameKind, root_path: PathBuf, steam_app_id: u32) -> Self {
         let data_path = root_path.join(kind.default_data_subdir());
         let id = Uuid::new_v4().to_string();
         let name = kind.display_name().to_string();
@@ -287,6 +335,7 @@ impl Game {
             name,
             kind,
             launcher_source: GameLauncherSource::Steam,
+            steam_app_id: Some(steam_app_id),
             root_path,
             data_path,
             mods_base_dir: None,
@@ -304,6 +353,7 @@ impl Game {
             name,
             kind,
             launcher_source: GameLauncherSource::NonSteamUmu,
+            steam_app_id: None,
             root_path,
             data_path,
             mods_base_dir: None,
@@ -315,6 +365,20 @@ impl Game {
         match self.launcher_source {
             GameLauncherSource::Steam => format!("{} (Steam)", self.name),
             GameLauncherSource::NonSteamUmu => format!("{} (Non-Steam / UMU)", self.name),
+        }
+    }
+
+    /// Steam App ID for this concrete game instance.
+    ///
+    /// For Steam instances this prefers the persisted per-instance app ID and
+    /// falls back to the canonical game-kind ID for backwards compatibility
+    /// with older config files that predate per-instance storage.
+    pub fn steam_instance_app_id(&self) -> Option<u32> {
+        match self.launcher_source {
+            GameLauncherSource::Steam => self
+                .steam_app_id
+                .or_else(|| self.kind.primary_steam_app_id()),
+            GameLauncherSource::NonSteamUmu => None,
         }
     }
 
@@ -380,7 +444,7 @@ impl Game {
                 None
             }
             GameLauncherSource::Steam => {
-                let app_id = self.kind.steam_app_id()?;
+                let app_id = self.steam_instance_app_id()?;
                 let compatdata = crate::core::steam::find_compatdata_path(app_id)?;
                 let path = compatdata
                     .join("pfx")
@@ -584,5 +648,79 @@ mod tests {
         let fallout4 = GameKind::Fallout4.expected_executable_names();
         assert!(fallout4.contains(&"Fallout4.exe"));
         assert!(fallout4.contains(&"f4se_loader.exe"));
+    }
+
+    #[test]
+    fn fallout_nv_alias_app_id_maps_to_same_game_kind() {
+        assert_eq!(
+            GameKind::from_steam_app_id(22380),
+            Some(GameKind::FalloutNV)
+        );
+        assert_eq!(
+            GameKind::from_steam_app_id(22490),
+            Some(GameKind::FalloutNV)
+        );
+    }
+
+    #[test]
+    fn primary_steam_app_id_remains_canonical_for_fallout_nv() {
+        assert_eq!(GameKind::FalloutNV.primary_steam_app_id(), Some(22380));
+        assert_eq!(GameKind::FalloutNV.steam_app_ids(), &[22380, 22490]);
+    }
+
+    #[test]
+    fn steam_instance_app_id_tracks_detected_instance_id() {
+        let pcr =
+            Game::new_steam_with_app_id(GameKind::FalloutNV, PathBuf::from("/tmp/pcr"), 22490);
+        assert_eq!(pcr.steam_instance_app_id(), Some(22490));
+        assert_eq!(pcr.kind.primary_steam_app_id(), Some(22380));
+    }
+
+    #[test]
+    fn legacy_steam_instance_without_saved_app_id_falls_back_to_primary() {
+        let mut game = Game::new_steam(GameKind::FalloutNV, PathBuf::from("/tmp/fnv"));
+        game.steam_app_id = None;
+        assert_eq!(game.steam_instance_app_id(), Some(22380));
+    }
+
+    #[test]
+    fn steam_app_id_serialization_is_instance_specific() {
+        let steam =
+            Game::new_steam_with_app_id(GameKind::FalloutNV, PathBuf::from("/tmp/pcr"), 22490);
+        let steam_json = serde_json::to_value(&steam).expect("serialize steam game");
+        assert_eq!(
+            steam_json.get("steam_app_id"),
+            Some(&serde_json::json!(22490))
+        );
+
+        let non_steam = Game::new_non_steam_umu(
+            GameKind::SkyrimSE,
+            PathBuf::from("/tmp/nonsteam"),
+            UmuGameConfig {
+                exe_path: PathBuf::from("/tmp/nonsteam/SkyrimSE.exe"),
+                prefix_path: None,
+                proton_path: None,
+            },
+        );
+        let non_steam_json = serde_json::to_value(&non_steam).expect("serialize non-steam game");
+        assert!(non_steam_json.get("steam_app_id").is_none());
+    }
+
+    #[test]
+    fn fallout_nv_and_pcr_instances_share_family_metadata() {
+        let base =
+            Game::new_steam_with_app_id(GameKind::FalloutNV, PathBuf::from("/tmp/fnv"), 22380);
+        let pcr =
+            Game::new_steam_with_app_id(GameKind::FalloutNV, PathBuf::from("/tmp/fnv_pcr"), 22490);
+
+        assert_eq!(base.steam_instance_app_id(), Some(22380));
+        assert_eq!(pcr.steam_instance_app_id(), Some(22490));
+        assert_eq!(base.kind.nexus_game_id(), "newvegas");
+        assert_eq!(pcr.kind.nexus_game_id(), "newvegas");
+        assert_eq!(base.kind.vanilla_masters(), pcr.kind.vanilla_masters());
+        assert_eq!(
+            base.kind.expected_executable_names(),
+            pcr.kind.expected_executable_names()
+        );
     }
 }

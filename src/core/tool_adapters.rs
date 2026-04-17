@@ -323,6 +323,7 @@ mod tests {
             name: "Adapter Test".to_string(),
             kind: GameKind::SkyrimSE,
             launcher_source: GameLauncherSource::NonSteamUmu,
+            steam_app_id: None,
             root_path: root,
             data_path: data,
             mods_base_dir: Some(tmp.path().join("mods")),
