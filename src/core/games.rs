@@ -705,4 +705,22 @@ mod tests {
         let non_steam_json = serde_json::to_value(&non_steam).expect("serialize non-steam game");
         assert!(non_steam_json.get("steam_app_id").is_none());
     }
+
+    #[test]
+    fn fallout_nv_and_pcr_instances_share_family_metadata() {
+        let base =
+            Game::new_steam_with_app_id(GameKind::FalloutNV, PathBuf::from("/tmp/fnv"), 22380);
+        let pcr =
+            Game::new_steam_with_app_id(GameKind::FalloutNV, PathBuf::from("/tmp/fnv_pcr"), 22490);
+
+        assert_eq!(base.steam_instance_app_id(), Some(22380));
+        assert_eq!(pcr.steam_instance_app_id(), Some(22490));
+        assert_eq!(base.kind.nexus_game_id(), "newvegas");
+        assert_eq!(pcr.kind.nexus_game_id(), "newvegas");
+        assert_eq!(base.kind.vanilla_masters(), pcr.kind.vanilla_masters());
+        assert_eq!(
+            base.kind.expected_executable_names(),
+            pcr.kind.expected_executable_names()
+        );
+    }
 }
