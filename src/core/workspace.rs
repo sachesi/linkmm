@@ -575,4 +575,87 @@ mod tests {
         assert_eq!(state_a.current_operation, WorkspaceOperation::ToolRun);
         assert_eq!(state_a.status_message.as_deref(), Some("Tool running in A"));
     }
+
+    #[test]
+    fn generated_output_enable_disable_and_remove_affect_dirty_state() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp, "workspace_output_toggle_remove");
+        let mut db = ModDatabase::default();
+        let mut pkg = crate::core::mods::GeneratedOutputPackage::new(
+            "Out",
+            "tool",
+            "default",
+            db.active_profile_id.clone(),
+            temp.path().join("gen"),
+        );
+        pkg.enabled = true;
+        db.generated_outputs.push(pkg);
+        db.save(&game);
+        mark_deployed_clean(&game, &db).unwrap();
+
+        db.generated_outputs[0].enabled = false;
+        db.save(&game);
+        let disabled_state = workspace_state_for_game(&game);
+        assert!(disabled_state.pending_changes.generated_outputs_changed);
+
+        db.generated_outputs.clear();
+        db.save(&game);
+        let removed_state = workspace_state_for_game(&game);
+        assert!(removed_state.pending_changes.generated_outputs_changed);
+    }
+
+    #[test]
+    fn generated_outputs_are_profile_scoped_for_dirty_evaluation() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp, "workspace_output_profile_scope");
+        let mut db = ModDatabase::default();
+        let pkg_a = crate::core::mods::GeneratedOutputPackage::new(
+            "Out A",
+            "tool_a",
+            "default",
+            "profile_a",
+            temp.path().join("gen_a"),
+        );
+        let pkg_b = crate::core::mods::GeneratedOutputPackage::new(
+            "Out B",
+            "tool_b",
+            "default",
+            "profile_b",
+            temp.path().join("gen_b"),
+        );
+        db.generated_outputs.push(pkg_a);
+        db.generated_outputs.push(pkg_b);
+        db.active_profile_id = "profile_a".to_string();
+        db.save(&game);
+        mark_deployed_clean(&game, &db).unwrap();
+
+        db.active_profile_id = "profile_b".to_string();
+        db.save(&game);
+        let profile_b_state = workspace_state_for_game(&game);
+        assert!(profile_b_state.pending_changes.generated_outputs_changed);
+    }
+
+    #[test]
+    fn redeploy_summary_format_is_truthful() {
+        let state = WorkspaceState {
+            game_id: "g".to_string(),
+            profile_id: "p".to_string(),
+            deployment_state: DeploymentState::Dirty,
+            pending_changes: PendingChanges {
+                generated_outputs_changed: true,
+                ..PendingChanges::default()
+            },
+            current_operation: WorkspaceOperation::None,
+            status_message: Some("Outputs captured".to_string()),
+            status_severity: StatusSeverity::Info,
+            safe_redeploy_required: true,
+            safe_redeploy_recommended: true,
+        };
+        let banner = format_workspace_banner_summary(&state);
+        let compact = format_workspace_compact_summary(&state);
+        assert!(banner.contains("Profile: p"));
+        assert!(banner.contains("Redeploy needed"));
+        assert!(banner.contains("Generated outputs changed"));
+        assert!(compact.contains("Redeploy needed"));
+    }
 }

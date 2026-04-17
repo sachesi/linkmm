@@ -84,8 +84,10 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         tools_group.add(&tools_list);
 
         let generated_group = adw::PreferencesGroup::builder()
-            .title("Generated Outputs")
-            .description("Managed output packages produced by tool runs.")
+            .title("Outputs & Runtime Changes")
+            .description(
+                "Review generated packages, runtime-preserved changes, and redeploy safety.",
+            )
             .build();
         let cleanup_generated_btn = gtk4::Button::new();
         cleanup_generated_btn.set_icon_name("edit-clear-symbolic");
@@ -96,6 +98,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         generated_list.add_css_class("boxed-list");
         generated_list.set_selection_mode(gtk4::SelectionMode::None);
         generated_group.add(&generated_list);
+        let last_captured_package_id = Rc::new(RefCell::new(None::<String>));
 
         let workspace_group = adw::PreferencesGroup::builder()
             .title("Workspace Lifecycle")
@@ -126,6 +129,8 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             let generated_list_c = generated_list.clone();
             let game_for_generated = game.clone();
             let game_for_rebuild = game.clone();
+            let rebuild_w_for_generated = rebuild_weak.clone();
+            let last_captured_package_id_c = Rc::clone(&last_captured_package_id);
 
             *rebuild.borrow_mut() = Box::new(move || {
                 // Clear existing rows
@@ -166,6 +171,8 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         let game_for_launch = game_for_rebuild.clone();
                         let config_for_launch = Rc::clone(&config_c);
                         let last_run_row_c = last_run_row.clone();
+                        let rebuild_after_run = rebuild_weak.clone();
+                        let last_pkg_id = Rc::clone(&last_captured_package_id);
                         launch_btn.connect_clicked(move |btn| {
                             launch_tool(
                                 &game_for_launch,
@@ -174,6 +181,8 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                                 btn,
                                 &toast_overlay_c2,
                                 Some(&last_run_row_c),
+                                rebuild_after_run.clone(),
+                                Rc::clone(&last_pkg_id),
                             );
                         });
                     }
@@ -247,6 +256,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         adopt_btn.connect_clicked(move |_| {
                             let profile = tool_for_adopt.primary_profile();
                             let mut db = ModDatabase::load(&game_for_adopt);
+                            let active_profile = db.active_profile_id.clone();
                             match crate::core::tool_runs::detect_unmanaged_outputs(
                                 &game_for_adopt,
                                 &db,
@@ -254,12 +264,22 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                                 &profile,
                             ) {
                                 Ok(files) if files.is_empty() => {
+                                    workspace::mark_unmanaged_runtime_changes(
+                                        &game_for_adopt.id,
+                                        &active_profile,
+                                        false,
+                                    );
                                     log::info!(
                                         "No unmanaged output candidates found for {}",
                                         tool_for_adopt.name
                                     );
                                 }
                                 Ok(files) => {
+                                    workspace::mark_unmanaged_runtime_changes(
+                                        &game_for_adopt.id,
+                                        &active_profile,
+                                        true,
+                                    );
                                     if let Err(e) = crate::core::tool_runs::adopt_unmanaged_outputs(
                                         &game_for_adopt,
                                         &mut db,
@@ -268,9 +288,31 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                                         &files,
                                     ) {
                                         log::error!("Failed adopting unmanaged outputs: {e}");
+                                    } else {
+                                        workspace::mark_unmanaged_runtime_changes(
+                                            &game_for_adopt.id,
+                                            &active_profile,
+                                            false,
+                                        );
+                                        workspace::set_status(
+                                            &game_for_adopt.id,
+                                            &active_profile,
+                                            workspace::StatusSeverity::Info,
+                                            format!(
+                                                "Adopted {} runtime/unmanaged file(s); review outputs and redeploy.",
+                                                files.len()
+                                            ),
+                                        );
                                     }
                                 }
-                                Err(e) => log::error!("Unmanaged output detection failed: {e}"),
+                                Err(e) => {
+                                    workspace::mark_unmanaged_runtime_changes(
+                                        &game_for_adopt.id,
+                                        &active_profile,
+                                        true,
+                                    );
+                                    log::error!("Unmanaged output detection failed: {e}");
+                                }
                             }
                             if let Some(rb) = rebuild_adopt.upgrade() {
                                 (rb.borrow())();
@@ -286,46 +328,178 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                     generated_list_c.remove(&child);
                 }
                 let db = ModDatabase::load(&game_for_generated);
-                if db.generated_outputs.is_empty() {
+                let workspace_state = workspace::workspace_state_for_game(&game_for_generated);
+                let redeploy_row = adw::ActionRow::builder()
+                    .title("Redeploy Guidance")
+                    .subtitle(workspace::format_workspace_compact_summary(
+                        &workspace_state,
+                    ))
+                    .build();
+                let redeploy_btn =
+                    gtk4::Button::with_label(if workspace_state.safe_redeploy_required {
+                        "Redeploy now"
+                    } else {
+                        "No redeploy needed"
+                    });
+                redeploy_btn.set_sensitive(workspace_state.safe_redeploy_required);
+                {
+                    let game_for_redeploy = game_for_generated.clone();
+                    let rebuild_redeploy = rebuild_w_for_generated.clone();
+                    redeploy_btn.connect_clicked(move |_| {
+                        if let Err(e) = ModManager::rebuild_all(&game_for_redeploy) {
+                            log::error!("Redeploy failed: {e}");
+                        }
+                        if let Some(rb) = rebuild_redeploy.upgrade() {
+                            (rb.borrow())();
+                        }
+                    });
+                }
+                redeploy_row.add_suffix(&redeploy_btn);
+                generated_list_c.append(&redeploy_row);
+
+                let runtime_subtitle = if workspace_state.pending_changes.unmanaged_runtime_changed
+                {
+                    "Runtime-preserved/unmanaged changes are flagged for this profile. Redeploy is recommended after review."
+                } else {
+                    "No runtime-preserved/unmanaged changes are currently flagged for this profile."
+                };
+                let runtime_row = adw::ActionRow::builder()
+                    .title("Runtime Preserved Changes")
+                    .subtitle(runtime_subtitle)
+                    .build();
+                generated_list_c.append(&runtime_row);
+
+                let active_profile = db.active_profile_id.clone();
+                let tracked_outputs = db
+                    .generated_outputs
+                    .iter()
+                    .filter(|o| o.manager_profile_id == active_profile)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if tracked_outputs.is_empty() {
                     let row = adw::ActionRow::builder()
                         .title("No generated outputs captured")
+                        .subtitle("Run a managed tool profile to capture outputs.")
                         .build();
                     row.set_sensitive(false);
                     generated_list_c.append(&row);
-                } else {
-                    for output in &db.generated_outputs {
-                        let subtitle =
-                            format!("Tool: {} · Profile: {}", output.tool_id, output.run_profile);
-                        let row = adw::ActionRow::builder()
-                            .title(&output.name)
-                            .subtitle(&subtitle)
-                            .build();
-                        let remove_btn = gtk4::Button::new();
-                        remove_btn.set_icon_name("user-trash-symbolic");
-                        remove_btn.add_css_class("flat");
-                        remove_btn.add_css_class("destructive-action");
+                    return;
+                }
+
+                let tool_names = {
+                    let cfg = config_c.borrow();
+                    cfg.game_settings
+                        .get(&game_id)
+                        .map(|gs| {
+                            gs.tools
+                                .iter()
+                                .map(|t| (t.id.clone(), t.name.clone()))
+                                .collect::<std::collections::HashMap<_, _>>()
+                        })
+                        .unwrap_or_default()
+                };
+
+                for output in &tracked_outputs {
+                    let tool_name = tool_names
+                        .get(&output.tool_id)
+                        .cloned()
+                        .unwrap_or_else(|| output.tool_id.clone());
+                    let is_new = last_captured_package_id_c
+                        .borrow()
+                        .as_ref()
+                        .map(|id| id == &output.id)
+                        .unwrap_or(false);
+                    let subtitle = format!(
+                        "Tool: {} ({}) · Run profile: {} · Manager profile: {} · Files: {} · Updated: {} · {}{}{}",
+                        tool_name,
+                        output.tool_id,
+                        output.run_profile,
+                        output.manager_profile_id,
+                        output.owned_files.len(),
+                        output.updated_at,
+                        if output.enabled {
+                            "Enabled"
+                        } else {
+                            "Disabled"
+                        },
+                        if is_new { " · Newly captured" } else { "" },
+                        if workspace_state.safe_redeploy_recommended {
+                            " · Redeploy recommended"
+                        } else {
+                            ""
+                        }
+                    );
+                    let row = adw::ActionRow::builder()
+                        .title(&output.name)
+                        .subtitle(&subtitle)
+                        .build();
+
+                    let enabled_switch = gtk4::Switch::new();
+                    enabled_switch.set_active(output.enabled);
+                    enabled_switch.set_valign(gtk4::Align::Center);
+                    {
+                        let game_for_toggle = game_for_generated.clone();
                         let output_id = output.id.clone();
-                        let game_for_remove = game_for_generated.clone();
-                        let rebuild_remove = rebuild_weak.clone();
-                        remove_btn.connect_clicked(move |_| {
-                            let mut db = ModDatabase::load(&game_for_remove);
-                            if let Err(e) =
-                                crate::core::generated_outputs::remove_generated_output_package(
-                                    &game_for_remove,
-                                    &mut db,
-                                    &output_id,
-                                )
+                        let rebuild_toggle = rebuild_w_for_generated.clone();
+                        enabled_switch.connect_state_set(move |_, state| {
+                            let mut db = ModDatabase::load(&game_for_toggle);
+                            if let Some(pkg) =
+                                db.generated_outputs.iter_mut().find(|p| p.id == output_id)
                             {
-                                log::error!("Failed to remove generated output package: {e}");
+                                pkg.enabled = state;
+                                db.save(&game_for_toggle);
+                                let _ = ModManager::rebuild_all(&game_for_toggle);
                             }
-                            let _ = ModManager::rebuild_all(&game_for_remove);
-                            if let Some(rb) = rebuild_remove.upgrade() {
+                            if let Some(rb) = rebuild_toggle.upgrade() {
                                 (rb.borrow())();
                             }
+                            glib::Propagation::Stop
                         });
-                        row.add_suffix(&remove_btn);
-                        generated_list_c.append(&row);
                     }
+                    row.add_suffix(&enabled_switch);
+
+                    let reveal_btn = gtk4::Button::new();
+                    reveal_btn.set_icon_name("folder-open-symbolic");
+                    reveal_btn.add_css_class("flat");
+                    reveal_btn.set_tooltip_text(Some("Reveal output directory"));
+                    {
+                        let path = output.source_path.clone();
+                        reveal_btn.connect_clicked(move |_| {
+                            let file = gio::File::for_path(&path);
+                            let _ = gio::AppInfo::launch_default_for_uri(
+                                &file.uri(),
+                                None::<&gio::AppLaunchContext>,
+                            );
+                        });
+                    }
+                    row.add_suffix(&reveal_btn);
+
+                    let remove_btn = gtk4::Button::new();
+                    remove_btn.set_icon_name("user-trash-symbolic");
+                    remove_btn.add_css_class("flat");
+                    remove_btn.add_css_class("destructive-action");
+                    remove_btn.set_tooltip_text(Some("Remove output package"));
+                    let output_id = output.id.clone();
+                    let game_for_remove = game_for_generated.clone();
+                    let rebuild_remove = rebuild_w_for_generated.clone();
+                    remove_btn.connect_clicked(move |_| {
+                        let mut db = ModDatabase::load(&game_for_remove);
+                        if let Err(e) =
+                            crate::core::generated_outputs::remove_generated_output_package(
+                                &game_for_remove,
+                                &mut db,
+                                &output_id,
+                            )
+                        {
+                            log::error!("Failed to remove generated output package: {e}");
+                        }
+                        let _ = ModManager::rebuild_all(&game_for_remove);
+                        if let Some(rb) = rebuild_remove.upgrade() {
+                            (rb.borrow())();
+                        }
+                    });
+                    row.add_suffix(&remove_btn);
+                    generated_list_c.append(&row);
                 }
             });
         }
@@ -754,6 +928,8 @@ fn launch_tool(
     btn: &gtk4::Button,
     toast_overlay: &adw::ToastOverlay,
     last_run_row: Option<&adw::ActionRow>,
+    rebuild_after_run: std::rc::Weak<RefCell<Box<dyn Fn()>>>,
+    last_captured_package_id: Rc<RefCell<Option<String>>>,
 ) {
     if game.launcher_source == GameLauncherSource::Steam {
         let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
@@ -846,10 +1022,22 @@ fn launch_tool(
                         run.captured_files, run.plugin_files, run.asset_files
                     ));
                 }
+                *last_captured_package_id.borrow_mut() = run.package_id.clone();
+                if run.captured_files > 0 {
+                    workspace::set_status(
+                        &game_id,
+                        &active_profile_id_c,
+                        workspace::StatusSeverity::Info,
+                        "Outputs captured. Review packages below and redeploy.".to_string(),
+                    );
+                }
                 toast_overlay_c.add_toast(adw::Toast::new(&msg));
                 btn_c.set_icon_name("media-playback-start-symbolic");
                 btn_c.set_tooltip_text(Some("Launch Tool"));
                 btn_c.set_sensitive(true);
+                if let Some(rb) = rebuild_after_run.upgrade() {
+                    (rb.borrow())();
+                }
                 glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
@@ -871,6 +1059,9 @@ fn launch_tool(
                 btn_c.set_icon_name("media-playback-start-symbolic");
                 btn_c.set_tooltip_text(Some("Launch Tool"));
                 btn_c.set_sensitive(true);
+                if let Some(rb) = rebuild_after_run.upgrade() {
+                    (rb.borrow())();
+                }
                 glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -883,6 +1074,9 @@ fn launch_tool(
                 btn_c.set_icon_name("media-playback-start-symbolic");
                 btn_c.set_tooltip_text(Some("Launch Tool"));
                 btn_c.set_sensitive(true);
+                if let Some(rb) = rebuild_after_run.upgrade() {
+                    (rb.borrow())();
+                }
                 glib::ControlFlow::Break
             }
         }

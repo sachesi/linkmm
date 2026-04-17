@@ -187,3 +187,19 @@ feeds workspace state:
 This keeps deterministic deploy as the source of truth while making tools and
 runtime-preserved output part of one coherent profile workflow instead of an
 isolated page action.
+
+Generated outputs and runtime-preserved changes are exposed as a first-class
+review/manage surface in Tools:
+
+- redeploy guidance card driven directly by workspace state (`required` /
+  `recommended` / clean)
+- runtime-preserved change flag explanation for the active profile
+- per-package metadata (tool, run profile, manager profile, update time, file count)
+- per-package actions: enable/disable, reveal source directory, remove package
+
+Output actions are deterministic and profile-aware:
+
+- package enable/disable/remove updates `ModDatabase`
+- deployment rebuild is triggered through the existing deterministic rebuild path
+- workspace dirty reasons are derived from baseline-vs-current snapshots and
+  therefore automatically reflect output state changes
