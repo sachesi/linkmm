@@ -2003,7 +2003,7 @@ pub fn show_fomod_wizard_from_library(
         HashMap::new(),
         move |strategy| {
             crate::ui::downloads::do_install(
-                &ap, &an, &gc, &cc, &cont, false, "", &strategy, &grc, None,
+                &ap, &an, &gc, &cc, &cont, false, "", &strategy, &grc, None, None,
             );
         },
     );

@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use super::installer::{LinkKind, determine_link_type};
@@ -447,12 +448,11 @@ fn restore_backups_not_in_desired(
         if let Some(backup_rel) = state.backups.remove(&dest_rel) {
             let backup_path = game.config_dir().join(backup_rel);
             if backup_path.exists() {
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|e| format!("Failed to restore parent directory: {e}"))?;
-                }
-                fs::rename(&backup_path, &dest)
-                    .map_err(|e| format!("Failed to restore backup for {}: {e}", dest.display()))?;
+                move_file_with_cross_fs_fallback(
+                    &backup_path,
+                    &dest,
+                    &format!("restore backup for {}", dest.display()),
+                )?;
             }
         }
     }
@@ -493,12 +493,45 @@ fn ensure_path_ready_for_link(
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create backup directory: {e}"))?;
     }
-    fs::rename(dest, &backup_path)
-        .map_err(|e| format!("Failed to backup existing file {}: {e}", dest.display()))?;
+    move_file_with_cross_fs_fallback(
+        dest,
+        &backup_path,
+        &format!("backup existing file {}", dest.display()),
+    )?;
     state
         .backups
         .insert(rel_s, backup_rel.to_string_lossy().into_owned());
     Ok(())
+}
+
+fn move_file_with_cross_fs_fallback(src: &Path, dest: &Path, action: &str) -> Result<(), String> {
+    match fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(err) if is_cross_device_link_error(&err) => {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!("Failed to create destination directory while trying to {action}: {e}")
+                })?;
+            }
+
+            fs::copy(src, dest)
+                .map_err(|e| format!("Failed to copy file while trying to {action}: {e}"))?;
+
+            if let Ok(metadata) = fs::metadata(src) {
+                let _ = fs::set_permissions(dest, metadata.permissions());
+            }
+
+            fs::remove_file(src).map_err(|e| {
+                format!("Failed to remove original file while trying to {action}: {e}")
+            })?;
+            Ok(())
+        }
+        Err(err) => Err(format!("Failed to {action}: {err}")),
+    }
+}
+
+fn is_cross_device_link_error(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(18)
 }
 
 fn collect_mod_destinations(mod_entry: &Mod) -> HashMap<PathBuf, PathBuf> {
@@ -977,6 +1010,42 @@ mod tests {
         // Check links exist (may be symlinks or hardlinks depending on filesystem)
         assert!(dest_dir.join("file1.txt").exists());
         assert!(dest_dir.join("subdir/file2.txt").exists());
+    }
+
+    #[test]
+    fn move_file_with_cross_fs_fallback_moves_file_and_creates_parent_dirs() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("source.txt");
+        let dest = temp.path().join("nested").join("dest.txt");
+
+        fs::write(&src, b"payload").unwrap();
+        move_file_with_cross_fs_fallback(&src, &dest, "move test file").unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn move_file_with_cross_fs_fallback_preserves_permissions_on_fallback_path() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src.txt");
+        let dest = temp.path().join("dest").join("dst.txt");
+        fs::write(&src, b"perm-check").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o640)).unwrap();
+            move_file_with_cross_fs_fallback(&src, &dest, "permission move").unwrap();
+            let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640);
+        }
+
+        #[cfg(not(unix))]
+        {
+            move_file_with_cross_fs_fallback(&src, &dest, "permission move").unwrap();
+            assert_eq!(fs::read(&dest).unwrap(), b"perm-check");
+        }
     }
 
     fn test_game(layout: &TempDir) -> Game {

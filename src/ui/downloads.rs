@@ -60,6 +60,8 @@ pub(crate) struct InstallStatusCtx {
     cancel_btn: gtk4::Button,
     /// Callback that locks/unlocks the sidebar navigation.
     nav_lock: Rc<dyn Fn(bool)>,
+    /// Callback to invalidate cached pages that depend on installed mod state.
+    on_mods_changed: Rc<dyn Fn()>,
 }
 
 // ── Public entry-point ────────────────────────────────────────────────────────
@@ -74,6 +76,7 @@ pub fn build_downloads_page(
     game: Option<&Game>,
     config: Rc<RefCell<AppConfig>>,
     nav_lock: Rc<dyn Fn(bool)>,
+    on_mods_changed: Rc<dyn Fn()>,
 ) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -176,6 +179,7 @@ pub fn build_downloads_page(
         cancel_flag: Arc::clone(&cancel_flag),
         cancel_btn: cancel_btn.clone(),
         nav_lock,
+        on_mods_changed,
     };
 
     let hide_installed = Rc::new(RefCell::new(false));
@@ -558,6 +562,7 @@ fn build_entry_row(
         let hide_installed_c = hide_installed;
         let search_query_c = search_query.to_string();
         let ctx_c = status_ctx.clone();
+        let on_mods_changed_c = Rc::clone(&status_ctx.on_mods_changed);
         install_btn.connect_clicked(move |btn| {
             show_install_dialog(
                 btn,
@@ -570,6 +575,7 @@ fn build_entry_row(
                 &search_query_c,
                 &game_rc_c,
                 &ctx_c,
+                Some(Rc::clone(&on_mods_changed_c)),
             );
         });
         row.add_suffix(&install_btn);
@@ -629,6 +635,7 @@ fn show_install_dialog(
     search_query: &str,
     game_rc: &Rc<Option<Game>>,
     status_ctx: &InstallStatusCtx,
+    on_mods_changed: Option<Rc<dyn Fn()>>,
 ) {
     // Show the status bar immediately.  The archive is fully extracted ONCE
     // into a hidden temporary folder inside the game's mods directory (same
@@ -695,6 +702,7 @@ fn show_install_dialog(
     let game_rc_c = Rc::clone(game_rc);
     let search_query_s = search_query.to_string();
     let status_ctx_c = status_ctx.clone();
+    let on_mods_changed_c = on_mods_changed.clone();
 
     glib::spawn_future_local(async move {
         #[allow(clippy::type_complexity)]
@@ -799,6 +807,7 @@ fn show_install_dialog(
                                 &strategy,
                                 &grc,
                                 ctx.as_ref(),
+                                on_mods_changed_c.clone(),
                             );
                         },
                     );
@@ -818,6 +827,7 @@ fn show_install_dialog(
                         &search_query_s,
                         &game_rc_c,
                         &status_ctx_c,
+                        on_mods_changed_c.clone(),
                     );
                 }
             }
@@ -861,6 +871,7 @@ fn show_strategy_picker(
     search_query: &str,
     game_rc: &Rc<Option<Game>>,
     status_ctx: &InstallStatusCtx,
+    on_mods_changed: Option<Rc<dyn Fn()>>,
 ) {
     let dialog = adw::AlertDialog::builder()
         .heading("Install Mod")
@@ -897,6 +908,7 @@ fn show_strategy_picker(
                 &InstallStrategy::Data,
                 &grc,
                 Some(&ctx),
+                on_mods_changed.clone(),
             );
         }
     });
@@ -921,6 +933,7 @@ fn do_install_from_extracted(
     strategy: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
     status_ctx: Option<&InstallStatusCtx>,
+    on_mods_changed: Option<Rc<dyn Fn()>>,
 ) {
     let mod_name = Path::new(archive_name)
         .file_stem()
@@ -986,6 +999,7 @@ fn do_install_from_extracted(
                     &game_rc_c,
                     status_ctx_clone.as_ref(),
                     &container_c,
+                    on_mods_changed.clone(),
                 );
                 gtk4::glib::ControlFlow::Break
             }
@@ -1007,6 +1021,7 @@ fn do_install_from_extracted(
                     &game_rc_c,
                     status_ctx_clone.as_ref(),
                     &container_c,
+                    on_mods_changed.clone(),
                 );
                 gtk4::glib::ControlFlow::Break
             }
@@ -1030,6 +1045,7 @@ pub(crate) fn do_install(
     strategy: &InstallStrategy,
     game_rc: &Rc<Option<Game>>,
     status_ctx: Option<&InstallStatusCtx>,
+    on_mods_changed: Option<Rc<dyn Fn()>>,
 ) {
     let mod_name = Path::new(archive_name)
         .file_stem()
@@ -1085,6 +1101,7 @@ pub(crate) fn do_install(
                     &game_rc_c,
                     status_ctx_clone.as_ref(),
                     &container_c,
+                    on_mods_changed.clone(),
                 );
                 gtk4::glib::ControlFlow::Break
             }
@@ -1106,6 +1123,7 @@ pub(crate) fn do_install(
                     &game_rc_c,
                     status_ctx_clone.as_ref(),
                     &container_c,
+                    on_mods_changed.clone(),
                 );
                 gtk4::glib::ControlFlow::Break
             }
@@ -1126,6 +1144,7 @@ fn on_install_complete(
     game_rc: &Rc<Option<Game>>,
     status_ctx: Option<&InstallStatusCtx>,
     container: &gtk4::Box,
+    on_mods_changed: Option<Rc<dyn Fn()>>,
 ) {
     match result {
         Ok(_) => {
@@ -1139,6 +1158,9 @@ fn on_install_complete(
             cfg.save();
             drop(cfg);
             log::info!("Installed mod \"{mod_name}\" from \"{archive_name}\"");
+            if let Some(cb) = on_mods_changed {
+                cb();
+            }
             let msg = format!("Installed: {mod_name}");
             if let Some(ctx) = status_ctx {
                 ctx.label.set_text(&msg);

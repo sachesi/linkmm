@@ -344,6 +344,42 @@ fn build_main_window(
         cfg.current_game().cloned()
     };
 
+    let content_stack_for_mods_changed = content_stack.clone();
+    let config_for_mods_changed = Rc::clone(&config);
+    let on_mods_changed: Rc<dyn Fn()> = Rc::new(move || {
+        let game_info = {
+            let cfg = config_for_mods_changed.borrow();
+            cfg.current_game().cloned()
+        };
+        let visible = content_stack_for_mods_changed
+            .visible_child_name()
+            .map(|n| n.to_string());
+
+        let new_library: gtk4::Widget = match &game_info {
+            Some(g) => library::build_library_page(g, Rc::clone(&config_for_mods_changed)),
+            None => build_no_game_page(
+                "No Game Selected",
+                "Select or add a game to manage its mods.",
+            ),
+        };
+        if let Some(old) = content_stack_for_mods_changed.child_by_name("library") {
+            content_stack_for_mods_changed.remove(&old);
+        }
+        content_stack_for_mods_changed.add_named(&new_library, Some("library"));
+
+        let new_load_order = load_order::build_load_order_page(game_info.as_ref());
+        if let Some(old) = content_stack_for_mods_changed.child_by_name("load_order") {
+            content_stack_for_mods_changed.remove(&old);
+        }
+        content_stack_for_mods_changed.add_named(&new_load_order, Some("load_order"));
+
+        if let Some(name) = visible.as_deref()
+            && (name == "library" || name == "load_order")
+        {
+            content_stack_for_mods_changed.set_visible_child_name(name);
+        }
+    });
+
     // Library
     let library_widget: gtk4::Widget = match &current_game {
         Some(g) => library::build_library_page(g, Rc::clone(&config)),
@@ -363,6 +399,7 @@ fn build_main_window(
         current_game.as_ref(),
         Rc::clone(&config),
         Rc::clone(&nav_lock),
+        Rc::clone(&on_mods_changed),
     );
     content_stack.add_named(&downloads_widget, Some("downloads"));
 
@@ -439,6 +476,7 @@ fn build_main_window(
     let nav_list_r = nav_list.clone();
     let play_btn_r = play_btn.clone();
     let nav_lock_r = Rc::clone(&nav_lock);
+    let on_mods_changed_r = Rc::clone(&on_mods_changed);
     let window_r = window.clone();
 
     let on_setup_done_rc: Rc<dyn Fn()> = Rc::new(move || {
@@ -489,6 +527,7 @@ fn build_main_window(
             game_info.as_ref(),
             Rc::clone(&config_r),
             Rc::clone(&nav_lock_r),
+            Rc::clone(&on_mods_changed_r),
         );
         if let Some(old) = content_stack_r.child_by_name("downloads") {
             content_stack_r.remove(&old);
