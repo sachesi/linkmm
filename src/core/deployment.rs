@@ -107,6 +107,31 @@ struct DesiredDeployment {
     owner_id: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DeploymentPreview {
+    pub links_to_create: Vec<PathBuf>,
+    pub links_to_replace: Vec<PathBuf>,
+    pub links_to_remove: Vec<PathBuf>,
+    pub real_files_to_backup: Vec<PathBuf>,
+    pub backups_to_restore: Vec<PathBuf>,
+    pub backups_remaining: Vec<PathBuf>,
+    pub generated_outputs_participating: Vec<String>,
+    pub blocked_paths: Vec<String>,
+}
+
+impl DeploymentPreview {
+    pub fn summary_line(&self) -> String {
+        format!(
+            "Add: {} · Replace: {} · Remove: {} · Backup: {} · Restore: {}",
+            self.links_to_create.len(),
+            self.links_to_replace.len(),
+            self.links_to_remove.len(),
+            self.real_files_to_backup.len(),
+            self.backups_to_restore.len()
+        )
+    }
+}
+
 // ── Link Creation ─────────────────────────────────────────────────────────────
 
 /// Create a link (symlink or hardlink) from source to destination.
