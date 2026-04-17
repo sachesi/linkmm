@@ -142,7 +142,7 @@ fn build_main_window(
         play_btn.set_visible(
             cfg.current_game()
                 .map(|g| {
-                    g.kind.steam_app_id().is_some()
+                    g.steam_instance_app_id().is_some()
                         || g.launcher_source == GameLauncherSource::NonSteamUmu
                 })
                 .unwrap_or(false),
@@ -261,7 +261,7 @@ fn build_main_window(
             if let Some(game) = current_game {
                 let game_session = manager.current_game_session(&game.id);
                 play_btn_t.set_visible(
-                    game.kind.steam_app_id().is_some()
+                    game.steam_instance_app_id().is_some()
                         || game.launcher_source == GameLauncherSource::NonSteamUmu,
                 );
                 play_btn_t.set_label(if game.launcher_source == GameLauncherSource::Steam {
@@ -458,7 +458,7 @@ fn build_main_window(
             game_info
                 .as_ref()
                 .map(|g| {
-                    g.kind.steam_app_id().is_some()
+                    g.steam_instance_app_id().is_some()
                         || g.launcher_source == GameLauncherSource::NonSteamUmu
                 })
                 .unwrap_or(false),

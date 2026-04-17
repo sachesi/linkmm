@@ -7,6 +7,13 @@ pub struct SteamLibrary {
     pub apps: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedSteamGame {
+    pub kind: GameKind,
+    pub app_id: u32,
+    pub path: PathBuf,
+}
+
 pub fn find_steam_libraries() -> Vec<SteamLibrary> {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -374,8 +381,11 @@ fn tools_match_version(tool1: &str, tool2: &str) -> bool {
 }
 
 pub fn find_game_path(app_id: u32) -> Option<PathBuf> {
-    let libraries = find_steam_libraries();
-    for lib in &libraries {
+    find_game_path_in_libraries(app_id, &find_steam_libraries())
+}
+
+fn find_game_path_in_libraries(app_id: u32, libraries: &[SteamLibrary]) -> Option<PathBuf> {
+    for lib in libraries {
         let manifest_path = lib.path.join(format!("appmanifest_{app_id}.acf"));
         if manifest_path.exists()
             && let Ok(contents) = std::fs::read_to_string(&manifest_path)
@@ -390,13 +400,21 @@ pub fn find_game_path(app_id: u32) -> Option<PathBuf> {
     None
 }
 
-pub fn detect_games() -> Vec<(GameKind, PathBuf)> {
+pub fn detect_games() -> Vec<DetectedSteamGame> {
+    detect_games_in_libraries(&find_steam_libraries())
+}
+
+fn detect_games_in_libraries(libraries: &[SteamLibrary]) -> Vec<DetectedSteamGame> {
     let mut found = Vec::new();
     for kind in GameKind::all() {
-        if let Some(app_id) = kind.steam_app_id()
-            && let Some(path) = find_game_path(app_id)
-        {
-            found.push((kind, path));
+        for &app_id in kind.steam_app_ids() {
+            if let Some(path) = find_game_path_in_libraries(app_id, libraries) {
+                found.push(DetectedSteamGame {
+                    kind: kind.clone(),
+                    app_id,
+                    path,
+                });
+            }
         }
     }
     found
@@ -455,11 +473,13 @@ pub fn is_path_in_flatpak(path: &Path) -> bool {
 /// approach of checking a static list of hardcoded home-relative paths, which
 /// failed whenever games were installed in a non-default Steam library.
 pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
-    let libraries = find_steam_libraries();
+    find_compatdata_path_in_libraries(app_id, &find_steam_libraries())
+}
 
+fn find_compatdata_path_in_libraries(app_id: u32, libraries: &[SteamLibrary]) -> Option<PathBuf> {
     // Prefer the library that actually contains the game's appmanifest — Steam
     // always creates the compatdata entry next to the appmanifest.
-    for lib in &libraries {
+    for lib in libraries {
         let manifest = lib.path.join(format!("appmanifest_{app_id}.acf"));
         if manifest.exists() {
             let path = lib.path.join("compatdata").join(app_id.to_string());
@@ -471,7 +491,7 @@ pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
 
     // Fallback: check all libraries (handles e.g. compatdata created before the
     // game was moved to a different library).
-    for lib in &libraries {
+    for lib in libraries {
         let path = lib.path.join("compatdata").join(app_id.to_string());
         if path.is_dir() {
             return Some(path);
@@ -492,8 +512,7 @@ pub fn find_compatdata_path(app_id: u32) -> Option<PathBuf> {
 /// failure.
 pub fn launch_game(game: &crate::core::games::Game) -> Result<(), String> {
     let app_id = game
-        .kind
-        .steam_app_id()
+        .steam_instance_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
 
     std::process::Command::new("xdg-open")
@@ -512,8 +531,7 @@ pub fn launch_game_managed_command(
     game: &crate::core::games::Game,
 ) -> Result<std::process::Command, String> {
     let app_id = game
-        .kind
-        .steam_app_id()
+        .steam_instance_app_id()
         .ok_or_else(|| "Game has no Steam App ID".to_string())?;
     let command = match select_managed_steam_backend(is_steam_flatpak(), detect_steam_path_kind()) {
         ManagedSteamBackend::Flatpak => launch_game_managed_flatpak_command(app_id),
@@ -949,6 +967,8 @@ fn split_launch_arguments(arguments: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
 
     #[test]
     fn launch_game_fails_without_steam_app_id() {
@@ -1034,6 +1054,156 @@ mod tests {
         assert_eq!(
             select_managed_steam_backend(false, SteamPathKind::FlatpakWrapper),
             ManagedSteamBackend::Flatpak
+        );
+    }
+
+    #[test]
+    fn detect_games_recognizes_fallout_nv_alias_without_duplicates() {
+        let tmp = TempDir::new().expect("tempdir");
+        let steamapps = tmp.path().join("steamapps");
+        let common = steamapps.join("common");
+        let game_dir = common.join("Fallout New Vegas PCR");
+        std::fs::create_dir_all(&game_dir).expect("create game dir");
+
+        let manifest = steamapps.join("appmanifest_22490.acf");
+        let manifest_body = r#"
+            "AppState"
+            {
+                "appid"      "22490"
+                "installdir" "Fallout New Vegas PCR"
+            }
+        "#;
+        std::fs::create_dir_all(&steamapps).expect("create steamapps");
+        std::fs::write(&manifest, manifest_body).expect("write manifest");
+
+        let libraries = vec![SteamLibrary {
+            path: steamapps,
+            apps: vec![22490],
+        }];
+
+        let detected = detect_games_in_libraries(&libraries);
+        let fallout_nv: Vec<_> = detected
+            .iter()
+            .filter(|entry| entry.kind == GameKind::FalloutNV)
+            .collect();
+        assert_eq!(fallout_nv.len(), 1);
+        assert_eq!(fallout_nv[0].app_id, 22490);
+        assert_eq!(fallout_nv[0].path, game_dir);
+    }
+
+    #[test]
+    fn detect_games_keeps_both_fallout_nv_steam_instances() {
+        let tmp = TempDir::new().expect("tempdir");
+        let steamapps = tmp.path().join("steamapps");
+        std::fs::create_dir_all(steamapps.join("common").join("Fallout New Vegas"))
+            .expect("create fnv dir");
+        std::fs::create_dir_all(steamapps.join("common").join("Fallout New Vegas PCR"))
+            .expect("create pcr dir");
+
+        std::fs::write(
+            steamapps.join("appmanifest_22380.acf"),
+            r#""AppState"{"appid" "22380" "installdir" "Fallout New Vegas"}"#,
+        )
+        .expect("write fnv manifest");
+        std::fs::write(
+            steamapps.join("appmanifest_22490.acf"),
+            r#""AppState"{"appid" "22490" "installdir" "Fallout New Vegas PCR"}"#,
+        )
+        .expect("write pcr manifest");
+
+        let libraries = vec![SteamLibrary {
+            path: steamapps.clone(),
+            apps: vec![22380, 22490],
+        }];
+
+        let detected = detect_games_in_libraries(&libraries);
+        let fallout_nv: Vec<_> = detected
+            .into_iter()
+            .filter(|entry| entry.kind == GameKind::FalloutNV)
+            .collect();
+        assert_eq!(fallout_nv.len(), 2);
+        assert!(fallout_nv.iter().any(|entry| entry.app_id == 22380));
+        assert!(fallout_nv.iter().any(|entry| entry.app_id == 22490));
+    }
+
+    #[test]
+    fn compatdata_lookup_uses_instance_app_id() {
+        let tmp = TempDir::new().expect("tempdir");
+        let steamapps = tmp.path().join("steamapps");
+        let compat_22380 = steamapps.join("compatdata").join("22380");
+        let compat_22490 = steamapps.join("compatdata").join("22490");
+        std::fs::create_dir_all(&compat_22380).expect("create 22380 compatdata");
+        std::fs::create_dir_all(&compat_22490).expect("create 22490 compatdata");
+        std::fs::write(steamapps.join("appmanifest_22490.acf"), "\"AppState\"{}")
+            .expect("write 22490 manifest");
+
+        let libraries = vec![SteamLibrary {
+            path: steamapps,
+            apps: vec![22380, 22490],
+        }];
+
+        assert_eq!(
+            find_compatdata_path_in_libraries(22490, &libraries),
+            Some(compat_22490)
+        );
+        assert_eq!(
+            find_compatdata_path_in_libraries(22380, &libraries),
+            Some(compat_22380)
+        );
+    }
+
+    #[test]
+    fn steam_launch_command_uses_instance_app_id() {
+        use crate::core::games::{Game, GameKind};
+        let game = Game::new_steam_with_app_id(GameKind::FalloutNV, PathBuf::from("/fake"), 22490);
+        let command = launch_game_managed_command(&game).expect("managed launch command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let has_22490 = args
+            .iter()
+            .any(|a| a == "22490" || a.contains("steam://run/22490"));
+        assert!(
+            has_22490,
+            "expected launch command args to include app id 22490: {args:?}"
+        );
+    }
+
+    #[test]
+    fn native_tool_command_uses_supplied_instance_app_id() {
+        let cmd_pcr = build_native_tool_command(
+            &PathBuf::from("/proton/proton"),
+            &PathBuf::from("/games/FalloutNV.exe"),
+            "",
+            &PathBuf::from("/steam/root"),
+            &PathBuf::from("/steamapps/compatdata/22490"),
+            22490,
+        )
+        .expect("pcr command");
+        assert_eq!(
+            cmd_pcr.get_envs().find(|(k, _)| *k == "SteamAppId"),
+            Some((
+                std::ffi::OsStr::new("SteamAppId"),
+                Some(std::ffi::OsStr::new("22490"))
+            ))
+        );
+
+        let cmd_base = build_native_tool_command(
+            &PathBuf::from("/proton/proton"),
+            &PathBuf::from("/games/FalloutNV.exe"),
+            "",
+            &PathBuf::from("/steam/root"),
+            &PathBuf::from("/steamapps/compatdata/22380"),
+            22380,
+        )
+        .expect("base command");
+        assert_eq!(
+            cmd_base.get_envs().find(|(k, _)| *k == "SteamAppId"),
+            Some((
+                std::ffi::OsStr::new("SteamAppId"),
+                Some(std::ffi::OsStr::new("22380"))
+            ))
         );
     }
 
