@@ -374,8 +374,20 @@ UI refresh behavior:
   polling
 - Tools workspace summary and deploy/review surface refresh from workspace
   events for profile/deploy/revert changes
+- Library and Load Order now expose page-local staged workflow summaries and
+  refresh those surfaces from workspace events (not periodic timers)
 - cached pages remain stable; updates target shared summaries and relevant page
   surfaces without full-window rebuilds
+
+Library / Load Order staged workflow participation:
+
+- each page shows local staged-status context (dirty/redeploy/discard
+  availability) in addition to the global workspace banner
+- Library rows visibly mark `pending_removal` items as “Pending removal after
+  redeploy” and disable normal row behavior to avoid ambiguous active state
+- both pages provide contextual redeploy/discard actions and concise consequence
+  hints (for example pending removals, link replacement count, plugin-change
+  impact) without duplicating the full Tools review surface
 
 Intentional remaining polling:
 

@@ -5,9 +5,77 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+use crate::core::deployment;
 use crate::core::games::Game;
-use crate::core::mods::{ModDatabase, PluginFile};
+use crate::core::mods::{ModDatabase, ModManager, PluginFile};
+use crate::core::workspace;
 use crate::ui::ordering;
+
+#[derive(Debug, Clone)]
+struct LoadOrderStageSummary {
+    summary: String,
+    redeploy_available: bool,
+    discard_available: bool,
+}
+
+fn is_event_for_game(event: &workspace::WorkspaceEvent, game_id: &str) -> bool {
+    match event {
+        workspace::WorkspaceEvent::ProfileStateChanged { game_id: id, .. }
+        | workspace::WorkspaceEvent::WorkspaceStateChanged { game_id: id, .. }
+        | workspace::WorkspaceEvent::DeployStarted { game_id: id, .. }
+        | workspace::WorkspaceEvent::DeployFinished { game_id: id, .. }
+        | workspace::WorkspaceEvent::DeployFailed { game_id: id, .. }
+        | workspace::WorkspaceEvent::ProfileSwitched { game_id: id, .. }
+        | workspace::WorkspaceEvent::RevertCompleted { game_id: id, .. } => id == game_id,
+    }
+}
+
+fn attach_load_order_workspace_listener<F>(mut on_event: F)
+where
+    F: FnMut(workspace::WorkspaceEvent) + 'static,
+{
+    let rx = workspace::subscribe_events();
+    let (tx_ui, rx_ui) = std::sync::mpsc::channel::<workspace::WorkspaceEvent>();
+    std::thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            if tx_ui.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    gtk4::glib::idle_add_local(move || {
+        while let Ok(event) = rx_ui.try_recv() {
+            on_event(event);
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
+}
+
+fn load_order_stage_summary(game: &Game) -> LoadOrderStageSummary {
+    let state = workspace::workspace_state_for_game(game);
+    let db = ModDatabase::load(game);
+    let preview = deployment::deployment_preview(game, &db).ok();
+    let plugin_changes = if state.pending_changes.plugin_order_changed {
+        "plugins.txt will change on redeploy"
+    } else {
+        "plugins.txt unchanged"
+    };
+    let replace_count = preview
+        .as_ref()
+        .map(|p| p.links_to_replace.len())
+        .unwrap_or(0);
+    LoadOrderStageSummary {
+        summary: format!(
+            "{} · {} · Asset links to replace: {}",
+            workspace::format_workspace_compact_summary(&state),
+            plugin_changes,
+            replace_count
+        ),
+        redeploy_available: state.safe_redeploy_required,
+        discard_available: state.safe_redeploy_required
+            && workspace::has_profile_baseline(game, &state.profile_id),
+    }
+}
 
 /// Build the Load Order page for `game`.
 ///
@@ -53,6 +121,16 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             sort_btn.set_tooltip_text(Some("Sort plugins using LOOT load order rules"));
             let game_rc = Rc::new(g.clone());
             let search_query = Rc::new(RefCell::new(String::new()));
+
+            let staged_row = adw::ActionRow::builder()
+                .title("Staged Plugin Changes")
+                .subtitle("Loading staged load-order state…")
+                .build();
+            let staged_redeploy_btn = gtk4::Button::with_label("Redeploy now");
+            let staged_discard_btn = gtk4::Button::with_label("Discard staged");
+            staged_row.add_suffix(&staged_redeploy_btn);
+            staged_row.add_suffix(&staged_discard_btn);
+            content_container.append(&staged_row);
 
             let reorder_hint = gtk4::Label::new(Some("Clear search to reorder."));
             reorder_hint.add_css_class("dim-label");
@@ -126,9 +204,6 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                     }
                     db.sort_plugins_by_type(&game_c);
                     db.save(&game_c);
-                    if let Err(e) = db.write_plugins_txt(&game_c) {
-                        log::warn!("Failed to write plugins.txt after sort: {e}");
-                    }
                     refresh_load_order_content(
                         &list_c,
                         &status_c,
@@ -137,6 +212,82 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                         &game_c,
                         &search_c.borrow(),
                     );
+                });
+            }
+
+            {
+                let game_stage = Rc::clone(&game_rc);
+                let staged_row_c = staged_row.clone();
+                let staged_redeploy_btn_c = staged_redeploy_btn.clone();
+                let staged_discard_btn_c = staged_discard_btn.clone();
+                let refresh_stage = move || {
+                    let stage = load_order_stage_summary(&game_stage);
+                    staged_row_c.set_subtitle(&stage.summary);
+                    staged_redeploy_btn_c.set_sensitive(stage.redeploy_available);
+                    staged_discard_btn_c.set_sensitive(stage.discard_available);
+                };
+                refresh_stage();
+                attach_load_order_workspace_listener(move |event| {
+                    if is_event_for_game(&event, &game_stage.id) {
+                        refresh_stage();
+                    }
+                });
+            }
+
+            {
+                let game_c = Rc::clone(&game_rc);
+                staged_redeploy_btn.connect_clicked(move |_| {
+                    if let Err(e) = ModManager::rebuild_all(&game_c) {
+                        log::error!("Load Order staged redeploy failed: {e}");
+                    }
+                });
+            }
+
+            {
+                let game_c = Rc::clone(&game_rc);
+                staged_discard_btn.connect_clicked(move |btn| {
+                    let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                    let dialog = adw::AlertDialog::builder()
+                        .heading("Discard staged changes?")
+                        .body("This restores profile state to the last deployed baseline. Deployed files on disk are unchanged until explicit redeploy.")
+                        .build();
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("discard", "Discard");
+                    dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+                    let game_response = Rc::clone(&game_c);
+                    dialog.connect_response(None, move |_, response| {
+                        if response != "discard" {
+                            return;
+                        }
+                        if let Err(e) = workspace::revert_active_profile_to_baseline(&game_response)
+                        {
+                            log::error!("Failed to discard staged changes from Load Order: {e}");
+                        }
+                    });
+                    dialog.present(parent.as_ref());
+                });
+            }
+
+            {
+                let game_c = Rc::clone(&game_rc);
+                let list_c = list_box.clone();
+                let status_c = status_page.clone();
+                let stack_c = stack.clone();
+                let search_c = Rc::clone(&search_query);
+                let hint_c = reorder_hint.clone();
+                attach_load_order_workspace_listener(move |event| {
+                    if is_event_for_game(&event, &game_c.id) {
+                        refresh_load_order_content(
+                            &list_c,
+                            &status_c,
+                            &stack_c,
+                            &hint_c,
+                            &game_c,
+                            &search_c.borrow(),
+                        );
+                    }
                 });
             }
 
@@ -297,7 +448,6 @@ fn build_plugin_row(
                 db.plugin_disabled.insert(plugin_name.clone());
             }
             db.save(&game_c);
-            let _ = db.write_plugins_txt(&game_c);
             refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
         });
     }
@@ -344,7 +494,6 @@ fn build_plugin_row(
             {
                 db.set_plugin_order(&updated);
                 db.save(&game_c);
-                let _ = db.write_plugins_txt(&game_c);
             }
             refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
         });
@@ -366,7 +515,6 @@ fn build_plugin_row(
             {
                 db.set_plugin_order(&updated);
                 db.save(&game_c);
-                let _ = db.write_plugins_txt(&game_c);
             }
             refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
         });
@@ -467,7 +615,6 @@ fn build_plugin_row(
                 let mut db = ModDatabase::load(&game_enable);
                 db.plugin_disabled.clear();
                 db.save(&game_enable);
-                let _ = db.write_plugins_txt(&game_enable);
                 refresh_load_order_content(
                     &list_enable,
                     &status_enable,
@@ -495,7 +642,6 @@ fn build_plugin_row(
                     }
                 }
                 db.save(&game_disable);
-                let _ = db.write_plugins_txt(&game_disable);
                 refresh_load_order_content(
                     &list_disable,
                     &status_disable,
@@ -575,7 +721,6 @@ fn show_move_to_position_dialog(
         ) {
             db.set_plugin_order(&updated);
             db.save(&game);
-            let _ = db.write_plugins_txt(&game);
         }
 
         refresh_load_order_content(
@@ -601,12 +746,23 @@ fn matches_query(value: &str, query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::matches_query;
+    use super::{is_event_for_game, matches_query};
+    use crate::core::workspace::WorkspaceEvent;
 
     #[test]
     fn matches_query_is_case_insensitive() {
         assert!(matches_query("MyPatch.esp", "patch"));
         assert!(matches_query("MyPatch.esp", "  ESP  "));
         assert!(!matches_query("MyPatch.esp", "armor"));
+    }
+
+    #[test]
+    fn event_filter_matches_expected_game_id() {
+        let ev = WorkspaceEvent::ProfileStateChanged {
+            game_id: "game_a".to_string(),
+            profile_id: "default".to_string(),
+        };
+        assert!(is_event_for_game(&ev, "game_a"));
+        assert!(!is_event_for_game(&ev, "game_b"));
     }
 }

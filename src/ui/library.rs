@@ -9,8 +9,10 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
+use crate::core::deployment;
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
+use crate::core::workspace;
 use crate::ui::ordering;
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
@@ -36,6 +38,81 @@ struct ConflictSummary {
     overwriting_mods: usize,
     overwritten_by_mods: usize,
     total_conflicting_files: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LibraryStageSummary {
+    summary: String,
+    redeploy_available: bool,
+    discard_available: bool,
+}
+
+fn is_event_for_game(event: &workspace::WorkspaceEvent, game_id: &str) -> bool {
+    match event {
+        workspace::WorkspaceEvent::ProfileStateChanged { game_id: id, .. }
+        | workspace::WorkspaceEvent::WorkspaceStateChanged { game_id: id, .. }
+        | workspace::WorkspaceEvent::DeployStarted { game_id: id, .. }
+        | workspace::WorkspaceEvent::DeployFinished { game_id: id, .. }
+        | workspace::WorkspaceEvent::DeployFailed { game_id: id, .. }
+        | workspace::WorkspaceEvent::ProfileSwitched { game_id: id, .. }
+        | workspace::WorkspaceEvent::RevertCompleted { game_id: id, .. } => id == game_id,
+    }
+}
+
+fn attach_library_workspace_listener<F>(mut on_event: F)
+where
+    F: FnMut(workspace::WorkspaceEvent) + 'static,
+{
+    let rx = workspace::subscribe_events();
+    let (tx_ui, rx_ui) = std::sync::mpsc::channel::<workspace::WorkspaceEvent>();
+    std::thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            if tx_ui.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    gtk4::glib::idle_add_local(move || {
+        while let Ok(event) = rx_ui.try_recv() {
+            on_event(event);
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
+}
+
+fn library_stage_summary(game: &Game) -> LibraryStageSummary {
+    let state = workspace::workspace_state_for_game(game);
+    let db = ModDatabase::load(game);
+    let pending_mod_removals = db.mods.iter().filter(|m| m.pending_removal).count();
+    let preview = deployment::deployment_preview(game, &db).ok();
+    let replace_count = preview
+        .as_ref()
+        .map(|p| p.links_to_replace.len())
+        .unwrap_or(0);
+    let summary = format!(
+        "{} · Pending removals: {} · Links to replace: {}",
+        workspace::format_workspace_compact_summary(&state),
+        pending_mod_removals,
+        replace_count
+    );
+    LibraryStageSummary {
+        summary,
+        redeploy_available: state.safe_redeploy_required,
+        discard_available: state.safe_redeploy_required
+            && workspace::has_profile_baseline(game, &state.profile_id),
+    }
+}
+
+fn mod_row_subtitle(base: &str, pending_removal: bool) -> String {
+    if pending_removal {
+        if base.is_empty() {
+            "Pending removal after redeploy".to_string()
+        } else {
+            format!("{base} · Pending removal after redeploy")
+        }
+    } else {
+        base.to_string()
+    }
 }
 
 /// Build the full Library page for `game`.
@@ -93,6 +170,16 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     status_revealer.set_child(Some(&status_card));
     content_container.append(&status_revealer);
 
+    let staged_row = adw::ActionRow::builder()
+        .title("Staged Mod Changes")
+        .subtitle("Loading staged mod workflow state…")
+        .build();
+    let staged_redeploy_btn = gtk4::Button::with_label("Redeploy now");
+    let staged_discard_btn = gtk4::Button::with_label("Discard staged");
+    staged_row.add_suffix(&staged_redeploy_btn);
+    staged_row.add_suffix(&staged_discard_btn);
+    content_container.append(&staged_row);
+
     let list_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     list_container.set_vexpand(true);
     let reorder_hint = gtk4::Label::new(Some("Clear search to reorder."));
@@ -109,6 +196,25 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     let game_rc = Rc::new(game.clone());
     let search_query = Rc::new(RefCell::new(String::new()));
     let selected_mod_id = Rc::new(RefCell::new(None::<String>));
+
+    {
+        let game_stage = Rc::clone(&game_rc);
+        let staged_row_c = staged_row.clone();
+        let staged_redeploy_btn_c = staged_redeploy_btn.clone();
+        let staged_discard_btn_c = staged_discard_btn.clone();
+        let refresh_stage = move || {
+            let stage = library_stage_summary(&game_stage);
+            staged_row_c.set_subtitle(&stage.summary);
+            staged_redeploy_btn_c.set_sensitive(stage.redeploy_available);
+            staged_discard_btn_c.set_sensitive(stage.discard_available);
+        };
+        refresh_stage();
+        attach_library_workspace_listener(move |event| {
+            if is_event_for_game(&event, &game_stage.id) {
+                refresh_stage();
+            }
+        });
+    }
 
     refresh_library_content_with_search(
         &list_container,
@@ -142,6 +248,64 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &reorder_hint_c,
                 false,
             );
+        });
+    }
+
+    {
+        let container_c = list_container.clone();
+        let game_c = Rc::clone(&game_rc);
+        let config_c = Rc::clone(&config);
+        let search_c = Rc::clone(&search_query);
+        let selected_c = Rc::clone(&selected_mod_id);
+        let reorder_hint_c = reorder_hint.clone();
+        attach_library_workspace_listener(move |event| {
+            if is_event_for_game(&event, &game_c.id) {
+                refresh_library_content_with_search(
+                    &container_c,
+                    &game_c,
+                    Rc::clone(&config_c),
+                    &search_c.borrow(),
+                    Rc::clone(&search_c),
+                    Rc::clone(&selected_c),
+                    &reorder_hint_c,
+                    false,
+                );
+            }
+        });
+    }
+
+    {
+        let game_c = Rc::clone(&game_rc);
+        staged_redeploy_btn.connect_clicked(move |_| {
+            if let Err(e) = ModManager::rebuild_all(&game_c) {
+                log::error!("Library staged redeploy failed: {e}");
+            }
+        });
+    }
+
+    {
+        let game_c = Rc::clone(&game_rc);
+        staged_discard_btn.connect_clicked(move |btn| {
+            let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+            let dialog = adw::AlertDialog::builder()
+                .heading("Discard staged changes?")
+                .body("This restores profile state to the last deployed baseline. Deployed files on disk are unchanged until explicit redeploy.")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("discard", "Discard");
+            dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let game_response = Rc::clone(&game_c);
+            dialog.connect_response(None, move |_, response| {
+                if response != "discard" {
+                    return;
+                }
+                if let Err(e) = workspace::revert_active_profile_to_baseline(&game_response) {
+                    log::error!("Failed to discard staged changes from Library: {e}");
+                }
+            });
+            dialog.present(parent.as_ref());
         });
     }
 
@@ -517,14 +681,9 @@ fn build_mod_row(
         (None, true) => "From Nexus Mods".to_string(),
         (None, false) => String::new(),
     };
-    if !subtitle.is_empty() {
-        if mod_entry.pending_removal {
-            row.set_subtitle(&format!("{subtitle} · Pending removal after redeploy"));
-        } else {
-            row.set_subtitle(&subtitle);
-        }
-    } else if mod_entry.pending_removal {
-        row.set_subtitle("Pending removal after redeploy");
+    let row_subtitle = mod_row_subtitle(&subtitle, mod_entry.pending_removal);
+    if !row_subtitle.is_empty() {
+        row.set_subtitle(&row_subtitle);
     }
 
     let index_label = gtk4::Label::new(Some(&format!("{}", full_idx + 1)));
@@ -1327,10 +1486,11 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConflictState, build_conflict_details, compute_conflict_states, matches_query,
-        summarize_conflicts,
+        ConflictState, build_conflict_details, compute_conflict_states, is_event_for_game,
+        matches_query, mod_row_subtitle, summarize_conflicts,
     };
     use crate::core::mods::Mod;
+    use crate::core::workspace::WorkspaceEvent;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1347,6 +1507,7 @@ mod tests {
             installed_from_nexus: false,
             archive_name: None,
             deployer: "assets".to_string(),
+            pending_removal: false,
         }
     }
 
@@ -1355,6 +1516,29 @@ mod tests {
         assert!(matches_query("Immersive Armors", "arm"));
         assert!(matches_query("Immersive Armors", "  ARMORS  "));
         assert!(!matches_query("Immersive Armors", "weapons"));
+    }
+
+    #[test]
+    fn mod_row_subtitle_marks_pending_removal() {
+        assert_eq!(
+            mod_row_subtitle("From Nexus Mods", true),
+            "From Nexus Mods · Pending removal after redeploy"
+        );
+        assert_eq!(
+            mod_row_subtitle("", true),
+            "Pending removal after redeploy".to_string()
+        );
+        assert_eq!(mod_row_subtitle("v1.0", false), "v1.0".to_string());
+    }
+
+    #[test]
+    fn event_filter_matches_expected_game_id() {
+        let ev = WorkspaceEvent::DeployFinished {
+            game_id: "game_a".to_string(),
+            profile_id: "default".to_string(),
+        };
+        assert!(is_event_for_game(&ev, "game_a"));
+        assert!(!is_event_for_game(&ev, "game_b"));
     }
 
     #[test]
