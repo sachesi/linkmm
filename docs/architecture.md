@@ -135,3 +135,6 @@ List/view update rule for Library and Load Order:
 - Prefer targeted state updates where possible.
 - If a list rebuild is required, preserve user context (scroll/focus/search) and
   avoid unrelated resets/jumping.
+- Reordering actions operate on authoritative full-order lists only; when search
+  filtering is active, reorder affordances are disabled until the filter is
+  cleared.
