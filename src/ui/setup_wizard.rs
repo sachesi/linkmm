@@ -22,7 +22,11 @@ use crate::core::umu;
 #[derive(Clone, Debug)]
 enum GameSelection {
     /// A Steam-detected or manually-added game (no UMU).
-    Steam(GameKind, std::path::PathBuf),
+    Steam {
+        kind: GameKind,
+        app_id: u32,
+        path: std::path::PathBuf,
+    },
     /// A game configured via UMU-launcher (non-Steam).
     Umu {
         kind: GameKind,
@@ -131,7 +135,7 @@ fn build_welcome_page() -> gtk4::Box {
 #[allow(clippy::type_complexity)]
 fn build_game_select_page(
     stack: &gtk4::Stack,
-    detected_games: Vec<(GameKind, std::path::PathBuf)>,
+    detected_games: Vec<steam::DetectedSteamGame>,
     selected_game: Rc<RefCell<Option<GameSelection>>>,
 ) -> (gtk4::Box, Rc<RefCell<Option<GameSelection>>>) {
     let page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
@@ -172,7 +176,9 @@ fn build_game_select_page(
         game_list.add_css_class("boxed-list");
         game_list.set_selection_mode(gtk4::SelectionMode::None);
 
-        for (kind, path) in &detected_games {
+        for detected in &detected_games {
+            let kind = &detected.kind;
+            let path = &detected.path;
             let row = adw::ActionRow::builder()
                 .title(kind.display_name())
                 .subtitle(path.to_string_lossy().as_ref())
@@ -184,8 +190,9 @@ fn build_game_select_page(
 
             check_buttons.borrow_mut().push(check.clone());
 
-            let kind_clone = kind.clone();
-            let path_clone = path.clone();
+            let kind_clone = detected.kind.clone();
+            let app_id = detected.app_id;
+            let path_clone = detected.path.clone();
             let selected_game_clone = Rc::clone(&selected_game);
             let all_checks = Rc::clone(&check_buttons);
 
@@ -196,11 +203,14 @@ fn build_game_select_page(
                             btn.set_active(false);
                         }
                     }
-                    *selected_game_clone.borrow_mut() =
-                        Some(GameSelection::Steam(kind_clone.clone(), path_clone.clone()));
+                    *selected_game_clone.borrow_mut() = Some(GameSelection::Steam {
+                        kind: kind_clone.clone(),
+                        app_id,
+                        path: path_clone.clone(),
+                    });
                 } else {
                     let mut sel = selected_game_clone.borrow_mut();
-                    if let Some(GameSelection::Steam(ref k, _)) = *sel {
+                    if let Some(GameSelection::Steam { kind: ref k, .. }) = *sel {
                         if k == &kind_clone {
                             *sel = None;
                         }
@@ -618,11 +628,18 @@ fn show_add_game_dialog(
         let kind_idx = kind_row_clone.selected() as usize;
         let all_kinds = GameKind::all();
         if let Some(kind) = all_kinds.get(kind_idx) {
+            let Some(app_id) = kind.primary_steam_app_id() else {
+                return;
+            };
             // Uncheck all radio buttons from the game select page
             for btn in all_checks.borrow().iter() {
                 btn.set_active(false);
             }
-            *selected_game.borrow_mut() = Some(GameSelection::Steam(kind.clone(), root_path));
+            *selected_game.borrow_mut() = Some(GameSelection::Steam {
+                kind: kind.clone(),
+                app_id,
+                path: root_path,
+            });
         }
         dialog_clone2.destroy();
     });
@@ -1049,7 +1066,9 @@ fn finish_wizard_apply(
         }
 
         let game_opt: Option<Game> = match selected_game.borrow().clone() {
-            Some(GameSelection::Steam(kind, path)) => Some(Game::new_steam(kind, path)),
+            Some(GameSelection::Steam { kind, app_id, path }) => {
+                Some(Game::new_steam_with_app_id(kind, path, app_id))
+            }
             Some(GameSelection::Umu {
                 kind,
                 root_path,
