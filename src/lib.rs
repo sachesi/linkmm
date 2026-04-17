@@ -12,6 +12,7 @@ pub mod core {
     pub mod nexus;
     pub mod nxm;
     pub mod runtime;
+    pub mod runtime_scan;
     pub mod steam;
     pub mod tool_adapters;
     pub mod tool_runs;

@@ -1,5 +1,6 @@
 use crate::core::games::Game;
 use crate::core::mods::ModDatabase;
+use crate::core::runtime_scan::RuntimeScanReport;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -88,6 +89,9 @@ pub struct WorkspaceState {
     pub status_severity: StatusSeverity,
     pub safe_redeploy_required: bool,
     pub safe_redeploy_recommended: bool,
+    pub runtime_review_required: bool,
+    pub runtime_adoptable_pending: usize,
+    pub runtime_unknown_pending: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -113,6 +117,14 @@ struct WorkspaceRuntimeState {
     severity: StatusSeverity,
     deploy_failed: bool,
     unmanaged_runtime_changed: bool,
+    runtime_scan: RuntimeScanStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeScanStatus {
+    unresolved_review_count: usize,
+    adoptable_count: usize,
+    unknown_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -129,6 +141,7 @@ impl Default for WorkspaceRuntimeState {
             severity: StatusSeverity::Info,
             deploy_failed: false,
             unmanaged_runtime_changed: false,
+            runtime_scan: RuntimeScanStatus::default(),
         }
     }
 }
@@ -257,6 +270,17 @@ pub fn mark_unmanaged_runtime_changes(game_id: &str, profile_id: &str, changed: 
         .unmanaged_runtime_changed = changed;
 }
 
+pub fn update_runtime_scan_status(game_id: &str, profile_id: &str, report: &RuntimeScanReport) {
+    let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
+    let state = map.entry(runtime_key(game_id, profile_id)).or_default();
+    state.unmanaged_runtime_changed = report.has_unresolved_changes();
+    state.runtime_scan = RuntimeScanStatus {
+        unresolved_review_count: report.unresolved_review_count(),
+        adoptable_count: report.adoptable_count(),
+        unknown_count: report.unknown_count(),
+    };
+}
+
 pub fn mark_deploy_failure(game_id: &str, profile_id: &str, message: impl Into<String>) {
     let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
     let state = map.entry(runtime_key(game_id, profile_id)).or_default();
@@ -280,6 +304,7 @@ pub fn mark_deployed_clean(game: &Game, db: &ModDatabase) -> Result<(), String> 
     state.deploy_failed = false;
     state.operation = WorkspaceOperation::None;
     state.unmanaged_runtime_changed = false;
+    state.runtime_scan = RuntimeScanStatus::default();
     state.status_message = Some("Deployment is up to date".to_string());
     state.severity = StatusSeverity::Info;
     Ok(())
@@ -316,6 +341,7 @@ pub fn workspace_state_for_game(game: &Game) -> WorkspaceState {
         .unwrap_or_default();
 
     let pending_changes = compute_pending_changes(baseline.as_ref(), &db, &runtime);
+    let runtime_review_required = runtime.runtime_scan.unresolved_review_count > 0;
     let dirty = pending_changes.any();
     let deployment_state = if runtime.operation == WorkspaceOperation::Deploy {
         DeploymentState::Busy
@@ -337,8 +363,11 @@ pub fn workspace_state_for_game(game: &Game) -> WorkspaceState {
         current_operation: runtime.operation,
         status_message: runtime.status_message.clone(),
         status_severity: runtime.severity,
-        safe_redeploy_required: dirty || runtime.deploy_failed,
-        safe_redeploy_recommended: dirty,
+        safe_redeploy_required: dirty || runtime.deploy_failed || runtime_review_required,
+        safe_redeploy_recommended: dirty || runtime_review_required,
+        runtime_review_required,
+        runtime_adoptable_pending: runtime.runtime_scan.adoptable_count,
+        runtime_unknown_pending: runtime.runtime_scan.unknown_count,
     }
 }
 
@@ -369,19 +398,38 @@ pub fn format_workspace_banner_summary(state: &WorkspaceState) -> String {
         summary.push_str(" · ");
         summary.push_str(msg);
     }
+    if state.runtime_review_required {
+        summary.push_str(" · Review runtime changes first");
+    }
     summary
 }
 
 pub fn format_workspace_compact_summary(state: &WorkspaceState) -> String {
     let reasons = state.pending_changes.reasons();
     if reasons.is_empty() {
-        format!("{} · clean", deployment_state_label(state.deployment_state))
+        if state.runtime_review_required {
+            format!(
+                "{} · Runtime review pending (adoptable: {}, unknown: {})",
+                deployment_state_label(state.deployment_state),
+                state.runtime_adoptable_pending,
+                state.runtime_unknown_pending
+            )
+        } else {
+            format!("{} · clean", deployment_state_label(state.deployment_state))
+        }
     } else {
-        format!(
+        let mut summary = format!(
             "{} · {}",
             deployment_state_label(state.deployment_state),
             reasons.join(", ")
-        )
+        );
+        if state.runtime_review_required {
+            summary.push_str(&format!(
+                " · Runtime review pending (adoptable: {}, unknown: {})",
+                state.runtime_adoptable_pending, state.runtime_unknown_pending
+            ));
+        }
+        summary
     }
 }
 
@@ -468,6 +516,9 @@ mod tests {
             status_severity: StatusSeverity::Info,
             safe_redeploy_required: false,
             safe_redeploy_recommended: false,
+            runtime_review_required: false,
+            runtime_adoptable_pending: 0,
+            runtime_unknown_pending: 0,
         };
         assert!(matches!(
             profile_switch_policy(&state_busy),
@@ -650,6 +701,9 @@ mod tests {
             status_severity: StatusSeverity::Info,
             safe_redeploy_required: true,
             safe_redeploy_recommended: true,
+            runtime_review_required: true,
+            runtime_adoptable_pending: 1,
+            runtime_unknown_pending: 0,
         };
         let banner = format_workspace_banner_summary(&state);
         let compact = format_workspace_compact_summary(&state);
@@ -657,5 +711,29 @@ mod tests {
         assert!(banner.contains("Redeploy needed"));
         assert!(banner.contains("Generated outputs changed"));
         assert!(compact.contains("Redeploy needed"));
+    }
+
+    #[test]
+    fn unresolved_runtime_scan_updates_workspace_truth() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp, "workspace_runtime_scan_truth");
+        let db = ModDatabase::default();
+        db.save(&game);
+        let report = RuntimeScanReport {
+            entries: vec![crate::core::runtime_scan::RuntimeScanEntry {
+                relative_path: PathBuf::from("textures/runtime.dds"),
+                classification:
+                    crate::core::runtime_scan::RuntimeEntryClassification::UnmanagedAdoptable,
+                review_status: crate::core::runtime_scan::RuntimeEntryReviewStatus::Pending,
+                package_id: None,
+                tool_id: None,
+                explanation: "pending".to_string(),
+            }],
+        };
+        update_runtime_scan_status(&game.id, &db.active_profile_id, &report);
+        let state = workspace_state_for_game(&game);
+        assert!(state.runtime_review_required);
+        assert!(state.safe_redeploy_required);
+        assert_eq!(state.runtime_adoptable_pending, 1);
     }
 }

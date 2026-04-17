@@ -327,7 +327,26 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                 while let Some(child) = generated_list_c.first_child() {
                     generated_list_c.remove(&child);
                 }
-                let db = ModDatabase::load(&game_for_generated);
+                let mut db = ModDatabase::load(&game_for_generated);
+                let scan_report = match crate::core::runtime_scan::scan_profile_runtime_changes(
+                    &game_for_generated,
+                    &db,
+                ) {
+                    Ok(report) => report,
+                    Err(e) => {
+                        let row = adw::ActionRow::builder()
+                            .title("Runtime scan failed")
+                            .subtitle(&e)
+                            .build();
+                        generated_list_c.append(&row);
+                        return;
+                    }
+                };
+                workspace::update_runtime_scan_status(
+                    &game_for_generated.id,
+                    &db.active_profile_id,
+                    &scan_report,
+                );
                 let workspace_state = workspace::workspace_state_for_game(&game_for_generated);
                 let redeploy_row = adw::ActionRow::builder()
                     .title("Redeploy Guidance")
@@ -357,17 +376,143 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                 redeploy_row.add_suffix(&redeploy_btn);
                 generated_list_c.append(&redeploy_row);
 
-                let runtime_subtitle = if workspace_state.pending_changes.unmanaged_runtime_changed
-                {
-                    "Runtime-preserved/unmanaged changes are flagged for this profile. Redeploy is recommended after review."
+                let runtime_subtitle = if scan_report.has_unresolved_changes() {
+                    "Runtime scan found unresolved changes. Review/adopt/ignore before redeploying."
                 } else {
-                    "No runtime-preserved/unmanaged changes are currently flagged for this profile."
+                    "Runtime scan found no unresolved unmanaged changes in the scoped Data locations."
                 };
                 let runtime_row = adw::ActionRow::builder()
                     .title("Runtime Preserved Changes")
                     .subtitle(runtime_subtitle)
                     .build();
+                let rescan_btn = gtk4::Button::with_label("Rescan");
+                {
+                    let rebuild_rescan = rebuild_w_for_generated.clone();
+                    rescan_btn.connect_clicked(move |_| {
+                        if let Some(rb) = rebuild_rescan.upgrade() {
+                            (rb.borrow())();
+                        }
+                    });
+                }
+                runtime_row.add_suffix(&rescan_btn);
                 generated_list_c.append(&runtime_row);
+
+                for entry in &scan_report.entries {
+                    if matches!(
+                        entry.classification,
+                        crate::core::runtime_scan::RuntimeEntryClassification::ManagedOwnedPresent
+                    ) {
+                        continue;
+                    }
+                    let row = adw::ActionRow::builder()
+                        .title(entry.relative_path.to_string_lossy().to_string())
+                        .subtitle(format!(
+                            "{:?} · {:?}{}{} · {}",
+                            entry.classification,
+                            entry.review_status,
+                            entry
+                                .tool_id
+                                .as_ref()
+                                .map(|t| format!(" · Tool: {t}"))
+                                .unwrap_or_default(),
+                            entry
+                                .package_id
+                                .as_ref()
+                                .map(|p| format!(" · Package: {p}"))
+                                .unwrap_or_default(),
+                            entry.explanation
+                        ))
+                        .build();
+                    let rel_path = entry.relative_path.clone();
+
+                    if matches!(
+                        entry.classification,
+                        crate::core::runtime_scan::RuntimeEntryClassification::UnmanagedAdoptable
+                    ) {
+                        let adopt_btn = gtk4::Button::with_label("Adopt");
+                        let game_for_adopt_item = game_for_generated.clone();
+                        let rebuild_adopt_item = rebuild_w_for_generated.clone();
+                        adopt_btn.connect_clicked(move |_| {
+                            let mut db = ModDatabase::load(&game_for_adopt_item);
+                            match crate::core::runtime_scan::adopt_runtime_paths(
+                                &game_for_adopt_item,
+                                &mut db,
+                                std::slice::from_ref(&rel_path),
+                            ) {
+                                Ok(Some(_)) => {
+                                    db.save(&game_for_adopt_item);
+                                    let _ = ModManager::rebuild_all(&game_for_adopt_item);
+                                }
+                                Ok(None) => {}
+                                Err(e) => log::error!("Runtime adoption failed: {e}"),
+                            }
+                            if let Some(rb) = rebuild_adopt_item.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                        row.add_suffix(&adopt_btn);
+                    }
+
+                    if entry.review_status
+                        == crate::core::runtime_scan::RuntimeEntryReviewStatus::Pending
+                    {
+                        let ignore_btn = gtk4::Button::with_label("Ignore");
+                        let game_for_ignore = game_for_generated.clone();
+                        let rebuild_ignore = rebuild_w_for_generated.clone();
+                        let rel_ignore = entry.relative_path.clone();
+                        ignore_btn.connect_clicked(move |_| {
+                            let mut db = ModDatabase::load(&game_for_ignore);
+                            crate::core::runtime_scan::set_runtime_path_ignored(
+                                &mut db,
+                                &rel_ignore,
+                                true,
+                            );
+                            db.save(&game_for_ignore);
+                            if let Some(rb) = rebuild_ignore.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                        row.add_suffix(&ignore_btn);
+                    }
+
+                    let reveal_btn = gtk4::Button::new();
+                    reveal_btn.set_icon_name("folder-open-symbolic");
+                    reveal_btn.add_css_class("flat");
+                    let file_path = game_for_generated.data_path.join(&entry.relative_path);
+                    reveal_btn.connect_clicked(move |_| {
+                        let file = gio::File::for_path(&file_path);
+                        let _ = gio::AppInfo::launch_default_for_uri(
+                            &file.uri(),
+                            None::<&gio::AppLaunchContext>,
+                        );
+                    });
+                    row.add_suffix(&reveal_btn);
+
+                    if matches!(
+                        entry.classification,
+                        crate::core::runtime_scan::RuntimeEntryClassification::UnmanagedAdoptable
+                            | crate::core::runtime_scan::RuntimeEntryClassification::UnknownNeedsReview
+                    ) {
+                        let remove_btn = gtk4::Button::new();
+                        remove_btn.set_icon_name("user-trash-symbolic");
+                        remove_btn.add_css_class("flat");
+                        remove_btn.add_css_class("destructive-action");
+                        let game_for_remove_runtime = game_for_generated.clone();
+                        let rebuild_remove_runtime = rebuild_w_for_generated.clone();
+                        let rel_remove = entry.relative_path.clone();
+                        remove_btn.connect_clicked(move |_| {
+                            let path = game_for_remove_runtime.data_path.join(&rel_remove);
+                            if path.exists() && let Err(e) = std::fs::remove_file(&path) {
+                                log::error!("Failed removing runtime file {}: {e}", path.display());
+                            }
+                            if let Some(rb) = rebuild_remove_runtime.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                        row.add_suffix(&remove_btn);
+                    }
+                    generated_list_c.append(&row);
+                }
 
                 let active_profile = db.active_profile_id.clone();
                 let tracked_outputs = db

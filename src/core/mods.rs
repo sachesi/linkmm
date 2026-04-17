@@ -212,6 +212,8 @@ pub struct ModDatabase {
     pub profile_plugin_disabled: HashMap<String, HashSet<String>>,
     #[serde(default)]
     pub profile_generated_outputs: HashMap<String, Vec<GeneratedOutputPackage>>,
+    #[serde(default)]
+    pub profile_runtime_ignored: HashMap<String, HashSet<String>>,
 }
 
 impl Default for ModDatabase {
@@ -228,6 +230,7 @@ impl Default for ModDatabase {
             profile_plugin_load_order: HashMap::new(),
             profile_plugin_disabled: HashMap::new(),
             profile_generated_outputs: HashMap::new(),
+            profile_runtime_ignored: HashMap::new(),
         }
     }
 }

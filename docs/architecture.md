@@ -203,3 +203,41 @@ Output actions are deterministic and profile-aware:
 - deployment rebuild is triggered through the existing deterministic rebuild path
 - workspace dirty reasons are derived from baseline-vs-current snapshots and
   therefore automatically reflect output state changes
+
+## 12. Runtime/unmanaged scan and review model
+
+LinkMM now has a scoped, profile-aware runtime scan model (`core::runtime_scan`)
+for reviewable unmanaged/runtime changes in game `Data/` (and generated output
+ownership expectations), rather than a coarse flag only.
+
+Scan categories:
+
+- `ManagedOwnedPresent`
+- `ManagedOwnedMissing`
+- `ManagedOwnedModified`
+- `UnmanagedAdoptable`
+- `UnmanagedIgnorable`
+- `UnknownNeedsReview`
+
+Each scan entry contains:
+
+- relative path
+- classification
+- review status (`Pending`/`Ignored`)
+- optional package/tool linkage when known
+- short explanation text
+
+Current scan scope is intentionally narrow and truthful:
+
+- generated output package owned files for the active manager profile
+- game `Data/` files in managed workflow areas already used for deploy/output
+- no whole-prefix or random large-area indexing
+
+Workflow integration:
+
+- Tools “Outputs & Runtime Changes” supports manual rescan, per-entry adopt,
+  ignore, reveal, and (for unmanaged files) explicit remove actions.
+- Adoption uses explicit generated-output package creation/update flow and keeps
+  behavior deterministic/profile-scoped.
+- Scan summaries feed workspace runtime-review state so redeploy guidance can
+  distinguish “redeploy now” vs “review runtime items first.”
