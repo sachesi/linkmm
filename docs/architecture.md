@@ -338,6 +338,25 @@ Deployment preview now includes pending destructive cleanup context:
 Tools surfaces this in the review card so users can inspect staged edits and
 cleanup consequences before explicitly applying deployment.
 
+### Revert-to-baseline (discard staged edits)
+
+LinkMM now supports profile-aware state revert to the last deployed baseline:
+
+- `workspace::revert_active_profile_to_baseline(game)` restores staged profile
+  state from `workspace_baseline.toml` for the active profile
+- restored state includes mod enabled/order, plugin order/disabled, generated
+  output enabled participation, pending destructive flags, and runtime ignored
+  path set for that profile
+- revert is state-only: it does not mutate deployed files on disk directly
+- if no baseline exists, revert is rejected with explicit messaging (action is
+  disabled in UI and surfaced as unavailable)
+
+Pending-removal semantics on revert:
+
+- staged pending removals not present in baseline are unqueued
+- payloads are not deleted by revert
+- deletion/final cleanup still happens only after successful explicit redeploy
+
 Backup hygiene:
 
 - restored payload files are removed from backup storage

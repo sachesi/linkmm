@@ -423,7 +423,56 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                     });
                 }
                 redeploy_row.add_suffix(&redeploy_btn);
+                let discard_btn = gtk4::Button::with_label("Discard staged changes");
+                let can_discard = workspace_state.safe_redeploy_required
+                    && workspace::has_profile_baseline(
+                        &game_for_generated,
+                        &workspace_state.profile_id,
+                    );
+                discard_btn.set_sensitive(can_discard);
+                {
+                    let game_for_discard = game_for_generated.clone();
+                    let rebuild_discard = rebuild_w_for_generated.clone();
+                    discard_btn.connect_clicked(move |btn| {
+                        let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                        let dialog = adw::AlertDialog::builder()
+                            .heading("Discard staged changes?")
+                            .body("This restores profile state to the last deployed baseline. Deployed files on disk are not changed until explicit redeploy.")
+                            .build();
+                        dialog.add_response("cancel", "Cancel");
+                        dialog.add_response("discard", "Discard");
+                        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+                        dialog.set_default_response(Some("cancel"));
+                        dialog.set_close_response("cancel");
+                        let game_for_response = game_for_discard.clone();
+                        let rebuild_response = rebuild_discard.clone();
+                        dialog.connect_response(None, move |_, response| {
+                            if response != "discard" {
+                                return;
+                            }
+                            if let Err(e) = workspace::revert_active_profile_to_baseline(
+                                &game_for_response,
+                            ) {
+                                log::error!("Failed to discard staged changes: {e}");
+                            }
+                            if let Some(rb) = rebuild_response.upgrade() {
+                                (rb.borrow())();
+                            }
+                        });
+                        dialog.present(parent.as_ref());
+                    });
+                }
+                redeploy_row.add_suffix(&discard_btn);
                 generated_list_c.append(&redeploy_row);
+                if workspace_state.safe_redeploy_required && !can_discard {
+                    let row = adw::ActionRow::builder()
+                        .title("Discard unavailable")
+                        .subtitle(
+                            "This profile has no deployed baseline yet; staged changes cannot be reverted.",
+                        )
+                        .build();
+                    generated_list_c.append(&row);
+                }
 
                 if let Some(preview) = preview {
                     let preview_row = adw::ActionRow::builder()

@@ -2,7 +2,7 @@ use crate::core::games::Game;
 use crate::core::mods::ModDatabase;
 use crate::core::runtime_scan::RuntimeScanReport;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -107,7 +107,12 @@ struct WorkspaceSnapshot {
     plugin_order: Vec<String>,
     plugin_disabled: BTreeSet<String>,
     generated_outputs: Vec<String>,
+    #[serde(default)]
+    generated_output_enabled: BTreeMap<String, bool>,
+    #[serde(default)]
     pending_destructive: Vec<String>,
+    #[serde(default)]
+    runtime_ignored: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,6 +214,12 @@ fn snapshot_from_db(db: &ModDatabase) -> WorkspaceSnapshot {
         .map(|o| format!("{}:{}:{}", o.id, o.enabled, o.updated_at))
         .collect::<Vec<_>>();
     generated_outputs.sort();
+    let generated_output_enabled = db
+        .generated_outputs
+        .iter()
+        .filter(|o| o.manager_profile_id == db.active_profile_id)
+        .map(|o| (o.id.clone(), o.enabled))
+        .collect::<BTreeMap<_, _>>();
     let mut pending_destructive = db
         .mods
         .iter()
@@ -222,6 +233,13 @@ fn snapshot_from_db(db: &ModDatabase) -> WorkspaceSnapshot {
         )
         .collect::<Vec<_>>();
     pending_destructive.sort();
+    let runtime_ignored = db
+        .profile_runtime_ignored
+        .get(&db.active_profile_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
 
     WorkspaceSnapshot {
         mod_ids,
@@ -230,7 +248,9 @@ fn snapshot_from_db(db: &ModDatabase) -> WorkspaceSnapshot {
         plugin_order: db.plugin_load_order.clone(),
         plugin_disabled: db.plugin_disabled.clone().into_iter().collect(),
         generated_outputs,
+        generated_output_enabled,
         pending_destructive,
+        runtime_ignored,
     }
 }
 
@@ -391,6 +411,75 @@ pub fn workspace_state_for_game(game: &Game) -> WorkspaceState {
         runtime_adoptable_pending: runtime.runtime_scan.adoptable_count,
         runtime_unknown_pending: runtime.runtime_scan.unknown_count,
     }
+}
+
+pub fn has_profile_baseline(game: &Game, profile_id: &str) -> bool {
+    load_baseline(game, profile_id).is_some()
+}
+
+pub fn revert_active_profile_to_baseline(game: &Game) -> Result<(), String> {
+    let mut db = ModDatabase::load(game);
+    let profile_id = db.active_profile_id.clone();
+    let Some(baseline) = load_baseline(game, &profile_id) else {
+        return Err("No deployed baseline exists for this profile yet".to_string());
+    };
+    let snapshot = baseline.snapshot;
+    let mod_ids_in_baseline: HashSet<String> = snapshot.mod_ids.iter().cloned().collect();
+    let pending_destructive: HashSet<String> = snapshot.pending_destructive.into_iter().collect();
+
+    for m in &mut db.mods {
+        m.enabled = snapshot.enabled_mod_ids.contains(&m.id);
+        m.pending_removal = pending_destructive.contains(&format!("mod:{}", m.id));
+        if !mod_ids_in_baseline.contains(&m.id) {
+            m.enabled = false;
+            m.pending_removal = true;
+        }
+    }
+
+    let mut mod_order = Vec::new();
+    for id in &snapshot.mod_order {
+        if let Some(entry) = db.mods.iter().find(|m| &m.id == id).cloned() {
+            mod_order.push(entry);
+        }
+    }
+    for entry in &db.mods {
+        if !mod_order.iter().any(|m| m.id == entry.id) {
+            mod_order.push(entry.clone());
+        }
+    }
+    db.mods = mod_order;
+
+    db.plugin_load_order = snapshot.plugin_order;
+    db.plugin_disabled = snapshot.plugin_disabled.into_iter().collect();
+
+    for pkg in &mut db.generated_outputs {
+        if pkg.manager_profile_id != profile_id {
+            continue;
+        }
+        pkg.enabled = snapshot
+            .generated_output_enabled
+            .get(&pkg.id)
+            .copied()
+            .unwrap_or(false);
+        pkg.pending_removal = pending_destructive.contains(&format!("generated:{}", pkg.id));
+        if !snapshot.generated_output_enabled.contains_key(&pkg.id) {
+            pkg.enabled = false;
+            pkg.pending_removal = true;
+        }
+    }
+
+    db.profile_runtime_ignored.insert(
+        profile_id.clone(),
+        snapshot.runtime_ignored.into_iter().collect(),
+    );
+    db.save(game);
+    set_status(
+        &game.id,
+        &profile_id,
+        StatusSeverity::Info,
+        "Discarded staged edits; profile state restored to deployed baseline",
+    );
+    Ok(())
 }
 
 fn deployment_state_label(state: DeploymentState) -> &'static str {
@@ -817,5 +906,88 @@ mod tests {
         assert!(state.runtime_review_required);
         assert!(state.safe_redeploy_required);
         assert_eq!(state.runtime_adoptable_pending, 1);
+    }
+
+    #[test]
+    fn revert_restores_staged_mod_plugin_and_pending_state_to_baseline() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp, "workspace_revert_baseline");
+        let mut db = ModDatabase::default();
+        let mut m1 = crate::core::mods::Mod::new("M1", temp.path().join("m1"));
+        let mut m2 = crate::core::mods::Mod::new("M2", temp.path().join("m2"));
+        m1.enabled = true;
+        m2.enabled = false;
+        db.mods = vec![m1.clone(), m2.clone()];
+        db.plugin_load_order = vec!["A.esp".to_string(), "B.esp".to_string()];
+        db.plugin_disabled = ["B.esp".to_string()].into_iter().collect();
+        let mut pkg = crate::core::mods::GeneratedOutputPackage::new(
+            "Out",
+            "tool",
+            "default",
+            db.active_profile_id.clone(),
+            temp.path().join("out"),
+        );
+        pkg.enabled = true;
+        db.generated_outputs.push(pkg.clone());
+        db.profile_runtime_ignored.insert(
+            db.active_profile_id.clone(),
+            ["Data/ignore.txt".to_string()].into_iter().collect(),
+        );
+        db.save(&game);
+        mark_deployed_clean(&game, &db).unwrap();
+
+        let mut staged = ModDatabase::load(&game);
+        staged.mods.swap(0, 1);
+        staged.mods[0].enabled = true;
+        staged.mods[1].enabled = false;
+        staged.mods[1].pending_removal = true;
+        let mut extra = crate::core::mods::Mod::new("Extra", temp.path().join("m3"));
+        extra.enabled = true;
+        staged.mods.push(extra.clone());
+        staged.plugin_load_order = vec!["B.esp".to_string(), "A.esp".to_string()];
+        staged.plugin_disabled.clear();
+        staged.generated_outputs[0].enabled = false;
+        staged.generated_outputs[0].pending_removal = true;
+        staged.profile_runtime_ignored.insert(
+            staged.active_profile_id.clone(),
+            ["Data/other.txt".to_string()].into_iter().collect(),
+        );
+        staged.save(&game);
+
+        revert_active_profile_to_baseline(&game).unwrap();
+        let reverted = ModDatabase::load(&game);
+        assert_eq!(reverted.mods[0].id, m1.id);
+        assert_eq!(reverted.mods[1].id, m2.id);
+        assert!(reverted.mods[0].enabled);
+        assert!(!reverted.mods[1].enabled);
+        assert!(!reverted.mods[0].pending_removal);
+        assert!(!reverted.mods[1].pending_removal);
+        let extra_reverted = reverted.mods.iter().find(|m| m.id == extra.id).unwrap();
+        assert!(extra_reverted.pending_removal);
+        assert!(!extra_reverted.enabled);
+        assert_eq!(
+            reverted.plugin_load_order,
+            vec!["A.esp".to_string(), "B.esp".to_string()]
+        );
+        assert!(reverted.plugin_disabled.contains("B.esp"));
+        assert!(reverted.generated_outputs[0].enabled);
+        assert!(!reverted.generated_outputs[0].pending_removal);
+        let ignored = reverted
+            .profile_runtime_ignored
+            .get(&reverted.active_profile_id)
+            .cloned()
+            .unwrap_or_default();
+        assert!(ignored.contains("Data/ignore.txt"));
+        assert!(!ignored.contains("Data/other.txt"));
+    }
+
+    #[test]
+    fn revert_without_baseline_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp, "workspace_revert_no_baseline");
+        let db = ModDatabase::default();
+        db.save(&game);
+        let err = revert_active_profile_to_baseline(&game).unwrap_err();
+        assert!(err.contains("No deployed baseline"));
     }
 }

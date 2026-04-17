@@ -1131,4 +1131,52 @@ mod tests {
         let workspace_state = crate::core::workspace::workspace_state_for_game(&game);
         assert!(workspace_state.safe_redeploy_required);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn revert_to_baseline_does_not_touch_deployed_files() {
+        use crate::core::games::{Game, GameKind, GameLauncherSource};
+
+        let tmp = tempdir();
+        let game_root = tmp.join("game");
+        let mods_base = tmp.join("mods_base");
+        std::fs::create_dir_all(game_root.join("Data")).unwrap();
+        std::fs::create_dir_all(mods_base.join("mods").join("test_game")).unwrap();
+        let game = Game {
+            id: "test_game".to_string(),
+            name: "Test Game".to_string(),
+            kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::Steam,
+            steam_app_id: Some(489830),
+            root_path: game_root.clone(),
+            data_path: game_root.join("Data"),
+            mods_base_dir: Some(mods_base),
+            umu_config: None,
+        };
+
+        let mod_dir = game.mods_dir().join("revert-mod");
+        std::fs::create_dir_all(mod_dir.join("Data").join("textures")).unwrap();
+        std::fs::write(
+            mod_dir.join("Data").join("textures").join("revert.dds"),
+            b"x",
+        )
+        .unwrap();
+        let mut m = Mod::new("Revert", mod_dir);
+        m.enabled = true;
+        let mut db = ModDatabase::load(&game);
+        db.mods.push(m.clone());
+        db.save(&game);
+        ModManager::rebuild_all(&game).unwrap();
+        let deployed = game.data_path.join("textures").join("revert.dds");
+        assert!(deployed.exists());
+
+        ModManager::set_mod_enabled(&game, &m.id, false).unwrap();
+        crate::core::workspace::revert_active_profile_to_baseline(&game).unwrap();
+        assert!(
+            deployed.exists(),
+            "revert is state-only and should not mutate deployed filesystem"
+        );
+        let ws = crate::core::workspace::workspace_state_for_game(&game);
+        assert!(!ws.safe_redeploy_required);
+    }
 }
