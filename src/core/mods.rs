@@ -347,15 +347,17 @@ impl ModDatabase {
         }
 
         if let Some(order) = self.profile_mod_order.get(&profile_id).cloned() {
-            let mut index: HashMap<String, usize> = order
+            let index: HashMap<String, usize> = order
                 .into_iter()
                 .enumerate()
                 .map(|(i, id)| (id, i))
                 .collect();
             self.mods.sort_by_key(|m| {
-                index
-                    .remove(&m.id)
-                    .unwrap_or(usize::MAX.saturating_sub(m.name.len()))
+                (
+                    index.get(&m.id).copied().unwrap_or(usize::MAX),
+                    m.name.to_lowercase(),
+                    m.id.clone(),
+                )
             });
         }
 
@@ -814,6 +816,82 @@ mod tests {
         let encoded = serde_json::to_string(&db).unwrap();
         assert_eq!(encoded.matches("A.esp").count(), 1);
         assert_eq!(encoded.matches("B.esm").count(), 1);
+    }
+
+    #[test]
+    fn apply_active_profile_state_restores_saved_mod_order_deterministically() {
+        let profile_id = "profile-a".to_string();
+        let mut db = ModDatabase {
+            active_profile_id: profile_id.clone(),
+            mods: vec![
+                Mod {
+                    id: "mod-c".to_string(),
+                    name: "Zulu".to_string(),
+                    version: None,
+                    enabled: false,
+                    priority: 0,
+                    nexus_id: None,
+                    source_path: PathBuf::from("/tmp/mod-c"),
+                    installed_from_nexus: false,
+                    archive_name: None,
+                    deployer: default_deployer(),
+                },
+                Mod {
+                    id: "mod-b".to_string(),
+                    name: "Alpha".to_string(),
+                    version: None,
+                    enabled: false,
+                    priority: 0,
+                    nexus_id: None,
+                    source_path: PathBuf::from("/tmp/mod-b"),
+                    installed_from_nexus: false,
+                    archive_name: None,
+                    deployer: default_deployer(),
+                },
+                Mod {
+                    id: "mod-a".to_string(),
+                    name: "Bravo".to_string(),
+                    version: None,
+                    enabled: false,
+                    priority: 0,
+                    nexus_id: None,
+                    source_path: PathBuf::from("/tmp/mod-a"),
+                    installed_from_nexus: false,
+                    archive_name: None,
+                    deployer: default_deployer(),
+                },
+                Mod {
+                    id: "mod-d".to_string(),
+                    name: "Alpha".to_string(),
+                    version: None,
+                    enabled: false,
+                    priority: 0,
+                    nexus_id: None,
+                    source_path: PathBuf::from("/tmp/mod-d"),
+                    installed_from_nexus: false,
+                    archive_name: None,
+                    deployer: default_deployer(),
+                },
+            ],
+            profile_mod_enabled: HashMap::from([(
+                profile_id.clone(),
+                HashSet::from(["mod-b".to_string(), "mod-d".to_string()]),
+            )]),
+            profile_mod_order: HashMap::from([(
+                profile_id,
+                vec!["mod-a".to_string(), "mod-c".to_string()],
+            )]),
+            ..ModDatabase::default()
+        };
+
+        db.apply_active_profile_state();
+
+        let ordered_ids: Vec<&str> = db.mods.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ordered_ids, vec!["mod-a", "mod-c", "mod-b", "mod-d"]);
+        assert!(db.mods[2].enabled);
+        assert!(db.mods[3].enabled);
+        assert!(!db.mods[0].enabled);
+        assert!(!db.mods[1].enabled);
     }
 
     #[test]
