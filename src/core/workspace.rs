@@ -115,6 +115,12 @@ struct WorkspaceRuntimeState {
     unmanaged_runtime_changed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkspaceRuntimeKey {
+    game_id: String,
+    profile_id: String,
+}
+
 impl Default for WorkspaceRuntimeState {
     fn default() -> Self {
         Self {
@@ -127,10 +133,18 @@ impl Default for WorkspaceRuntimeState {
     }
 }
 
-static RUNTIME_STATE: OnceLock<Mutex<HashMap<String, WorkspaceRuntimeState>>> = OnceLock::new();
+static RUNTIME_STATE: OnceLock<Mutex<HashMap<WorkspaceRuntimeKey, WorkspaceRuntimeState>>> =
+    OnceLock::new();
 
-fn runtime_state_map() -> &'static Mutex<HashMap<String, WorkspaceRuntimeState>> {
+fn runtime_state_map() -> &'static Mutex<HashMap<WorkspaceRuntimeKey, WorkspaceRuntimeState>> {
     RUNTIME_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn runtime_key(game_id: &str, profile_id: &str) -> WorkspaceRuntimeKey {
+    WorkspaceRuntimeKey {
+        game_id: game_id.to_string(),
+        profile_id: profile_id.to_string(),
+    }
 }
 
 fn baseline_path(game: &Game, profile_id: &str) -> PathBuf {
@@ -192,13 +206,11 @@ fn compute_pending_changes(
     db: &ModDatabase,
     runtime: &WorkspaceRuntimeState,
 ) -> PendingChanges {
-    let Some(baseline) = baseline else {
-        return PendingChanges {
-            unmanaged_runtime_changed: runtime.unmanaged_runtime_changed,
-            ..PendingChanges::default()
-        };
+    let empty_baseline = WorkspaceBaseline {
+        profile_id: db.active_profile_id.clone(),
+        snapshot: WorkspaceSnapshot::default(),
     };
-
+    let baseline = baseline.unwrap_or(&empty_baseline);
     let now = snapshot_from_db(db);
     PendingChanges {
         mod_set_changed: now.mod_ids != baseline.snapshot.mod_ids,
@@ -211,36 +223,43 @@ fn compute_pending_changes(
     }
 }
 
-pub fn mark_operation(game_id: &str, op: WorkspaceOperation) {
+pub fn mark_operation(game_id: &str, profile_id: &str, op: WorkspaceOperation) {
     let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
-    map.entry(game_id.to_string()).or_default().operation = op;
+    map.entry(runtime_key(game_id, profile_id))
+        .or_default()
+        .operation = op;
 }
 
-pub fn set_status(game_id: &str, severity: StatusSeverity, message: impl Into<String>) {
+pub fn set_status(
+    game_id: &str,
+    profile_id: &str,
+    severity: StatusSeverity,
+    message: impl Into<String>,
+) {
     let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
-    let state = map.entry(game_id.to_string()).or_default();
+    let state = map.entry(runtime_key(game_id, profile_id)).or_default();
     state.severity = severity;
     state.status_message = Some(message.into());
 }
 
-pub fn clear_status(game_id: &str) {
+pub fn clear_status(game_id: &str, profile_id: &str) {
     let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
-    if let Some(state) = map.get_mut(game_id) {
+    if let Some(state) = map.get_mut(&runtime_key(game_id, profile_id)) {
         state.status_message = None;
         state.severity = StatusSeverity::Info;
     }
 }
 
-pub fn mark_unmanaged_runtime_changes(game_id: &str, changed: bool) {
+pub fn mark_unmanaged_runtime_changes(game_id: &str, profile_id: &str, changed: bool) {
     let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
-    map.entry(game_id.to_string())
+    map.entry(runtime_key(game_id, profile_id))
         .or_default()
         .unmanaged_runtime_changed = changed;
 }
 
-pub fn mark_deploy_failure(game_id: &str, message: impl Into<String>) {
+pub fn mark_deploy_failure(game_id: &str, profile_id: &str, message: impl Into<String>) {
     let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
-    let state = map.entry(game_id.to_string()).or_default();
+    let state = map.entry(runtime_key(game_id, profile_id)).or_default();
     state.deploy_failed = true;
     state.severity = StatusSeverity::Error;
     state.status_message = Some(message.into());
@@ -255,7 +274,9 @@ pub fn mark_deployed_clean(game: &Game, db: &ModDatabase) -> Result<(), String> 
     save_baseline(game, &baseline)?;
 
     let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
-    let state = map.entry(game.id.clone()).or_default();
+    let state = map
+        .entry(runtime_key(&game.id, &db.active_profile_id))
+        .or_default();
     state.deploy_failed = false;
     state.operation = WorkspaceOperation::None;
     state.unmanaged_runtime_changed = false;
@@ -290,7 +311,7 @@ pub fn workspace_state_for_game(game: &Game) -> WorkspaceState {
     let runtime = runtime_state_map()
         .lock()
         .expect("workspace lock poisoned")
-        .get(&game.id)
+        .get(&runtime_key(&game.id, &profile_id))
         .cloned()
         .unwrap_or_default();
 
@@ -318,6 +339,49 @@ pub fn workspace_state_for_game(game: &Game) -> WorkspaceState {
         status_severity: runtime.severity,
         safe_redeploy_required: dirty || runtime.deploy_failed,
         safe_redeploy_recommended: dirty,
+    }
+}
+
+fn deployment_state_label(state: DeploymentState) -> &'static str {
+    match state {
+        DeploymentState::Deployed => "Deployed",
+        DeploymentState::NotDeployed => "Not deployed",
+        DeploymentState::Dirty => "Redeploy needed",
+        DeploymentState::Busy => "Deploying…",
+        DeploymentState::Failed => "Deploy failed",
+    }
+}
+
+pub fn format_workspace_banner_summary(state: &WorkspaceState) -> String {
+    let mut summary = format!(
+        "Profile: {} · {}",
+        state.profile_id,
+        deployment_state_label(state.deployment_state)
+    );
+    let reasons = state.pending_changes.reasons();
+    if !reasons.is_empty() {
+        summary.push_str(" · ");
+        summary.push_str(&reasons.join(", "));
+    }
+    if let Some(msg) = state.status_message.as_deref()
+        && !msg.trim().is_empty()
+    {
+        summary.push_str(" · ");
+        summary.push_str(msg);
+    }
+    summary
+}
+
+pub fn format_workspace_compact_summary(state: &WorkspaceState) -> String {
+    let reasons = state.pending_changes.reasons();
+    if reasons.is_empty() {
+        format!("{} · clean", deployment_state_label(state.deployment_state))
+    } else {
+        format!(
+            "{} · {}",
+            deployment_state_label(state.deployment_state),
+            reasons.join(", ")
+        )
     }
 }
 
@@ -382,11 +446,11 @@ mod tests {
         db.save(&game);
         mark_deployed_clean(&game, &db).unwrap();
 
-        mark_operation(&game.id, WorkspaceOperation::Deploy);
+        mark_operation(&game.id, &db.active_profile_id, WorkspaceOperation::Deploy);
         let busy = workspace_state_for_game(&game);
         assert_eq!(busy.deployment_state, DeploymentState::Busy);
 
-        mark_deploy_failure(&game.id, "deploy failed");
+        mark_deploy_failure(&game.id, &db.active_profile_id, "deploy failed");
         let failed = workspace_state_for_game(&game);
         assert_eq!(failed.deployment_state, DeploymentState::Failed);
         assert!(failed.status_message.unwrap_or_default().contains("failed"));
@@ -419,6 +483,15 @@ mod tests {
             profile_switch_policy(&state_dirty),
             ProfileSwitchPolicy::Warn(_)
         ));
+
+        let state_allowed = WorkspaceState {
+            safe_redeploy_required: false,
+            ..state_dirty
+        };
+        assert!(matches!(
+            profile_switch_policy(&state_allowed),
+            ProfileSwitchPolicy::Allowed
+        ));
     }
 
     #[test]
@@ -441,5 +514,65 @@ mod tests {
 
         let state = workspace_state_for_game(&game);
         assert!(state.pending_changes.generated_outputs_changed);
+    }
+
+    #[test]
+    fn no_baseline_non_empty_profile_reports_pending_reasons() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp, "workspace_no_baseline_pending");
+        let mut db = ModDatabase::default();
+        db.mods.push(crate::core::mods::Mod::new(
+            "A",
+            temp.path().join("mods").join("a"),
+        ));
+        db.mods[0].enabled = true;
+        db.plugin_load_order.push("Patch.esp".to_string());
+        db.generated_outputs
+            .push(crate::core::mods::GeneratedOutputPackage::new(
+                "Out",
+                "tool",
+                "default",
+                db.active_profile_id.clone(),
+                temp.path().join("gen"),
+            ));
+        db.save(&game);
+
+        let state = workspace_state_for_game(&game);
+        assert_eq!(state.deployment_state, DeploymentState::Dirty);
+        assert!(state.pending_changes.mod_set_changed);
+        assert!(state.pending_changes.mod_enabled_changed);
+        assert!(state.pending_changes.mod_order_changed);
+        assert!(state.pending_changes.plugin_order_changed);
+        assert!(state.pending_changes.generated_outputs_changed);
+        assert!(state.safe_redeploy_required);
+    }
+
+    #[test]
+    fn runtime_state_is_profile_aware_and_does_not_leak() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp, "workspace_runtime_profile_aware");
+        let mut db = ModDatabase::default();
+        db.save(&game);
+        mark_deployed_clean(&game, &db).unwrap();
+
+        mark_operation(&game.id, "profile_a", WorkspaceOperation::ToolRun);
+        set_status(
+            &game.id,
+            "profile_a",
+            StatusSeverity::Warning,
+            "Tool running in A",
+        );
+
+        db.active_profile_id = "profile_b".to_string();
+        db.save(&game);
+        let state_b = workspace_state_for_game(&game);
+        assert_eq!(state_b.current_operation, WorkspaceOperation::None);
+        assert!(state_b.status_message.is_none());
+
+        db.active_profile_id = "profile_a".to_string();
+        db.save(&game);
+        let state_a = workspace_state_for_game(&game);
+        assert_eq!(state_a.current_operation, WorkspaceOperation::ToolRun);
+        assert_eq!(state_a.status_message.as_deref(), Some("Tool running in A"));
     }
 }

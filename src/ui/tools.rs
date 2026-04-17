@@ -365,30 +365,80 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                 if global_runtime_manager().any_active() {
                     return;
                 }
+                let selected = row.selected() as usize;
                 let workspace_state = workspace::workspace_state_for_game(&game_profile);
+                let (selected_profile_id, selected_profile_name, previous_profile_id, previous_idx) = {
+                    let mut cfg = config_profile.borrow_mut();
+                    let gs = cfg.game_settings_mut(&game_profile.id);
+                    let selected_profile = gs.profiles.get(selected).cloned();
+                    let prev_id = gs.active_profile_id.clone();
+                    let prev_idx = gs
+                        .profiles
+                        .iter()
+                        .position(|p| p.id == prev_id)
+                        .map(|v| v as u32)
+                        .unwrap_or(0);
+                    (
+                        selected_profile.clone().map(|p| p.id),
+                        selected_profile.map(|p| p.name),
+                        prev_id,
+                        prev_idx,
+                    )
+                };
+                let Some(profile_id) = selected_profile_id else {
+                    row.set_selected(previous_idx);
+                    return;
+                };
+                if profile_id == previous_profile_id {
+                    return;
+                }
+
                 match workspace::profile_switch_policy(&workspace_state) {
                     ProfileSwitchPolicy::Blocked(reason) => {
                         log::warn!("Profile switch blocked: {reason}");
-                        return;
+                        row.set_selected(previous_idx);
                     }
                     ProfileSwitchPolicy::Warn(reason) => {
-                        log::warn!("Profile switch warning: {reason}");
+                        let parent = row.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+                        let target = selected_profile_name
+                            .as_deref()
+                            .unwrap_or("selected profile");
+                        let dialog = adw::AlertDialog::builder()
+                            .heading("Switch Profile?")
+                            .body(format!(
+                                "{reason}\n\nSwitching to “{target}” may leave undeployed changes unapplied."
+                            ))
+                            .build();
+                        dialog.add_response("cancel", "Cancel");
+                        dialog.add_response("switch", "Switch Anyway");
+                        dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
+                        dialog.set_default_response(Some("cancel"));
+                        dialog.set_close_response("cancel");
+                        let row_c = row.clone();
+                        let config_c = Rc::clone(&config_profile);
+                        let game_c = game_profile.clone();
+                        let rebuild_c = Rc::clone(&rebuild_profile);
+                        let profile_id_c = profile_id.clone();
+                        dialog.connect_response(None, move |_, response| {
+                            if response == "switch" {
+                                apply_profile_switch(
+                                    &config_c,
+                                    &game_c,
+                                    &profile_id_c,
+                                    &rebuild_c,
+                                );
+                            } else {
+                                row_c.set_selected(previous_idx);
+                            }
+                        });
+                        dialog.present(parent.as_ref());
                     }
-                    ProfileSwitchPolicy::Allowed => {}
-                }
-                let selected = row.selected() as usize;
-                let mut cfg = config_profile.borrow_mut();
-                let selected_profile_id = {
-                    let gs = cfg.game_settings_mut(&game_profile.id);
-                    gs.profiles.get(selected).map(|p| p.id.clone())
-                };
-                if let Some(profile_id) = selected_profile_id {
-                    cfg.game_settings_mut(&game_profile.id).active_profile_id = profile_id.clone();
-                    cfg.save();
-                    if let Err(e) = ModManager::switch_profile(&game_profile, &profile_id) {
-                        log::error!("Failed switching profile: {e}");
-                    }
-                    (rebuild_profile.borrow())();
+                    ProfileSwitchPolicy::Allowed => apply_profile_switch(
+                        &config_profile,
+                        &game_profile,
+                        &profile_id,
+                        &rebuild_profile,
+                    ),
                 }
             });
         }
@@ -409,12 +459,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             let workspace_row_c = workspace_row.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
                 let state = workspace::workspace_state_for_game(&game_workspace);
-                let reasons = state.pending_changes.reasons();
-                let summary = if reasons.is_empty() {
-                    format!("{:?} · clean", state.deployment_state)
-                } else {
-                    format!("{:?} · {}", state.deployment_state, reasons.join(", "))
-                };
+                let summary = workspace::format_workspace_compact_summary(&state);
                 workspace_row_c.set_subtitle(&summary);
                 glib::ControlFlow::Continue
             });
@@ -686,6 +731,21 @@ fn default_profiles_for_name(name: &str) -> Vec<ToolRunProfile> {
     adapter_for_tool(&tool).default_profiles(&tool)
 }
 
+fn apply_profile_switch(
+    config: &Rc<RefCell<AppConfig>>,
+    game: &Game,
+    profile_id: &str,
+    rebuild: &Rc<RefCell<Box<dyn Fn()>>>,
+) {
+    let mut cfg = config.borrow_mut();
+    cfg.game_settings_mut(&game.id).active_profile_id = profile_id.to_string();
+    cfg.save();
+    if let Err(e) = ModManager::switch_profile(game, profile_id) {
+        log::error!("Failed switching profile: {e}");
+    }
+    (rebuild.borrow())();
+}
+
 /// Launch a tool in the selected game instance context.
 fn launch_tool(
     game: &Game,
@@ -738,7 +798,11 @@ fn launch_tool(
         }
     };
     log::info!("Started managed tool session {}", session_id);
-    workspace::mark_operation(&game.id, workspace::WorkspaceOperation::ToolRun);
+    workspace::mark_operation(
+        &game.id,
+        &active_profile_id,
+        workspace::WorkspaceOperation::ToolRun,
+    );
     btn.set_sensitive(false);
 
     let btn_c = btn.clone();
@@ -747,6 +811,7 @@ fn launch_tool(
     let tool_name = tool.name.clone();
     let toast_overlay_c = toast_overlay.clone();
     let last_run_row_c = last_run_row.cloned();
+    let active_profile_id_c = active_profile_id.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
         let manager = global_runtime_manager();
         if let Some(s) = manager.current_tool_session(&game_id, &tool_id)
@@ -764,8 +829,17 @@ fn launch_tool(
                 } else {
                     format!("{} complete", tool_name)
                 };
-                workspace::mark_operation(&game_id, workspace::WorkspaceOperation::None);
-                workspace::set_status(&game_id, workspace::StatusSeverity::Info, msg.clone());
+                workspace::mark_operation(
+                    &game_id,
+                    &active_profile_id_c,
+                    workspace::WorkspaceOperation::None,
+                );
+                workspace::set_status(
+                    &game_id,
+                    &active_profile_id_c,
+                    workspace::StatusSeverity::Info,
+                    msg.clone(),
+                );
                 if let Some(row) = &last_run_row_c {
                     row.set_subtitle(&format!(
                         "Captured {} files (plugins: {}, assets: {})",
@@ -779,9 +853,14 @@ fn launch_tool(
                 glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
-                workspace::mark_operation(&game_id, workspace::WorkspaceOperation::None);
+                workspace::mark_operation(
+                    &game_id,
+                    &active_profile_id_c,
+                    workspace::WorkspaceOperation::None,
+                );
                 workspace::set_status(
                     &game_id,
+                    &active_profile_id_c,
                     workspace::StatusSeverity::Error,
                     format!("Tool run failed: {e}"),
                 );
@@ -796,7 +875,11 @@ fn launch_tool(
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                workspace::mark_operation(&game_id, workspace::WorkspaceOperation::None);
+                workspace::mark_operation(
+                    &game_id,
+                    &active_profile_id_c,
+                    workspace::WorkspaceOperation::None,
+                );
                 btn_c.set_icon_name("media-playback-start-symbolic");
                 btn_c.set_tooltip_text(Some("Launch Tool"));
                 btn_c.set_sensitive(true);

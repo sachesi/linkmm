@@ -13,7 +13,7 @@ use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
 use crate::core::runtime::global_runtime_manager;
-use crate::core::workspace::{self, DeploymentState};
+use crate::core::workspace;
 
 pub mod downloads;
 pub mod library;
@@ -432,25 +432,7 @@ fn build_main_window(
             let game = config_t.borrow().current_game().cloned();
             if let Some(game) = game {
                 let state = workspace::workspace_state_for_game(&game);
-                let mut summary = format!("Profile: {}", state.profile_id);
-                match state.deployment_state {
-                    DeploymentState::Deployed => summary.push_str(" · Deployed"),
-                    DeploymentState::NotDeployed => summary.push_str(" · Not deployed"),
-                    DeploymentState::Dirty => summary.push_str(" · Redeploy needed"),
-                    DeploymentState::Busy => summary.push_str(" · Deploying…"),
-                    DeploymentState::Failed => summary.push_str(" · Deploy failed"),
-                }
-                let reasons = state.pending_changes.reasons();
-                if !reasons.is_empty() {
-                    summary.push_str(" · ");
-                    summary.push_str(&reasons.join(", "));
-                }
-                if let Some(msg) = state.status_message
-                    && !msg.trim().is_empty()
-                {
-                    summary.push_str(" · ");
-                    summary.push_str(&msg);
-                }
+                let summary = workspace::format_workspace_banner_summary(&state);
                 workspace_banner_t.set_title(&summary);
                 workspace_revealer_t.set_reveal_child(true);
             } else {

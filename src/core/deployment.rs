@@ -319,13 +319,21 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
 // ── High-Level Deployment ─────────────────────────────────────────────────────
 
 pub fn rebuild_deployment(game: &Game, db: &mut ModDatabase) -> Result<(), String> {
-    workspace::mark_operation(&game.id, workspace::WorkspaceOperation::Deploy);
+    workspace::mark_operation(
+        &game.id,
+        &db.active_profile_id,
+        workspace::WorkspaceOperation::Deploy,
+    );
     let deployers: Vec<Box<dyn Deployer>> =
         vec![Box::new(AssetsDeployer), Box::new(PluginsDeployer)];
     for deployer in deployers {
         log::debug!("[Deployer:{}] Rebuilding", deployer.id());
         if let Err(e) = deployer.rebuild(game, db) {
-            workspace::mark_deploy_failure(&game.id, format!("Deployment failed: {e}"));
+            workspace::mark_deploy_failure(
+                &game.id,
+                &db.active_profile_id,
+                format!("Deployment failed: {e}"),
+            );
             return Err(e);
         }
     }

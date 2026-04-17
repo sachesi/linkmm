@@ -153,6 +153,8 @@ LinkMM now exposes an app-shared workspace state model per game instance/profile
 
 Dirty state is computed against a persisted per-profile baseline snapshot written
 after successful deployment (`workspace_baseline.toml` under profile config).
+When no baseline exists yet, the active profile is compared against an implicit
+empty baseline so first-deploy state still reports truthful pending reasons.
 
 Tracked dirty sources:
 
@@ -167,8 +169,10 @@ Safety contract:
 
 - deployment success writes a fresh clean baseline and clears deploy-failed state
 - deployment failure preserves truthful failed state and status message
-- profile switching consults workspace policy (`Allowed` / `Warn` / `Blocked`)
-  so active operations and undeployed changes are visible in UI workflows
+- transient operation/status runtime state is profile-aware (keyed by game +
+  profile) so profile A runtime state is never shown on profile B
+- profile switching consults workspace policy (`Allowed` / `Warn` / `Blocked`);
+  `Warn` requires explicit user confirmation while `Blocked` is denied
 
 ## 11. Tool runs and generated output lifecycle in workspace flow
 

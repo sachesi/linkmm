@@ -32,6 +32,13 @@ struct ConflictDetailRow {
     competing_mods: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConflictSummary {
+    overwriting_mods: usize,
+    overwritten_by_mods: usize,
+    total_conflicting_files: usize,
+}
+
 /// Build the full Library page for `game`.
 pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
@@ -328,6 +335,7 @@ fn refresh_library_content_with_search(
             && !state.files.is_empty()
         {
             let details = build_conflict_details(&db.mods, selected_mod, state);
+            let summary_counts = summarize_conflicts(&db.mods, selected_mod, state);
             let card = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
             card.add_css_class("card");
             card.set_margin_start(12);
@@ -346,13 +354,9 @@ fn refresh_library_content_with_search(
 
             let summary = gtk4::Label::new(Some(&format!(
                 "Overwriting: {} mod(s) · Overwritten by: {} mod(s) · Conflicting files: {}",
-                state
-                    .conflict_mods_by_file
-                    .values()
-                    .filter(|mods| mods.iter().any(|m| m != &selected_mod.name))
-                    .count(),
-                usize::from(state.overwritten),
-                state.files.len()
+                summary_counts.overwriting_mods,
+                summary_counts.overwritten_by_mods,
+                summary_counts.total_conflicting_files
             )));
             summary.set_xalign(0.0);
             summary.add_css_class("dim-label");
@@ -389,31 +393,73 @@ fn build_conflict_details(
     let mod_index = mods
         .iter()
         .enumerate()
-        .map(|(idx, m)| (m.name.clone(), idx))
+        .map(|(idx, m)| (m.id.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let mod_name = mods
+        .iter()
+        .map(|m| (m.id.clone(), m.name.clone()))
         .collect::<HashMap<_, _>>();
     let mut details = state
         .conflict_mods_by_file
         .iter()
         .map(|(file, competing)| {
             let mut contenders = competing.iter().cloned().collect::<Vec<_>>();
-            if !contenders.iter().any(|m| m == &selected_mod.name) {
-                contenders.push(selected_mod.name.clone());
+            if !contenders.iter().any(|m| m == &selected_mod.id) {
+                contenders.push(selected_mod.id.clone());
             }
             contenders.sort();
-            let winner = contenders
+            let winner_id = contenders
                 .iter()
                 .max_by_key(|name| mod_index.get(*name).copied().unwrap_or(usize::MIN))
                 .cloned()
-                .unwrap_or_else(|| selected_mod.name.clone());
+                .unwrap_or_else(|| selected_mod.id.clone());
             ConflictDetailRow {
                 file: file.clone(),
-                winner_mod: winner,
-                competing_mods: contenders,
+                winner_mod: mod_name
+                    .get(&winner_id)
+                    .cloned()
+                    .unwrap_or_else(|| selected_mod.name.clone()),
+                competing_mods: contenders
+                    .iter()
+                    .map(|id| mod_name.get(id).cloned().unwrap_or_else(|| id.to_string()))
+                    .collect(),
             }
         })
         .collect::<Vec<_>>();
     details.sort_by(|a, b| a.file.cmp(&b.file));
     details
+}
+
+fn summarize_conflicts(mods: &[Mod], selected_mod: &Mod, state: &ConflictState) -> ConflictSummary {
+    let selected_idx = mods
+        .iter()
+        .position(|m| m.id == selected_mod.id)
+        .unwrap_or(usize::MAX);
+    let mod_index = mods
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| (m.id.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut overwriting_mods = BTreeSet::new();
+    let mut overwritten_by_mods = BTreeSet::new();
+    for competing in state.conflict_mods_by_file.values() {
+        for mod_id in competing {
+            if mod_id == &selected_mod.id {
+                continue;
+            }
+            let idx = mod_index.get(mod_id).copied().unwrap_or(usize::MAX);
+            if idx < selected_idx {
+                overwriting_mods.insert(mod_id.clone());
+            } else if idx > selected_idx {
+                overwritten_by_mods.insert(mod_id.clone());
+            }
+        }
+    }
+    ConflictSummary {
+        overwriting_mods: overwriting_mods.len(),
+        overwritten_by_mods: overwritten_by_mods.len(),
+        total_conflicting_files: state.files.len(),
+    }
 }
 
 /// Toggle interactivity for Library controls during long deploy operations.
@@ -761,12 +807,29 @@ fn build_mod_row(
         let selected_rclick = Rc::clone(&selected_mod_id);
         let mod_id_rclick = mod_entry.id.clone();
         let reorder_hint_rclick = reorder_hint.clone();
+        let mod_name_by_id = ModDatabase::load(game)
+            .mods
+            .into_iter()
+            .map(|m| (m.id, m.name))
+            .collect::<HashMap<_, _>>();
         let conflict_entries = conflict_state
             .map(|state| {
                 state
                     .conflict_mods_by_file
                     .iter()
-                    .map(|(file, mods)| (file.clone(), mods.iter().cloned().collect::<Vec<_>>()))
+                    .map(|(file, mods)| {
+                        (
+                            file.clone(),
+                            mods.iter()
+                                .map(|mod_id| {
+                                    mod_name_by_id
+                                        .get(mod_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| mod_id.to_string())
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -1112,7 +1175,7 @@ fn compute_conflict_states(
                         .conflict_mods_by_file
                         .entry(file.clone())
                         .or_default()
-                        .insert(mods[selected_idx].name.clone());
+                        .insert(mods[selected_idx].id.clone());
                 }
             }
             states
@@ -1127,7 +1190,7 @@ fn compute_conflict_states(
                         .conflict_mods_by_file
                         .entry(file.clone())
                         .or_default()
-                        .insert(m.name.clone());
+                        .insert(m.id.clone());
                 }
             }
         }
@@ -1172,7 +1235,7 @@ fn compute_global_conflict_states(mods: &[Mod]) -> HashMap<String, ConflictState
                         .conflict_mods_by_file
                         .entry(file.clone())
                         .or_default()
-                        .insert(mods[j].name.clone());
+                        .insert(mods[j].id.clone());
                 }
             }
             states
@@ -1187,7 +1250,7 @@ fn compute_global_conflict_states(mods: &[Mod]) -> HashMap<String, ConflictState
                         .conflict_mods_by_file
                         .entry(file.clone())
                         .or_default()
-                        .insert(mods[i].name.clone());
+                        .insert(mods[i].id.clone());
                 }
             }
         }
@@ -1286,7 +1349,10 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConflictState, build_conflict_details, compute_conflict_states, matches_query};
+    use super::{
+        ConflictState, build_conflict_details, compute_conflict_states, matches_query,
+        summarize_conflicts,
+    };
     use crate::core::mods::Mod;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
@@ -1355,14 +1421,14 @@ mod tests {
                 .conflict_mods_by_file
                 .get("data/textures/sky.dds")
                 .unwrap()
-                .contains("B")
+                .contains("b")
         );
         assert!(
             conflicting
                 .conflict_mods_by_file
                 .get("data/textures/sky.dds")
                 .unwrap()
-                .contains("A")
+                .contains("a")
         );
         assert!(!states.contains_key("c"));
 
@@ -1398,13 +1464,13 @@ mod tests {
             a.conflict_mods_by_file
                 .get("data/textures/sky.dds")
                 .unwrap()
-                .contains("B")
+                .contains("b")
         );
         assert!(
             b.conflict_mods_by_file
                 .get("data/textures/sky.dds")
                 .unwrap()
-                .contains("A")
+                .contains("a")
         );
         assert!(!a.overwrites && !a.overwritten);
         assert!(!b.overwrites && !b.overwritten);
@@ -1492,7 +1558,7 @@ mod tests {
         state.files.insert("data/textures/sky.dds".to_string());
         state.conflict_mods_by_file.insert(
             "data/textures/sky.dds".to_string(),
-            BTreeSet::from(["A".to_string(), "B".to_string()]),
+            BTreeSet::from(["a".to_string(), "b".to_string()]),
         );
         let details = build_conflict_details(&mods, &selected, &state);
         let by_file = details
@@ -1503,5 +1569,52 @@ mod tests {
             by_file.get("data/textures/sky.dds").map(String::as_str),
             Some("B")
         );
+    }
+
+    #[test]
+    fn conflict_details_use_ids_when_names_are_duplicated() {
+        let mods = vec![
+            sample_mod("a", "Duplicate Name", "/tmp/a"),
+            sample_mod("b", "Duplicate Name", "/tmp/b"),
+            sample_mod("c", "Other", "/tmp/c"),
+        ];
+        let selected = mods[0].clone();
+        let mut state = ConflictState::default();
+        state.files.insert("data/textures/sky.dds".to_string());
+        state.conflict_mods_by_file.insert(
+            "data/textures/sky.dds".to_string(),
+            BTreeSet::from(["b".to_string()]),
+        );
+        let details = build_conflict_details(&mods, &selected, &state);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].winner_mod, "Duplicate Name");
+    }
+
+    #[test]
+    fn conflict_summary_counts_are_truthful() {
+        let mods = vec![
+            sample_mod("a", "A", "/tmp/a"),
+            sample_mod("b", "B", "/tmp/b"),
+            sample_mod("c", "C", "/tmp/c"),
+            sample_mod("d", "D", "/tmp/d"),
+        ];
+        let selected = mods[1].clone(); // index 1
+        let mut state = ConflictState::default();
+        state.files.extend([
+            "data/textures/one.dds".to_string(),
+            "data/textures/two.dds".to_string(),
+        ]);
+        state.conflict_mods_by_file.insert(
+            "data/textures/one.dds".to_string(),
+            BTreeSet::from(["a".to_string(), "c".to_string()]),
+        );
+        state.conflict_mods_by_file.insert(
+            "data/textures/two.dds".to_string(),
+            BTreeSet::from(["d".to_string()]),
+        );
+        let summary = summarize_conflicts(&mods, &selected, &state);
+        assert_eq!(summary.overwriting_mods, 1); // A is lower precedence
+        assert_eq!(summary.overwritten_by_mods, 2); // C and D higher precedence
+        assert_eq!(summary.total_conflicting_files, 2);
     }
 }
