@@ -42,6 +42,7 @@ pub struct PendingChanges {
     pub plugin_order_changed: bool,
     pub generated_outputs_changed: bool,
     pub unmanaged_runtime_changed: bool,
+    pub pending_destructive_changes: bool,
 }
 
 impl PendingChanges {
@@ -52,6 +53,7 @@ impl PendingChanges {
             || self.plugin_order_changed
             || self.generated_outputs_changed
             || self.unmanaged_runtime_changed
+            || self.pending_destructive_changes
     }
 
     pub fn reasons(&self) -> Vec<&'static str> {
@@ -73,6 +75,9 @@ impl PendingChanges {
         }
         if self.unmanaged_runtime_changed {
             reasons.push("Runtime/unmanaged files detected");
+        }
+        if self.pending_destructive_changes {
+            reasons.push("Pending destructive cleanup");
         }
         reasons
     }
@@ -102,6 +107,7 @@ struct WorkspaceSnapshot {
     plugin_order: Vec<String>,
     plugin_disabled: BTreeSet<String>,
     generated_outputs: Vec<String>,
+    pending_destructive: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +209,19 @@ fn snapshot_from_db(db: &ModDatabase) -> WorkspaceSnapshot {
         .map(|o| format!("{}:{}:{}", o.id, o.enabled, o.updated_at))
         .collect::<Vec<_>>();
     generated_outputs.sort();
+    let mut pending_destructive = db
+        .mods
+        .iter()
+        .filter(|m| m.pending_removal)
+        .map(|m| format!("mod:{}", m.id))
+        .chain(
+            db.generated_outputs
+                .iter()
+                .filter(|p| p.pending_removal && p.manager_profile_id == db.active_profile_id)
+                .map(|p| format!("generated:{}", p.id)),
+        )
+        .collect::<Vec<_>>();
+    pending_destructive.sort();
 
     WorkspaceSnapshot {
         mod_ids,
@@ -211,6 +230,7 @@ fn snapshot_from_db(db: &ModDatabase) -> WorkspaceSnapshot {
         plugin_order: db.plugin_load_order.clone(),
         plugin_disabled: db.plugin_disabled.clone().into_iter().collect(),
         generated_outputs,
+        pending_destructive,
     }
 }
 
@@ -233,6 +253,8 @@ fn compute_pending_changes(
             || now.plugin_disabled != baseline.snapshot.plugin_disabled,
         generated_outputs_changed: now.generated_outputs != baseline.snapshot.generated_outputs,
         unmanaged_runtime_changed: runtime.unmanaged_runtime_changed,
+        pending_destructive_changes: now.pending_destructive
+            != baseline.snapshot.pending_destructive,
     }
 }
 

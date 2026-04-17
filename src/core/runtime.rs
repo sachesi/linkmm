@@ -1,6 +1,6 @@
 use crate::core::config::{ToolConfig, ToolRunProfile};
 use crate::core::games::{Game, GameLauncherSource};
-use crate::core::mods::{ModDatabase, ModManager};
+use crate::core::mods::ModDatabase;
 use crate::core::tool_runs::{self, ToolRunResult};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
@@ -229,9 +229,6 @@ impl RuntimeSessionManager {
                 &run_profile_clone,
                 |_tool_cfg, _profile_cfg| Ok(status),
             );
-            if result.is_ok() {
-                let _ = ModManager::rebuild_all(&game_clone);
-            }
             let _ = done_tx.send(result.clone());
             result.map(|_| ())
         });

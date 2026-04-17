@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::mpsc;
 
 use gio;
 use gtk4::prelude::*;
@@ -492,26 +491,6 @@ fn hide_status_popup_later(status_revealer: gtk4::Revealer) {
     );
 }
 
-fn apply_library_reorder_deploy_async(game: &Rc<Game>) {
-    let game_bg = game.as_ref().clone();
-    let (tx, rx) = mpsc::channel::<Result<(), String>>();
-    std::thread::spawn(move || {
-        let _ = tx.send(ModManager::rebuild_all(&game_bg));
-    });
-
-    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        match rx.try_recv() {
-            Ok(Ok(())) => gtk4::glib::ControlFlow::Break,
-            Ok(Err(e)) => {
-                log::error!("Failed to rebuild deployment after reorder: {e}");
-                gtk4::glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => gtk4::glib::ControlFlow::Break,
-        }
-    });
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_mod_row(
     mod_entry: &Mod,
@@ -539,7 +518,13 @@ fn build_mod_row(
         (None, false) => String::new(),
     };
     if !subtitle.is_empty() {
-        row.set_subtitle(&subtitle);
+        if mod_entry.pending_removal {
+            row.set_subtitle(&format!("{subtitle} · Pending removal after redeploy"));
+        } else {
+            row.set_subtitle(&subtitle);
+        }
+    } else if mod_entry.pending_removal {
+        row.set_subtitle("Pending removal after redeploy");
     }
 
     let index_label = gtk4::Label::new(Some(&format!("{}", full_idx + 1)));
@@ -561,10 +546,11 @@ fn build_mod_row(
     let mod_id = mod_entry.id.clone();
     let game_clone = Rc::clone(game);
 
+    row.set_sensitive(!mod_entry.pending_removal);
     row.connect_active_notify(move |switch_row| {
         let enabled = switch_row.is_active();
         if let Err(e) = ModManager::set_mod_enabled(&game_clone, &mod_id, enabled) {
-            log::error!("Failed to rebuild deployment after toggle: {e}");
+            log::error!("Failed to update mod enabled state: {e}");
             switch_row.set_active(!enabled);
         }
     });
@@ -618,7 +604,6 @@ fn build_mod_row(
                     &hint_c,
                     false,
                 );
-                apply_library_reorder_deploy_async(&game_c);
             }
         });
     }
@@ -646,7 +631,6 @@ fn build_mod_row(
                     &hint_c,
                     false,
                 );
-                apply_library_reorder_deploy_async(&game_c);
             }
         });
     }
@@ -674,7 +658,7 @@ fn build_mod_row(
         let dialog = adw::AlertDialog::builder()
             .heading("Remove Mod?")
             .body(format!(
-                "“{}” will be permanently removed from disk.",
+                "“{}” will be queued for removal. Files will be deleted after a successful redeploy.",
                 mod_name_del
             ))
             .build();
@@ -995,9 +979,6 @@ fn build_mod_row(
                     m.enabled = true;
                 }
                 db.save(&game_enable);
-                if let Err(e) = ModManager::rebuild_all(&game_enable) {
-                    log::error!("Failed to rebuild deployment after enable all: {e}");
-                }
                 refresh_library_content_with_search(
                     &container_enable,
                     &game_enable,
@@ -1024,9 +1005,6 @@ fn build_mod_row(
                     m.enabled = false;
                 }
                 db.save(&game_disable);
-                if let Err(e) = ModManager::rebuild_all(&game_disable) {
-                    log::error!("Failed to rebuild deployment after disable all: {e}");
-                }
                 refresh_library_content_with_search(
                     &container_disable,
                     &game_disable,
@@ -1110,7 +1088,6 @@ fn show_move_to_position_dialog_for_mod(
                 &reorder_hint,
                 false,
             );
-            apply_library_reorder_deploy_async(&game);
         }
     });
 

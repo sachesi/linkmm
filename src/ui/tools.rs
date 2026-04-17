@@ -487,6 +487,21 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         "Blocked paths",
                         &preview.blocked_paths,
                     );
+                    append_preview_string_group_row(
+                        &generated_list_c,
+                        "Pending mod removals",
+                        &preview.pending_mod_removals,
+                    );
+                    append_preview_string_group_row(
+                        &generated_list_c,
+                        "Pending generated output removals",
+                        &preview.pending_generated_output_removals,
+                    );
+                    append_preview_group_row(
+                        &generated_list_c,
+                        "Payload paths deleted after successful redeploy",
+                        &preview.pending_payload_deletions,
+                    );
                 }
 
                 if let Ok(backup_status) = crate::core::deployment::deployment_backup_status(
@@ -600,7 +615,6 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                             ) {
                                 Ok(Some(_)) => {
                                     db.save(&game_for_adopt_item);
-                                    let _ = ModManager::rebuild_all(&game_for_adopt_item);
                                 }
                                 Ok(None) => {}
                                 Err(e) => log::error!("Runtime adoption failed: {e}"),
@@ -658,12 +672,13 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         remove_btn.add_css_class("destructive-action");
                         let game_for_remove_runtime = game_for_generated.clone();
                         let rebuild_remove_runtime = rebuild_w_for_generated.clone();
-                        let rel_remove = entry.relative_path.clone();
                         remove_btn.connect_clicked(move |_| {
-                            let path = game_for_remove_runtime.data_path.join(&rel_remove);
-                            if path.exists() && let Err(e) = std::fs::remove_file(&path) {
-                                log::error!("Failed removing runtime file {}: {e}", path.display());
-                            }
+                            workspace::set_status(
+                                &game_for_remove_runtime.id,
+                                &ModDatabase::load(&game_for_remove_runtime).active_profile_id,
+                                workspace::StatusSeverity::Warning,
+                                "Runtime file deletion is blocked until explicit redeploy support is finalized.",
+                            );
                             if let Some(rb) = rebuild_remove_runtime.upgrade() {
                                 (rb.borrow())();
                             }
@@ -726,6 +741,11 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         } else {
                             "Disabled"
                         },
+                        if output.pending_removal {
+                            " · Pending removal after redeploy"
+                        } else {
+                            ""
+                        },
                         if is_new { " · Newly captured" } else { "" },
                         if workspace_state.safe_redeploy_recommended {
                             " · Redeploy recommended"
@@ -740,6 +760,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
 
                     let enabled_switch = gtk4::Switch::new();
                     enabled_switch.set_active(output.enabled);
+                    enabled_switch.set_sensitive(!output.pending_removal);
                     enabled_switch.set_valign(gtk4::Align::Center);
                     {
                         let game_for_toggle = game_for_generated.clone();
@@ -750,9 +771,11 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                             if let Some(pkg) =
                                 db.generated_outputs.iter_mut().find(|p| p.id == output_id)
                             {
+                                if pkg.pending_removal {
+                                    return glib::Propagation::Stop;
+                                }
                                 pkg.enabled = state;
                                 db.save(&game_for_toggle);
-                                let _ = ModManager::rebuild_all(&game_for_toggle);
                             }
                             if let Some(rb) = rebuild_toggle.upgrade() {
                                 (rb.borrow())();
@@ -788,16 +811,11 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                     let rebuild_remove = rebuild_w_for_generated.clone();
                     remove_btn.connect_clicked(move |_| {
                         let mut db = ModDatabase::load(&game_for_remove);
-                        if let Err(e) =
-                            crate::core::generated_outputs::remove_generated_output_package(
-                                &game_for_remove,
-                                &mut db,
-                                &output_id,
-                            )
-                        {
-                            log::error!("Failed to remove generated output package: {e}");
+                        if let Err(e) = db.queue_generated_output_removal(&output_id) {
+                            log::error!("Failed to queue generated output package removal: {e}");
+                        } else {
+                            db.save(&game_for_remove);
                         }
-                        let _ = ModManager::rebuild_all(&game_for_remove);
                         if let Some(rb) = rebuild_remove.upgrade() {
                             (rb.borrow())();
                         }
@@ -830,7 +848,6 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                     &game_cleanup,
                     &mut db,
                 );
-                let _ = ModManager::rebuild_all(&game_cleanup);
                 (rebuild_cleanup.borrow())();
             });
         }

@@ -112,6 +112,8 @@ pub struct Mod {
     pub archive_name: Option<String>,
     #[serde(default = "default_deployer")]
     pub deployer: String,
+    #[serde(default)]
+    pub pending_removal: bool,
 }
 
 impl Mod {
@@ -129,6 +131,7 @@ impl Mod {
             installed_from_nexus: false,
             archive_name: None,
             deployer: default_deployer(),
+            pending_removal: false,
         }
     }
 }
@@ -157,6 +160,8 @@ pub struct GeneratedOutputPackage {
     pub updated_at: u64,
     #[serde(default)]
     pub owned_files: Vec<OwnedGeneratedFile>,
+    #[serde(default)]
+    pub pending_removal: bool,
 }
 
 impl GeneratedOutputPackage {
@@ -181,6 +186,7 @@ impl GeneratedOutputPackage {
             created_at: ts,
             updated_at: ts,
             owned_files: Vec::new(),
+            pending_removal: false,
         }
     }
 }
@@ -236,6 +242,63 @@ impl Default for ModDatabase {
 }
 
 impl ModDatabase {
+    pub fn queue_mod_removal(&mut self, mod_id: &str) -> Result<(), String> {
+        let Some(target) = self.mods.iter_mut().find(|m| m.id == mod_id) else {
+            return Err(format!("Unknown mod id: {mod_id}"));
+        };
+        target.enabled = false;
+        target.pending_removal = true;
+        Ok(())
+    }
+
+    pub fn queue_generated_output_removal(&mut self, package_id: &str) -> Result<(), String> {
+        let Some(target) = self
+            .generated_outputs
+            .iter_mut()
+            .find(|p| p.id == package_id)
+        else {
+            return Err(format!("Unknown generated output package id: {package_id}"));
+        };
+        target.enabled = false;
+        target.pending_removal = true;
+        Ok(())
+    }
+
+    pub fn finalize_pending_removals(&mut self, game: &Game) -> Result<(), String> {
+        let mut mod_paths = Vec::new();
+        for m in self.mods.iter().filter(|m| m.pending_removal) {
+            mod_paths.push((m.name.clone(), m.source_path.clone()));
+        }
+        let mut output_paths = Vec::new();
+        for p in self
+            .generated_outputs
+            .iter()
+            .filter(|p| p.pending_removal && p.manager_profile_id == self.active_profile_id)
+        {
+            output_paths.push((p.name.clone(), p.source_path.clone()));
+        }
+
+        for (name, path) in mod_paths {
+            if path.exists() {
+                std::fs::remove_dir_all(&path)
+                    .map_err(|e| format!("Failed to finalize pending mod removal '{name}': {e}"))?;
+            }
+        }
+        for (name, path) in output_paths {
+            if path.exists() {
+                std::fs::remove_dir_all(&path).map_err(|e| {
+                    format!("Failed to finalize pending generated output removal '{name}': {e}")
+                })?;
+            }
+        }
+
+        self.mods.retain(|m| !m.pending_removal);
+        self.generated_outputs
+            .retain(|p| !(p.pending_removal && p.manager_profile_id == self.active_profile_id));
+        self.save(game);
+        Ok(())
+    }
+
     fn loot_game_type(game: &Game) -> LootGameType {
         match game.kind {
             crate::core::games::GameKind::SkyrimSE => LootGameType::SkyrimSE,
@@ -653,21 +716,24 @@ impl ModManager {
         let Some(target) = db.mods.iter_mut().find(|m| m.id == mod_id) else {
             return Err(format!("Unknown mod id: {mod_id}"));
         };
+        if target.pending_removal {
+            return Err("Cannot toggle a mod that is pending removal".to_string());
+        }
         target.enabled = enabled;
-        deployment::rebuild_deployment(game, &mut db)?;
         db.save(game);
         Ok(())
     }
 
     pub fn rebuild_all(game: &Game) -> Result<(), String> {
         let mut db = ModDatabase::load(game);
-        deployment::rebuild_deployment(game, &mut db)
+        deployment::rebuild_deployment(game, &mut db)?;
+        db.save(game);
+        Ok(())
     }
 
     pub fn switch_profile(game: &Game, profile_id: &str) -> Result<(), String> {
         let mut db = ModDatabase::load(game);
         db.switch_active_profile(profile_id);
-        deployment::rebuild_deployment(game, &mut db)?;
         db.save(game);
         Ok(())
     }
@@ -680,30 +746,12 @@ impl ModManager {
         Ok(dir)
     }
 
-    /// Fully uninstall a mod: remove its symlinks from the game directory,
-    /// delete its files from disk, and remove its entry from the database.
+    /// Queue a mod for removal. Payload deletion is finalized only after a
+    /// successful explicit redeploy.
     pub fn uninstall_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        // Undeploy first so no dangling symlinks remain in the game directory.
-        // Log but do not abort on undeploy failure – we still want to clean up
-        // the files and database record.
-        if let Err(e) = Self::disable_mod(game, mod_entry) {
-            log::warn!(
-                "Undeploy warning during uninstall of '{}': {e}",
-                mod_entry.name
-            );
-        }
-
-        // Delete the mod's managed directory from disk.
-        if mod_entry.source_path.exists() {
-            std::fs::remove_dir_all(&mod_entry.source_path)
-                .map_err(|e| format!("Failed to delete mod files for '{}': {e}", mod_entry.name))?;
-        }
-
-        // Remove the mod entry from the database.
         let mut db = ModDatabase::load(game);
-        db.mods.retain(|m| m.id != mod_entry.id);
+        db.queue_mod_removal(&mod_entry.id)?;
         db.save(game);
-
         Ok(())
     }
 }
@@ -943,7 +991,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn uninstall_mod_removes_source_directory_and_database_entry() {
+    fn uninstall_mod_is_deferred_until_successful_redeploy() {
         use crate::core::games::{Game, GameKind, GameLauncherSource};
 
         let tmp = tempdir();
@@ -991,21 +1039,96 @@ mod tests {
             "link should exist before uninstall"
         );
 
-        // Uninstall.
+        // Queue uninstall.
         ModManager::uninstall_mod(&game, &mod_entry).unwrap();
 
-        // Symlinks cleaned up.
+        // Link still exists until explicit redeploy applies staged edits.
+        assert!(
+            game.data_path.join("textures").join("sky.dds").exists(),
+            "deployed file should remain before redeploy"
+        );
+        // Mod directory is still present while removal is pending.
+        assert!(
+            mod_dir.exists(),
+            "mod directory should still exist while pending"
+        );
+        let db_pending = ModDatabase::load(&game);
+        assert!(
+            db_pending
+                .mods
+                .iter()
+                .any(|m| m.id == mod_entry.id && m.pending_removal)
+        );
+
+        // Explicit redeploy finalizes pending removal.
+        ModManager::rebuild_all(&game).unwrap();
+
+        // Symlink cleaned up after redeploy.
         assert!(
             !game.data_path.join("textures").join("sky.dds").exists(),
-            "symlink should be gone after uninstall"
+            "deployed file should be gone after redeploy"
         );
-        // Mod directory deleted.
+        // Mod directory deleted after successful redeploy.
         assert!(!mod_dir.exists(), "mod directory should be deleted");
-        // Database entry removed.
+        // Database entry removed after successful redeploy.
         let db_after = ModDatabase::load(&game);
         assert!(
             db_after.mods.iter().all(|m| m.id != mod_entry.id),
             "mod should be removed from database"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_toggle_does_not_mutate_deployed_files_until_redeploy() {
+        use crate::core::games::{Game, GameKind, GameLauncherSource};
+
+        let tmp = tempdir();
+        let game_root = tmp.join("game");
+        let mods_base = tmp.join("mods_base");
+        std::fs::create_dir_all(game_root.join("Data")).unwrap();
+        std::fs::create_dir_all(mods_base.join("mods").join("test_game")).unwrap();
+        let game = Game {
+            id: "test_game".to_string(),
+            name: "Test Game".to_string(),
+            kind: GameKind::SkyrimSE,
+            launcher_source: GameLauncherSource::Steam,
+            steam_app_id: Some(489830),
+            root_path: game_root.clone(),
+            data_path: game_root.join("Data"),
+            mods_base_dir: Some(mods_base),
+            umu_config: None,
+        };
+
+        let mod_dir = game.mods_dir().join("staged-toggle");
+        std::fs::create_dir_all(mod_dir.join("Data").join("textures")).unwrap();
+        std::fs::write(
+            mod_dir.join("Data").join("textures").join("toggle.dds"),
+            b"x",
+        )
+        .unwrap();
+        let mut m = Mod::new("Toggle", mod_dir);
+        m.enabled = true;
+        let mut db = ModDatabase::load(&game);
+        db.mods.push(m.clone());
+        db.save(&game);
+        ModManager::rebuild_all(&game).unwrap();
+        let deployed = game.data_path.join("textures").join("toggle.dds");
+        assert!(deployed.exists());
+
+        ModManager::set_mod_enabled(&game, &m.id, false).unwrap();
+        assert!(
+            deployed.exists(),
+            "staged toggle should not mutate deployed files before redeploy"
+        );
+        let db_after_toggle = ModDatabase::load(&game);
+        let preview = crate::core::deployment::deployment_preview(&game, &db_after_toggle).unwrap();
+        assert!(
+            preview
+                .links_to_remove
+                .contains(&PathBuf::from("Data/textures/toggle.dds"))
+        );
+        let workspace_state = crate::core::workspace::workspace_state_for_game(&game);
+        assert!(workspace_state.safe_redeploy_required);
     }
 }

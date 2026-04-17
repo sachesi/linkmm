@@ -302,6 +302,42 @@ UI integration:
 - grouped rows summarize create/replace/remove/backup/restore/blocked sets and
   generated outputs participation with concise examples
 
+## 15. Staged profile edits vs explicit apply-deploy
+
+Profile editing and deployment application are now separated:
+
+- profile edits (enable/disable/reorder/toggle output/queue removal) update
+  `ModDatabase` and workspace dirty truth only
+- filesystem mutation happens only on explicit redeploy/apply actions
+  (`rebuild_deployment` / `ModManager::rebuild_all`)
+
+This keeps deterministic rebuild semantics while removing scattered implicit
+apply side effects from normal editing workflows.
+
+### Deferred destructive cleanup
+
+Destructive edits are staged first and finalized only after successful redeploy:
+
+- mods and generated output packages can be marked `pending_removal`
+- pending removals are excluded from desired deploy intent immediately
+- payload deletion and DB record removal happen in `finalize_pending_removals`
+  after a successful deploy plan apply
+- failed deploys do not finalize pending removals
+
+This prevents broken deployed links caused by deleting source payloads before a
+redeploy has switched filesystem state safely.
+
+### Preview visibility for staged destructive changes
+
+Deployment preview now includes pending destructive cleanup context:
+
+- pending mod removals
+- pending generated output removals
+- payload paths that will be deleted after a successful redeploy
+
+Tools surfaces this in the review card so users can inspect staged edits and
+cleanup consequences before explicitly applying deployment.
+
 Backup hygiene:
 
 - restored payload files are removed from backup storage

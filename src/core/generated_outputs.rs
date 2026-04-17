@@ -102,13 +102,7 @@ pub fn remove_generated_output_package(
     db: &mut ModDatabase,
     package_id: &str,
 ) -> Result<(), String> {
-    if let Some(pkg) = db.generated_outputs.iter().find(|p| p.id == package_id)
-        && pkg.source_path.exists()
-    {
-        std::fs::remove_dir_all(&pkg.source_path)
-            .map_err(|e| format!("Failed to remove generated output package data: {e}"))?;
-    }
-    db.generated_outputs.retain(|p| p.id != package_id);
+    db.queue_generated_output_removal(package_id)?;
     db.save(game);
     Ok(())
 }
@@ -471,7 +465,14 @@ mod tests {
         assert!(game.data_path.join("meshes/out.nif").exists());
 
         remove_generated_output_package(&game, &mut db, &package_id).unwrap();
+        assert!(
+            db.generated_outputs
+                .iter()
+                .any(|p| p.id == package_id && p.pending_removal)
+        );
+        assert!(game.data_path.join("meshes/out.nif").exists());
         deployment::rebuild_deployment(&game, &mut db).unwrap();
         assert!(!game.data_path.join("meshes/out.nif").exists());
+        assert!(db.generated_outputs.iter().all(|p| p.id != package_id));
     }
 }

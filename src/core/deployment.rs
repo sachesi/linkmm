@@ -156,6 +156,9 @@ pub struct DeploymentPreview {
     pub backups_remaining: Vec<PathBuf>,
     pub generated_outputs_participating: Vec<String>,
     pub blocked_paths: Vec<String>,
+    pub pending_mod_removals: Vec<String>,
+    pub pending_generated_output_removals: Vec<String>,
+    pub pending_payload_deletions: Vec<PathBuf>,
 }
 
 impl DeploymentPreview {
@@ -440,6 +443,7 @@ pub fn rebuild_deployment(game: &Game, db: &mut ModDatabase) -> Result<(), Strin
             return Err(e);
         }
     }
+    db.finalize_pending_removals(game)?;
     workspace::mark_deployed_clean(game, db)?;
     let backup_status = deployment_backup_status(game, &db.active_profile_id)?;
     workspace::set_status(
@@ -519,7 +523,35 @@ pub fn deployment_preview(game: &Game, db: &ModDatabase) -> Result<DeploymentPre
     let desired = build_assets_plan(db, ASSETS_DEPLOYER_ID);
     let state = DeploymentState::load(game, &db.active_profile_id);
     let exec = build_assets_execution_plan(game, &db.active_profile_id, &state, &desired)?;
-    Ok(preview_from_plan(exec))
+    let mut preview = preview_from_plan(exec);
+    preview.pending_mod_removals = db
+        .mods
+        .iter()
+        .filter(|m| m.pending_removal)
+        .map(|m| m.name.clone())
+        .collect();
+    preview.pending_generated_output_removals = db
+        .generated_outputs
+        .iter()
+        .filter(|p| p.pending_removal && p.manager_profile_id == db.active_profile_id)
+        .map(|p| p.name.clone())
+        .collect();
+    preview.pending_payload_deletions = db
+        .mods
+        .iter()
+        .filter(|m| m.pending_removal)
+        .map(|m| m.source_path.clone())
+        .chain(
+            db.generated_outputs
+                .iter()
+                .filter(|p| p.pending_removal && p.manager_profile_id == db.active_profile_id)
+                .map(|p| p.source_path.clone()),
+        )
+        .collect();
+    preview.pending_mod_removals.sort();
+    preview.pending_generated_output_removals.sort();
+    preview.pending_payload_deletions.sort();
+    Ok(preview)
 }
 
 fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> AssetsDesiredPlan {
@@ -528,7 +560,7 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> AssetsDesiredPlan {
     for mod_entry in db
         .mods
         .iter()
-        .filter(|m| m.enabled && m.deployer.as_str() == deployer_id)
+        .filter(|m| m.enabled && !m.pending_removal && m.deployer.as_str() == deployer_id)
     {
         for (dest, src) in collect_mod_destinations(mod_entry) {
             desired.insert(
@@ -542,6 +574,7 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> AssetsDesiredPlan {
     }
     for output in db.generated_outputs.iter().filter(|o| {
         o.enabled
+            && !o.pending_removal
             && o.deployer.as_str() == deployer_id
             && o.manager_profile_id == db.active_profile_id
     }) {
@@ -1920,6 +1953,46 @@ mod tests {
         );
         assert!(after.links_to_create.is_empty());
         assert!(after.links_to_remove.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_redeploy_does_not_finalize_pending_removals() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "remove_me",
+            "Data/textures/live.dds",
+            b"live",
+            true,
+        );
+        rebuild_deployment(&game, &mut db).unwrap();
+        let pending_path = db.mods[0].source_path.clone();
+        let pending_id = db.mods[0].id.clone();
+        db.queue_mod_removal(&pending_id).unwrap();
+
+        add_mod(
+            &game,
+            &mut db,
+            "blocked",
+            "Data/textures/blocked.dds",
+            b"blocked",
+            true,
+        );
+        let blocked_target = game.data_path.join("textures/blocked.dds");
+        fs::create_dir_all(&blocked_target).unwrap();
+
+        let err = rebuild_deployment(&game, &mut db).unwrap_err();
+        assert!(err.contains("blocked"));
+        assert!(pending_path.exists());
+        assert!(
+            db.mods
+                .iter()
+                .any(|m| m.id == pending_id && m.pending_removal)
+        );
     }
 
     #[cfg(unix)]
