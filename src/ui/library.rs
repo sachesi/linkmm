@@ -165,6 +165,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let status_label_c = status_label_c.clone();
             let status_progress_c = status_progress_c.clone();
             let status_revealer_c = status_revealer_c.clone();
+            let reorder_hint_idle = reorder_hint_c.clone();
             let btn = btn.clone();
             gtk4::glib::idle_add_local_once(move || {
                 let db = ModDatabase::load(&game_c);
@@ -192,7 +193,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     &search_c.borrow(),
                     Rc::clone(&search_c),
                     Rc::clone(&selected_c),
-                    &reorder_hint_c,
+                    &reorder_hint_idle,
                     true,
                 );
             });
@@ -545,6 +546,7 @@ fn build_mod_row(
         let config_c = Rc::clone(&config_del);
         let search_c = Rc::clone(&search_del);
         let selected_c = Rc::clone(&selected_del);
+        let hint_dialog = hint_del.clone();
         dialog.connect_response(None, move |_, response| {
             if response != "remove" {
                 return;
@@ -589,7 +591,7 @@ fn build_mod_row(
                 &search_c.borrow(),
                 Rc::clone(&search_c),
                 Rc::clone(&selected_c),
-                &hint_del,
+                &hint_dialog,
                 false,
             );
         });
@@ -629,6 +631,7 @@ fn build_mod_row(
             let config_idle = Rc::clone(&config_sel);
             let search_idle = Rc::clone(&search_sel);
             let selected_idle = Rc::clone(&selected_sel);
+            let hint_idle = hint_sel.clone();
             gtk4::glib::idle_add_local_once(move || {
                 refresh_library_content_with_search(
                     &container_idle,
@@ -637,7 +640,7 @@ fn build_mod_row(
                     &search_idle.borrow(),
                     Rc::clone(&search_idle),
                     Rc::clone(&selected_idle),
-                    &hint_sel,
+                    &hint_idle,
                     false,
                 );
             });
@@ -658,6 +661,7 @@ fn build_mod_row(
         let search_rclick = Rc::clone(&search_state);
         let selected_rclick = Rc::clone(&selected_mod_id);
         let mod_id_rclick = mod_entry.id.clone();
+        let reorder_hint_rclick = reorder_hint.clone();
         let conflict_entries = conflict_state
             .map(|state| {
                 state
@@ -795,7 +799,7 @@ fn build_mod_row(
             let config_move = Rc::clone(&config_rclick);
             let search_move = Rc::clone(&search_rclick);
             let selected_move = Rc::clone(&selected_rclick);
-            let hint_move = reorder_hint.clone();
+            let hint_move = reorder_hint_rclick.clone();
             let mod_id_move = mod_id_rclick.clone();
             move_item.connect_clicked(move |_| {
                 popover_move.popdown();
@@ -821,7 +825,7 @@ fn build_mod_row(
             let config_enable = Rc::clone(&config_rclick);
             let search_enable = Rc::clone(&search_rclick);
             let selected_enable = Rc::clone(&selected_rclick);
-            let hint_enable = reorder_hint.clone();
+            let hint_enable = reorder_hint_rclick.clone();
             enable_all_item.connect_clicked(move |_| {
                 popover_enable.popdown();
                 let mut db = ModDatabase::load(&game_enable);
@@ -850,7 +854,7 @@ fn build_mod_row(
             let config_disable = Rc::clone(&config_rclick);
             let search_disable = Rc::clone(&search_rclick);
             let selected_disable = Rc::clone(&selected_rclick);
-            let hint_disable = reorder_hint.clone();
+            let hint_disable = reorder_hint_rclick.clone();
             disable_all_item.connect_clicked(move |_| {
                 popover_disable.popdown();
                 let mut db = ModDatabase::load(&game_disable);
