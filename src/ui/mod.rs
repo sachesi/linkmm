@@ -13,6 +13,7 @@ use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
 use crate::core::runtime::global_runtime_manager;
+use crate::core::workspace::{self, DeploymentState};
 
 pub mod downloads;
 pub mod library;
@@ -303,12 +304,22 @@ fn build_main_window(
     install_lock_banner.set_button_label(None::<&str>);
     install_lock_revealer.set_child(Some(&install_lock_banner));
 
+    let workspace_revealer = gtk4::Revealer::new();
+    workspace_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    workspace_revealer.set_reveal_child(true);
+
+    let workspace_banner = adw::Banner::new("Workspace status unavailable");
+    workspace_banner.set_revealed(true);
+    workspace_banner.set_button_label(None::<&str>);
+    workspace_revealer.set_child(Some(&workspace_banner));
+
     let content_stack = gtk4::Stack::new();
     content_stack.set_transition_type(gtk4::StackTransitionType::None);
     content_stack.set_vexpand(true);
     content_stack.set_hexpand(true);
     let content_layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content_layout.append(&install_lock_revealer);
+    content_layout.append(&workspace_revealer);
     content_layout.append(&content_stack);
 
     let content_page = adw::NavigationPage::builder()
@@ -412,6 +423,43 @@ fn build_main_window(
     let preferences_widget =
         settings::build_settings_page(Rc::clone(&config), window.upcast_ref::<gtk4::Window>());
     content_stack.add_named(&preferences_widget, Some("preferences"));
+
+    {
+        let config_t = Rc::clone(&config);
+        let workspace_banner_t = workspace_banner.clone();
+        let workspace_revealer_t = workspace_revealer.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
+            let game = config_t.borrow().current_game().cloned();
+            if let Some(game) = game {
+                let state = workspace::workspace_state_for_game(&game);
+                let mut summary = format!("Profile: {}", state.profile_id);
+                match state.deployment_state {
+                    DeploymentState::Deployed => summary.push_str(" · Deployed"),
+                    DeploymentState::NotDeployed => summary.push_str(" · Not deployed"),
+                    DeploymentState::Dirty => summary.push_str(" · Redeploy needed"),
+                    DeploymentState::Busy => summary.push_str(" · Deploying…"),
+                    DeploymentState::Failed => summary.push_str(" · Deploy failed"),
+                }
+                let reasons = state.pending_changes.reasons();
+                if !reasons.is_empty() {
+                    summary.push_str(" · ");
+                    summary.push_str(&reasons.join(", "));
+                }
+                if let Some(msg) = state.status_message
+                    && !msg.trim().is_empty()
+                {
+                    summary.push_str(" · ");
+                    summary.push_str(&msg);
+                }
+                workspace_banner_t.set_title(&summary);
+                workspace_revealer_t.set_reveal_child(true);
+            } else {
+                workspace_banner_t.set_title("Select a game to view workspace status");
+                workspace_revealer_t.set_reveal_child(true);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 
     // Allow mobile-like narrow layouts: collapse the sidebar when the window is small.
     split_view.add_tick_callback(|sv, _| {

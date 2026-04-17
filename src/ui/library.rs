@@ -25,6 +25,13 @@ struct ConflictState {
     conflict_mods_by_file: BTreeMap<String, BTreeSet<String>>,
 }
 
+#[derive(Debug, Clone)]
+struct ConflictDetailRow {
+    file: String,
+    winner_mod: String,
+    competing_mods: Vec<String>,
+}
+
 /// Build the full Library page for `game`.
 pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
@@ -314,7 +321,99 @@ fn refresh_library_content_with_search(
                 adj.set_value(value.clamp(0.0, max_value));
             });
         }
+
+        if let Some(selected_id) = selected
+            && let Some(selected_mod) = db.mods.iter().find(|m| m.id == selected_id)
+            && let Some(state) = conflict_states.get(&selected_mod.id)
+            && !state.files.is_empty()
+        {
+            let details = build_conflict_details(&db.mods, selected_mod, state);
+            let card = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+            card.add_css_class("card");
+            card.set_margin_start(12);
+            card.set_margin_end(12);
+            card.set_margin_bottom(12);
+            card.set_margin_top(4);
+
+            let heading =
+                gtk4::Label::new(Some(&format!("Conflict Details · {}", selected_mod.name)));
+            heading.set_xalign(0.0);
+            heading.add_css_class("heading");
+            heading.set_margin_top(8);
+            heading.set_margin_start(8);
+            heading.set_margin_end(8);
+            card.append(&heading);
+
+            let summary = gtk4::Label::new(Some(&format!(
+                "Overwriting: {} mod(s) · Overwritten by: {} mod(s) · Conflicting files: {}",
+                state
+                    .conflict_mods_by_file
+                    .values()
+                    .filter(|mods| mods.iter().any(|m| m != &selected_mod.name))
+                    .count(),
+                usize::from(state.overwritten),
+                state.files.len()
+            )));
+            summary.set_xalign(0.0);
+            summary.add_css_class("dim-label");
+            summary.set_margin_start(8);
+            summary.set_margin_end(8);
+            card.append(&summary);
+
+            let details_list = gtk4::ListBox::new();
+            details_list.add_css_class("boxed-list");
+            details_list.set_selection_mode(gtk4::SelectionMode::None);
+            for detail in details.into_iter().take(60) {
+                let subtitle = format!(
+                    "Winner: {} · Competing: {}",
+                    detail.winner_mod,
+                    detail.competing_mods.join(", ")
+                );
+                let row = adw::ActionRow::builder()
+                    .title(&detail.file)
+                    .subtitle(&subtitle)
+                    .build();
+                details_list.append(&row);
+            }
+            card.append(&details_list);
+            container.append(&card);
+        }
     }
+}
+
+fn build_conflict_details(
+    mods: &[Mod],
+    selected_mod: &Mod,
+    state: &ConflictState,
+) -> Vec<ConflictDetailRow> {
+    let mod_index = mods
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| (m.name.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut details = state
+        .conflict_mods_by_file
+        .iter()
+        .map(|(file, competing)| {
+            let mut contenders = competing.iter().cloned().collect::<Vec<_>>();
+            if !contenders.iter().any(|m| m == &selected_mod.name) {
+                contenders.push(selected_mod.name.clone());
+            }
+            contenders.sort();
+            let winner = contenders
+                .iter()
+                .max_by_key(|name| mod_index.get(*name).copied().unwrap_or(usize::MIN))
+                .cloned()
+                .unwrap_or_else(|| selected_mod.name.clone());
+            ConflictDetailRow {
+                file: file.clone(),
+                winner_mod: winner,
+                competing_mods: contenders,
+            }
+        })
+        .collect::<Vec<_>>();
+    details.sort_by(|a, b| a.file.cmp(&b.file));
+    details
 }
 
 /// Toggle interactivity for Library controls during long deploy operations.
@@ -1187,8 +1286,9 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_conflict_states, matches_query};
+    use super::{ConflictState, build_conflict_details, compute_conflict_states, matches_query};
     use crate::core::mods::Mod;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1203,6 +1303,7 @@ mod tests {
             source_path: PathBuf::from(path),
             installed_from_nexus: false,
             archive_name: None,
+            deployer: "assets".to_string(),
         }
     }
 
@@ -1377,5 +1478,30 @@ mod tests {
         assert!(!states.contains_key("c"));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conflict_details_choose_highest_precedence_winner() {
+        let mods = vec![
+            sample_mod("a", "A", "/tmp/a"),
+            sample_mod("b", "B", "/tmp/b"),
+            sample_mod("c", "C", "/tmp/c"),
+        ];
+        let selected = mods[0].clone();
+        let mut state = ConflictState::default();
+        state.files.insert("data/textures/sky.dds".to_string());
+        state.conflict_mods_by_file.insert(
+            "data/textures/sky.dds".to_string(),
+            BTreeSet::from(["A".to_string(), "B".to_string()]),
+        );
+        let details = build_conflict_details(&mods, &selected, &state);
+        let by_file = details
+            .into_iter()
+            .map(|d| (d.file, d.winner_mod))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_file.get("data/textures/sky.dds").map(String::as_str),
+            Some("B")
+        );
     }
 }

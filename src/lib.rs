@@ -16,4 +16,5 @@ pub mod core {
     pub mod tool_adapters;
     pub mod tool_runs;
     pub mod umu;
+    pub mod workspace;
 }

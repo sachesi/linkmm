@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use super::installer::{LinkKind, determine_link_type};
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase};
+use crate::core::workspace;
 
 const DEPLOY_STATE_FILE: &str = "deployment_state.toml";
 
@@ -318,12 +319,17 @@ pub fn unlink_directory_recursive(src_dir: &Path, dest_dir: &Path) -> Result<usi
 // ── High-Level Deployment ─────────────────────────────────────────────────────
 
 pub fn rebuild_deployment(game: &Game, db: &mut ModDatabase) -> Result<(), String> {
+    workspace::mark_operation(&game.id, workspace::WorkspaceOperation::Deploy);
     let deployers: Vec<Box<dyn Deployer>> =
         vec![Box::new(AssetsDeployer), Box::new(PluginsDeployer)];
     for deployer in deployers {
         log::debug!("[Deployer:{}] Rebuilding", deployer.id());
-        deployer.rebuild(game, db)?;
+        if let Err(e) = deployer.rebuild(game, db) {
+            workspace::mark_deploy_failure(&game.id, format!("Deployment failed: {e}"));
+            return Err(e);
+        }
     }
+    workspace::mark_deployed_clean(game, db)?;
     Ok(())
 }
 
@@ -926,6 +932,7 @@ mod tests {
     use super::*;
     use crate::core::games::{Game, GameKind, GameLauncherSource, UmuGameConfig};
     use crate::core::mods::{Mod, ModDatabase};
+    use crate::core::workspace;
     use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;

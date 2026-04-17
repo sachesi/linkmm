@@ -11,6 +11,7 @@ use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile}
 use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::{ModDatabase, ModManager};
 use crate::core::runtime::{SessionStatus, global_runtime_manager};
+use crate::core::workspace::{self, ProfileSwitchPolicy};
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
 pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
@@ -96,6 +97,23 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         generated_list.set_selection_mode(gtk4::SelectionMode::None);
         generated_group.add(&generated_list);
 
+        let workspace_group = adw::PreferencesGroup::builder()
+            .title("Workspace Lifecycle")
+            .description(
+                "Tool output capture, runtime adoption, and safe redeploy status for this profile.",
+            )
+            .build();
+        let workspace_row = adw::ActionRow::builder()
+            .title("Workspace Status")
+            .subtitle("Loading workspace state…")
+            .build();
+        workspace_group.add(&workspace_row);
+        let last_run_row = adw::ActionRow::builder()
+            .title("Last Tool Run")
+            .subtitle("No runs recorded in this session.")
+            .build();
+        workspace_group.add(&last_run_row);
+
         // Rebuild function to refresh the tool list
         let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
         let rebuild_weak = Rc::downgrade(&rebuild);
@@ -147,6 +165,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         let toast_overlay_c2 = toast_overlay_c.clone();
                         let game_for_launch = game_for_rebuild.clone();
                         let config_for_launch = Rc::clone(&config_c);
+                        let last_run_row_c = last_run_row.clone();
                         launch_btn.connect_clicked(move |btn| {
                             launch_tool(
                                 &game_for_launch,
@@ -154,6 +173,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                                 Rc::clone(&config_for_launch),
                                 btn,
                                 &toast_overlay_c2,
+                                Some(&last_run_row_c),
                             );
                         });
                     }
@@ -345,6 +365,17 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                 if global_runtime_manager().any_active() {
                     return;
                 }
+                let workspace_state = workspace::workspace_state_for_game(&game_profile);
+                match workspace::profile_switch_policy(&workspace_state) {
+                    ProfileSwitchPolicy::Blocked(reason) => {
+                        log::warn!("Profile switch blocked: {reason}");
+                        return;
+                    }
+                    ProfileSwitchPolicy::Warn(reason) => {
+                        log::warn!("Profile switch warning: {reason}");
+                    }
+                    ProfileSwitchPolicy::Allowed => {}
+                }
                 let selected = row.selected() as usize;
                 let mut cfg = config_profile.borrow_mut();
                 let selected_profile_id = {
@@ -373,10 +404,27 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             });
         }
 
+        {
+            let game_workspace = game.clone();
+            let workspace_row_c = workspace_row.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
+                let state = workspace::workspace_state_for_game(&game_workspace);
+                let reasons = state.pending_changes.reasons();
+                let summary = if reasons.is_empty() {
+                    format!("{:?} · clean", state.deployment_state)
+                } else {
+                    format!("{:?} · {}", state.deployment_state, reasons.join(", "))
+                };
+                workspace_row_c.set_subtitle(&summary);
+                glib::ControlFlow::Continue
+            });
+        }
+
         // Initial build
         (rebuild.borrow())();
 
         content_box.append(&profile_group);
+        content_box.append(&workspace_group);
         content_box.append(&tools_group);
         content_box.append(&generated_group);
     } else {
@@ -645,11 +693,15 @@ fn launch_tool(
     config: Rc<RefCell<AppConfig>>,
     btn: &gtk4::Button,
     toast_overlay: &adw::ToastOverlay,
+    last_run_row: Option<&adw::ActionRow>,
 ) {
     if game.launcher_source == GameLauncherSource::Steam {
         let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
         match crate::core::steam::launch_tool_with_proton(&tool.exe_path, &tool.arguments, app_id) {
             Ok(_child) => {
+                if let Some(row) = last_run_row {
+                    row.set_subtitle("Launched via Steam/Proton (capture unavailable).");
+                }
                 toast_overlay.add_toast(adw::Toast::new("Tool launched via Steam/Proton"))
             }
             Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Launch failed: {e}"))),
@@ -686,6 +738,7 @@ fn launch_tool(
         }
     };
     log::info!("Started managed tool session {}", session_id);
+    workspace::mark_operation(&game.id, workspace::WorkspaceOperation::ToolRun);
     btn.set_sensitive(false);
 
     let btn_c = btn.clone();
@@ -693,6 +746,7 @@ fn launch_tool(
     let tool_id = tool.id.clone();
     let tool_name = tool.name.clone();
     let toast_overlay_c = toast_overlay.clone();
+    let last_run_row_c = last_run_row.cloned();
     glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
         let manager = global_runtime_manager();
         if let Some(s) = manager.current_tool_session(&game_id, &tool_id)
@@ -710,6 +764,14 @@ fn launch_tool(
                 } else {
                     format!("{} complete", tool_name)
                 };
+                workspace::mark_operation(&game_id, workspace::WorkspaceOperation::None);
+                workspace::set_status(&game_id, workspace::StatusSeverity::Info, msg.clone());
+                if let Some(row) = &last_run_row_c {
+                    row.set_subtitle(&format!(
+                        "Captured {} files (plugins: {}, assets: {})",
+                        run.captured_files, run.plugin_files, run.asset_files
+                    ));
+                }
                 toast_overlay_c.add_toast(adw::Toast::new(&msg));
                 btn_c.set_icon_name("media-playback-start-symbolic");
                 btn_c.set_tooltip_text(Some("Launch Tool"));
@@ -717,6 +779,15 @@ fn launch_tool(
                 glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
+                workspace::mark_operation(&game_id, workspace::WorkspaceOperation::None);
+                workspace::set_status(
+                    &game_id,
+                    workspace::StatusSeverity::Error,
+                    format!("Tool run failed: {e}"),
+                );
+                if let Some(row) = &last_run_row_c {
+                    row.set_subtitle(&format!("Failed: {e}"));
+                }
                 toast_overlay_c.add_toast(adw::Toast::new(&format!("Tool run failed: {e}")));
                 btn_c.set_icon_name("media-playback-start-symbolic");
                 btn_c.set_tooltip_text(Some("Launch Tool"));
@@ -725,6 +796,7 @@ fn launch_tool(
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                workspace::mark_operation(&game_id, workspace::WorkspaceOperation::None);
                 btn_c.set_icon_name("media-playback-start-symbolic");
                 btn_c.set_tooltip_text(Some("Launch Tool"));
                 btn_c.set_sensitive(true);

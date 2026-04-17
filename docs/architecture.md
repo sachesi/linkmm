@@ -138,3 +138,48 @@ List/view update rule for Library and Load Order:
 - Reordering actions operate on authoritative full-order lists only; when search
   filtering is active, reorder affordances are disabled until the filter is
   cleared.
+
+## 10. Workspace state and dirty semantics
+
+LinkMM now exposes an app-shared workspace state model per game instance/profile.
+
+`core::workspace` is responsible for:
+
+- current `game_id` and active `profile_id`
+- deployment state (`Deployed`, `NotDeployed`, `Dirty`, `Busy`, `Failed`)
+- current long-running operation (`None`, `Install`, `Deploy`, `ToolRun`, `Capture`, `Restore`)
+- status message + severity
+- pending change flags used for safe redeploy decisions
+
+Dirty state is computed against a persisted per-profile baseline snapshot written
+after successful deployment (`workspace_baseline.toml` under profile config).
+
+Tracked dirty sources:
+
+- mod set changed (install/uninstall)
+- mod enabled/disabled changed
+- mod order changed
+- plugin order/disabled state changed
+- generated output package set changed
+- unmanaged/runtime changes explicitly flagged by tool/runtime flows
+
+Safety contract:
+
+- deployment success writes a fresh clean baseline and clears deploy-failed state
+- deployment failure preserves truthful failed state and status message
+- profile switching consults workspace policy (`Allowed` / `Warn` / `Blocked`)
+  so active operations and undeployed changes are visible in UI workflows
+
+## 11. Tool runs and generated output lifecycle in workspace flow
+
+Tool execution remains adapter-driven (`tool_runs` + `tool_adapters`) but now
+feeds workspace state:
+
+- launch marks operation as `ToolRun`
+- success/failure updates shared status
+- generated output import/adoption changes become dirty sources
+- UI surfaces show whether capture/import happened and whether redeploy is needed
+
+This keeps deterministic deploy as the source of truth while making tools and
+runtime-preserved output part of one coherent profile workflow instead of an
+isolated page action.
