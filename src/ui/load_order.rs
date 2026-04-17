@@ -1,13 +1,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4::gdk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, PluginFile};
+use crate::ui::ordering;
 
 /// Build the Load Order page for `game`.
 ///
@@ -54,25 +54,71 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             let game_rc = Rc::new(g.clone());
             let search_query = Rc::new(RefCell::new(String::new()));
 
+            let reorder_hint = gtk4::Label::new(Some("Clear search to reorder."));
+            reorder_hint.add_css_class("dim-label");
+            reorder_hint.set_margin_top(8);
+            reorder_hint.set_margin_bottom(4);
+            reorder_hint.set_margin_start(16);
+            reorder_hint.set_margin_end(16);
+            reorder_hint.set_halign(gtk4::Align::Start);
+            reorder_hint.set_visible(false);
+            content_container.append(&reorder_hint);
+
+            let stack = gtk4::Stack::new();
+            stack.set_vexpand(true);
+
+            let list_box = gtk4::ListBox::new();
+            list_box.add_css_class("boxed-list");
+            list_box.set_selection_mode(gtk4::SelectionMode::None);
+
+            let clamp = adw::Clamp::new();
+            clamp.set_maximum_size(900);
+            clamp.set_margin_top(12);
+            clamp.set_margin_bottom(12);
+            clamp.set_margin_start(12);
+            clamp.set_margin_end(12);
+            clamp.set_child(Some(&list_box));
+
+            let scrolled = gtk4::ScrolledWindow::new();
+            scrolled.set_vexpand(true);
+            scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
+            scrolled.set_child(Some(&clamp));
+
+            let status_page = adw::StatusPage::new();
+            status_page.set_vexpand(true);
+
+            stack.add_named(&scrolled, Some("list"));
+            stack.add_named(&status_page, Some("status"));
+            stack.set_visible_child_name("list");
+            content_container.append(&stack);
+
             {
                 let game_c = Rc::clone(&game_rc);
-                let container_c = content_container.clone();
+                let list_c = list_box.clone();
+                let status_c = status_page.clone();
+                let stack_c = stack.clone();
                 let search_c = Rc::clone(&search_query);
+                let hint_c = reorder_hint.clone();
                 search_entry.connect_search_changed(move |entry| {
                     *search_c.borrow_mut() = entry.text().to_string();
-                    refresh_load_order_content_with_search(
-                        &container_c,
+                    refresh_load_order_content(
+                        &list_c,
+                        &status_c,
+                        &stack_c,
+                        &hint_c,
                         &game_c,
                         &search_c.borrow(),
                     );
                 });
             }
 
-            // Connect sort button
             {
                 let game_c = Rc::clone(&game_rc);
-                let container_c = content_container.clone();
+                let list_c = list_box.clone();
+                let status_c = status_page.clone();
+                let stack_c = stack.clone();
                 let search_c = Rc::clone(&search_query);
+                let hint_c = reorder_hint.clone();
                 sort_btn.connect_clicked(move |_| {
                     let mut db = ModDatabase::load(&game_c);
                     if db.plugin_load_order.is_empty() {
@@ -83,16 +129,22 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                     if let Err(e) = db.write_plugins_txt(&game_c) {
                         log::warn!("Failed to write plugins.txt after sort: {e}");
                     }
-                    refresh_load_order_content_with_search(
-                        &container_c,
+                    refresh_load_order_content(
+                        &list_c,
+                        &status_c,
+                        &stack_c,
+                        &hint_c,
                         &game_c,
                         &search_c.borrow(),
                     );
                 });
             }
 
-            refresh_load_order_content_with_search(
-                &content_container,
+            refresh_load_order_content(
+                &list_box,
+                &status_page,
+                &stack,
+                &reorder_hint,
                 &game_rc,
                 &search_query.borrow(),
             );
@@ -103,113 +155,92 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     toolbar_view.upcast()
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
-
-/// Re-populate `container` with the current plugin list for `game`.
-fn refresh_load_order_content(container: &gtk4::Box, game: &Rc<Game>) {
-    refresh_load_order_content_with_search(container, game, "");
-}
-
-fn refresh_load_order_content_with_search(
-    container: &gtk4::Box,
+fn refresh_load_order_content(
+    list_box: &gtk4::ListBox,
+    status_page: &adw::StatusPage,
+    stack: &gtk4::Stack,
+    reorder_hint: &gtk4::Label,
     game: &Rc<Game>,
     search_query: &str,
 ) {
-    let previous_scroll = container
-        .first_child()
-        .and_then(|child| child.downcast::<gtk4::ScrolledWindow>().ok())
-        .map(|scrolled| {
-            let adj = scrolled.vadjustment();
-            (adj.value(), adj.upper(), adj.page_size())
-        });
+    let is_filtered = !search_query.trim().is_empty();
+    reorder_hint.set_visible(is_filtered);
 
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
     }
 
     let mut db = ModDatabase::load(game);
-    // Initialise from plugins.txt if we have no saved order yet
     if db.plugin_load_order.is_empty() {
         db.sync_from_plugins_txt(game);
     }
-    let plugins = db.get_ordered_plugins(game);
 
-    if plugins.is_empty() {
-        let status = adw::StatusPage::builder()
-            .title("No Plugins Found")
-            .description(
-                "No .esm / .esl / .esp files were found in the game's Data directory.\n\
-                 Install and deploy mods first, or check that the game path is correct.",
-            )
-            .icon_name("format-justify-left-symbolic")
-            .build();
-        status.set_vexpand(true);
-        container.append(&status);
+    let ordered_plugins = db.get_ordered_plugins(game);
+    if ordered_plugins.is_empty() {
+        status_page.set_title("No Plugins Found");
+        status_page.set_description(Some(
+            "No .esm / .esl / .esp files were found in the game's Data directory.\nInstall and deploy mods first, or check that the game path is correct.",
+        ));
+        status_page.set_icon_name(Some("format-justify-left-symbolic"));
+        stack.set_visible_child_name("status");
         return;
     }
 
-    let filtered: Vec<PluginFile> = plugins
-        .into_iter()
+    let filtered: Vec<PluginFile> = ordered_plugins
+        .iter()
         .filter(|p| {
             matches_query(&p.name, search_query) || matches_query(p.kind.label(), search_query)
         })
+        .cloned()
         .collect();
 
     if filtered.is_empty() {
-        let status = adw::StatusPage::builder()
-            .title("No Matching Plugins")
-            .description("No plugins match your search.")
-            .icon_name("system-search-symbolic")
-            .build();
-        status.set_vexpand(true);
-        container.append(&status);
+        status_page.set_title("No Matching Plugins");
+        status_page.set_description(Some("No plugins match your search."));
+        status_page.set_icon_name(Some("system-search-symbolic"));
+        stack.set_visible_child_name("status");
         return;
     }
 
-    let count = filtered.len();
-    let vanilla_count = filtered.iter().filter(|p| p.is_vanilla).count();
-    let list_box = gtk4::ListBox::new();
-    list_box.add_css_class("boxed-list");
-    list_box.set_selection_mode(gtk4::SelectionMode::None);
+    let pinned_prefix_len = ordered_plugins.iter().take_while(|p| p.is_vanilla).count();
 
-    for (idx, plugin) in filtered.iter().enumerate() {
-        let row = build_plugin_row(plugin, idx, count, vanilla_count, game, container);
+    for plugin in &filtered {
+        let Some(full_index) = ordered_plugins.iter().position(|p| p.name == plugin.name) else {
+            continue;
+        };
+        let row = build_plugin_row(
+            plugin,
+            full_index,
+            ordered_plugins.len(),
+            pinned_prefix_len,
+            !is_filtered,
+            game,
+            list_box,
+            status_page,
+            stack,
+            reorder_hint,
+            search_query,
+        );
         list_box.append(&row);
     }
 
-    let clamp = adw::Clamp::new();
-    clamp.set_maximum_size(900);
-    clamp.set_child(Some(&list_box));
-    clamp.set_margin_top(12);
-    clamp.set_margin_bottom(12);
-    clamp.set_margin_start(12);
-    clamp.set_margin_end(12);
-
-    let scrolled = gtk4::ScrolledWindow::new();
-    scrolled.set_vexpand(true);
-    scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
-    scrolled.set_child(Some(&clamp));
-
-    container.append(&scrolled);
-    if let Some((value, _, _)) = previous_scroll {
-        let scrolled_clone = scrolled.clone();
-        gtk4::glib::idle_add_local_once(move || {
-            let adj = scrolled_clone.vadjustment();
-            let max_value = (adj.upper() - adj.page_size()).max(0.0);
-            adj.set_value(value.clamp(0.0, max_value));
-        });
-    }
+    stack.set_visible_child_name("list");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_plugin_row(
     plugin: &PluginFile,
-    idx: usize,
+    full_index: usize,
     total: usize,
-    vanilla_count: usize,
+    pinned_prefix_len: usize,
+    allow_reorder: bool,
     game: &Rc<Game>,
-    container: &gtk4::Box,
+    list_box: &gtk4::ListBox,
+    status_page: &adw::StatusPage,
+    stack: &gtk4::Stack,
+    reorder_hint: &gtk4::Label,
+    search_query: &str,
 ) -> adw::ActionRow {
-    // Subtitle: type label + vanilla marker
     let subtitle = if plugin.is_vanilla {
         format!("{} · Vanilla master (pinned)", plugin.kind.label())
     } else {
@@ -221,22 +252,12 @@ fn build_plugin_row(
         .subtitle(&subtitle)
         .build();
 
-    // Drag handle (non-vanilla only) – shown at the far left to indicate draggability
-    if !plugin.is_vanilla {
-        let drag_handle = gtk4::Image::from_icon_name("list-drag-handle-symbolic");
-        drag_handle.add_css_class("dim-label");
-        drag_handle.set_tooltip_text(Some("Drag to reorder"));
-        row.add_prefix(&drag_handle);
-    }
-
-    // Index prefix
-    let index_label = gtk4::Label::new(Some(&format!("{}", idx + 1)));
+    let index_label = gtk4::Label::new(Some(&format!("{}", full_index + 1)));
     index_label.add_css_class("dim-label");
     index_label.add_css_class("numeric");
     index_label.set_width_chars(3);
     row.add_prefix(&index_label);
 
-    // Type badge
     let badge = gtk4::Label::new(Some(plugin.kind.label()));
     badge.add_css_class("caption");
     badge.add_css_class("dim-label");
@@ -244,7 +265,6 @@ fn build_plugin_row(
     row.add_suffix(&badge);
 
     if plugin.is_vanilla {
-        // Vanilla masters: no controls, just a lock icon
         let lock = gtk4::Image::from_icon_name("changes-prevent-symbolic");
         lock.set_tooltip_text(Some("Vanilla master – cannot be moved or disabled"));
         lock.add_css_class("dim-label");
@@ -252,7 +272,6 @@ fn build_plugin_row(
         return row;
     }
 
-    // Enable/disable toggle
     let enabled_btn = gtk4::CheckButton::new();
     enabled_btn.set_active(plugin.enabled);
     enabled_btn.set_tooltip_text(Some(if plugin.enabled {
@@ -261,11 +280,14 @@ fn build_plugin_row(
         "Enable plugin"
     }));
     enabled_btn.set_valign(gtk4::Align::Center);
-
     {
         let game_c = Rc::clone(game);
-        let container_c = container.clone();
+        let list_c = list_box.clone();
+        let status_c = status_page.clone();
+        let stack_c = stack.clone();
+        let hint_c = reorder_hint.clone();
         let plugin_name = plugin.name.clone();
+        let search_q = search_query.to_string();
         enabled_btn.connect_toggled(move |btn| {
             let enabled = btn.is_active();
             let mut db = ModDatabase::load(&game_c);
@@ -276,152 +298,97 @@ fn build_plugin_row(
             }
             db.save(&game_c);
             let _ = db.write_plugins_txt(&game_c);
-            refresh_load_order_content(&container_c, &game_c);
+            refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
         });
     }
     row.add_suffix(&enabled_btn);
 
-    // Move up / move down buttons (non-vanilla only)
     let up_btn = gtk4::Button::new();
     up_btn.set_icon_name("go-up-symbolic");
     up_btn.set_valign(gtk4::Align::Center);
     up_btn.add_css_class("flat");
-    up_btn.set_tooltip_text(Some("Move up"));
-    // Disable when this is the first non-vanilla plugin (can't move into vanilla territory)
-    up_btn.set_sensitive(idx > vanilla_count);
+    up_btn.set_tooltip_text(Some(if allow_reorder {
+        "Move up"
+    } else {
+        "Clear search to reorder"
+    }));
+    up_btn.set_sensitive(allow_reorder && full_index > pinned_prefix_len);
 
     let down_btn = gtk4::Button::new();
     down_btn.set_icon_name("go-down-symbolic");
     down_btn.set_valign(gtk4::Align::Center);
     down_btn.add_css_class("flat");
-    down_btn.set_tooltip_text(Some("Move down"));
-    down_btn.set_sensitive(idx + 1 < total);
+    down_btn.set_tooltip_text(Some(if allow_reorder {
+        "Move down"
+    } else {
+        "Clear search to reorder"
+    }));
+    down_btn.set_sensitive(allow_reorder && full_index + 1 < total);
 
     row.add_suffix(&up_btn);
     row.add_suffix(&down_btn);
 
-    // Up button
     {
         let game_c = Rc::clone(game);
-        let container_c = container.clone();
+        let list_c = list_box.clone();
+        let status_c = status_page.clone();
+        let stack_c = stack.clone();
+        let hint_c = reorder_hint.clone();
         let plugin_name = plugin.name.clone();
+        let search_q = search_query.to_string();
         up_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
-            let mut ordered = db.get_ordered_plugins(&game_c);
-            // Only move within the non-vanilla section
-            if let Some(pos) = ordered
-                .iter()
-                .position(|p| p.name == plugin_name && !p.is_vanilla)
-                && pos > 0
-                && !ordered[pos - 1].is_vanilla
+            let ordered = db.get_ordered_plugins(&game_c);
+            if let Ok(updated) =
+                ordering::move_up_by_id(&ordered, &plugin_name, pinned_prefix_len, |p| &p.name)
             {
-                ordered.swap(pos, pos - 1);
-                db.set_plugin_order(&ordered);
+                db.set_plugin_order(&updated);
                 db.save(&game_c);
                 let _ = db.write_plugins_txt(&game_c);
-                refresh_load_order_content(&container_c, &game_c);
             }
+            refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
         });
     }
 
-    // Down button
     {
         let game_c = Rc::clone(game);
-        let container_c = container.clone();
+        let list_c = list_box.clone();
+        let status_c = status_page.clone();
+        let stack_c = stack.clone();
+        let hint_c = reorder_hint.clone();
         let plugin_name = plugin.name.clone();
+        let search_q = search_query.to_string();
         down_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
-            let mut ordered = db.get_ordered_plugins(&game_c);
-            let len = ordered.len();
-            if let Some(pos) = ordered
-                .iter()
-                .position(|p| p.name == plugin_name && !p.is_vanilla)
-                && pos + 1 < len
-                && !ordered[pos + 1].is_vanilla
+            let ordered = db.get_ordered_plugins(&game_c);
+            if let Ok(updated) =
+                ordering::move_down_by_id(&ordered, &plugin_name, pinned_prefix_len, |p| &p.name)
             {
-                ordered.swap(pos, pos + 1);
-                db.set_plugin_order(&ordered);
+                db.set_plugin_order(&updated);
                 db.save(&game_c);
                 let _ = db.write_plugins_txt(&game_c);
-                refresh_load_order_content(&container_c, &game_c);
             }
+            refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
         });
     }
 
-    // ── Drag-and-drop ─────────────────────────────────────────────────────────
-
-    // DragSource: let the user drag this row to a new position
-    let drag_source = gtk4::DragSource::new();
-    drag_source.set_actions(gdk::DragAction::MOVE);
-    {
-        let plugin_name_drag = plugin.name.clone();
-        drag_source.connect_prepare(move |_, _, _| {
-            let value = plugin_name_drag.to_value();
-            Some(gdk::ContentProvider::for_value(&value))
-        });
-    }
-    {
-        let row_c = row.clone();
-        drag_source.connect_drag_begin(move |src, _| {
-            let paintable = gtk4::WidgetPaintable::new(Some(&row_c));
-            src.set_icon(Some(&paintable), 0, 0);
-        });
-    }
-    row.add_controller(drag_source);
-
-    // DropTarget: accept a dragged plugin name and move it here
-    let drop_target = gtk4::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
-    {
-        let game_drop = Rc::clone(game);
-        let container_drop = container.clone();
-        let target_name = plugin.name.clone();
-        drop_target.connect_drop(move |_, value, _, _| {
-            let Ok(source_name) = value.get::<String>() else {
-                return false;
-            };
-            if source_name == target_name {
-                return false;
-            }
-            let mut db = ModDatabase::load(&game_drop);
-            let mut ordered = db.get_ordered_plugins(&game_drop);
-            if let (Some(src_pos), Some(tgt_pos)) = (
-                ordered.iter().position(|p| p.name == source_name),
-                ordered.iter().position(|p| p.name == target_name),
-            ) && !ordered[src_pos].is_vanilla
-                && !ordered[tgt_pos].is_vanilla
-            {
-                let plugin_to_move = ordered.remove(src_pos);
-                // After removal the indices above src_pos shift down by one
-                let insert_pos = adjusted_insert_pos(src_pos, tgt_pos, &ordered);
-                ordered.insert(insert_pos, plugin_to_move);
-                db.set_plugin_order(&ordered);
-                db.save(&game_drop);
-                let _ = db.write_plugins_txt(&game_drop);
-                refresh_load_order_content(&container_drop, &game_drop);
-            }
-            true
-        });
-    }
-    row.add_controller(drop_target);
-
-    // ── Right-click context menu ──────────────────────────────────────────────
     let right_click = gtk4::GestureClick::new();
-    right_click.set_button(3); // right mouse button
+    right_click.set_button(3);
     {
         let row_c = row.clone();
         let game_rclick = Rc::clone(game);
-        let container_rclick = container.clone();
+        let list_rclick = list_box.clone();
+        let status_rclick = status_page.clone();
+        let stack_rclick = stack.clone();
+        let hint_rclick = reorder_hint.clone();
         let plugin_name_rclick = plugin.name.clone();
-        let current_idx = idx;
-        let vanilla_count_rclick = vanilla_count;
-        let total_rclick = total;
-
+        let search_q = search_query.to_string();
         right_click.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
 
             let popover = gtk4::Popover::new();
             popover.set_parent(&row_c);
-            let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
             popover.set_pointing_to(Some(&rect));
             popover.set_has_arrow(false);
 
@@ -431,10 +398,16 @@ fn build_plugin_row(
             menu_box.set_margin_start(4);
             menu_box.set_margin_end(4);
 
-            let move_item = gtk4::Button::with_label("Move to Position\u{2026}");
+            let move_item = gtk4::Button::with_label("Move to Position…");
             move_item.add_css_class("flat");
             move_item.set_halign(gtk4::Align::Fill);
             move_item.set_hexpand(true);
+            move_item.set_sensitive(allow_reorder);
+            move_item.set_tooltip_text(Some(if allow_reorder {
+                "Move to a specific load-order position"
+            } else {
+                "Clear search to reorder"
+            }));
             menu_box.append(&move_item);
 
             let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
@@ -457,9 +430,12 @@ fn build_plugin_row(
             let popover_c = popover.clone();
             let row_btn = row_c.clone();
             let game_btn = Rc::clone(&game_rclick);
-            let container_btn = container_rclick.clone();
+            let list_btn = list_rclick.clone();
+            let status_btn = status_rclick.clone();
+            let stack_btn = stack_rclick.clone();
+            let hint_btn = hint_rclick.clone();
             let plugin_name_btn = plugin_name_rclick.clone();
-
+            let search_btn = search_q.clone();
             move_item.connect_clicked(move |_| {
                 popover_c.popdown();
                 if let Some(root) = row_btn.root()
@@ -468,30 +444,47 @@ fn build_plugin_row(
                     show_move_to_position_dialog(
                         &window,
                         plugin_name_btn.clone(),
-                        current_idx,
-                        vanilla_count_rclick,
-                        total_rclick,
+                        pinned_prefix_len,
                         Rc::clone(&game_btn),
-                        container_btn.clone(),
+                        list_btn.clone(),
+                        status_btn.clone(),
+                        stack_btn.clone(),
+                        hint_btn.clone(),
+                        search_btn.clone(),
                     );
                 }
             });
 
             let popover_enable = popover.clone();
             let game_enable = Rc::clone(&game_rclick);
-            let container_enable = container_rclick.clone();
+            let list_enable = list_rclick.clone();
+            let status_enable = status_rclick.clone();
+            let stack_enable = stack_rclick.clone();
+            let hint_enable = hint_rclick.clone();
+            let search_enable = search_q.clone();
             enable_all_item.connect_clicked(move |_| {
                 popover_enable.popdown();
                 let mut db = ModDatabase::load(&game_enable);
                 db.plugin_disabled.clear();
                 db.save(&game_enable);
                 let _ = db.write_plugins_txt(&game_enable);
-                refresh_load_order_content(&container_enable, &game_enable);
+                refresh_load_order_content(
+                    &list_enable,
+                    &status_enable,
+                    &stack_enable,
+                    &hint_enable,
+                    &game_enable,
+                    &search_enable,
+                );
             });
 
             let popover_disable = popover.clone();
             let game_disable = Rc::clone(&game_rclick);
-            let container_disable = container_rclick.clone();
+            let list_disable = list_rclick.clone();
+            let status_disable = status_rclick.clone();
+            let stack_disable = stack_rclick.clone();
+            let hint_disable = hint_rclick.clone();
+            let search_disable = search_q.clone();
             disable_all_item.connect_clicked(move |_| {
                 popover_disable.popdown();
                 let mut db = ModDatabase::load(&game_disable);
@@ -503,7 +496,14 @@ fn build_plugin_row(
                 }
                 db.save(&game_disable);
                 let _ = db.write_plugins_txt(&game_disable);
-                refresh_load_order_content(&container_disable, &game_disable);
+                refresh_load_order_content(
+                    &list_disable,
+                    &status_disable,
+                    &stack_disable,
+                    &hint_disable,
+                    &game_disable,
+                    &search_disable,
+                );
             });
 
             popover.popup();
@@ -514,58 +514,32 @@ fn build_plugin_row(
     row
 }
 
-// ── Move-to-Position dialog ───────────────────────────────────────────────────
-
-/// Compute the insertion index after removing an element from `ordered`.
-///
-/// When `src_pos` is removed, all indices above it shift down by one.  The
-/// returned `insert_pos` maps the original `target_idx` to its correct
-/// post-removal slot, clamped so it never falls inside the vanilla region.
-fn adjusted_insert_pos(src_pos: usize, target_idx: usize, ordered: &[PluginFile]) -> usize {
-    let raw = if src_pos < target_idx {
-        target_idx - 1
-    } else {
-        target_idx
-    };
-    let first_non_vanilla = ordered
-        .iter()
-        .position(|p| !p.is_vanilla)
-        .unwrap_or(ordered.len());
-    raw.max(first_non_vanilla).min(ordered.len())
-}
-
-fn matches_query(value: &str, query: &str) -> bool {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    value.to_lowercase().contains(&trimmed.to_lowercase())
-}
-
-/// Show a modal dialog that lets the user type a load-order position number for
-/// `plugin_name`.  Vanilla masters (positions 1–`vanilla_count`) are protected;
-/// the valid input range is `vanilla_count + 1` to `total`.
+#[allow(clippy::too_many_arguments)]
 fn show_move_to_position_dialog(
     parent: &gtk4::Window,
     plugin_name: String,
-    current_idx: usize,
-    vanilla_count: usize,
-    total: usize,
+    pinned_prefix_len: usize,
     game: Rc<Game>,
-    container: gtk4::Box,
+    list_box: gtk4::ListBox,
+    status_page: adw::StatusPage,
+    stack: gtk4::Stack,
+    reorder_hint: gtk4::Label,
+    search_query: String,
 ) {
-    let min_pos = vanilla_count + 1;
+    let db = ModDatabase::load(&game);
+    let ordered = db.get_ordered_plugins(&game);
+    let total = ordered.len();
+    let Some(current_idx) = ordered.iter().position(|p| p.name == plugin_name) else {
+        return;
+    };
 
-    let body = if vanilla_count > 0 {
+    let min_pos = pinned_prefix_len + 1;
+    let body = if pinned_prefix_len > 0 {
         format!(
-            "Enter the new load order position for \"{plugin_name}\".\n\
-             Valid range: {min_pos}–{total} (positions 1–{vanilla_count} are vanilla masters).",
+            "Enter the new load order position for \"{plugin_name}\".\nValid range: {min_pos}–{total} (positions 1–{pinned_prefix_len} are vanilla masters).",
         )
     } else {
-        format!(
-            "Enter the new load order position for \"{plugin_name}\".\n\
-             Valid range: 1–{total}.",
-        )
+        format!("Enter the new load order position for \"{plugin_name}\".\nValid range: 1–{total}.")
     };
 
     let dialog = adw::AlertDialog::builder()
@@ -588,53 +562,46 @@ fn show_move_to_position_dialog(
         if response != "move" {
             return;
         }
-        let target_pos_1indexed = spin.value() as usize;
-        // Convert to 0-indexed
-        let target_idx = target_pos_1indexed.saturating_sub(1);
 
+        let target_idx = (spin.value() as usize).saturating_sub(1);
         let mut db = ModDatabase::load(&game);
-        let mut ordered = db.get_ordered_plugins(&game);
-
-        if let Some(src_pos) = ordered.iter().position(|p| p.name == plugin_name)
-            && !ordered[src_pos].is_vanilla
-            && target_idx < ordered.len()
-        {
-            let p = ordered.remove(src_pos);
-            let insert_pos = adjusted_insert_pos(src_pos, target_idx, &ordered);
-            ordered.insert(insert_pos, p);
-            db.set_plugin_order(&ordered);
+        let ordered = db.get_ordered_plugins(&game);
+        if let Ok(updated) = ordering::move_to_absolute_position_by_id(
+            &ordered,
+            &plugin_name,
+            target_idx,
+            pinned_prefix_len,
+            |p| &p.name,
+        ) {
+            db.set_plugin_order(&updated);
             db.save(&game);
             let _ = db.write_plugins_txt(&game);
-            refresh_load_order_content(&container, &game);
         }
+
+        refresh_load_order_content(
+            &list_box,
+            &status_page,
+            &stack,
+            &reorder_hint,
+            &game,
+            &search_query,
+        );
     });
 
     dialog.present(Some(parent));
 }
 
+fn matches_query(value: &str, query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    value.to_lowercase().contains(&trimmed.to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_insert_pos, matches_query};
-    use crate::core::mods::{PluginFile, PluginKind};
-
-    #[test]
-    fn adjusted_insert_pos_never_enters_vanilla_region() {
-        let ordered = vec![
-            PluginFile {
-                name: "Skyrim.esm".to_string(),
-                kind: PluginKind::Master,
-                enabled: true,
-                is_vanilla: true,
-            },
-            PluginFile {
-                name: "A.esp".to_string(),
-                kind: PluginKind::Plugin,
-                enabled: true,
-                is_vanilla: false,
-            },
-        ];
-        assert_eq!(adjusted_insert_pos(1, 0, &ordered), 1);
-    }
+    use super::matches_query;
 
     #[test]
     fn matches_query_is_case_insensitive() {
