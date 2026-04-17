@@ -433,6 +433,39 @@ pub fn format_workspace_compact_summary(state: &WorkspaceState) -> String {
     }
 }
 
+pub fn format_redeploy_guidance(
+    state: &WorkspaceState,
+    preview: Option<&crate::core::deployment::DeploymentPreview>,
+) -> String {
+    if state.current_operation == WorkspaceOperation::Deploy {
+        return "Deploy in progress".to_string();
+    }
+    if state.deployment_state == DeploymentState::Failed {
+        return "Deploy failed; review errors before retry".to_string();
+    }
+    if let Some(preview) = preview
+        && !preview.blocked_paths.is_empty()
+    {
+        return format!(
+            "Redeploy blocked by {} path issue(s)",
+            preview.blocked_paths.len()
+        );
+    }
+    if state.runtime_review_required {
+        return format!(
+            "Review runtime changes first (adoptable: {}, unknown: {})",
+            state.runtime_adoptable_pending, state.runtime_unknown_pending
+        );
+    }
+    if state.safe_redeploy_required {
+        return "Redeploy ready after review".to_string();
+    }
+    if state.safe_redeploy_recommended {
+        return "Redeploy recommended after review".to_string();
+    }
+    "No redeploy needed".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +744,33 @@ mod tests {
         assert!(banner.contains("Redeploy needed"));
         assert!(banner.contains("Generated outputs changed"));
         assert!(compact.contains("Redeploy needed"));
+    }
+
+    #[test]
+    fn redeploy_guidance_prioritizes_blocked_and_runtime_review() {
+        let state = WorkspaceState {
+            game_id: "g".to_string(),
+            profile_id: "p".to_string(),
+            deployment_state: DeploymentState::Dirty,
+            pending_changes: PendingChanges::default(),
+            current_operation: WorkspaceOperation::None,
+            status_message: None,
+            status_severity: StatusSeverity::Info,
+            safe_redeploy_required: true,
+            safe_redeploy_recommended: true,
+            runtime_review_required: true,
+            runtime_adoptable_pending: 2,
+            runtime_unknown_pending: 1,
+        };
+        let blocked_preview = crate::core::deployment::DeploymentPreview {
+            blocked_paths: vec!["Data/textures".into()],
+            ..crate::core::deployment::DeploymentPreview::default()
+        };
+        let blocked = format_redeploy_guidance(&state, Some(&blocked_preview));
+        assert!(blocked.contains("blocked"));
+
+        let review = format_redeploy_guidance(&state, None);
+        assert!(review.contains("Review runtime changes first"));
     }
 
     #[test]

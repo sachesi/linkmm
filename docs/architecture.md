@@ -259,6 +259,49 @@ Restore semantics are unchanged:
   original file from backup storage
 - cross-filesystem move fallback (copy + remove) remains in place
 
+## 14. Deployment preview planning and review contract
+
+`core::deployment::deployment_preview` now computes a real dry-run plan for the
+active game/profile without mutating filesystem state.
+
+Planning uses the same authoritative deployment intent as real deploy:
+
+- desired file ownership map from enabled mods + enabled generated outputs for
+  the active profile (`assets` deployer plan)
+- persisted per-profile deployment state (`deployment_state.toml`)
+- current destination filesystem state
+
+The planner emits `DeploymentPreview` with truthful consequences:
+
+- links to create / replace / remove
+- real files that will be backed up before link placement
+- preserved originals that will be restored this deploy
+- preserved backups that remain after deploy
+- generated outputs participating in this deploy intent
+- blocked paths that would prevent safe apply
+
+Blocked path semantics:
+
+- destination exists as an unsupported object (for example directory/device)
+- restore destination cannot be safely replaced
+- parent path conflicts (parent exists and is not a directory)
+- path inspection failures relevant to deploy safety
+
+Preview/apply drift prevention:
+
+- both preview and apply use the shared assets execution planner
+- apply refuses to start when planner reports blocked paths
+- apply executes the same planned remove/apply/restore phases represented by
+  preview output, so the UI review step reflects real deploy behavior
+
+UI integration:
+
+- Tools → Outputs & Runtime Changes shows redeploy guidance derived from
+  workspace truth plus preview blocked-path status
+- a redeploy preview row shows compact `summary_line()`
+- grouped rows summarize create/replace/remove/backup/restore/blocked sets and
+  generated outputs participation with concise examples
+
 Backup hygiene:
 
 - restored payload files are removed from backup storage

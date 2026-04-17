@@ -107,6 +107,45 @@ struct DesiredDeployment {
     owner_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct AssetsDesiredPlan {
+    desired: HashMap<PathBuf, DesiredDeployment>,
+    generated_outputs_participating: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkPlanAction {
+    None,
+    Create,
+    Replace,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedApplyLink {
+    dest_rel: PathBuf,
+    entry: DesiredDeployment,
+    action: LinkPlanAction,
+    needs_backup: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedRestoreBackup {
+    dest_rel: PathBuf,
+    backup_key: String,
+    backup_path: PathBuf,
+    will_restore: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AssetsExecutionPlan {
+    removals: Vec<(String, PathBuf)>,
+    applies: Vec<PlannedApplyLink>,
+    restores: Vec<PlannedRestoreBackup>,
+    blocked_paths: Vec<String>,
+    backups_remaining_after: Vec<PathBuf>,
+    generated_outputs_participating: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DeploymentPreview {
     pub links_to_create: Vec<PathBuf>,
@@ -476,8 +515,16 @@ impl Deployer for PluginsDeployer {
     }
 }
 
-fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, DesiredDeployment> {
+pub fn deployment_preview(game: &Game, db: &ModDatabase) -> Result<DeploymentPreview, String> {
+    let desired = build_assets_plan(db, ASSETS_DEPLOYER_ID);
+    let state = DeploymentState::load(game, &db.active_profile_id);
+    let exec = build_assets_execution_plan(game, &db.active_profile_id, &state, &desired)?;
+    Ok(preview_from_plan(exec))
+}
+
+fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> AssetsDesiredPlan {
     let mut desired = HashMap::new();
+    let mut generated_outputs_participating = Vec::new();
     for mod_entry in db
         .mods
         .iter()
@@ -498,6 +545,7 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, De
             && o.deployer.as_str() == deployer_id
             && o.manager_profile_id == db.active_profile_id
     }) {
+        generated_outputs_participating.push(output.id.clone());
         for (dest, src) in collect_generated_output_destinations(output) {
             desired.insert(
                 dest,
@@ -508,109 +556,245 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, De
             );
         }
     }
-    desired
+    generated_outputs_participating.sort();
+    generated_outputs_participating.dedup();
+    AssetsDesiredPlan {
+        desired,
+        generated_outputs_participating,
+    }
 }
 
 fn apply_assets_plan(
     game: &Game,
     profile_id: &str,
-    desired: HashMap<PathBuf, DesiredDeployment>,
+    desired: AssetsDesiredPlan,
 ) -> Result<(), String> {
     let mut state = DeploymentState::load(game, profile_id);
-    let desired_set: HashSet<PathBuf> = desired.keys().cloned().collect();
-
-    for (dest_rel, src_rel) in state.deployed.clone() {
-        let dest = game.root_path.join(&dest_rel);
-        let src = PathBuf::from(&src_rel);
-        if !desired_set.contains(&PathBuf::from(&dest_rel))
-            || desired
-                .get(&PathBuf::from(&dest_rel))
-                .is_none_or(|s| s.source != src)
-        {
-            let removed = remove_link_if_matches(&src, &dest).unwrap_or(false);
-            if !removed && (dest.exists() || dest.is_symlink()) {
-                let _ = fs::remove_file(&dest);
-            }
-            state.deployed.remove(&dest_rel);
-            state.owners.remove(&dest_rel);
-        }
+    let plan = build_assets_execution_plan(game, profile_id, &state, &desired)?;
+    if !plan.blocked_paths.is_empty() {
+        return Err(format!(
+            "Deployment blocked by unsupported destination state(s): {}",
+            plan.blocked_paths.join(" | ")
+        ));
     }
 
-    for (dest_rel, entry) in &desired {
+    for (dest_rel, src_rel) in &plan.removals {
         let dest = game.root_path.join(dest_rel);
-        ensure_path_ready_for_link(game, profile_id, &mut state, &dest)?;
-        if remove_link_if_matches(&entry.source, &dest).is_err()
+        let removed = remove_link_if_matches(src_rel, &dest).unwrap_or(false);
+        if !removed && (dest.exists() || dest.is_symlink()) {
+            let _ = fs::remove_file(&dest);
+        }
+        state.deployed.remove(dest_rel);
+        state.owners.remove(dest_rel);
+    }
+
+    for step in &plan.applies {
+        if step.action == LinkPlanAction::None {
+            continue;
+        }
+        let dest = game.root_path.join(&step.dest_rel);
+        if step.needs_backup {
+            backup_real_file_for_destination(game, profile_id, &mut state, &dest)?;
+        } else if remove_link_if_matches(&step.entry.source, &dest).is_err()
             && (dest.exists() || dest.is_symlink())
         {
             let _ = fs::remove_file(&dest);
         }
-        let _ = create_link(&entry.source, &dest)?;
+        let _ = create_link(&step.entry.source, &dest)?;
         state.deployed.insert(
-            dest_rel.to_string_lossy().into_owned(),
-            entry.source.to_string_lossy().into_owned(),
+            step.dest_rel.to_string_lossy().into_owned(),
+            step.entry.source.to_string_lossy().into_owned(),
         );
         state.owners.insert(
-            dest_rel.to_string_lossy().into_owned(),
-            entry.owner_id.clone(),
+            step.dest_rel.to_string_lossy().into_owned(),
+            step.entry.owner_id.clone(),
         );
     }
 
-    restore_backups_not_in_desired(game, profile_id, &mut state, &desired_set)?;
+    restore_backups_from_plan(game, profile_id, &mut state, &plan.restores)?;
     state.save(game, profile_id)?;
     let _ = cleanup_stale_backup_payloads(game, profile_id);
     Ok(())
 }
 
-fn restore_backups_not_in_desired(
+fn build_assets_execution_plan(
     game: &Game,
     profile_id: &str,
-    state: &mut DeploymentState,
-    desired: &HashSet<PathBuf>,
-) -> Result<(), String> {
-    let backup_keys: Vec<String> = state.backups.keys().cloned().collect();
-    for dest_rel in backup_keys {
-        if desired.contains(&PathBuf::from(&dest_rel)) {
-            continue;
-        }
-        let dest = game.root_path.join(&dest_rel);
-        if dest.exists() || dest.is_symlink() {
-            let _ = fs::remove_file(&dest);
-        }
-        if let Some(backup_rel) = state.backups.remove(&dest_rel) {
-            let backup_path = resolve_backup_payload_path(game, profile_id, &backup_rel);
-            if backup_path.exists() {
-                move_file_with_cross_fs_fallback(
-                    &backup_path,
-                    &dest,
-                    &format!("restore backup for {}", dest.display()),
-                )?;
-                let stop = backup_payload_root(game, profile_id);
-                cleanup_empty_parents(&backup_path, &stop);
-            }
+    state: &DeploymentState,
+    desired: &AssetsDesiredPlan,
+) -> Result<AssetsExecutionPlan, String> {
+    let mut removals = Vec::new();
+    let desired_set: HashSet<PathBuf> = desired.desired.keys().cloned().collect();
+    for (dest_rel, src_rel) in &state.deployed {
+        if !desired_set.contains(&PathBuf::from(dest_rel))
+            || desired
+                .desired
+                .get(&PathBuf::from(dest_rel))
+                .is_none_or(|s| s.source != PathBuf::from(src_rel))
+        {
+            removals.push((dest_rel.clone(), PathBuf::from(src_rel)));
         }
     }
-    Ok(())
+
+    let removal_set: HashSet<PathBuf> = removals
+        .iter()
+        .map(|(dest_rel, _)| PathBuf::from(dest_rel))
+        .collect();
+    let mut applies = Vec::new();
+    let mut blocked_paths = Vec::new();
+    let mut new_backups = HashSet::new();
+
+    for (dest_rel, entry) in &desired.desired {
+        let dest = game.root_path.join(dest_rel);
+        let rel_key = dest_rel.to_string_lossy().into_owned();
+        if let Some(blocked) = detect_blocked_parent(&dest, &game.root_path) {
+            blocked_paths.push(blocked);
+            applies.push(PlannedApplyLink {
+                dest_rel: dest_rel.clone(),
+                entry: entry.clone(),
+                action: LinkPlanAction::None,
+                needs_backup: false,
+            });
+            continue;
+        }
+        let mut action = LinkPlanAction::None;
+        let mut needs_backup = false;
+
+        if removal_set.contains(dest_rel) {
+            action = LinkPlanAction::Replace;
+        } else {
+            match fs::symlink_metadata(&dest) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    if fs::read_link(&dest).ok().as_ref() != Some(&entry.source) {
+                        action = LinkPlanAction::Replace;
+                    }
+                }
+                Ok(meta) if meta.is_file() => {
+                    action = LinkPlanAction::Replace;
+                    if !state.backups.contains_key(&rel_key) {
+                        needs_backup = true;
+                        new_backups.insert(dest_rel.clone());
+                    }
+                }
+                Ok(_) => {
+                    blocked_paths.push(format!(
+                        "{} (exists as unsupported filesystem object)",
+                        dest.display()
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    action = if removal_set.contains(dest_rel) {
+                        LinkPlanAction::Replace
+                    } else {
+                        LinkPlanAction::Create
+                    };
+                }
+                Err(err) => {
+                    blocked_paths.push(format!("{} (failed to inspect: {err})", dest.display()));
+                }
+            }
+        }
+
+        applies.push(PlannedApplyLink {
+            dest_rel: dest_rel.clone(),
+            entry: entry.clone(),
+            action,
+            needs_backup,
+        });
+    }
+
+    let mut restores = Vec::new();
+    let mut backups_remaining: HashSet<PathBuf> = state
+        .backups
+        .keys()
+        .map(PathBuf::from)
+        .collect::<HashSet<_>>();
+    for (dest_rel, backup_rel) in &state.backups {
+        let rel_path = PathBuf::from(dest_rel);
+        if desired_set.contains(&rel_path) {
+            continue;
+        }
+        backups_remaining.remove(&rel_path);
+        let dest = game.root_path.join(dest_rel);
+        match fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {}
+            Ok(_) => blocked_paths.push(format!(
+                "{} (cannot restore backup over unsupported object)",
+                dest.display()
+            )),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => blocked_paths.push(format!(
+                "{} (failed to inspect restore destination: {err})",
+                dest.display()
+            )),
+        }
+        let backup_path = resolve_backup_payload_path(game, profile_id, backup_rel);
+        restores.push(PlannedRestoreBackup {
+            dest_rel: rel_path,
+            backup_key: dest_rel.clone(),
+            will_restore: backup_path.exists(),
+            backup_path,
+        });
+    }
+
+    backups_remaining.extend(new_backups);
+    let mut backups_remaining_after = backups_remaining.into_iter().collect::<Vec<_>>();
+    backups_remaining_after.sort();
+    blocked_paths.sort();
+    blocked_paths.dedup();
+
+    Ok(AssetsExecutionPlan {
+        removals,
+        applies,
+        restores,
+        blocked_paths,
+        backups_remaining_after,
+        generated_outputs_participating: desired.generated_outputs_participating.clone(),
+    })
 }
 
-fn ensure_path_ready_for_link(
+fn preview_from_plan(plan: AssetsExecutionPlan) -> DeploymentPreview {
+    let mut preview = DeploymentPreview::default();
+    preview.links_to_remove = plan
+        .removals
+        .iter()
+        .map(|(dest_rel, _)| PathBuf::from(dest_rel))
+        .collect();
+    for apply in &plan.applies {
+        match apply.action {
+            LinkPlanAction::Create => preview.links_to_create.push(apply.dest_rel.clone()),
+            LinkPlanAction::Replace => preview.links_to_replace.push(apply.dest_rel.clone()),
+            LinkPlanAction::None => {}
+        }
+        if apply.needs_backup {
+            preview.real_files_to_backup.push(apply.dest_rel.clone());
+        }
+    }
+    preview.backups_to_restore = plan
+        .restores
+        .iter()
+        .filter(|r| r.will_restore)
+        .map(|r| r.dest_rel.clone())
+        .collect();
+    preview.backups_remaining = plan.backups_remaining_after;
+    preview.generated_outputs_participating = plan.generated_outputs_participating;
+    preview.blocked_paths = plan.blocked_paths;
+    preview.links_to_create.sort();
+    preview.links_to_replace.sort();
+    preview.links_to_remove.sort();
+    preview.real_files_to_backup.sort();
+    preview.backups_to_restore.sort();
+    preview.generated_outputs_participating.sort();
+    preview.generated_outputs_participating.dedup();
+    preview
+}
+
+fn backup_real_file_for_destination(
     game: &Game,
     profile_id: &str,
     state: &mut DeploymentState,
     dest: &Path,
 ) -> Result<(), String> {
-    if dest.is_symlink() {
-        return Ok(());
-    }
-    if !dest.exists() {
-        return Ok(());
-    }
-    if !dest.is_file() {
-        return Err(format!(
-            "Destination exists and is not a file: {}",
-            dest.display()
-        ));
-    }
-
     let rel = dest
         .strip_prefix(&game.root_path)
         .map_err(|_| format!("Destination not inside game root: {}", dest.display()))?
@@ -621,7 +805,7 @@ fn ensure_path_ready_for_link(
             .map_err(|e| format!("Failed to remove existing file {}: {e}", dest.display()))?;
         return Ok(());
     }
-    let backup_path = backup_payload_root(game, &profile_id).join(&rel);
+    let backup_path = backup_payload_root(game, profile_id).join(&rel);
     if let Some(parent) = backup_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create backup directory: {e}"))?;
@@ -635,6 +819,61 @@ fn ensure_path_ready_for_link(
         .backups
         .insert(rel_s, backup_record_value(&backup_path));
     Ok(())
+}
+
+fn restore_backups_from_plan(
+    game: &Game,
+    profile_id: &str,
+    state: &mut DeploymentState,
+    restores: &[PlannedRestoreBackup],
+) -> Result<(), String> {
+    for restore in restores {
+        let dest = game.root_path.join(&restore.dest_rel);
+        if dest.exists() || dest.is_symlink() {
+            let _ = fs::remove_file(&dest);
+        }
+        state.backups.remove(&restore.backup_key);
+        if restore.will_restore {
+            move_file_with_cross_fs_fallback(
+                &restore.backup_path,
+                &dest,
+                &format!("restore backup for {}", dest.display()),
+            )?;
+            let stop = backup_payload_root(game, profile_id);
+            cleanup_empty_parents(&restore.backup_path, &stop);
+        }
+    }
+    Ok(())
+}
+
+fn detect_blocked_parent(dest: &Path, root: &Path) -> Option<String> {
+    let mut current = dest.parent();
+    while let Some(parent) = current {
+        if !parent.starts_with(root) {
+            break;
+        }
+        match fs::symlink_metadata(parent) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Some(format!(
+                    "{} (parent path exists and is not a directory)",
+                    parent.display()
+                ));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Some(format!(
+                    "{} (failed to inspect parent path: {err})",
+                    parent.display()
+                ));
+            }
+        }
+        if parent == root {
+            break;
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 fn move_file_with_cross_fs_fallback(src: &Path, dest: &Path, action: &str) -> Result<(), String> {
@@ -1489,6 +1728,13 @@ mod tests {
         package.enabled = true;
         db.generated_outputs.push(package);
 
+        let preview_with_generated = deployment_preview(&game, &db).unwrap();
+        assert!(
+            !preview_with_generated
+                .generated_outputs_participating
+                .is_empty()
+        );
+
         rebuild_deployment(&game, &mut db).unwrap();
         let winner = fs::read(game.data_path.join("textures/shared.dds")).unwrap();
         assert_eq!(winner, b"generated");
@@ -1497,6 +1743,183 @@ mod tests {
         rebuild_deployment(&game, &mut db).unwrap();
         let winner_after = fs::read(game.data_path.join("textures/shared.dds")).unwrap();
         assert_eq!(winner_after, b"mod");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_preview_reports_create_replace_remove_and_generated_outputs() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(
+            &game,
+            &mut db,
+            "base",
+            "Data/textures/shared.dds",
+            b"mod",
+            true,
+        );
+
+        let generated_dir = game
+            .mods_dir()
+            .join("generated_outputs")
+            .join("preview_generated");
+        fs::create_dir_all(generated_dir.join("textures")).unwrap();
+        fs::write(generated_dir.join("textures/generated.dds"), b"generated").unwrap();
+        let mut package = crate::core::mods::GeneratedOutputPackage::new(
+            "Generated",
+            "tool",
+            "default",
+            db.active_profile_id.clone(),
+            generated_dir,
+        );
+        package.enabled = true;
+        db.generated_outputs.push(package);
+
+        rebuild_deployment(&game, &mut db).unwrap();
+
+        db.mods[0].enabled = false;
+        db.generated_outputs[0].enabled = false;
+        add_mod(&game, &mut db, "new", "Data/textures/new.dds", b"new", true);
+
+        let preview = deployment_preview(&game, &db).unwrap();
+        assert!(
+            preview
+                .links_to_remove
+                .contains(&PathBuf::from("Data/textures/shared.dds"))
+        );
+        assert!(
+            preview
+                .links_to_remove
+                .contains(&PathBuf::from("Data/textures/generated.dds"))
+        );
+        assert!(
+            preview
+                .links_to_create
+                .contains(&PathBuf::from("Data/textures/new.dds"))
+        );
+        assert!(preview.generated_outputs_participating.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_preview_reports_backup_restore_and_remaining() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        let live_file = game.data_path.join("textures/live_backup.dds");
+        let restore_file = game.data_path.join("textures/restore_me.dds");
+        fs::create_dir_all(live_file.parent().unwrap()).unwrap();
+        fs::write(&live_file, b"original-live").unwrap();
+        fs::write(&restore_file, b"original-restore").unwrap();
+        add_mod(
+            &game,
+            &mut db,
+            "override_live",
+            "Data/textures/live_backup.dds",
+            b"modded-live",
+            true,
+        );
+        add_mod(
+            &game,
+            &mut db,
+            "override_restore",
+            "Data/textures/restore_me.dds",
+            b"modded-restore",
+            true,
+        );
+        rebuild_deployment(&game, &mut db).unwrap();
+
+        db.mods[1].enabled = false;
+        let new_target = game.data_path.join("textures/new_backup.dds");
+        fs::write(&new_target, b"new-original").unwrap();
+        add_mod(
+            &game,
+            &mut db,
+            "override_new",
+            "Data/textures/new_backup.dds",
+            b"modded-new",
+            true,
+        );
+
+        let preview = deployment_preview(&game, &db).unwrap();
+        assert!(
+            preview
+                .real_files_to_backup
+                .contains(&PathBuf::from("Data/textures/new_backup.dds"))
+        );
+        assert!(
+            preview
+                .backups_to_restore
+                .contains(&PathBuf::from("Data/textures/restore_me.dds"))
+        );
+        assert!(
+            preview
+                .backups_remaining
+                .contains(&PathBuf::from("Data/textures/live_backup.dds"))
+        );
+        assert!(
+            preview
+                .backups_remaining
+                .contains(&PathBuf::from("Data/textures/new_backup.dds"))
+        );
+        assert!(
+            !preview
+                .backups_remaining
+                .contains(&PathBuf::from("Data/textures/restore_me.dds"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_preview_detects_blocked_paths() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        let blocked_dir = game.data_path.join("textures/blocked.dds");
+        fs::create_dir_all(&blocked_dir).unwrap();
+        add_mod(
+            &game,
+            &mut db,
+            "blocked_mod",
+            "Data/textures/blocked.dds",
+            b"modded",
+            true,
+        );
+        let preview = deployment_preview(&game, &db).unwrap();
+        assert!(!preview.blocked_paths.is_empty());
+        assert!(
+            preview
+                .blocked_paths
+                .iter()
+                .any(|b| b.contains("unsupported filesystem object"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_preview_aligns_with_applied_link_changes() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp);
+        let mut db = ModDatabase::default();
+        add_mod(&game, &mut db, "a", "Data/textures/shared.dds", b"a", true);
+        rebuild_deployment(&game, &mut db).unwrap();
+        add_mod(&game, &mut db, "b", "Data/textures/shared.dds", b"b", true);
+        let preview = deployment_preview(&game, &db).unwrap();
+        assert_eq!(
+            preview.links_to_replace,
+            vec![PathBuf::from("Data/textures/shared.dds")]
+        );
+
+        rebuild_deployment(&game, &mut db).unwrap();
+        let after = deployment_preview(&game, &db).unwrap();
+        assert!(
+            !after
+                .links_to_replace
+                .contains(&PathBuf::from("Data/textures/shared.dds"))
+        );
+        assert!(after.links_to_create.is_empty());
+        assert!(after.links_to_remove.is_empty());
     }
 
     #[cfg(unix)]

@@ -13,6 +13,38 @@ use crate::core::mods::{ModDatabase, ModManager};
 use crate::core::runtime::{SessionStatus, global_runtime_manager};
 use crate::core::workspace::{self, ProfileSwitchPolicy};
 
+fn preview_examples<T: ToString>(items: &[T]) -> String {
+    if items.is_empty() {
+        return "None".to_string();
+    }
+    const PREVIEW_LIMIT: usize = 5;
+    let mut listed = items
+        .iter()
+        .take(PREVIEW_LIMIT)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if items.len() > PREVIEW_LIMIT {
+        listed.push(format!("…and {} more", items.len() - PREVIEW_LIMIT));
+    }
+    listed.join(" · ")
+}
+
+fn append_preview_group_row(list: &gtk4::ListBox, title: &str, paths: &[PathBuf]) {
+    let values = paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    append_preview_string_group_row(list, title, &values);
+}
+
+fn append_preview_string_group_row(list: &gtk4::ListBox, title: &str, values: &[String]) {
+    let row = adw::ActionRow::builder()
+        .title(format!("{title} ({})", values.len()))
+        .subtitle(preview_examples(values))
+        .build();
+    list.append(&row);
+}
+
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
 pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
@@ -348,10 +380,23 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                     &scan_report,
                 );
                 let workspace_state = workspace::workspace_state_for_game(&game_for_generated);
+                let preview =
+                    match crate::core::deployment::deployment_preview(&game_for_generated, &db) {
+                        Ok(preview) => Some(preview),
+                        Err(e) => {
+                            let row = adw::ActionRow::builder()
+                                .title("Redeploy Preview")
+                                .subtitle(format!("Preview failed: {e}"))
+                                .build();
+                            generated_list_c.append(&row);
+                            None
+                        }
+                    };
                 let redeploy_row = adw::ActionRow::builder()
                     .title("Redeploy Guidance")
-                    .subtitle(workspace::format_workspace_compact_summary(
+                    .subtitle(workspace::format_redeploy_guidance(
                         &workspace_state,
+                        preview.as_ref(),
                     ))
                     .build();
                 let redeploy_btn =
@@ -360,7 +405,11 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                     } else {
                         "No redeploy needed"
                     });
-                redeploy_btn.set_sensitive(workspace_state.safe_redeploy_required);
+                let preview_blocked = preview
+                    .as_ref()
+                    .is_some_and(|p| !p.blocked_paths.is_empty());
+                redeploy_btn
+                    .set_sensitive(workspace_state.safe_redeploy_required && !preview_blocked);
                 {
                     let game_for_redeploy = game_for_generated.clone();
                     let rebuild_redeploy = rebuild_w_for_generated.clone();
@@ -375,6 +424,70 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                 }
                 redeploy_row.add_suffix(&redeploy_btn);
                 generated_list_c.append(&redeploy_row);
+
+                if let Some(preview) = preview {
+                    let preview_row = adw::ActionRow::builder()
+                        .title("Redeploy Preview")
+                        .subtitle(preview.summary_line())
+                        .build();
+                    generated_list_c.append(&preview_row);
+
+                    let pending_runtime_note = if workspace_state.runtime_review_required {
+                        format!(
+                            "Pending runtime review: {} unresolved item(s)",
+                            workspace_state.runtime_adoptable_pending
+                                + workspace_state.runtime_unknown_pending
+                        )
+                    } else {
+                        "Pending runtime review: none".to_string()
+                    };
+                    let pending_row = adw::ActionRow::builder()
+                        .title("Review State")
+                        .subtitle(&pending_runtime_note)
+                        .build();
+                    generated_list_c.append(&pending_row);
+
+                    append_preview_group_row(
+                        &generated_list_c,
+                        "Create links",
+                        &preview.links_to_create,
+                    );
+                    append_preview_group_row(
+                        &generated_list_c,
+                        "Replace links",
+                        &preview.links_to_replace,
+                    );
+                    append_preview_group_row(
+                        &generated_list_c,
+                        "Remove links",
+                        &preview.links_to_remove,
+                    );
+                    append_preview_group_row(
+                        &generated_list_c,
+                        "Backup real files",
+                        &preview.real_files_to_backup,
+                    );
+                    append_preview_group_row(
+                        &generated_list_c,
+                        "Restore preserved files",
+                        &preview.backups_to_restore,
+                    );
+                    append_preview_group_row(
+                        &generated_list_c,
+                        "Preserved backups remaining",
+                        &preview.backups_remaining,
+                    );
+                    append_preview_string_group_row(
+                        &generated_list_c,
+                        "Generated outputs participating",
+                        &preview.generated_outputs_participating,
+                    );
+                    append_preview_string_group_row(
+                        &generated_list_c,
+                        "Blocked paths",
+                        &preview.blocked_paths,
+                    );
+                }
 
                 if let Ok(backup_status) = crate::core::deployment::deployment_backup_status(
                     &game_for_generated,
