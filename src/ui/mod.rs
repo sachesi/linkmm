@@ -19,6 +19,7 @@ pub mod library;
 pub mod load_order;
 pub mod logs;
 pub mod mod_list;
+pub mod ordering;
 pub mod settings;
 pub mod setup_wizard;
 pub mod tools;

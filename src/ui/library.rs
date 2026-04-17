@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::mpsc;
 
 use gio;
-use gtk4::gdk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -12,6 +12,7 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
+use crate::ui::ordering;
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
 const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
@@ -81,6 +82,15 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     let list_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     list_container.set_vexpand(true);
+    let reorder_hint = gtk4::Label::new(Some("Clear search to reorder."));
+    reorder_hint.add_css_class("dim-label");
+    reorder_hint.set_margin_top(8);
+    reorder_hint.set_margin_bottom(4);
+    reorder_hint.set_margin_start(16);
+    reorder_hint.set_margin_end(16);
+    reorder_hint.set_halign(gtk4::Align::Start);
+    reorder_hint.set_visible(false);
+    content_container.append(&reorder_hint);
     content_container.append(&list_container);
 
     let game_rc = Rc::new(game.clone());
@@ -94,6 +104,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         &search_query.borrow(),
         Rc::clone(&search_query),
         Rc::clone(&selected_mod_id),
+        &reorder_hint,
         true,
     );
 
@@ -105,6 +116,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_query);
         let selected_c = Rc::clone(&selected_mod_id);
+        let reorder_hint_c = reorder_hint.clone();
         search_entry.connect_search_changed(move |entry| {
             *search_c.borrow_mut() = entry.text().to_string();
             refresh_library_content_with_search(
@@ -114,6 +126,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 &search_c.borrow(),
                 Rc::clone(&search_c),
                 Rc::clone(&selected_c),
+                &reorder_hint_c,
                 false,
             );
         });
@@ -131,6 +144,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         let status_label_c = status_label.clone();
         let status_progress_c = status_progress.clone();
         let status_revealer_c = status_revealer.clone();
+        let reorder_hint_c = reorder_hint.clone();
         deploy_btn.connect_clicked(move |btn| {
             set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, true);
             status_revealer_c.set_reveal_child(true);
@@ -151,6 +165,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             let status_label_c = status_label_c.clone();
             let status_progress_c = status_progress_c.clone();
             let status_revealer_c = status_revealer_c.clone();
+            let reorder_hint_idle = reorder_hint_c.clone();
             let btn = btn.clone();
             gtk4::glib::idle_add_local_once(move || {
                 let db = ModDatabase::load(&game_c);
@@ -178,6 +193,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                     &search_c.borrow(),
                     Rc::clone(&search_c),
                     Rc::clone(&selected_c),
+                    &reorder_hint_idle,
                     true,
                 );
             });
@@ -196,6 +212,7 @@ fn refresh_library_content_with_search(
     search_query: &str,
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
+    reorder_hint: &gtk4::Label,
     do_scan: bool,
 ) {
     let previous_scroll = container
@@ -222,11 +239,15 @@ fn refresh_library_content_with_search(
         *selected_mod_id.borrow_mut() = None;
     }
 
+    let reorder_allowed = search_query.trim().is_empty();
+    reorder_hint.set_visible(!reorder_allowed);
+
     let visible_mods: Vec<_> = db
         .mods
         .iter()
-        .filter(|m| matches_query(&m.name, search_query))
-        .cloned()
+        .enumerate()
+        .filter(|(_, m)| matches_query(&m.name, search_query))
+        .map(|(idx, m)| (idx, m.clone()))
         .collect();
 
     if visible_mods.is_empty() {
@@ -254,16 +275,18 @@ fn refresh_library_content_with_search(
         list_box.add_css_class("boxed-list");
         list_box.set_selection_mode(gtk4::SelectionMode::None);
 
-        for (idx, mod_entry) in visible_mods.iter().enumerate() {
+        for (full_idx, mod_entry) in &visible_mods {
             let row = build_mod_row(
                 mod_entry,
-                idx,
-                visible_mods.len(),
+                *full_idx,
+                db.mods.len(),
+                reorder_allowed,
                 game,
                 container,
                 Rc::clone(&config),
                 Rc::clone(&search_state),
                 Rc::clone(&selected_mod_id),
+                reorder_hint,
                 conflict_states.get(&mod_entry.id),
             );
             list_box.append(&row);
@@ -324,16 +347,38 @@ fn hide_status_popup_later(status_revealer: gtk4::Revealer) {
     );
 }
 
+fn apply_library_reorder_deploy_async(game: &Rc<Game>) {
+    let game_bg = game.as_ref().clone();
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(ModManager::rebuild_all(&game_bg));
+    });
+
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        match rx.try_recv() {
+            Ok(Ok(())) => gtk4::glib::ControlFlow::Break,
+            Ok(Err(e)) => {
+                log::error!("Failed to rebuild deployment after reorder: {e}");
+                gtk4::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => gtk4::glib::ControlFlow::Break,
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_mod_row(
     mod_entry: &Mod,
-    idx: usize,
+    full_idx: usize,
     total: usize,
+    allow_reorder: bool,
     game: &Rc<Game>,
     container: &gtk4::Box,
     config: Rc<RefCell<AppConfig>>,
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
+    reorder_hint: &gtk4::Label,
     conflict_state: Option<&ConflictState>,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
@@ -352,13 +397,7 @@ fn build_mod_row(
         row.set_subtitle(&subtitle);
     }
 
-    // Drag handle + index prefix
-    let drag_handle = gtk4::Image::from_icon_name("list-drag-handle-symbolic");
-    drag_handle.add_css_class("dim-label");
-    drag_handle.set_tooltip_text(Some("Drag to reorder"));
-    row.add_prefix(&drag_handle);
-
-    let index_label = gtk4::Label::new(Some(&format!("{}", idx + 1)));
+    let index_label = gtk4::Label::new(Some(&format!("{}", full_idx + 1)));
     index_label.add_css_class("dim-label");
     index_label.add_css_class("numeric");
     index_label.set_width_chars(3);
@@ -390,15 +429,23 @@ fn build_mod_row(
     up_btn.set_icon_name("go-up-symbolic");
     up_btn.set_valign(gtk4::Align::Center);
     up_btn.add_css_class("flat");
-    up_btn.set_tooltip_text(Some("Move up"));
-    up_btn.set_sensitive(idx > 0);
+    up_btn.set_tooltip_text(Some(if allow_reorder {
+        "Move up"
+    } else {
+        "Clear search to reorder"
+    }));
+    up_btn.set_sensitive(allow_reorder && full_idx > 0);
 
     let down_btn = gtk4::Button::new();
     down_btn.set_icon_name("go-down-symbolic");
     down_btn.set_valign(gtk4::Align::Center);
     down_btn.add_css_class("flat");
-    down_btn.set_tooltip_text(Some("Move down"));
-    down_btn.set_sensitive(idx + 1 < total);
+    down_btn.set_tooltip_text(Some(if allow_reorder {
+        "Move down"
+    } else {
+        "Clear search to reorder"
+    }));
+    down_btn.set_sensitive(allow_reorder && full_idx + 1 < total);
 
     row.add_suffix(&up_btn);
     row.add_suffix(&down_btn);
@@ -409,17 +456,13 @@ fn build_mod_row(
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_state);
         let selected_c = Rc::clone(&selected_mod_id);
+        let hint_c = reorder_hint.clone();
         let mod_id_c = mod_entry.id.clone();
         up_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
-            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
-                && pos > 0
-            {
-                db.mods.swap(pos, pos - 1);
+            if let Ok(updated) = ordering::move_up_by_id(&db.mods, &mod_id_c, 0, |m| &m.id) {
+                db.mods = updated;
                 db.save(&game_c);
-                if let Err(e) = ModManager::rebuild_all(&game_c) {
-                    log::error!("Failed to rebuild deployment after reorder: {e}");
-                }
                 refresh_library_content_with_search(
                     &container_c,
                     &game_c,
@@ -427,8 +470,10 @@ fn build_mod_row(
                     &search_c.borrow(),
                     Rc::clone(&search_c),
                     Rc::clone(&selected_c),
+                    &hint_c,
                     false,
                 );
+                apply_library_reorder_deploy_async(&game_c);
             }
         });
     }
@@ -439,18 +484,13 @@ fn build_mod_row(
         let config_c = Rc::clone(&config);
         let search_c = Rc::clone(&search_state);
         let selected_c = Rc::clone(&selected_mod_id);
+        let hint_c = reorder_hint.clone();
         let mod_id_c = mod_entry.id.clone();
         down_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
-            let len = db.mods.len();
-            if let Some(pos) = db.mods.iter().position(|m| m.id == mod_id_c)
-                && pos + 1 < len
-            {
-                db.mods.swap(pos, pos + 1);
+            if let Ok(updated) = ordering::move_down_by_id(&db.mods, &mod_id_c, 0, |m| &m.id) {
+                db.mods = updated;
                 db.save(&game_c);
-                if let Err(e) = ModManager::rebuild_all(&game_c) {
-                    log::error!("Failed to rebuild deployment after reorder: {e}");
-                }
                 refresh_library_content_with_search(
                     &container_c,
                     &game_c,
@@ -458,72 +498,13 @@ fn build_mod_row(
                     &search_c.borrow(),
                     Rc::clone(&search_c),
                     Rc::clone(&selected_c),
+                    &hint_c,
                     false,
                 );
+                apply_library_reorder_deploy_async(&game_c);
             }
         });
     }
-
-    // Drag-and-drop reorder
-    let drag_source = gtk4::DragSource::new();
-    drag_source.set_actions(gdk::DragAction::MOVE);
-    {
-        let mod_id_drag = mod_entry.id.clone();
-        drag_source.connect_prepare(move |_, _, _| {
-            let value = mod_id_drag.to_value();
-            Some(gdk::ContentProvider::for_value(&value))
-        });
-    }
-    {
-        let row_c = row.clone();
-        drag_source.connect_drag_begin(move |src, _| {
-            let paintable = gtk4::WidgetPaintable::new(Some(&row_c));
-            src.set_icon(Some(&paintable), 0, 0);
-        });
-    }
-    row.add_controller(drag_source);
-
-    let drop_target = gtk4::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
-    {
-        let game_drop = Rc::clone(game);
-        let container_drop = container.clone();
-        let config_drop = Rc::clone(&config);
-        let search_drop = Rc::clone(&search_state);
-        let selected_drop = Rc::clone(&selected_mod_id);
-        let target_id = mod_entry.id.clone();
-        drop_target.connect_drop(move |_, value, _, _| {
-            let Ok(source_id) = value.get::<String>() else {
-                return false;
-            };
-            if source_id == target_id {
-                return false;
-            }
-            let mut db = ModDatabase::load(&game_drop);
-            if let (Some(src_pos), Some(tgt_pos)) = (
-                db.mods.iter().position(|m| m.id == source_id),
-                db.mods.iter().position(|m| m.id == target_id),
-            ) {
-                let moved = db.mods.remove(src_pos);
-                let insert_pos = adjusted_insert_pos(src_pos, tgt_pos);
-                db.mods.insert(insert_pos, moved);
-                db.save(&game_drop);
-                if let Err(e) = ModManager::rebuild_all(&game_drop) {
-                    log::error!("Failed to rebuild deployment after drag reorder: {e}");
-                }
-                refresh_library_content_with_search(
-                    &container_drop,
-                    &game_drop,
-                    Rc::clone(&config_drop),
-                    &search_drop.borrow(),
-                    Rc::clone(&search_drop),
-                    Rc::clone(&selected_drop),
-                    false,
-                );
-            }
-            true
-        });
-    }
-    row.add_controller(drop_target);
 
     // ── Uninstall button ─────────────────────────────────────────────────────
     let delete_btn = gtk4::Button::new();
@@ -540,6 +521,7 @@ fn build_mod_row(
     let config_del = Rc::clone(&config);
     let search_del = Rc::clone(&search_state);
     let selected_del = Rc::clone(&selected_mod_id);
+    let hint_del = reorder_hint.clone();
 
     delete_btn.connect_clicked(move |btn| {
         let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
@@ -564,6 +546,7 @@ fn build_mod_row(
         let config_c = Rc::clone(&config_del);
         let search_c = Rc::clone(&search_del);
         let selected_c = Rc::clone(&selected_del);
+        let hint_dialog = hint_del.clone();
         dialog.connect_response(None, move |_, response| {
             if response != "remove" {
                 return;
@@ -608,6 +591,7 @@ fn build_mod_row(
                 &search_c.borrow(),
                 Rc::clone(&search_c),
                 Rc::clone(&selected_c),
+                &hint_dialog,
                 false,
             );
         });
@@ -624,6 +608,7 @@ fn build_mod_row(
         let config_sel = Rc::clone(&config);
         let search_sel = Rc::clone(&search_state);
         let selected_sel = Rc::clone(&selected_mod_id);
+        let hint_sel = reorder_hint.clone();
         let mod_id_sel = mod_entry.id.clone();
         // Use `released` (not `pressed`) so built-in SwitchRow controls process
         // the click first; refreshing immediately on press can swallow toggle
@@ -646,6 +631,7 @@ fn build_mod_row(
             let config_idle = Rc::clone(&config_sel);
             let search_idle = Rc::clone(&search_sel);
             let selected_idle = Rc::clone(&selected_sel);
+            let hint_idle = hint_sel.clone();
             gtk4::glib::idle_add_local_once(move || {
                 refresh_library_content_with_search(
                     &container_idle,
@@ -654,6 +640,7 @@ fn build_mod_row(
                     &search_idle.borrow(),
                     Rc::clone(&search_idle),
                     Rc::clone(&selected_idle),
+                    &hint_idle,
                     false,
                 );
             });
@@ -674,6 +661,7 @@ fn build_mod_row(
         let search_rclick = Rc::clone(&search_state);
         let selected_rclick = Rc::clone(&selected_mod_id);
         let mod_id_rclick = mod_entry.id.clone();
+        let reorder_hint_rclick = reorder_hint.clone();
         let conflict_entries = conflict_state
             .map(|state| {
                 state
@@ -689,7 +677,7 @@ fn build_mod_row(
 
             let popover = gtk4::Popover::new();
             popover.set_parent(&row_c);
-            let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
             popover.set_pointing_to(Some(&rect));
             popover.set_has_arrow(false);
 
@@ -726,6 +714,12 @@ fn build_mod_row(
             move_item.add_css_class("flat");
             move_item.set_halign(gtk4::Align::Fill);
             move_item.set_hexpand(true);
+            move_item.set_sensitive(allow_reorder);
+            move_item.set_tooltip_text(Some(if allow_reorder {
+                "Move to a specific precedence position"
+            } else {
+                "Clear search to reorder"
+            }));
             menu_box.append(&move_item);
 
             let enable_all_item = gtk4::Button::with_label("Enable All");
@@ -805,6 +799,7 @@ fn build_mod_row(
             let config_move = Rc::clone(&config_rclick);
             let search_move = Rc::clone(&search_rclick);
             let selected_move = Rc::clone(&selected_rclick);
+            let hint_move = reorder_hint_rclick.clone();
             let mod_id_move = mod_id_rclick.clone();
             move_item.connect_clicked(move |_| {
                 popover_move.popdown();
@@ -819,6 +814,7 @@ fn build_mod_row(
                         Rc::clone(&config_move),
                         Rc::clone(&search_move),
                         Rc::clone(&selected_move),
+                        hint_move.clone(),
                     );
                 }
             });
@@ -829,6 +825,7 @@ fn build_mod_row(
             let config_enable = Rc::clone(&config_rclick);
             let search_enable = Rc::clone(&search_rclick);
             let selected_enable = Rc::clone(&selected_rclick);
+            let hint_enable = reorder_hint_rclick.clone();
             enable_all_item.connect_clicked(move |_| {
                 popover_enable.popdown();
                 let mut db = ModDatabase::load(&game_enable);
@@ -846,6 +843,7 @@ fn build_mod_row(
                     &search_enable.borrow(),
                     Rc::clone(&search_enable),
                     Rc::clone(&selected_enable),
+                    &hint_enable,
                     false,
                 );
             });
@@ -856,6 +854,7 @@ fn build_mod_row(
             let config_disable = Rc::clone(&config_rclick);
             let search_disable = Rc::clone(&search_rclick);
             let selected_disable = Rc::clone(&selected_rclick);
+            let hint_disable = reorder_hint_rclick.clone();
             disable_all_item.connect_clicked(move |_| {
                 popover_disable.popdown();
                 let mut db = ModDatabase::load(&game_disable);
@@ -873,6 +872,7 @@ fn build_mod_row(
                     &search_disable.borrow(),
                     Rc::clone(&search_disable),
                     Rc::clone(&selected_disable),
+                    &hint_disable,
                     false,
                 );
             });
@@ -885,19 +885,6 @@ fn build_mod_row(
     row
 }
 
-/// Compute target insertion index after removing an item from `src_pos`.
-///
-/// If `src_pos < target_idx`, removing the source shifts subsequent indices
-/// down by one, so the insertion position must be decremented to preserve the
-/// intended visual drop target.
-fn adjusted_insert_pos(src_pos: usize, target_idx: usize) -> usize {
-    if src_pos < target_idx {
-        target_idx.saturating_sub(1)
-    } else {
-        target_idx
-    }
-}
-
 /// Show a modal dialog that lets the user type a position number for a mod.
 /// The valid range is 1 to the total number of installed mods.
 fn show_move_to_position_dialog_for_mod(
@@ -908,6 +895,7 @@ fn show_move_to_position_dialog_for_mod(
     config: Rc<RefCell<AppConfig>>,
     search_state: Rc<RefCell<String>>,
     selected_mod_id: Rc<RefCell<Option<String>>>,
+    reorder_hint: gtk4::Label,
 ) {
     let db = ModDatabase::load(&game);
     let total = db.mods.len();
@@ -945,16 +933,11 @@ fn show_move_to_position_dialog_for_mod(
         let target_idx = target_pos_1indexed.saturating_sub(1);
 
         let mut db = ModDatabase::load(&game);
-        if let Some(src_pos) = db.mods.iter().position(|m| m.id == mod_id)
-            && target_idx < db.mods.len()
+        if let Ok(updated) =
+            ordering::move_to_absolute_position_by_id(&db.mods, &mod_id, target_idx, 0, |m| &m.id)
         {
-            let m = db.mods.remove(src_pos);
-            let insert_pos = adjusted_insert_pos(src_pos, target_idx);
-            db.mods.insert(insert_pos, m);
+            db.mods = updated;
             db.save(&game);
-            if let Err(e) = ModManager::rebuild_all(&game) {
-                log::error!("Failed to rebuild deployment after move: {e}");
-            }
             refresh_library_content_with_search(
                 &container,
                 &game,
@@ -962,8 +945,10 @@ fn show_move_to_position_dialog_for_mod(
                 &search_state.borrow(),
                 Rc::clone(&search_state),
                 Rc::clone(&selected_mod_id),
+                &reorder_hint,
                 false,
             );
+            apply_library_reorder_deploy_async(&game);
         }
     });
 
@@ -1202,7 +1187,7 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_insert_pos, compute_conflict_states, matches_query};
+    use super::{compute_conflict_states, matches_query};
     use crate::core::mods::Mod;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1226,12 +1211,6 @@ mod tests {
         assert!(matches_query("Immersive Armors", "arm"));
         assert!(matches_query("Immersive Armors", "  ARMORS  "));
         assert!(!matches_query("Immersive Armors", "weapons"));
-    }
-
-    #[test]
-    fn adjusted_insert_pos_accounts_for_source_removal() {
-        assert_eq!(adjusted_insert_pos(0, 2), 1);
-        assert_eq!(adjusted_insert_pos(3, 1), 1);
     }
 
     #[test]
