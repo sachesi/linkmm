@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use std::rc::Rc;
+use std::sync::mpsc;
 
 use gio;
 use glib;
