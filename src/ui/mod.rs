@@ -23,6 +23,7 @@ pub mod ordering;
 pub mod settings;
 pub mod setup_wizard;
 pub mod tools;
+pub mod workspace_events;
 pub mod workspace_page;
 
 pub fn build_ui(app: &libadwaita::Application) {
@@ -58,8 +59,8 @@ pub fn build_ui(app: &libadwaita::Application) {
 
 const NAV_LIBRARY: i32 = 0;
 const NAV_LOAD_ORDER: i32 = 1;
-const NAV_DOWNLOADS: i32 = 2;
-const NAV_WORKSPACE: i32 = 3;
+const NAV_WORKSPACE: i32 = 2;
+const NAV_DOWNLOADS: i32 = 3;
 const NAV_TOOLS: i32 = 4;
 const NAV_PREFERENCES: i32 = 5;
 
@@ -196,8 +197,8 @@ fn build_main_window(
     for (name, icon) in &[
         ("Library", "applications-games-symbolic"),
         ("Load Order", "format-justify-left-symbolic"),
-        ("Downloads", "folder-download-symbolic"),
         ("Workspace", "view-list-bullet-symbolic"),
+        ("Downloads", "folder-download-symbolic"),
         ("Tools", "applications-utilities-symbolic"),
         ("Preferences", "preferences-system-symbolic"),
     ] {

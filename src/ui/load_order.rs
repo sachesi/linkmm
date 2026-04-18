@@ -10,45 +10,13 @@ use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, ModManager, PluginFile};
 use crate::core::workspace;
 use crate::ui::ordering;
+use crate::ui::workspace_events;
 
 #[derive(Debug, Clone)]
 struct LoadOrderStageSummary {
     summary: String,
     redeploy_available: bool,
     discard_available: bool,
-}
-
-fn is_event_for_game(event: &workspace::WorkspaceEvent, game_id: &str) -> bool {
-    match event {
-        workspace::WorkspaceEvent::ProfileStateChanged { game_id: id, .. }
-        | workspace::WorkspaceEvent::WorkspaceStateChanged { game_id: id, .. }
-        | workspace::WorkspaceEvent::DeployStarted { game_id: id, .. }
-        | workspace::WorkspaceEvent::DeployFinished { game_id: id, .. }
-        | workspace::WorkspaceEvent::DeployFailed { game_id: id, .. }
-        | workspace::WorkspaceEvent::ProfileSwitched { game_id: id, .. }
-        | workspace::WorkspaceEvent::RevertCompleted { game_id: id, .. } => id == game_id,
-    }
-}
-
-fn attach_load_order_workspace_listener<F>(mut on_event: F)
-where
-    F: FnMut(workspace::WorkspaceEvent) + 'static,
-{
-    let rx = workspace::subscribe_events();
-    let (tx_ui, rx_ui) = std::sync::mpsc::channel::<workspace::WorkspaceEvent>();
-    std::thread::spawn(move || {
-        while let Ok(event) = rx.recv() {
-            if tx_ui.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    gtk4::glib::idle_add_local(move || {
-        while let Ok(event) = rx_ui.try_recv() {
-            on_event(event);
-        }
-        gtk4::glib::ControlFlow::Continue
-    });
 }
 
 fn load_order_stage_summary(game: &Game) -> LoadOrderStageSummary {
@@ -234,8 +202,8 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                     staged_discard_btn_c.set_sensitive(stage.discard_available);
                 };
                 refresh_stage();
-                attach_load_order_workspace_listener(move |event| {
-                    if is_event_for_game(&event, &game_stage_events.id) {
+                workspace_events::attach_workspace_event_listener(move |event| {
+                    if workspace_events::is_event_for_game(&event, &game_stage_events.id) {
                         refresh_stage();
                     }
                 });
@@ -284,8 +252,8 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 let stack_c = stack.clone();
                 let search_c = Rc::clone(&search_query);
                 let hint_c = reorder_hint.clone();
-                attach_load_order_workspace_listener(move |event| {
-                    if is_event_for_game(&event, &game_c.id) {
+                workspace_events::attach_workspace_event_listener(move |event| {
+                    if workspace_events::is_event_for_game(&event, &game_c.id) {
                         refresh_load_order_content(
                             &list_c,
                             &status_c,
@@ -769,7 +737,7 @@ mod tests {
             game_id: "game_a".to_string(),
             profile_id: "default".to_string(),
         };
-        assert!(is_event_for_game(&ev, "game_a"));
-        assert!(!is_event_for_game(&ev, "game_b"));
+        assert!(workspace_events::is_event_for_game(&ev, "game_a"));
+        assert!(!workspace_events::is_event_for_game(&ev, "game_b"));
     }
 }

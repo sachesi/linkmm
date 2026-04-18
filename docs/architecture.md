@@ -161,6 +161,15 @@ This preserves the cached-page/event-driven model while making the primary
 workflow clearer: edit in Library/Load Order, run tools in Tools, review/apply
 in Workspace.
 
+Cleanup notes for current structure:
+
+- Global review/apply/runtime/integrity surfaces were removed from Tools UI and
+  kept in Workspace to avoid duplicate control centers.
+- Shared workspace-event wiring now lives in `ui/workspace_events.rs` and is
+  reused by Library, Load Order, Tools, and Workspace page listeners.
+- Library/Load Order keep concise staged hints and actions only (`Redeploy now`
+  + `Discard staged`), with a lightweight handoff to Workspace for details.
+
 ## 10. Workspace state and dirty semantics
 
 LinkMM now exposes an app-shared workspace state model per game instance/profile.

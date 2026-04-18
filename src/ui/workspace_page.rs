@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gio;
-use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -15,39 +14,7 @@ use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, ModManager};
 use crate::core::runtime_scan::{self, RuntimeEntryClassification};
 use crate::core::workspace;
-
-fn attach_workspace_event_listener<F>(mut on_event: F)
-where
-    F: FnMut(workspace::WorkspaceEvent) + 'static,
-{
-    let rx = workspace::subscribe_events();
-    let (tx_ui, rx_ui) = std::sync::mpsc::channel::<workspace::WorkspaceEvent>();
-    std::thread::spawn(move || {
-        while let Ok(event) = rx.recv() {
-            if tx_ui.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    glib::idle_add_local(move || {
-        while let Ok(event) = rx_ui.try_recv() {
-            on_event(event);
-        }
-        glib::ControlFlow::Continue
-    });
-}
-
-fn is_event_for_game(event: &workspace::WorkspaceEvent, game_id: &str) -> bool {
-    match event {
-        workspace::WorkspaceEvent::ProfileStateChanged { game_id: id, .. }
-        | workspace::WorkspaceEvent::WorkspaceStateChanged { game_id: id, .. }
-        | workspace::WorkspaceEvent::DeployStarted { game_id: id, .. }
-        | workspace::WorkspaceEvent::DeployFinished { game_id: id, .. }
-        | workspace::WorkspaceEvent::DeployFailed { game_id: id, .. }
-        | workspace::WorkspaceEvent::ProfileSwitched { game_id: id, .. }
-        | workspace::WorkspaceEvent::RevertCompleted { game_id: id, .. } => id == game_id,
-    }
-}
+use crate::ui::workspace_events;
 
 fn preview_examples<T: ToString>(items: &[T]) -> String {
     if items.is_empty() {
@@ -74,6 +41,9 @@ fn append_group_row(list: &gtk4::ListBox, title: &str, values: &[String]) {
 }
 
 fn append_paths_row(list: &gtk4::ListBox, title: &str, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
     let values = paths
         .iter()
         .map(|p| p.to_string_lossy().to_string())
@@ -196,7 +166,9 @@ pub fn build_workspace_page(game: Option<&Game>, _config: Rc<RefCell<AppConfig>>
                         "Restore preserved files",
                         &preview.backups_to_restore,
                     );
-                    append_group_row(&details_list_c, "Blocked paths", &preview.blocked_paths);
+                    if !preview.blocked_paths.is_empty() {
+                        append_group_row(&details_list_c, "Blocked paths", &preview.blocked_paths);
+                    }
                 }
 
                 if let Ok(scan_report) = runtime_scan::scan_profile_runtime_changes(&game_c, &db) {
@@ -252,7 +224,9 @@ pub fn build_workspace_page(game: Option<&Game>, _config: Rc<RefCell<AppConfig>>
                         )
                     })
                     .collect::<Vec<_>>();
-                append_group_row(&details_list_c, "Generated outputs", &output_rows);
+                if !output_rows.is_empty() {
+                    append_group_row(&details_list_c, "Generated outputs", &output_rows);
+                }
 
                 if let Ok(backup_status) =
                     deployment::deployment_backup_status(&game_c, &db.active_profile_id)
@@ -372,8 +346,8 @@ pub fn build_workspace_page(game: Option<&Game>, _config: Rc<RefCell<AppConfig>>
         {
             let game_c = game.clone();
             let rebuild_c = rebuild_weak.clone();
-            attach_workspace_event_listener(move |event| {
-                if is_event_for_game(&event, &game_c.id)
+            workspace_events::attach_workspace_event_listener(move |event| {
+                if workspace_events::is_event_for_game(&event, &game_c.id)
                     && let Some(rb) = rebuild_c.upgrade()
                 {
                     (rb.borrow())();
@@ -414,7 +388,7 @@ mod tests {
             game_id: "other".to_string(),
             profile_id: "p".to_string(),
         };
-        assert!(is_event_for_game(&hit, "g"));
-        assert!(!is_event_for_game(&miss, "g"));
+        assert!(workspace_events::is_event_for_game(&hit, "g"));
+        assert!(!workspace_events::is_event_for_game(&miss, "g"));
     }
 }

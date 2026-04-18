@@ -8,70 +8,17 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile};
-use crate::core::deployment;
 use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::{ModDatabase, ModManager};
 use crate::core::runtime::{SessionStatus, global_runtime_manager};
 use crate::core::workspace::{self, ProfileSwitchPolicy};
-
-fn attach_workspace_event_listener<F>(mut on_event: F)
-where
-    F: FnMut(workspace::WorkspaceEvent) + 'static,
-{
-    let rx = workspace::subscribe_events();
-    let (tx_ui, rx_ui) = std::sync::mpsc::channel::<workspace::WorkspaceEvent>();
-    std::thread::spawn(move || {
-        while let Ok(event) = rx.recv() {
-            if tx_ui.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    glib::idle_add_local(move || {
-        while let Ok(event) = rx_ui.try_recv() {
-            on_event(event);
-        }
-        glib::ControlFlow::Continue
-    });
-}
-
-fn preview_examples<T: ToString>(items: &[T]) -> String {
-    if items.is_empty() {
-        return "None".to_string();
-    }
-    const PREVIEW_LIMIT: usize = 5;
-    let mut listed = items
-        .iter()
-        .take(PREVIEW_LIMIT)
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if items.len() > PREVIEW_LIMIT {
-        listed.push(format!("…and {} more", items.len() - PREVIEW_LIMIT));
-    }
-    listed.join(" · ")
-}
-
-fn append_preview_group_row(list: &gtk4::ListBox, title: &str, paths: &[PathBuf]) {
-    let values = paths
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-    append_preview_string_group_row(list, title, &values);
-}
-
-fn append_preview_string_group_row(list: &gtk4::ListBox, title: &str, values: &[String]) {
-    let row = adw::ActionRow::builder()
-        .title(format!("{title} ({})", values.len()))
-        .subtitle(preview_examples(values))
-        .build();
-    list.append(&row);
-}
+use crate::ui::workspace_events;
 
 /// Build the Tools page for managing external Windows tools (e.g., BodySlide, xEdit).
 pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
-    let title_widget = adw::WindowTitle::new("Tools", "");
+    let title_widget = adw::WindowTitle::new("Tools", "Run and configure external tools");
     header.set_title_widget(Some(&title_widget));
     toolbar_view.add_top_bar(&header);
 
@@ -93,7 +40,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
     if let Some(game) = game.cloned() {
         let profile_group = adw::PreferencesGroup::builder()
             .title("Active Profile")
-            .description("Tool runs and generated output management are scoped to this profile.")
+            .description("Tool runs are scoped to this profile.")
             .build();
         let profile_row = adw::ComboRow::new();
         profile_row.set_title("Profile");
@@ -117,7 +64,6 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         profile_row.set_model(Some(&profile_names));
         profile_group.add(&profile_row);
 
-        // Tools group
         let tools_group = adw::PreferencesGroup::builder()
             .title("External Tools")
             .description(format!(
@@ -137,28 +83,15 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         tools_list.set_selection_mode(gtk4::SelectionMode::None);
         tools_group.add(&tools_list);
 
-        let generated_group = adw::PreferencesGroup::builder()
-            .title("Outputs & Runtime Changes")
-            .description("Moved to Workspace page.")
-            .build();
-        let cleanup_generated_btn = gtk4::Button::new();
-        cleanup_generated_btn.set_icon_name("edit-clear-symbolic");
-        cleanup_generated_btn.add_css_class("flat");
-        cleanup_generated_btn.set_tooltip_text(Some("Cleanup stale generated outputs"));
-        generated_group.set_header_suffix(Some(&cleanup_generated_btn));
-        let generated_list = gtk4::ListBox::new();
-        generated_list.add_css_class("boxed-list");
-        generated_list.set_selection_mode(gtk4::SelectionMode::None);
-        generated_group.add(&generated_list);
-        let last_captured_package_id = Rc::new(RefCell::new(None::<String>));
-
         let workspace_group = adw::PreferencesGroup::builder()
-            .title("Tool Run Status")
-            .description("Use Workspace page for review/apply/recovery flows.")
+            .title("Workflow Handoff")
+            .description("Review/apply/recovery lives on Workspace.")
             .build();
         let workspace_row = adw::ActionRow::builder()
-            .title("Workspace Status")
-            .subtitle("Loading workspace state…")
+            .title("Workspace")
+            .subtitle(
+                "Use Workspace to review staged changes, runtime status, backups, and integrity.",
+            )
             .build();
         workspace_group.add(&workspace_row);
         let last_run_row = adw::ActionRow::builder()
@@ -166,13 +99,8 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             .subtitle("No runs recorded in this session.")
             .build();
         workspace_group.add(&last_run_row);
-        let handoff_row = adw::ActionRow::builder()
-            .title("Review & Apply")
-            .subtitle("Open the Workspace page to review deploy preview, integrity, runtime changes, and backups.")
-            .build();
-        workspace_group.add(&handoff_row);
 
-        // Rebuild function to refresh the tool list
+        let last_captured_package_id = Rc::new(RefCell::new(None::<String>));
         let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
         let rebuild_weak = Rc::downgrade(&rebuild);
 
@@ -181,14 +109,11 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             let config_c = Rc::clone(&config);
             let game_id = game.id.clone();
             let toast_overlay_c = toast_overlay.clone();
-            let generated_list_c = generated_list.clone();
-            let game_for_generated = game.clone();
             let game_for_rebuild = game.clone();
-            let rebuild_w_for_generated = rebuild_weak.clone();
+            let last_run_row_c = last_run_row.clone();
             let last_captured_package_id_c = Rc::clone(&last_captured_package_id);
 
             *rebuild.borrow_mut() = Box::new(move || {
-                // Clear existing rows
                 while let Some(child) = tools_list_c.first_child() {
                     tools_list_c.remove(&child);
                 }
@@ -213,21 +138,19 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         .subtitle(tool.exe_path.to_string_lossy().as_ref())
                         .build();
 
-                    // Launch button
                     let launch_btn = gtk4::Button::new();
                     launch_btn.set_icon_name("media-playback-start-symbolic");
                     launch_btn.add_css_class("flat");
                     launch_btn.set_valign(gtk4::Align::Center);
                     launch_btn.set_tooltip_text(Some("Launch Tool"));
-
                     {
                         let tool_clone = tool.clone();
                         let toast_overlay_c2 = toast_overlay_c.clone();
                         let game_for_launch = game_for_rebuild.clone();
                         let config_for_launch = Rc::clone(&config_c);
-                        let last_run_row_c = last_run_row.clone();
+                        let last_run_row_inner = last_run_row_c.clone();
                         let rebuild_after_run = rebuild_weak.clone();
-                        let last_pkg_id = Rc::clone(&last_captured_package_id);
+                        let last_pkg_id = Rc::clone(&last_captured_package_id_c);
                         launch_btn.connect_clicked(move |btn| {
                             launch_tool(
                                 &game_for_launch,
@@ -235,29 +158,25 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                                 Rc::clone(&config_for_launch),
                                 btn,
                                 &toast_overlay_c2,
-                                Some(&last_run_row_c),
+                                Some(&last_run_row_inner),
                                 rebuild_after_run.clone(),
                                 Rc::clone(&last_pkg_id),
                             );
                         });
                     }
-
                     row.add_suffix(&launch_btn);
 
-                    // Edit button
                     let edit_btn = gtk4::Button::new();
                     edit_btn.set_icon_name("document-edit-symbolic");
                     edit_btn.add_css_class("flat");
                     edit_btn.set_valign(gtk4::Align::Center);
                     edit_btn.set_tooltip_text(Some("Edit Tool"));
-
                     {
                         let tool_id = tool.id.clone();
                         let config_c2 = Rc::clone(&config_c);
                         let game_id_c = game_id.clone();
                         let rebuild_w = rebuild_weak.clone();
                         let toast_overlay_c3 = toast_overlay_c.clone();
-
                         edit_btn.connect_clicked(move |_| {
                             show_tool_dialog(
                                 &config_c2,
@@ -268,714 +187,37 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                             );
                         });
                     }
-
                     row.add_suffix(&edit_btn);
 
-                    // Delete button
                     let delete_btn = gtk4::Button::new();
                     delete_btn.set_icon_name("user-trash-symbolic");
                     delete_btn.add_css_class("flat");
                     delete_btn.add_css_class("destructive-action");
                     delete_btn.set_valign(gtk4::Align::Center);
                     delete_btn.set_tooltip_text(Some("Delete Tool"));
-
                     {
                         let tool_id = tool.id.clone();
                         let config_c3 = Rc::clone(&config_c);
                         let game_id_c2 = game_id.clone();
                         let rebuild_w2 = rebuild_weak.clone();
-
                         delete_btn.connect_clicked(move |_| {
                             let mut cfg = config_c3.borrow_mut();
                             let game_settings = cfg.game_settings_mut(&game_id_c2);
                             game_settings.tools.retain(|t| t.id != tool_id);
                             cfg.save();
                             drop(cfg);
-
                             if let Some(rb) = rebuild_w2.upgrade() {
                                 (rb.borrow())();
                             }
                         });
                     }
-
                     row.add_suffix(&delete_btn);
 
-                    let adopt_btn = gtk4::Button::new();
-                    adopt_btn.set_icon_name("folder-download-symbolic");
-                    adopt_btn.add_css_class("flat");
-                    adopt_btn.set_tooltip_text(Some("Adopt unmanaged generated output"));
-                    {
-                        let tool_for_adopt = tool.clone();
-                        let game_for_adopt = game_for_rebuild.clone();
-                        let rebuild_adopt = rebuild_weak.clone();
-                        adopt_btn.connect_clicked(move |_| {
-                            let profile = tool_for_adopt.primary_profile();
-                            let mut db = ModDatabase::load(&game_for_adopt);
-                            let active_profile = db.active_profile_id.clone();
-                            match crate::core::tool_runs::detect_unmanaged_outputs(
-                                &game_for_adopt,
-                                &db,
-                                &tool_for_adopt,
-                                &profile,
-                            ) {
-                                Ok(files) if files.is_empty() => {
-                                    workspace::mark_unmanaged_runtime_changes(
-                                        &game_for_adopt.id,
-                                        &active_profile,
-                                        false,
-                                    );
-                                    log::info!(
-                                        "No unmanaged output candidates found for {}",
-                                        tool_for_adopt.name
-                                    );
-                                }
-                                Ok(files) => {
-                                    workspace::mark_unmanaged_runtime_changes(
-                                        &game_for_adopt.id,
-                                        &active_profile,
-                                        true,
-                                    );
-                                    if let Err(e) = crate::core::tool_runs::adopt_unmanaged_outputs(
-                                        &game_for_adopt,
-                                        &mut db,
-                                        &tool_for_adopt,
-                                        &profile,
-                                        &files,
-                                    ) {
-                                        log::error!("Failed adopting unmanaged outputs: {e}");
-                                    } else {
-                                        workspace::mark_unmanaged_runtime_changes(
-                                            &game_for_adopt.id,
-                                            &active_profile,
-                                            false,
-                                        );
-                                        workspace::set_status(
-                                            &game_for_adopt.id,
-                                            &active_profile,
-                                            workspace::StatusSeverity::Info,
-                                            format!(
-                                                "Adopted {} runtime/unmanaged file(s); review outputs and redeploy.",
-                                                files.len()
-                                            ),
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    workspace::mark_unmanaged_runtime_changes(
-                                        &game_for_adopt.id,
-                                        &active_profile,
-                                        true,
-                                    );
-                                    log::error!("Unmanaged output detection failed: {e}");
-                                }
-                            }
-                            if let Some(rb) = rebuild_adopt.upgrade() {
-                                (rb.borrow())();
-                            }
-                        });
-                    }
-                    row.add_suffix(&adopt_btn);
-
                     tools_list_c.append(&row);
-                }
-
-                while let Some(child) = generated_list_c.first_child() {
-                    generated_list_c.remove(&child);
-                }
-                let db = ModDatabase::load(&game_for_generated);
-                let scan_report = match crate::core::runtime_scan::scan_profile_runtime_changes(
-                    &game_for_generated,
-                    &db,
-                ) {
-                    Ok(report) => report,
-                    Err(e) => {
-                        let row = adw::ActionRow::builder()
-                            .title("Runtime scan failed")
-                            .subtitle(&e)
-                            .build();
-                        generated_list_c.append(&row);
-                        return;
-                    }
-                };
-                workspace::update_runtime_scan_status(
-                    &game_for_generated.id,
-                    &db.active_profile_id,
-                    &scan_report,
-                );
-                let workspace_state = workspace::workspace_state_for_game(&game_for_generated);
-                let integrity_report = workspace::latest_integrity_report(
-                    &game_for_generated.id,
-                    &db.active_profile_id,
-                );
-                let preview =
-                    match crate::core::deployment::deployment_preview(&game_for_generated, &db) {
-                        Ok(preview) => Some(preview),
-                        Err(e) => {
-                            let row = adw::ActionRow::builder()
-                                .title("Redeploy Preview")
-                                .subtitle(format!("Preview failed: {e}"))
-                                .build();
-                            generated_list_c.append(&row);
-                            None
-                        }
-                    };
-                let integrity_row = adw::ActionRow::builder()
-                    .title("Deployment Integrity")
-                    .subtitle(&workspace_state.integrity_summary)
-                    .build();
-                let verify_integrity_btn =
-                    gtk4::Button::with_label(if integrity_report.is_some() {
-                        "Recheck integrity"
-                    } else {
-                        "Verify deployed state"
-                    });
-                {
-                    let game_for_verify = game_for_generated.clone();
-                    let rebuild_verify = rebuild_w_for_generated.clone();
-                    verify_integrity_btn.connect_clicked(move |_| {
-                        if let Err(e) = workspace::verify_and_store_integrity(&game_for_verify) {
-                            log::error!("Integrity verification failed: {e}");
-                        }
-                        if let Some(rb) = rebuild_verify.upgrade() {
-                            (rb.borrow())();
-                        }
-                    });
-                }
-                integrity_row.add_suffix(&verify_integrity_btn);
-                generated_list_c.append(&integrity_row);
-                if workspace_state.integrity_issue_total > 0 {
-                    let guidance_row = adw::ActionRow::builder()
-                        .title("Integrity Recovery Guidance")
-                        .subtitle(workspace::format_integrity_guidance(&workspace_state))
-                        .build();
-                    generated_list_c.append(&guidance_row);
-                    append_preview_string_group_row(
-                        &generated_list_c,
-                        "Top integrity examples",
-                        &workspace_state.integrity_examples,
-                    );
-                }
-                if let Some(report) = integrity_report
-                    && !report.issues.is_empty()
-                {
-                    use std::collections::BTreeMap;
-                    let mut by_kind = BTreeMap::<String, usize>::new();
-                    for issue in &report.issues {
-                        *by_kind
-                            .entry(deployment::integrity_issue_kind_label(&issue.kind).to_string())
-                            .or_insert(0) += 1;
-                    }
-                    let grouped = by_kind
-                        .into_iter()
-                        .map(|(label, count)| format!("{label}: {count}"))
-                        .collect::<Vec<_>>();
-                    append_preview_string_group_row(
-                        &generated_list_c,
-                        "Integrity issue categories",
-                        &grouped,
-                    );
-                    let recovery_tips = report
-                        .issues
-                        .iter()
-                        .take(5)
-                        .map(|issue| {
-                            format!(
-                                "{}: {}",
-                                deployment::integrity_issue_kind_label(&issue.kind),
-                                deployment::integrity_issue_recovery_guidance(&issue.kind)
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    append_preview_string_group_row(
-                        &generated_list_c,
-                        "Integrity recovery tips",
-                        &recovery_tips,
-                    );
-                }
-                let redeploy_row = adw::ActionRow::builder()
-                    .title("Redeploy Guidance")
-                    .subtitle(workspace::format_redeploy_guidance(
-                        &workspace_state,
-                        preview.as_ref(),
-                    ))
-                    .build();
-                let redeploy_btn =
-                    gtk4::Button::with_label(if workspace_state.safe_redeploy_required {
-                        "Redeploy now"
-                    } else {
-                        "No redeploy needed"
-                    });
-                let preview_blocked = preview
-                    .as_ref()
-                    .is_some_and(|p| !p.blocked_paths.is_empty());
-                redeploy_btn
-                    .set_sensitive(workspace_state.safe_redeploy_required && !preview_blocked);
-                {
-                    let game_for_redeploy = game_for_generated.clone();
-                    let rebuild_redeploy = rebuild_w_for_generated.clone();
-                    redeploy_btn.connect_clicked(move |_| {
-                        if let Err(e) = ModManager::rebuild_all(&game_for_redeploy) {
-                            log::error!("Redeploy failed: {e}");
-                        }
-                        if let Some(rb) = rebuild_redeploy.upgrade() {
-                            (rb.borrow())();
-                        }
-                    });
-                }
-                redeploy_row.add_suffix(&redeploy_btn);
-                let discard_btn = gtk4::Button::with_label("Discard staged changes");
-                let can_discard = workspace_state.safe_redeploy_required
-                    && workspace::has_profile_baseline(
-                        &game_for_generated,
-                        &workspace_state.profile_id,
-                    );
-                discard_btn.set_sensitive(can_discard);
-                {
-                    let game_for_discard = game_for_generated.clone();
-                    let rebuild_discard = rebuild_w_for_generated.clone();
-                    discard_btn.connect_clicked(move |btn| {
-                        let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-                        let dialog = adw::AlertDialog::builder()
-                            .heading("Discard staged changes?")
-                            .body("This restores profile state to the last deployed baseline. Deployed files on disk are not changed until explicit redeploy.")
-                            .build();
-                        dialog.add_response("cancel", "Cancel");
-                        dialog.add_response("discard", "Discard");
-                        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
-                        dialog.set_default_response(Some("cancel"));
-                        dialog.set_close_response("cancel");
-                        let game_for_response = game_for_discard.clone();
-                        let rebuild_response = rebuild_discard.clone();
-                        dialog.connect_response(None, move |_, response| {
-                            if response != "discard" {
-                                return;
-                            }
-                            if let Err(e) = workspace::revert_active_profile_to_baseline(
-                                &game_for_response,
-                            ) {
-                                log::error!("Failed to discard staged changes: {e}");
-                            }
-                            if let Some(rb) = rebuild_response.upgrade() {
-                                (rb.borrow())();
-                            }
-                        });
-                        dialog.present(parent.as_ref());
-                    });
-                }
-                redeploy_row.add_suffix(&discard_btn);
-                generated_list_c.append(&redeploy_row);
-                if workspace_state.safe_redeploy_required && !can_discard {
-                    let row = adw::ActionRow::builder()
-                        .title("Discard unavailable")
-                        .subtitle(
-                            "This profile has no deployed baseline yet; staged changes cannot be reverted.",
-                        )
-                        .build();
-                    generated_list_c.append(&row);
-                }
-
-                if let Some(preview) = preview {
-                    let preview_row = adw::ActionRow::builder()
-                        .title("Redeploy Preview")
-                        .subtitle(preview.summary_line())
-                        .build();
-                    generated_list_c.append(&preview_row);
-
-                    let pending_runtime_note = if workspace_state.runtime_review_required {
-                        format!(
-                            "Pending runtime review: {} unresolved item(s)",
-                            workspace_state.runtime_adoptable_pending
-                                + workspace_state.runtime_unknown_pending
-                        )
-                    } else {
-                        "Pending runtime review: none".to_string()
-                    };
-                    let pending_row = adw::ActionRow::builder()
-                        .title("Review State")
-                        .subtitle(&pending_runtime_note)
-                        .build();
-                    generated_list_c.append(&pending_row);
-
-                    append_preview_group_row(
-                        &generated_list_c,
-                        "Create links",
-                        &preview.links_to_create,
-                    );
-                    append_preview_group_row(
-                        &generated_list_c,
-                        "Replace links",
-                        &preview.links_to_replace,
-                    );
-                    append_preview_group_row(
-                        &generated_list_c,
-                        "Remove links",
-                        &preview.links_to_remove,
-                    );
-                    append_preview_group_row(
-                        &generated_list_c,
-                        "Backup real files",
-                        &preview.real_files_to_backup,
-                    );
-                    append_preview_group_row(
-                        &generated_list_c,
-                        "Restore preserved files",
-                        &preview.backups_to_restore,
-                    );
-                    append_preview_group_row(
-                        &generated_list_c,
-                        "Preserved backups remaining",
-                        &preview.backups_remaining,
-                    );
-                    append_preview_string_group_row(
-                        &generated_list_c,
-                        "Generated outputs participating",
-                        &preview.generated_outputs_participating,
-                    );
-                    append_preview_string_group_row(
-                        &generated_list_c,
-                        "Blocked paths",
-                        &preview.blocked_paths,
-                    );
-                    append_preview_string_group_row(
-                        &generated_list_c,
-                        "Pending mod removals",
-                        &preview.pending_mod_removals,
-                    );
-                    append_preview_string_group_row(
-                        &generated_list_c,
-                        "Pending generated output removals",
-                        &preview.pending_generated_output_removals,
-                    );
-                    append_preview_group_row(
-                        &generated_list_c,
-                        "Payload paths deleted after successful redeploy",
-                        &preview.pending_payload_deletions,
-                    );
-                }
-
-                if let Ok(backup_status) = crate::core::deployment::deployment_backup_status(
-                    &game_for_generated,
-                    &db.active_profile_id,
-                ) {
-                    let subtitle = format!(
-                        "Preserved originals: {} entry/entries ({} payload file(s))",
-                        backup_status.backup_entries, backup_status.existing_payload_files
-                    );
-                    let backup_row = adw::ActionRow::builder()
-                        .title("Deployment Backups")
-                        .subtitle(&subtitle)
-                        .build();
-                    let reveal_backup_btn = gtk4::Button::with_label("Reveal");
-                    {
-                        let backup_root = backup_status.backup_root.clone();
-                        reveal_backup_btn.connect_clicked(move |_| {
-                            let file = gio::File::for_path(&backup_root);
-                            let _ = gio::AppInfo::launch_default_for_uri(
-                                &file.uri(),
-                                None::<&gio::AppLaunchContext>,
-                            );
-                        });
-                    }
-                    backup_row.add_suffix(&reveal_backup_btn);
-                    let cleanup_backup_btn = gtk4::Button::with_label("Cleanup stale");
-                    cleanup_backup_btn.set_sensitive(backup_status.backup_entries > 0);
-                    {
-                        let game_cleanup = game_for_generated.clone();
-                        let profile_cleanup = db.active_profile_id.clone();
-                        let rebuild_cleanup = rebuild_w_for_generated.clone();
-                        cleanup_backup_btn.connect_clicked(move |_| {
-                            if let Err(e) = crate::core::deployment::cleanup_stale_backup_payloads(
-                                &game_cleanup,
-                                &profile_cleanup,
-                            ) {
-                                log::error!("Backup cleanup failed: {e}");
-                            }
-                            if let Some(rb) = rebuild_cleanup.upgrade() {
-                                (rb.borrow())();
-                            }
-                        });
-                    }
-                    backup_row.add_suffix(&cleanup_backup_btn);
-                    generated_list_c.append(&backup_row);
-                }
-
-                let runtime_subtitle = if scan_report.has_unresolved_changes() {
-                    "Runtime scan found unresolved changes. Review/adopt/ignore before redeploying."
-                } else {
-                    "Runtime scan found no unresolved unmanaged changes in the scoped Data locations."
-                };
-                let runtime_row = adw::ActionRow::builder()
-                    .title("Runtime Preserved Changes")
-                    .subtitle(runtime_subtitle)
-                    .build();
-                let rescan_btn = gtk4::Button::with_label("Rescan");
-                {
-                    let rebuild_rescan = rebuild_w_for_generated.clone();
-                    rescan_btn.connect_clicked(move |_| {
-                        if let Some(rb) = rebuild_rescan.upgrade() {
-                            (rb.borrow())();
-                        }
-                    });
-                }
-                runtime_row.add_suffix(&rescan_btn);
-                generated_list_c.append(&runtime_row);
-
-                for entry in &scan_report.entries {
-                    if matches!(
-                        entry.classification,
-                        crate::core::runtime_scan::RuntimeEntryClassification::ManagedOwnedPresent
-                    ) {
-                        continue;
-                    }
-                    let row = adw::ActionRow::builder()
-                        .title(entry.relative_path.to_string_lossy().to_string())
-                        .subtitle(format!(
-                            "{:?} · {:?}{}{} · {}",
-                            entry.classification,
-                            entry.review_status,
-                            entry
-                                .tool_id
-                                .as_ref()
-                                .map(|t| format!(" · Tool: {t}"))
-                                .unwrap_or_default(),
-                            entry
-                                .package_id
-                                .as_ref()
-                                .map(|p| format!(" · Package: {p}"))
-                                .unwrap_or_default(),
-                            entry.explanation
-                        ))
-                        .build();
-                    let rel_path = entry.relative_path.clone();
-
-                    if matches!(
-                        entry.classification,
-                        crate::core::runtime_scan::RuntimeEntryClassification::UnmanagedAdoptable
-                    ) {
-                        let adopt_btn = gtk4::Button::with_label("Adopt");
-                        let game_for_adopt_item = game_for_generated.clone();
-                        let rebuild_adopt_item = rebuild_w_for_generated.clone();
-                        adopt_btn.connect_clicked(move |_| {
-                            let mut db = ModDatabase::load(&game_for_adopt_item);
-                            match crate::core::runtime_scan::adopt_runtime_paths(
-                                &game_for_adopt_item,
-                                &mut db,
-                                std::slice::from_ref(&rel_path),
-                            ) {
-                                Ok(Some(_)) => {
-                                    db.save(&game_for_adopt_item);
-                                }
-                                Ok(None) => {}
-                                Err(e) => log::error!("Runtime adoption failed: {e}"),
-                            }
-                            if let Some(rb) = rebuild_adopt_item.upgrade() {
-                                (rb.borrow())();
-                            }
-                        });
-                        row.add_suffix(&adopt_btn);
-                    }
-
-                    if entry.review_status
-                        == crate::core::runtime_scan::RuntimeEntryReviewStatus::Pending
-                    {
-                        let ignore_btn = gtk4::Button::with_label("Ignore");
-                        let game_for_ignore = game_for_generated.clone();
-                        let rebuild_ignore = rebuild_w_for_generated.clone();
-                        let rel_ignore = entry.relative_path.clone();
-                        ignore_btn.connect_clicked(move |_| {
-                            let mut db = ModDatabase::load(&game_for_ignore);
-                            crate::core::runtime_scan::set_runtime_path_ignored(
-                                &mut db,
-                                &rel_ignore,
-                                true,
-                            );
-                            db.save(&game_for_ignore);
-                            if let Some(rb) = rebuild_ignore.upgrade() {
-                                (rb.borrow())();
-                            }
-                        });
-                        row.add_suffix(&ignore_btn);
-                    }
-
-                    let reveal_btn = gtk4::Button::new();
-                    reveal_btn.set_icon_name("folder-open-symbolic");
-                    reveal_btn.add_css_class("flat");
-                    let file_path = game_for_generated.data_path.join(&entry.relative_path);
-                    reveal_btn.connect_clicked(move |_| {
-                        let file = gio::File::for_path(&file_path);
-                        let _ = gio::AppInfo::launch_default_for_uri(
-                            &file.uri(),
-                            None::<&gio::AppLaunchContext>,
-                        );
-                    });
-                    row.add_suffix(&reveal_btn);
-
-                    if matches!(
-                        entry.classification,
-                        crate::core::runtime_scan::RuntimeEntryClassification::UnmanagedAdoptable
-                            | crate::core::runtime_scan::RuntimeEntryClassification::UnknownNeedsReview
-                    ) {
-                        let remove_btn = gtk4::Button::new();
-                        remove_btn.set_icon_name("user-trash-symbolic");
-                        remove_btn.add_css_class("flat");
-                        remove_btn.add_css_class("destructive-action");
-                        let game_for_remove_runtime = game_for_generated.clone();
-                        let rebuild_remove_runtime = rebuild_w_for_generated.clone();
-                        remove_btn.connect_clicked(move |_| {
-                            workspace::set_status(
-                                &game_for_remove_runtime.id,
-                                &ModDatabase::load(&game_for_remove_runtime).active_profile_id,
-                                workspace::StatusSeverity::Warning,
-                                "Runtime file deletion is blocked until explicit redeploy support is finalized.",
-                            );
-                            if let Some(rb) = rebuild_remove_runtime.upgrade() {
-                                (rb.borrow())();
-                            }
-                        });
-                        row.add_suffix(&remove_btn);
-                    }
-                    generated_list_c.append(&row);
-                }
-
-                let active_profile = db.active_profile_id.clone();
-                let tracked_outputs = db
-                    .generated_outputs
-                    .iter()
-                    .filter(|o| o.manager_profile_id == active_profile)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if tracked_outputs.is_empty() {
-                    let row = adw::ActionRow::builder()
-                        .title("No generated outputs captured")
-                        .subtitle("Run a managed tool profile to capture outputs.")
-                        .build();
-                    row.set_sensitive(false);
-                    generated_list_c.append(&row);
-                    return;
-                }
-
-                let tool_names = {
-                    let cfg = config_c.borrow();
-                    cfg.game_settings
-                        .get(&game_id)
-                        .map(|gs| {
-                            gs.tools
-                                .iter()
-                                .map(|t| (t.id.clone(), t.name.clone()))
-                                .collect::<std::collections::HashMap<_, _>>()
-                        })
-                        .unwrap_or_default()
-                };
-
-                for output in &tracked_outputs {
-                    let tool_name = tool_names
-                        .get(&output.tool_id)
-                        .cloned()
-                        .unwrap_or_else(|| output.tool_id.clone());
-                    let is_new = last_captured_package_id_c
-                        .borrow()
-                        .as_ref()
-                        .map(|id| id == &output.id)
-                        .unwrap_or(false);
-                    let subtitle = format!(
-                        "Tool: {} ({}) · Run profile: {} · Manager profile: {} · Files: {} · Updated: {} · {}{}{}{}",
-                        tool_name,
-                        output.tool_id,
-                        output.run_profile,
-                        output.manager_profile_id,
-                        output.owned_files.len(),
-                        output.updated_at,
-                        if output.enabled {
-                            "Enabled"
-                        } else {
-                            "Disabled"
-                        },
-                        if output.pending_removal {
-                            " · Pending removal after redeploy"
-                        } else {
-                            ""
-                        },
-                        if is_new { " · Newly captured" } else { "" },
-                        if workspace_state.safe_redeploy_recommended {
-                            " · Redeploy recommended"
-                        } else {
-                            ""
-                        }
-                    );
-                    let row = adw::ActionRow::builder()
-                        .title(&output.name)
-                        .subtitle(&subtitle)
-                        .build();
-
-                    let enabled_switch = gtk4::Switch::new();
-                    enabled_switch.set_active(output.enabled);
-                    enabled_switch.set_sensitive(!output.pending_removal);
-                    enabled_switch.set_valign(gtk4::Align::Center);
-                    {
-                        let game_for_toggle = game_for_generated.clone();
-                        let output_id = output.id.clone();
-                        let rebuild_toggle = rebuild_w_for_generated.clone();
-                        enabled_switch.connect_state_set(move |_, state| {
-                            let mut db = ModDatabase::load(&game_for_toggle);
-                            if let Some(pkg) =
-                                db.generated_outputs.iter_mut().find(|p| p.id == output_id)
-                            {
-                                if pkg.pending_removal {
-                                    return glib::Propagation::Stop;
-                                }
-                                pkg.enabled = state;
-                                db.save(&game_for_toggle);
-                            }
-                            if let Some(rb) = rebuild_toggle.upgrade() {
-                                (rb.borrow())();
-                            }
-                            glib::Propagation::Stop
-                        });
-                    }
-                    row.add_suffix(&enabled_switch);
-
-                    let reveal_btn = gtk4::Button::new();
-                    reveal_btn.set_icon_name("folder-open-symbolic");
-                    reveal_btn.add_css_class("flat");
-                    reveal_btn.set_tooltip_text(Some("Reveal output directory"));
-                    {
-                        let path = output.source_path.clone();
-                        reveal_btn.connect_clicked(move |_| {
-                            let file = gio::File::for_path(&path);
-                            let _ = gio::AppInfo::launch_default_for_uri(
-                                &file.uri(),
-                                None::<&gio::AppLaunchContext>,
-                            );
-                        });
-                    }
-                    row.add_suffix(&reveal_btn);
-
-                    let remove_btn = gtk4::Button::new();
-                    remove_btn.set_icon_name("user-trash-symbolic");
-                    remove_btn.add_css_class("flat");
-                    remove_btn.add_css_class("destructive-action");
-                    remove_btn.set_tooltip_text(Some("Remove output package"));
-                    let output_id = output.id.clone();
-                    let game_for_remove = game_for_generated.clone();
-                    let rebuild_remove = rebuild_w_for_generated.clone();
-                    remove_btn.connect_clicked(move |_| {
-                        let mut db = ModDatabase::load(&game_for_remove);
-                        if let Err(e) = db.queue_generated_output_removal(&output_id) {
-                            log::error!("Failed to queue generated output package removal: {e}");
-                        } else {
-                            db.save(&game_for_remove);
-                        }
-                        if let Some(rb) = rebuild_remove.upgrade() {
-                            (rb.borrow())();
-                        }
-                    });
-                    row.add_suffix(&remove_btn);
-                    generated_list_c.append(&row);
                 }
             });
         }
 
-        // Add Tool button handler
         {
             let config_c = Rc::clone(&config);
             let game_id = game.id.clone();
@@ -985,19 +227,6 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             add_tool_btn.connect_clicked(move |_| {
                 let rebuild_w = Rc::downgrade(&rebuild_c);
                 show_tool_dialog(&config_c, &game_id, None, &rebuild_w, &toast_overlay_c);
-            });
-        }
-
-        {
-            let game_cleanup = game.clone();
-            let rebuild_cleanup = Rc::clone(&rebuild);
-            cleanup_generated_btn.connect_clicked(move |_| {
-                let mut db = ModDatabase::load(&game_cleanup);
-                crate::core::generated_outputs::cleanup_stale_generated_outputs(
-                    &game_cleanup,
-                    &mut db,
-                );
-                (rebuild_cleanup.borrow())();
             });
         }
 
@@ -1050,7 +279,9 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         let dialog = adw::AlertDialog::builder()
                             .heading("Switch Profile?")
                             .body(format!(
-                                "{reason}\n\nSwitching to “{target}” may leave undeployed changes unapplied."
+                                "{reason}
+
+Switching to “{target}” may leave undeployed changes unapplied."
                             ))
                             .build();
                         dialog.add_response("cancel", "Cancel");
@@ -1107,7 +338,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                 workspace_row_c.set_subtitle(&summary);
             };
             refresh_workspace_row();
-            attach_workspace_event_listener(move |event| {
+            workspace_events::attach_workspace_event_listener(move |event| {
                 if matches!(
                     event,
                     workspace::WorkspaceEvent::WorkspaceStateChanged { .. }
@@ -1125,7 +356,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         {
             let game_events = game.clone();
             let rebuild_events = Rc::downgrade(&rebuild);
-            attach_workspace_event_listener(move |event| {
+            workspace_events::attach_workspace_event_listener(move |event| {
                 let relevant = match event {
                     workspace::WorkspaceEvent::ProfileStateChanged { game_id, .. }
                     | workspace::WorkspaceEvent::DeployFinished { game_id, .. }
@@ -1143,14 +374,12 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             });
         }
 
-        // Initial build
         (rebuild.borrow())();
 
         content_box.append(&profile_group);
         content_box.append(&workspace_group);
         content_box.append(&tools_group);
     } else {
-        // No game selected
         let status_page = adw::StatusPage::builder()
             .title("No Game Selected")
             .description("Select a game to configure its external tools.")
