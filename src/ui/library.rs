@@ -16,7 +16,6 @@ use crate::core::workspace;
 use crate::ui::ordering;
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
-const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
 
 #[derive(Debug, Clone, Default)]
 struct ConflictState {
@@ -99,6 +98,7 @@ fn library_stage_summary(game: &Game) -> LibraryStageSummary {
         summary.push_str(" · Integrity example: ");
         summary.push_str(example);
     }
+    summary.push_str(" · See Workspace page for detailed review");
     LibraryStageSummary {
         summary,
         redeploy_available: state.safe_redeploy_required,
@@ -132,47 +132,10 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     search_entry.set_width_chars(24);
     header.pack_start(&search_entry);
 
-    // Deploy button – applies all enabled mods by (re)linking their files
-    let deploy_btn = gtk4::Button::with_label("Deploy");
-    deploy_btn.add_css_class("suggested-action");
-    deploy_btn.set_tooltip_text(Some(
-        "Apply all enabled mods by linking their files into the game directory",
-    ));
-    header.pack_end(&deploy_btn);
-
     toolbar_view.add_top_bar(&header);
 
     let content_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content_container.set_vexpand(true);
-
-    let status_revealer = gtk4::Revealer::new();
-    status_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-    status_revealer.set_reveal_child(false);
-
-    let status_card = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    status_card.add_css_class("card");
-    status_card.set_margin_bottom(4);
-    status_card.set_margin_top(4);
-    status_card.set_margin_start(4);
-    status_card.set_margin_end(4);
-
-    let status_label = gtk4::Label::new(None);
-    status_label.set_xalign(0.0);
-    status_label.add_css_class("dim-label");
-    status_label.set_margin_top(8);
-    status_label.set_margin_start(8);
-    status_label.set_margin_end(8);
-
-    let status_progress = gtk4::ProgressBar::new();
-    status_progress.set_show_text(true);
-    status_progress.set_margin_start(8);
-    status_progress.set_margin_end(8);
-    status_progress.set_margin_bottom(8);
-
-    status_card.append(&status_label);
-    status_card.append(&status_progress);
-    status_revealer.set_child(Some(&status_card));
-    content_container.append(&status_revealer);
 
     let staged_row = adw::ActionRow::builder()
         .title("Staged Mod Changes")
@@ -311,74 +274,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
                 }
             });
             dialog.present(parent.as_ref());
-        });
-    }
-
-    // Wire Deploy button: undeploy everything, then deploy all enabled mods
-    {
-        let game_c = Rc::clone(&game_rc);
-        let container_c = list_container.clone();
-        let config_c = Rc::clone(&config);
-        let search_c = Rc::clone(&search_query);
-        let selected_c = Rc::clone(&selected_mod_id);
-        let search_entry_c = search_entry.clone();
-        let deploy_btn_c = deploy_btn.clone();
-        let status_label_c = status_label.clone();
-        let status_progress_c = status_progress.clone();
-        let status_revealer_c = status_revealer.clone();
-        let reorder_hint_c = reorder_hint.clone();
-        deploy_btn.connect_clicked(move |btn| {
-            set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, true);
-            status_revealer_c.set_reveal_child(true);
-            status_label_c.set_text("Preparing deployment…");
-            status_progress_c.set_fraction(0.0);
-            status_progress_c.set_text(Some("0%"));
-
-            // Defer the blocking deploy work to the next idle opportunity so
-            // the Revealer slide-down animation can start on this frame before
-            // the main thread is occupied.
-            let game_c = Rc::clone(&game_c);
-            let container_c = container_c.clone();
-            let config_c = Rc::clone(&config_c);
-            let search_c = Rc::clone(&search_c);
-            let selected_c = Rc::clone(&selected_c);
-            let search_entry_c = search_entry_c.clone();
-            let deploy_btn_c = deploy_btn_c.clone();
-            let status_label_c = status_label_c.clone();
-            let status_progress_c = status_progress_c.clone();
-            let status_revealer_c = status_revealer_c.clone();
-            let reorder_hint_idle = reorder_hint_c.clone();
-            let btn = btn.clone();
-            gtk4::glib::idle_add_local_once(move || {
-                let db = ModDatabase::load(&game_c);
-                let enabled_count = db.mods.iter().filter(|m| m.enabled).count();
-                status_label_c.set_text("Rebuilding deployment from enabled mod set…");
-                flush_ui_events();
-                let result = ModManager::rebuild_all(&game_c);
-                let msg = match result {
-                    Ok(()) => format!("Deployed {enabled_count} mod(s)"),
-                    Err(e) => {
-                        log::error!("Deploy error: {e}");
-                        format!("Deploy failed: {e}")
-                    }
-                };
-                status_label_c.set_text(&msg);
-                status_progress_c.set_fraction(1.0);
-                status_progress_c.set_text(Some("100%"));
-                set_library_busy(&search_entry_c, &deploy_btn_c, &container_c, false);
-                hide_status_popup_later(status_revealer_c.clone());
-                show_toast(btn.upcast_ref(), &msg);
-                refresh_library_content_with_search(
-                    &container_c,
-                    &game_c,
-                    Rc::clone(&config_c),
-                    &search_c.borrow(),
-                    Rc::clone(&search_c),
-                    Rc::clone(&selected_c),
-                    &reorder_hint_idle,
-                    true,
-                );
-            });
         });
     }
 
@@ -628,36 +523,6 @@ fn summarize_conflicts(mods: &[Mod], selected_mod: &Mod, state: &ConflictState) 
         overwritten_by_mods: overwritten_by_mods.len(),
         total_conflicting_files: state.files.len(),
     }
-}
-
-/// Toggle interactivity for Library controls during long deploy operations.
-fn set_library_busy(
-    search_entry: &gtk4::SearchEntry,
-    deploy_btn: &gtk4::Button,
-    content_container: &gtk4::Box,
-    busy: bool,
-) {
-    let sensitive = !busy;
-    search_entry.set_sensitive(sensitive);
-    deploy_btn.set_sensitive(sensitive);
-    content_container.set_sensitive(sensitive);
-}
-
-/// Process pending GTK events so status text updates are shown during long loops.
-fn flush_ui_events() {
-    let context = gtk4::glib::MainContext::default();
-    while context.pending() {
-        context.iteration(false);
-    }
-}
-
-fn hide_status_popup_later(status_revealer: gtk4::Revealer) {
-    gtk4::glib::timeout_add_local_once(
-        std::time::Duration::from_millis(STATUS_POPUP_HIDE_DELAY_MS),
-        move || {
-            status_revealer.set_reveal_child(false);
-        },
-    );
 }
 
 #[allow(clippy::too_many_arguments)]

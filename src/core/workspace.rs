@@ -668,78 +668,47 @@ fn deployment_state_label(state: DeploymentState) -> &'static str {
 
 fn integrity_compact_label(state: &WorkspaceState) -> String {
     match state.integrity_level {
-        DeploymentIntegrityLevel::Healthy => "Integrity healthy".to_string(),
-        DeploymentIntegrityLevel::Unknown => "Integrity unknown".to_string(),
-        DeploymentIntegrityLevel::Warnings => format!(
-            "Integrity warnings: {} issue(s), {} repairable by redeploy",
-            state.integrity_issue_total, state.integrity_repairable_issues
-        ),
-        DeploymentIntegrityLevel::Broken => format!(
-            "Integrity broken: {} issue(s), {} manual review",
-            state.integrity_issue_total, state.integrity_manual_review_issues
-        ),
+        DeploymentIntegrityLevel::Healthy => "Integrity: clean".to_string(),
+        DeploymentIntegrityLevel::Unknown => "Integrity: unknown".to_string(),
+        DeploymentIntegrityLevel::Warnings => "Integrity: warning".to_string(),
+        DeploymentIntegrityLevel::Broken => "Integrity: broken".to_string(),
     }
 }
 
 pub fn format_workspace_banner_summary(state: &WorkspaceState) -> String {
-    let mut summary = format!(
-        "Profile: {} · {}",
-        state.profile_id,
-        deployment_state_label(state.deployment_state)
-    );
-    let reasons = state.pending_changes.reasons();
-    if !reasons.is_empty() {
-        summary.push_str(" · ");
-        summary.push_str(&reasons.join(", "));
-    }
-    if let Some(msg) = state.status_message.as_deref()
-        && !msg.trim().is_empty()
-    {
-        summary.push_str(" · ");
-        summary.push_str(msg);
+    let mut labels = vec![deployment_state_label(state.deployment_state).to_string()];
+    if state.pending_changes.any() {
+        labels.push("Staged changes".to_string());
+    } else {
+        labels.push("Clean".to_string());
     }
     if state.runtime_review_required {
-        summary.push_str(" · Review runtime changes first");
+        labels.push("Runtime review needed".to_string());
     }
-    summary.push_str(" · ");
-    summary.push_str(&integrity_compact_label(state));
-    summary
+    if state.integrity_level == DeploymentIntegrityLevel::Warnings {
+        labels.push("Integrity warning".to_string());
+    }
+    if state.integrity_level == DeploymentIntegrityLevel::Broken {
+        labels.push("Integrity issue".to_string());
+    }
+    if state.deployment_state == DeploymentState::Failed {
+        labels.push("Deploy failed".to_string());
+    }
+    labels.join(" · ")
 }
 
 pub fn format_workspace_compact_summary(state: &WorkspaceState) -> String {
-    let reasons = state.pending_changes.reasons();
-    if reasons.is_empty() {
-        if state.runtime_review_required {
-            format!(
-                "{} · Runtime review pending (adoptable: {}, unknown: {}) · {}",
-                deployment_state_label(state.deployment_state),
-                state.runtime_adoptable_pending,
-                state.runtime_unknown_pending,
-                integrity_compact_label(state)
-            )
-        } else {
-            format!(
-                "{} · clean · {}",
-                deployment_state_label(state.deployment_state),
-                integrity_compact_label(state)
-            )
-        }
+    let mut labels = vec![deployment_state_label(state.deployment_state).to_string()];
+    if state.pending_changes.any() {
+        labels.push("Redeploy needed".to_string());
     } else {
-        let mut summary = format!(
-            "{} · {}",
-            deployment_state_label(state.deployment_state),
-            reasons.join(", ")
-        );
-        if state.runtime_review_required {
-            summary.push_str(&format!(
-                " · Runtime review pending (adoptable: {}, unknown: {})",
-                state.runtime_adoptable_pending, state.runtime_unknown_pending
-            ));
-        }
-        summary.push_str(" · ");
-        summary.push_str(&integrity_compact_label(state));
-        summary
+        labels.push("Clean".to_string());
     }
+    if state.runtime_review_required {
+        labels.push("Runtime review needed".to_string());
+    }
+    labels.push(integrity_compact_label(state));
+    labels.join(" · ")
 }
 
 pub fn format_integrity_guidance(state: &WorkspaceState) -> String {
@@ -1096,9 +1065,9 @@ mod tests {
         };
         let banner = format_workspace_banner_summary(&state);
         let compact = format_workspace_compact_summary(&state);
-        assert!(banner.contains("Profile: p"));
         assert!(banner.contains("Redeploy needed"));
-        assert!(banner.contains("Generated outputs changed"));
+        assert!(banner.contains("Redeploy needed"));
+        assert!(banner.contains("Runtime review needed"));
         assert!(compact.contains("Redeploy needed"));
     }
 

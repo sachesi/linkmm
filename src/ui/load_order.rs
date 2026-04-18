@@ -74,6 +74,7 @@ fn load_order_stage_summary(game: &Game) -> LoadOrderStageSummary {
         summary.push_str(" · Integrity example: ");
         summary.push_str(example);
     }
+    summary.push_str(" · See Workspace page for detailed review");
     LoadOrderStageSummary {
         summary,
         redeploy_available: state.safe_redeploy_required,

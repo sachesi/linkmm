@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 
 use std::rc::Rc;
-use std::sync::mpsc;
 
 use gio;
 use glib;
@@ -13,7 +12,6 @@ use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
 use crate::core::runtime::global_runtime_manager;
-use crate::core::workspace;
 
 pub mod downloads;
 pub mod library;
@@ -63,27 +61,6 @@ const NAV_DOWNLOADS: i32 = 2;
 const NAV_WORKSPACE: i32 = 3;
 const NAV_TOOLS: i32 = 4;
 const NAV_PREFERENCES: i32 = 5;
-
-fn attach_workspace_event_listener<F>(mut on_event: F)
-where
-    F: FnMut(workspace::WorkspaceEvent) + 'static,
-{
-    let rx = workspace::subscribe_events();
-    let (tx_ui, rx_ui) = std::sync::mpsc::channel::<workspace::WorkspaceEvent>();
-    std::thread::spawn(move || {
-        while let Ok(event) = rx.recv() {
-            if tx_ui.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    glib::idle_add_local(move || {
-        while let Ok(event) = rx_ui.try_recv() {
-            on_event(event);
-        }
-        glib::ControlFlow::Continue
-    });
-}
 
 // ── Main window ────────────────────────────────────────────────────────────
 
@@ -328,22 +305,12 @@ fn build_main_window(
     install_lock_banner.set_button_label(None::<&str>);
     install_lock_revealer.set_child(Some(&install_lock_banner));
 
-    let workspace_revealer = gtk4::Revealer::new();
-    workspace_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-    workspace_revealer.set_reveal_child(true);
-
-    let workspace_banner = adw::Banner::new("Workspace status unavailable");
-    workspace_banner.set_revealed(true);
-    workspace_banner.set_button_label(None::<&str>);
-    workspace_revealer.set_child(Some(&workspace_banner));
-
     let content_stack = gtk4::Stack::new();
     content_stack.set_transition_type(gtk4::StackTransitionType::None);
     content_stack.set_vexpand(true);
     content_stack.set_hexpand(true);
     let content_layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content_layout.append(&install_lock_revealer);
-    content_layout.append(&workspace_revealer);
     content_layout.append(&content_stack);
 
     let content_page = adw::NavigationPage::builder()
@@ -452,38 +419,6 @@ fn build_main_window(
     let preferences_widget =
         settings::build_settings_page(Rc::clone(&config), window.upcast_ref::<gtk4::Window>());
     content_stack.add_named(&preferences_widget, Some("preferences"));
-
-    {
-        let config_t = Rc::clone(&config);
-        let workspace_banner_t = workspace_banner.clone();
-        let workspace_revealer_t = workspace_revealer.clone();
-        let refresh_banner = move || {
-            let game = config_t.borrow().current_game().cloned();
-            if let Some(game) = game {
-                let state = workspace::workspace_state_for_game(&game);
-                let summary = workspace::format_workspace_banner_summary(&state);
-                workspace_banner_t.set_title(&summary);
-                workspace_revealer_t.set_reveal_child(true);
-            } else {
-                workspace_banner_t.set_title("Select a game to view workspace status");
-                workspace_revealer_t.set_reveal_child(true);
-            }
-        };
-        refresh_banner();
-        attach_workspace_event_listener(move |event| {
-            if matches!(
-                event,
-                workspace::WorkspaceEvent::WorkspaceStateChanged { .. }
-                    | workspace::WorkspaceEvent::ProfileStateChanged { .. }
-                    | workspace::WorkspaceEvent::ProfileSwitched { .. }
-                    | workspace::WorkspaceEvent::DeployFinished { .. }
-                    | workspace::WorkspaceEvent::DeployFailed { .. }
-                    | workspace::WorkspaceEvent::RevertCompleted { .. }
-            ) {
-                refresh_banner();
-            }
-        });
-    }
 
     // Allow mobile-like narrow layouts: collapse the sidebar when the window is small.
     split_view.add_tick_callback(|sv, _| {
