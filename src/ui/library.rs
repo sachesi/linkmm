@@ -89,12 +89,16 @@ fn library_stage_summary(game: &Game) -> LibraryStageSummary {
         .as_ref()
         .map(|p| p.links_to_replace.len())
         .unwrap_or(0);
-    let summary = format!(
+    let mut summary = format!(
         "{} · Pending removals: {} · Links to replace: {}",
         workspace::format_workspace_compact_summary(&state),
         pending_mod_removals,
         replace_count
     );
+    if let Some(example) = state.integrity_examples.first() {
+        summary.push_str(" · Integrity example: ");
+        summary.push_str(example);
+    }
     LibraryStageSummary {
         summary,
         redeploy_available: state.safe_redeploy_required,

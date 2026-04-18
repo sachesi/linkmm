@@ -181,6 +181,52 @@ pub enum DeploymentIntegrityIssueKind {
     PathInspectionFailed,
 }
 
+pub fn integrity_issue_kind_label(kind: &DeploymentIntegrityIssueKind) -> &'static str {
+    match kind {
+        DeploymentIntegrityIssueKind::ExpectedTargetMissing => "Expected managed path missing",
+        DeploymentIntegrityIssueKind::ManagedTargetPointsElsewhere => {
+            "Managed path points to unexpected target"
+        }
+        DeploymentIntegrityIssueKind::ManagedTargetWrongType => "Managed path has unsupported type",
+        DeploymentIntegrityIssueKind::ManagedSourceMissing => "Managed source payload missing",
+        DeploymentIntegrityIssueKind::BackupPayloadMissing => "Backup payload missing",
+        DeploymentIntegrityIssueKind::OwnerMismatch => "Owner mismatch",
+        DeploymentIntegrityIssueKind::PendingRemovalPayloadMissing => {
+            "Pending-removal payload missing"
+        }
+        DeploymentIntegrityIssueKind::PathInspectionFailed => "Path inspection failed",
+    }
+}
+
+pub fn integrity_issue_recovery_guidance(kind: &DeploymentIntegrityIssueKind) -> &'static str {
+    match kind {
+        DeploymentIntegrityIssueKind::ExpectedTargetMissing => {
+            "Managed file is missing from the game directory; redeploy should recreate it."
+        }
+        DeploymentIntegrityIssueKind::ManagedTargetPointsElsewhere => {
+            "Managed link/file target drifted; redeploy should restore expected ownership."
+        }
+        DeploymentIntegrityIssueKind::ManagedTargetWrongType => {
+            "Destination has an unsupported object type; clear/rename it, then redeploy."
+        }
+        DeploymentIntegrityIssueKind::ManagedSourceMissing => {
+            "Managed source payload is missing; review mod/generated package storage before redeploy."
+        }
+        DeploymentIntegrityIssueKind::BackupPayloadMissing => {
+            "Original backup payload is missing; redeploy can continue, but original restore is not automatic."
+        }
+        DeploymentIntegrityIssueKind::OwnerMismatch => {
+            "Recorded owner differs from desired owner; review staged profile state and redeploy."
+        }
+        DeploymentIntegrityIssueKind::PendingRemovalPayloadMissing => {
+            "Pending-removal payload disappeared externally; review staged removals and redeploy state."
+        }
+        DeploymentIntegrityIssueKind::PathInspectionFailed => {
+            "Path could not be inspected; check permissions/path validity, then recheck or redeploy."
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentIntegrityIssue {
     pub kind: DeploymentIntegrityIssueKind,
@@ -665,6 +711,9 @@ pub fn rebuild_deployment(game: &Game, db: &mut ModDatabase) -> Result<(), Strin
     }
     db.finalize_pending_removals(game)?;
     workspace::mark_deployed_clean(game, db)?;
+    if let Err(e) = workspace::verify_and_store_integrity(game) {
+        log::warn!("Integrity verification after deploy failed: {e}");
+    }
     let backup_status = deployment_backup_status(game, &db.active_profile_id)?;
     workspace::set_status(
         &game.id,
@@ -2262,5 +2311,24 @@ mod tests {
         db.write_plugins_txt(&game).unwrap();
         let other_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
         assert!(other_plugins.lines().any(|l| l.trim() == "SwitchTest.esp"));
+    }
+
+    #[test]
+    fn integrity_issue_guidance_covers_key_categories() {
+        assert!(
+            integrity_issue_recovery_guidance(&DeploymentIntegrityIssueKind::ExpectedTargetMissing)
+                .contains("redeploy")
+        );
+        assert!(
+            integrity_issue_recovery_guidance(&DeploymentIntegrityIssueKind::BackupPayloadMissing)
+                .contains("not automatic")
+        );
+        assert!(
+            integrity_issue_recovery_guidance(&DeploymentIntegrityIssueKind::ManagedSourceMissing)
+                .contains("missing")
+        );
+        assert!(
+            !integrity_issue_kind_label(&DeploymentIntegrityIssueKind::OwnerMismatch).is_empty()
+        );
     }
 }

@@ -64,13 +64,18 @@ fn load_order_stage_summary(game: &Game) -> LoadOrderStageSummary {
         .as_ref()
         .map(|p| p.links_to_replace.len())
         .unwrap_or(0);
+    let mut summary = format!(
+        "{} · {} · Asset links to replace: {}",
+        workspace::format_workspace_compact_summary(&state),
+        plugin_changes,
+        replace_count
+    );
+    if let Some(example) = state.integrity_examples.first() {
+        summary.push_str(" · Integrity example: ");
+        summary.push_str(example);
+    }
     LoadOrderStageSummary {
-        summary: format!(
-            "{} · {} · Asset links to replace: {}",
-            workspace::format_workspace_compact_summary(&state),
-            plugin_changes,
-            replace_count
-        ),
+        summary,
         redeploy_available: state.safe_redeploy_required,
         discard_available: state.safe_redeploy_required
             && workspace::has_profile_baseline(game, &state.profile_id),

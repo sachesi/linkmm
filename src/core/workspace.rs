@@ -1,3 +1,4 @@
+use crate::core::deployment::{self, DeploymentIntegrityLevel, DeploymentIntegrityReport};
 use crate::core::games::Game;
 use crate::core::mods::ModDatabase;
 use crate::core::runtime_scan::RuntimeScanReport;
@@ -43,6 +44,15 @@ pub enum StatusSeverity {
     Info,
     Warning,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityRepairOutlook {
+    Healthy,
+    RedeployLikelyRepairsAll,
+    RedeployLikelyRepairsSome,
+    ManualReviewRequired,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -108,6 +118,13 @@ pub struct WorkspaceState {
     pub runtime_review_required: bool,
     pub runtime_adoptable_pending: usize,
     pub runtime_unknown_pending: usize,
+    pub integrity_level: DeploymentIntegrityLevel,
+    pub integrity_issue_total: usize,
+    pub integrity_repairable_issues: usize,
+    pub integrity_manual_review_issues: usize,
+    pub integrity_summary: String,
+    pub integrity_repair_outlook: IntegrityRepairOutlook,
+    pub integrity_examples: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -140,6 +157,7 @@ struct WorkspaceRuntimeState {
     deploy_failed: bool,
     unmanaged_runtime_changed: bool,
     runtime_scan: RuntimeScanStatus,
+    integrity_report: Option<DeploymentIntegrityReport>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,6 +182,7 @@ impl Default for WorkspaceRuntimeState {
             deploy_failed: false,
             unmanaged_runtime_changed: false,
             runtime_scan: RuntimeScanStatus::default(),
+            integrity_report: None,
         }
     }
 }
@@ -381,6 +400,33 @@ pub fn update_runtime_scan_status(game_id: &str, profile_id: &str, report: &Runt
     });
 }
 
+pub fn latest_integrity_report(
+    game_id: &str,
+    profile_id: &str,
+) -> Option<DeploymentIntegrityReport> {
+    runtime_state_map()
+        .lock()
+        .expect("workspace lock poisoned")
+        .get(&runtime_key(game_id, profile_id))
+        .and_then(|state| state.integrity_report.clone())
+}
+
+pub fn verify_and_store_integrity(game: &Game) -> Result<DeploymentIntegrityReport, String> {
+    let db = ModDatabase::load(game);
+    let profile_id = db.active_profile_id.clone();
+    let report = deployment::verify_deployment_integrity(game, &db)?;
+    {
+        let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
+        let state = map.entry(runtime_key(&game.id, &profile_id)).or_default();
+        state.integrity_report = Some(report.clone());
+    }
+    emit_event(WorkspaceEvent::WorkspaceStateChanged {
+        game_id: game.id.clone(),
+        profile_id,
+    });
+    Ok(report)
+}
+
 pub fn mark_deploy_failure(game_id: &str, profile_id: &str, message: impl Into<String>) {
     let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
     let state = map.entry(runtime_key(game_id, profile_id)).or_default();
@@ -413,6 +459,7 @@ pub fn mark_deployed_clean(game: &Game, db: &ModDatabase) -> Result<(), String> 
     state.operation = WorkspaceOperation::None;
     state.unmanaged_runtime_changed = false;
     state.runtime_scan = RuntimeScanStatus::default();
+    state.integrity_report = None;
     state.status_message = Some("Deployment is up to date".to_string());
     state.severity = StatusSeverity::Info;
     emit_event(WorkspaceEvent::WorkspaceStateChanged {
@@ -459,6 +506,34 @@ pub fn workspace_state_for_game(game: &Game) -> WorkspaceState {
     let pending_changes = compute_pending_changes(baseline.as_ref(), &db, &runtime);
     let runtime_review_required = runtime.runtime_scan.unresolved_review_count > 0;
     let dirty = pending_changes.any();
+    let integrity_report = runtime.integrity_report.as_ref();
+    let integrity_level = integrity_report
+        .and_then(|r| r.level)
+        .unwrap_or(DeploymentIntegrityLevel::Unknown);
+    let integrity_issue_total = integrity_report.map(|r| r.issue_count()).unwrap_or(0);
+    let integrity_repairable_issues = integrity_report.map(|r| r.repairable_count()).unwrap_or(0);
+    let integrity_manual_review_issues = integrity_report
+        .map(|r| r.manual_review_count())
+        .unwrap_or(0);
+    let integrity_summary = integrity_report
+        .map(|r| r.summary_line())
+        .unwrap_or_else(|| "Integrity: unknown (not verified)".to_string());
+    let integrity_examples = integrity_report
+        .map(|r| r.top_examples(3))
+        .unwrap_or_default();
+    let integrity_repair_outlook = if integrity_issue_total == 0 {
+        if integrity_level == DeploymentIntegrityLevel::Healthy {
+            IntegrityRepairOutlook::Healthy
+        } else {
+            IntegrityRepairOutlook::Unknown
+        }
+    } else if integrity_manual_review_issues == 0 {
+        IntegrityRepairOutlook::RedeployLikelyRepairsAll
+    } else if integrity_repairable_issues == 0 {
+        IntegrityRepairOutlook::ManualReviewRequired
+    } else {
+        IntegrityRepairOutlook::RedeployLikelyRepairsSome
+    };
     let deployment_state = if runtime.operation == WorkspaceOperation::Deploy {
         DeploymentState::Busy
     } else if runtime.deploy_failed {
@@ -479,11 +554,21 @@ pub fn workspace_state_for_game(game: &Game) -> WorkspaceState {
         current_operation: runtime.operation,
         status_message: runtime.status_message.clone(),
         status_severity: runtime.severity,
-        safe_redeploy_required: dirty || runtime.deploy_failed || runtime_review_required,
-        safe_redeploy_recommended: dirty || runtime_review_required,
+        safe_redeploy_required: dirty
+            || runtime.deploy_failed
+            || runtime_review_required
+            || integrity_issue_total > 0,
+        safe_redeploy_recommended: dirty || runtime_review_required || integrity_issue_total > 0,
         runtime_review_required,
         runtime_adoptable_pending: runtime.runtime_scan.adoptable_count,
         runtime_unknown_pending: runtime.runtime_scan.unknown_count,
+        integrity_level,
+        integrity_issue_total,
+        integrity_repairable_issues,
+        integrity_manual_review_issues,
+        integrity_summary,
+        integrity_repair_outlook,
+        integrity_examples,
     }
 }
 
@@ -581,6 +666,21 @@ fn deployment_state_label(state: DeploymentState) -> &'static str {
     }
 }
 
+fn integrity_compact_label(state: &WorkspaceState) -> String {
+    match state.integrity_level {
+        DeploymentIntegrityLevel::Healthy => "Integrity healthy".to_string(),
+        DeploymentIntegrityLevel::Unknown => "Integrity unknown".to_string(),
+        DeploymentIntegrityLevel::Warnings => format!(
+            "Integrity warnings: {} issue(s), {} repairable by redeploy",
+            state.integrity_issue_total, state.integrity_repairable_issues
+        ),
+        DeploymentIntegrityLevel::Broken => format!(
+            "Integrity broken: {} issue(s), {} manual review",
+            state.integrity_issue_total, state.integrity_manual_review_issues
+        ),
+    }
+}
+
 pub fn format_workspace_banner_summary(state: &WorkspaceState) -> String {
     let mut summary = format!(
         "Profile: {} · {}",
@@ -601,6 +701,8 @@ pub fn format_workspace_banner_summary(state: &WorkspaceState) -> String {
     if state.runtime_review_required {
         summary.push_str(" · Review runtime changes first");
     }
+    summary.push_str(" · ");
+    summary.push_str(&integrity_compact_label(state));
     summary
 }
 
@@ -609,13 +711,18 @@ pub fn format_workspace_compact_summary(state: &WorkspaceState) -> String {
     if reasons.is_empty() {
         if state.runtime_review_required {
             format!(
-                "{} · Runtime review pending (adoptable: {}, unknown: {})",
+                "{} · Runtime review pending (adoptable: {}, unknown: {}) · {}",
                 deployment_state_label(state.deployment_state),
                 state.runtime_adoptable_pending,
-                state.runtime_unknown_pending
+                state.runtime_unknown_pending,
+                integrity_compact_label(state)
             )
         } else {
-            format!("{} · clean", deployment_state_label(state.deployment_state))
+            format!(
+                "{} · clean · {}",
+                deployment_state_label(state.deployment_state),
+                integrity_compact_label(state)
+            )
         }
     } else {
         let mut summary = format!(
@@ -629,7 +736,35 @@ pub fn format_workspace_compact_summary(state: &WorkspaceState) -> String {
                 state.runtime_adoptable_pending, state.runtime_unknown_pending
             ));
         }
+        summary.push_str(" · ");
+        summary.push_str(&integrity_compact_label(state));
         summary
+    }
+}
+
+pub fn format_integrity_guidance(state: &WorkspaceState) -> String {
+    if state.integrity_issue_total == 0 {
+        return match state.integrity_level {
+            DeploymentIntegrityLevel::Healthy => "Deployed integrity is healthy".to_string(),
+            _ => "Deployed integrity has not been verified yet".to_string(),
+        };
+    }
+    match state.integrity_repair_outlook {
+        IntegrityRepairOutlook::RedeployLikelyRepairsAll => format!(
+            "Integrity drift detected: redeploy is likely to repair all {} issue(s)",
+            state.integrity_issue_total
+        ),
+        IntegrityRepairOutlook::RedeployLikelyRepairsSome => format!(
+            "Integrity drift detected: redeploy may repair {} issue(s), but {} still need manual review",
+            state.integrity_repairable_issues, state.integrity_manual_review_issues
+        ),
+        IntegrityRepairOutlook::ManualReviewRequired => format!(
+            "Integrity drift detected: {} issue(s) require manual review before full recovery",
+            state.integrity_manual_review_issues
+        ),
+        IntegrityRepairOutlook::Healthy | IntegrityRepairOutlook::Unknown => {
+            "Deployed integrity state is unknown; run verification".to_string()
+        }
     }
 }
 
@@ -641,6 +776,10 @@ pub fn format_redeploy_guidance(
         return "Deploy in progress".to_string();
     }
     if state.deployment_state == DeploymentState::Failed {
+        if state.integrity_issue_total > 0 {
+            return "Deploy failed and integrity drift is present; review issues before retry"
+                .to_string();
+        }
         return "Deploy failed; review errors before retry".to_string();
     }
     if let Some(preview) = preview
@@ -656,6 +795,9 @@ pub fn format_redeploy_guidance(
             "Review runtime changes first (adoptable: {}, unknown: {})",
             state.runtime_adoptable_pending, state.runtime_unknown_pending
         );
+    }
+    if state.integrity_issue_total > 0 {
+        return format_integrity_guidance(state);
     }
     if state.safe_redeploy_required {
         return "Redeploy ready after review".to_string();
@@ -752,6 +894,13 @@ mod tests {
             runtime_review_required: false,
             runtime_adoptable_pending: 0,
             runtime_unknown_pending: 0,
+            integrity_level: DeploymentIntegrityLevel::Unknown,
+            integrity_issue_total: 0,
+            integrity_repairable_issues: 0,
+            integrity_manual_review_issues: 0,
+            integrity_summary: "Integrity: unknown (not verified)".to_string(),
+            integrity_repair_outlook: IntegrityRepairOutlook::Unknown,
+            integrity_examples: Vec::new(),
         };
         assert!(matches!(
             profile_switch_policy(&state_busy),
@@ -937,6 +1086,13 @@ mod tests {
             runtime_review_required: true,
             runtime_adoptable_pending: 1,
             runtime_unknown_pending: 0,
+            integrity_level: DeploymentIntegrityLevel::Broken,
+            integrity_issue_total: 2,
+            integrity_repairable_issues: 1,
+            integrity_manual_review_issues: 1,
+            integrity_summary: "Integrity: 2 issue(s), 1 require manual review".to_string(),
+            integrity_repair_outlook: IntegrityRepairOutlook::RedeployLikelyRepairsSome,
+            integrity_examples: vec!["Managed source path is missing".to_string()],
         };
         let banner = format_workspace_banner_summary(&state);
         let compact = format_workspace_compact_summary(&state);
@@ -961,6 +1117,13 @@ mod tests {
             runtime_review_required: true,
             runtime_adoptable_pending: 2,
             runtime_unknown_pending: 1,
+            integrity_level: DeploymentIntegrityLevel::Warnings,
+            integrity_issue_total: 1,
+            integrity_repairable_issues: 1,
+            integrity_manual_review_issues: 0,
+            integrity_summary: "Integrity: 1 issue(s), 1 likely repairable by redeploy".to_string(),
+            integrity_repair_outlook: IntegrityRepairOutlook::RedeployLikelyRepairsAll,
+            integrity_examples: vec!["Expected managed deployed path is missing".to_string()],
         };
         let blocked_preview = crate::core::deployment::DeploymentPreview {
             blocked_paths: vec!["Data/textures".into()],
@@ -971,6 +1134,106 @@ mod tests {
 
         let review = format_redeploy_guidance(&state, None);
         assert!(review.contains("Review runtime changes first"));
+    }
+
+    #[test]
+    fn integrity_report_maps_into_workspace_state() {
+        let temp = TempDir::new().unwrap();
+        let game = test_game(&temp, "workspace_integrity_truth");
+        let db = ModDatabase::default();
+        db.save(&game);
+
+        {
+            let mut map = runtime_state_map().lock().expect("workspace lock poisoned");
+            map.entry(runtime_key(&game.id, &db.active_profile_id))
+                .or_default()
+                .integrity_report = Some(DeploymentIntegrityReport {
+                level: Some(DeploymentIntegrityLevel::Broken),
+                issues: vec![
+                    crate::core::deployment::DeploymentIntegrityIssue {
+                        kind: crate::core::deployment::DeploymentIntegrityIssueKind::ManagedSourceMissing,
+                        path: Some(PathBuf::from("/tmp/missing")),
+                        details: "Managed source path is missing".to_string(),
+                        repairable_by_redeploy: false,
+                    },
+                    crate::core::deployment::DeploymentIntegrityIssue {
+                        kind: crate::core::deployment::DeploymentIntegrityIssueKind::ExpectedTargetMissing,
+                        path: Some(PathBuf::from("/tmp/dest")),
+                        details: "Expected managed deployed path is missing".to_string(),
+                        repairable_by_redeploy: true,
+                    },
+                ],
+            });
+        }
+
+        let state = workspace_state_for_game(&game);
+        assert_eq!(state.integrity_level, DeploymentIntegrityLevel::Broken);
+        assert_eq!(state.integrity_issue_total, 2);
+        assert_eq!(state.integrity_repairable_issues, 1);
+        assert_eq!(state.integrity_manual_review_issues, 1);
+        assert_eq!(
+            state.integrity_repair_outlook,
+            IntegrityRepairOutlook::RedeployLikelyRepairsSome
+        );
+        assert!(state.safe_redeploy_required);
+    }
+
+    #[test]
+    fn redeploy_guidance_mentions_failed_plus_integrity() {
+        let state = WorkspaceState {
+            game_id: "g".to_string(),
+            profile_id: "p".to_string(),
+            deployment_state: DeploymentState::Failed,
+            pending_changes: PendingChanges::default(),
+            current_operation: WorkspaceOperation::None,
+            status_message: None,
+            status_severity: StatusSeverity::Error,
+            safe_redeploy_required: true,
+            safe_redeploy_recommended: true,
+            runtime_review_required: false,
+            runtime_adoptable_pending: 0,
+            runtime_unknown_pending: 0,
+            integrity_level: DeploymentIntegrityLevel::Broken,
+            integrity_issue_total: 1,
+            integrity_repairable_issues: 0,
+            integrity_manual_review_issues: 1,
+            integrity_summary: "Integrity: 1 issue(s), 1 require manual review".to_string(),
+            integrity_repair_outlook: IntegrityRepairOutlook::ManualReviewRequired,
+            integrity_examples: vec!["Managed source path is missing".to_string()],
+        };
+        let guidance = format_redeploy_guidance(&state, None);
+        assert!(guidance.contains("Deploy failed and integrity drift is present"));
+    }
+
+    #[test]
+    fn integrity_guidance_formats_repairability_truthfully() {
+        let mut state = WorkspaceState {
+            game_id: "g".to_string(),
+            profile_id: "p".to_string(),
+            deployment_state: DeploymentState::Dirty,
+            pending_changes: PendingChanges::default(),
+            current_operation: WorkspaceOperation::None,
+            status_message: None,
+            status_severity: StatusSeverity::Info,
+            safe_redeploy_required: true,
+            safe_redeploy_recommended: true,
+            runtime_review_required: false,
+            runtime_adoptable_pending: 0,
+            runtime_unknown_pending: 0,
+            integrity_level: DeploymentIntegrityLevel::Warnings,
+            integrity_issue_total: 3,
+            integrity_repairable_issues: 3,
+            integrity_manual_review_issues: 0,
+            integrity_summary: String::new(),
+            integrity_repair_outlook: IntegrityRepairOutlook::RedeployLikelyRepairsAll,
+            integrity_examples: Vec::new(),
+        };
+        assert!(format_integrity_guidance(&state).contains("repair all 3 issue(s)"));
+
+        state.integrity_repair_outlook = IntegrityRepairOutlook::ManualReviewRequired;
+        state.integrity_repairable_issues = 0;
+        state.integrity_manual_review_issues = 3;
+        assert!(format_integrity_guidance(&state).contains("require manual review"));
     }
 
     #[test]

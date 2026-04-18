@@ -8,6 +8,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::core::config::{AppConfig, ToolConfig, ToolPresetKind, ToolRunProfile};
+use crate::core::deployment;
 use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::{ModDatabase, ModManager};
 use crate::core::runtime::{SessionStatus, global_runtime_manager};
@@ -401,6 +402,10 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                     &scan_report,
                 );
                 let workspace_state = workspace::workspace_state_for_game(&game_for_generated);
+                let integrity_report = workspace::latest_integrity_report(
+                    &game_for_generated.id,
+                    &db.active_profile_id,
+                );
                 let preview =
                     match crate::core::deployment::deployment_preview(&game_for_generated, &db) {
                         Ok(preview) => Some(preview),
@@ -413,6 +418,79 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                             None
                         }
                     };
+                let integrity_row = adw::ActionRow::builder()
+                    .title("Deployment Integrity")
+                    .subtitle(&workspace_state.integrity_summary)
+                    .build();
+                let verify_integrity_btn =
+                    gtk4::Button::with_label(if integrity_report.is_some() {
+                        "Recheck integrity"
+                    } else {
+                        "Verify deployed state"
+                    });
+                {
+                    let game_for_verify = game_for_generated.clone();
+                    let rebuild_verify = rebuild_w_for_generated.clone();
+                    verify_integrity_btn.connect_clicked(move |_| {
+                        if let Err(e) = workspace::verify_and_store_integrity(&game_for_verify) {
+                            log::error!("Integrity verification failed: {e}");
+                        }
+                        if let Some(rb) = rebuild_verify.upgrade() {
+                            (rb.borrow())();
+                        }
+                    });
+                }
+                integrity_row.add_suffix(&verify_integrity_btn);
+                generated_list_c.append(&integrity_row);
+                if workspace_state.integrity_issue_total > 0 {
+                    let guidance_row = adw::ActionRow::builder()
+                        .title("Integrity Recovery Guidance")
+                        .subtitle(workspace::format_integrity_guidance(&workspace_state))
+                        .build();
+                    generated_list_c.append(&guidance_row);
+                    append_preview_string_group_row(
+                        &generated_list_c,
+                        "Top integrity examples",
+                        &workspace_state.integrity_examples,
+                    );
+                }
+                if let Some(report) = integrity_report
+                    && !report.issues.is_empty()
+                {
+                    use std::collections::BTreeMap;
+                    let mut by_kind = BTreeMap::<String, usize>::new();
+                    for issue in &report.issues {
+                        *by_kind
+                            .entry(deployment::integrity_issue_kind_label(&issue.kind).to_string())
+                            .or_insert(0) += 1;
+                    }
+                    let grouped = by_kind
+                        .into_iter()
+                        .map(|(label, count)| format!("{label}: {count}"))
+                        .collect::<Vec<_>>();
+                    append_preview_string_group_row(
+                        &generated_list_c,
+                        "Integrity issue categories",
+                        &grouped,
+                    );
+                    let recovery_tips = report
+                        .issues
+                        .iter()
+                        .take(5)
+                        .map(|issue| {
+                            format!(
+                                "{}: {}",
+                                deployment::integrity_issue_kind_label(&issue.kind),
+                                deployment::integrity_issue_recovery_guidance(&issue.kind)
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    append_preview_string_group_row(
+                        &generated_list_c,
+                        "Integrity recovery tips",
+                        &recovery_tips,
+                    );
+                }
                 let redeploy_row = adw::ActionRow::builder()
                     .title("Redeploy Guidance")
                     .subtitle(workspace::format_redeploy_guidance(

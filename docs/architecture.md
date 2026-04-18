@@ -174,6 +174,36 @@ Safety contract:
 - profile switching consults workspace policy (`Allowed` / `Warn` / `Blocked`);
   `Warn` requires explicit user confirmation while `Blocked` is denied
 
+### Staged dirty state vs deployed integrity state
+
+Workspace truth now keeps **two distinct axes**:
+
+- **Staged profile dirty state**: baseline-vs-current staged edits waiting for explicit redeploy.
+- **Deployed integrity state**: drift/problems in currently deployed on-disk managed state.
+
+These are intentionally not collapsed into one boolean. A profile can be:
+
+- staged-clean but integrity-broken (external drift),
+- staged-dirty but integrity-healthy (pending user edits only),
+- both dirty and integrity-affected.
+
+Integrity verification is explicit (`Verify deployed state` / `Recheck integrity`) and
+feeds per-profile workspace runtime state with:
+
+- integrity level (`Healthy`, `Warnings`, `Broken`, `Unknown`)
+- issue totals
+- repairable vs manual-review counts
+- short summary and top examples
+
+Redeploy guidance combines both axes truthfully:
+
+- repairable integrity issues: redeploy is likely to repair all/some
+- non-repairable integrity issues: manual review is required
+- failed deploy + integrity issues: surfaced as a combined recovery state
+
+No background full-filesystem watcher is introduced; verification remains explicit
+and event-driven.
+
 ## 11. Tool runs and generated output lifecycle in workspace flow
 
 Tool execution remains adapter-driven (`tool_runs` + `tool_adapters`) but now
