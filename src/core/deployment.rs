@@ -440,6 +440,30 @@ pub fn verify_deployment_integrity(
     Ok(report)
 }
 
+fn paths_refer_same_file(dest: &Path, src: &Path) -> bool {
+    if dest == src {
+        return true;
+    }
+    let Ok(dest_meta) = fs::metadata(dest) else {
+        return false;
+    };
+    let Ok(src_meta) = fs::metadata(src) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return dest_meta.dev() == src_meta.dev() && dest_meta.ino() == src_meta.ino();
+    }
+    #[cfg(not(unix))]
+    {
+        if let (Ok(dest_canon), Ok(src_canon)) = (dest.canonicalize(), src.canonicalize()) {
+            return dest_canon == src_canon;
+        }
+        false
+    }
+}
+
 // ── Link Creation ─────────────────────────────────────────────────────────────
 
 /// Create a link (symlink or hardlink) from source to destination.

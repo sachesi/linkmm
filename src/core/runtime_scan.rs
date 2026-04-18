@@ -1,7 +1,7 @@
 use crate::core::games::Game;
 use crate::core::generated_outputs::adopt_existing_game_data_files;
 use crate::core::mods::ModDatabase;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
