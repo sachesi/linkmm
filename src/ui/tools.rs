@@ -139,9 +139,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
 
         let generated_group = adw::PreferencesGroup::builder()
             .title("Outputs & Runtime Changes")
-            .description(
-                "Review generated packages, runtime-preserved changes, and redeploy safety.",
-            )
+            .description("Moved to Workspace page.")
             .build();
         let cleanup_generated_btn = gtk4::Button::new();
         cleanup_generated_btn.set_icon_name("edit-clear-symbolic");
@@ -155,10 +153,8 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         let last_captured_package_id = Rc::new(RefCell::new(None::<String>));
 
         let workspace_group = adw::PreferencesGroup::builder()
-            .title("Workspace Lifecycle")
-            .description(
-                "Tool output capture, runtime adoption, and safe redeploy status for this profile.",
-            )
+            .title("Tool Run Status")
+            .description("Use Workspace page for review/apply/recovery flows.")
             .build();
         let workspace_row = adw::ActionRow::builder()
             .title("Workspace Status")
@@ -170,6 +166,11 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
             .subtitle("No runs recorded in this session.")
             .build();
         workspace_group.add(&last_run_row);
+        let handoff_row = adw::ActionRow::builder()
+            .title("Review & Apply")
+            .subtitle("Open the Workspace page to review deploy preview, integrity, runtime changes, and backups.")
+            .build();
+        workspace_group.add(&handoff_row);
 
         // Rebuild function to refresh the tool list
         let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
@@ -1148,7 +1149,6 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
         content_box.append(&profile_group);
         content_box.append(&workspace_group);
         content_box.append(&tools_group);
-        content_box.append(&generated_group);
     } else {
         // No game selected
         let status_page = adw::StatusPage::builder()

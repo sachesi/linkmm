@@ -139,6 +139,28 @@ List/view update rule for Library and Load Order:
   filtering is active, reorder affordances are disabled until the filter is
   cleared.
 
+### Dedicated Workspace page (review/apply control center)
+
+Global review/apply surfaces are now centralized in a dedicated **Workspace**
+page, instead of living primarily under Tools.
+
+Separation of concerns:
+
+- **Library / Load Order**: editing and staging profile changes (with concise hints).
+- **Tools**: launching/configuring tools and tool-run context.
+- **Workspace**: review/apply/recovery control center:
+  - workspace summary
+  - redeploy/discard actions
+  - deployment preview
+  - runtime/unmanaged review summary
+  - generated output summary
+  - deployment backup summary
+  - deployment integrity summary/guidance
+
+This preserves the cached-page/event-driven model while making the primary
+workflow clearer: edit in Library/Load Order, run tools in Tools, review/apply
+in Workspace.
+
 ## 10. Workspace state and dirty semantics
 
 LinkMM now exposes an app-shared workspace state model per game instance/profile.

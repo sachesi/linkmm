@@ -24,6 +24,7 @@ pub mod ordering;
 pub mod settings;
 pub mod setup_wizard;
 pub mod tools;
+pub mod workspace_page;
 
 pub fn build_ui(app: &libadwaita::Application) {
     let config = Rc::new(RefCell::new(AppConfig::load_or_default()));
@@ -59,8 +60,9 @@ pub fn build_ui(app: &libadwaita::Application) {
 const NAV_LIBRARY: i32 = 0;
 const NAV_LOAD_ORDER: i32 = 1;
 const NAV_DOWNLOADS: i32 = 2;
-const NAV_TOOLS: i32 = 3;
-const NAV_PREFERENCES: i32 = 4;
+const NAV_WORKSPACE: i32 = 3;
+const NAV_TOOLS: i32 = 4;
+const NAV_PREFERENCES: i32 = 5;
 
 fn attach_workspace_event_listener<F>(mut on_event: F)
 where
@@ -217,6 +219,7 @@ fn build_main_window(
         ("Library", "applications-games-symbolic"),
         ("Load Order", "format-justify-left-symbolic"),
         ("Downloads", "folder-download-symbolic"),
+        ("Workspace", "view-list-bullet-symbolic"),
         ("Tools", "applications-utilities-symbolic"),
         ("Preferences", "preferences-system-symbolic"),
     ] {
@@ -436,6 +439,11 @@ fn build_main_window(
     );
     content_stack.add_named(&downloads_widget, Some("downloads"));
 
+    // Workspace
+    let workspace_widget =
+        workspace_page::build_workspace_page(current_game.as_ref(), Rc::clone(&config));
+    content_stack.add_named(&workspace_widget, Some("workspace"));
+
     // Tools
     let tools_widget = tools::build_tools_page(current_game.as_ref(), Rc::clone(&config));
     content_stack.add_named(&tools_widget, Some("tools"));
@@ -518,6 +526,10 @@ fn build_main_window(
                     content_page_c.set_title("Downloads");
                     content_stack_c.set_visible_child_name("downloads");
                 }
+                NAV_WORKSPACE => {
+                    content_page_c.set_title("Workspace");
+                    content_stack_c.set_visible_child_name("workspace");
+                }
                 NAV_TOOLS => {
                     content_page_c.set_title("Tools");
                     content_stack_c.set_visible_child_name("tools");
@@ -599,6 +611,14 @@ fn build_main_window(
         }
         content_stack_r.add_named(&new_downloads, Some("downloads"));
 
+        // Rebuild Workspace page
+        let new_workspace =
+            workspace_page::build_workspace_page(game_info.as_ref(), Rc::clone(&config_r));
+        if let Some(old) = content_stack_r.child_by_name("workspace") {
+            content_stack_r.remove(&old);
+        }
+        content_stack_r.add_named(&new_workspace, Some("workspace"));
+
         // Rebuild Tools page
         let new_tools = tools::build_tools_page(game_info.as_ref(), Rc::clone(&config_r));
         if let Some(old) = content_stack_r.child_by_name("tools") {
@@ -648,13 +668,16 @@ fn build_main_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{NAV_DOWNLOADS, NAV_LIBRARY, NAV_LOAD_ORDER, NAV_PREFERENCES, NAV_TOOLS};
+    use super::{
+        NAV_DOWNLOADS, NAV_LIBRARY, NAV_LOAD_ORDER, NAV_PREFERENCES, NAV_TOOLS, NAV_WORKSPACE,
+    };
 
     fn page_for_nav(index: i32) -> Option<(&'static str, &'static str)> {
         match index {
             NAV_LIBRARY => Some(("Library", "library")),
             NAV_LOAD_ORDER => Some(("Load Order", "load_order")),
             NAV_DOWNLOADS => Some(("Downloads", "downloads")),
+            NAV_WORKSPACE => Some(("Workspace", "workspace")),
             NAV_TOOLS => Some(("Tools", "tools")),
             NAV_PREFERENCES => Some(("Preferences", "preferences")),
             _ => None,
@@ -671,6 +694,10 @@ mod tests {
         assert_eq!(
             page_for_nav(NAV_DOWNLOADS),
             Some(("Downloads", "downloads"))
+        );
+        assert_eq!(
+            page_for_nav(NAV_WORKSPACE),
+            Some(("Workspace", "workspace"))
         );
         assert_eq!(page_for_nav(NAV_TOOLS), Some(("Tools", "tools")));
         assert_eq!(
