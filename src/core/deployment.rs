@@ -161,6 +161,88 @@ pub struct DeploymentPreview {
     pub pending_payload_deletions: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentIntegrityLevel {
+    Healthy,
+    Warnings,
+    Broken,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeploymentIntegrityIssueKind {
+    ExpectedTargetMissing,
+    ManagedTargetPointsElsewhere,
+    ManagedTargetWrongType,
+    ManagedSourceMissing,
+    BackupPayloadMissing,
+    OwnerMismatch,
+    PendingRemovalPayloadMissing,
+    PathInspectionFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentIntegrityIssue {
+    pub kind: DeploymentIntegrityIssueKind,
+    pub path: Option<PathBuf>,
+    pub details: String,
+    pub repairable_by_redeploy: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeploymentIntegrityReport {
+    pub level: Option<DeploymentIntegrityLevel>,
+    pub issues: Vec<DeploymentIntegrityIssue>,
+}
+
+impl DeploymentIntegrityReport {
+    pub fn issue_count(&self) -> usize {
+        self.issues.len()
+    }
+
+    pub fn repairable_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|i| i.repairable_by_redeploy)
+            .count()
+    }
+
+    pub fn manual_review_count(&self) -> usize {
+        self.issues.len().saturating_sub(self.repairable_count())
+    }
+
+    pub fn summary_line(&self) -> String {
+        match self.level.unwrap_or(DeploymentIntegrityLevel::Unknown) {
+            DeploymentIntegrityLevel::Healthy => "Integrity: healthy".to_string(),
+            DeploymentIntegrityLevel::Unknown => "Integrity: unknown (not verified)".to_string(),
+            DeploymentIntegrityLevel::Warnings => format!(
+                "Integrity: {} issue(s), {} likely repairable by redeploy",
+                self.issue_count(),
+                self.repairable_count()
+            ),
+            DeploymentIntegrityLevel::Broken => format!(
+                "Integrity: {} issue(s), {} require manual review",
+                self.issue_count(),
+                self.manual_review_count()
+            ),
+        }
+    }
+
+    pub fn top_examples(&self, max: usize) -> Vec<String> {
+        self.issues
+            .iter()
+            .take(max)
+            .map(|i| {
+                if let Some(path) = &i.path {
+                    format!("{} ({})", i.details, path.display())
+                } else {
+                    i.details.clone()
+                }
+            })
+            .collect()
+    }
+}
+
 impl DeploymentPreview {
     pub fn summary_line(&self) -> String {
         format!(
@@ -172,6 +254,144 @@ impl DeploymentPreview {
             self.backups_to_restore.len()
         )
     }
+}
+
+pub fn verify_deployment_integrity(
+    game: &Game,
+    db: &ModDatabase,
+) -> Result<DeploymentIntegrityReport, String> {
+    let mut report = DeploymentIntegrityReport::default();
+    let state = DeploymentState::load(game, &db.active_profile_id);
+    let desired = build_assets_plan(db, ASSETS_DEPLOYER_ID);
+
+    for (dest_rel, src_rel) in &state.deployed {
+        let dest = game.root_path.join(dest_rel);
+        let src = PathBuf::from(src_rel);
+        if !src.exists() {
+            report.issues.push(DeploymentIntegrityIssue {
+                kind: DeploymentIntegrityIssueKind::ManagedSourceMissing,
+                path: Some(src.clone()),
+                details: "Managed source path is missing".to_string(),
+                repairable_by_redeploy: false,
+            });
+        }
+        match fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.file_type().is_symlink() => match fs::read_link(&dest) {
+                Ok(target) if target == src => {}
+                Ok(target) => report.issues.push(DeploymentIntegrityIssue {
+                    kind: DeploymentIntegrityIssueKind::ManagedTargetPointsElsewhere,
+                    path: Some(dest.clone()),
+                    details: format!("Managed symlink points to {}", target.display()),
+                    repairable_by_redeploy: true,
+                }),
+                Err(err) => report.issues.push(DeploymentIntegrityIssue {
+                    kind: DeploymentIntegrityIssueKind::PathInspectionFailed,
+                    path: Some(dest.clone()),
+                    details: format!("Failed to read managed symlink target: {err}"),
+                    repairable_by_redeploy: true,
+                }),
+            },
+            Ok(meta) if meta.is_file() => {
+                if !paths_refer_same_file(&dest, &src) {
+                    report.issues.push(DeploymentIntegrityIssue {
+                        kind: DeploymentIntegrityIssueKind::ManagedTargetPointsElsewhere,
+                        path: Some(dest.clone()),
+                        details: "Managed deployed file no longer points to expected source"
+                            .to_string(),
+                        repairable_by_redeploy: true,
+                    });
+                }
+            }
+            Ok(_) => report.issues.push(DeploymentIntegrityIssue {
+                kind: DeploymentIntegrityIssueKind::ManagedTargetWrongType,
+                path: Some(dest.clone()),
+                details: "Managed destination exists but is not a file/link".to_string(),
+                repairable_by_redeploy: true,
+            }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                report.issues.push(DeploymentIntegrityIssue {
+                    kind: DeploymentIntegrityIssueKind::ExpectedTargetMissing,
+                    path: Some(dest.clone()),
+                    details: "Expected managed deployed path is missing".to_string(),
+                    repairable_by_redeploy: true,
+                });
+            }
+            Err(err) => report.issues.push(DeploymentIntegrityIssue {
+                kind: DeploymentIntegrityIssueKind::PathInspectionFailed,
+                path: Some(dest.clone()),
+                details: format!("Failed inspecting deployed target: {err}"),
+                repairable_by_redeploy: true,
+            }),
+        }
+
+        if let Some(owner) = state.owners.get(dest_rel)
+            && let Some(desired_owner) = desired.desired.get(&PathBuf::from(dest_rel))
+            && owner != &desired_owner.owner_id
+        {
+            report.issues.push(DeploymentIntegrityIssue {
+                kind: DeploymentIntegrityIssueKind::OwnerMismatch,
+                path: Some(dest.clone()),
+                details: format!(
+                    "Recorded owner mismatch (state: {owner}, desired: {})",
+                    desired_owner.owner_id
+                ),
+                repairable_by_redeploy: true,
+            });
+        }
+    }
+
+    for backup in state.backups.values() {
+        let path = resolve_backup_payload_path(game, &db.active_profile_id, backup);
+        if !path.exists() {
+            report.issues.push(DeploymentIntegrityIssue {
+                kind: DeploymentIntegrityIssueKind::BackupPayloadMissing,
+                path: Some(path),
+                details: "Backup payload referenced by deployment state is missing".to_string(),
+                repairable_by_redeploy: false,
+            });
+        }
+    }
+
+    for m in db.mods.iter().filter(|m| m.pending_removal) {
+        if !m.source_path.exists() {
+            report.issues.push(DeploymentIntegrityIssue {
+                kind: DeploymentIntegrityIssueKind::PendingRemovalPayloadMissing,
+                path: Some(m.source_path.clone()),
+                details: format!("Pending-removal mod payload missing: {}", m.name),
+                repairable_by_redeploy: false,
+            });
+        }
+    }
+    for pkg in db
+        .generated_outputs
+        .iter()
+        .filter(|p| p.pending_removal && p.manager_profile_id == db.active_profile_id)
+    {
+        if !pkg.source_path.exists() {
+            report.issues.push(DeploymentIntegrityIssue {
+                kind: DeploymentIntegrityIssueKind::PendingRemovalPayloadMissing,
+                path: Some(pkg.source_path.clone()),
+                details: format!(
+                    "Pending-removal generated output payload missing: {}",
+                    pkg.name
+                ),
+                repairable_by_redeploy: false,
+            });
+        }
+    }
+
+    report.level = Some(if report.issues.is_empty() {
+        DeploymentIntegrityLevel::Healthy
+    } else if report
+        .issues
+        .iter()
+        .any(|issue| !issue.repairable_by_redeploy)
+    {
+        DeploymentIntegrityLevel::Broken
+    } else {
+        DeploymentIntegrityLevel::Warnings
+    });
+    Ok(report)
 }
 
 // ── Link Creation ─────────────────────────────────────────────────────────────
