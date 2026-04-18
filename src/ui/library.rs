@@ -203,6 +203,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
     {
         let game_stage = Rc::clone(&game_rc);
+        let game_stage_events = Rc::clone(&game_stage);
         let staged_row_c = staged_row.clone();
         let staged_redeploy_btn_c = staged_redeploy_btn.clone();
         let staged_discard_btn_c = staged_discard_btn.clone();
@@ -214,7 +215,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         };
         refresh_stage();
         attach_library_workspace_listener(move |event| {
-            if is_event_for_game(&event, &game_stage.id) {
+            if is_event_for_game(&event, &game_stage_events.id) {
                 refresh_stage();
             }
         });

@@ -381,7 +381,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                 while let Some(child) = generated_list_c.first_child() {
                     generated_list_c.remove(&child);
                 }
-                let mut db = ModDatabase::load(&game_for_generated);
+                let db = ModDatabase::load(&game_for_generated);
                 let scan_report = match crate::core::runtime_scan::scan_profile_runtime_changes(
                     &game_for_generated,
                     &db,
@@ -877,7 +877,7 @@ pub fn build_tools_page(game: Option<&Game>, config: Rc<RefCell<AppConfig>>) -> 
                         .map(|id| id == &output.id)
                         .unwrap_or(false);
                     let subtitle = format!(
-                        "Tool: {} ({}) · Run profile: {} · Manager profile: {} · Files: {} · Updated: {} · {}{}{}",
+                        "Tool: {} ({}) · Run profile: {} · Manager profile: {} · Files: {} · Updated: {} · {}{}{}{}",
                         tool_name,
                         output.tool_id,
                         output.run_profile,
@@ -1466,7 +1466,7 @@ fn launch_tool(
     let profile = tool.primary_profile();
     let (session_id, rx) = match manager.start_tool_session(
         game.clone(),
-        active_profile_id,
+        active_profile_id.clone(),
         tool.clone(),
         profile.clone(),
     ) {
@@ -1503,7 +1503,7 @@ fn launch_tool(
         }
         match rx.try_recv() {
             Ok(Ok(run)) => {
-                let msg = if let Some(pkg) = run.package_id {
+                let msg = if let Some(ref pkg) = run.package_id {
                     format!("{} complete; generated package {}", tool_name, pkg)
                 } else {
                     format!("{} complete", tool_name)
