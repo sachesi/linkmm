@@ -434,8 +434,17 @@ impl ModDatabase {
             });
         }
 
-        self.plugin_load_order = state.plugin_load_order;
-        self.plugin_disabled = state.plugin_disabled;
+        // Normalise to lowercase so all plugin lookups are case-insensitive.
+        self.plugin_load_order = state
+            .plugin_load_order
+            .into_iter()
+            .map(|n| n.to_lowercase())
+            .collect();
+        self.plugin_disabled = state
+            .plugin_disabled
+            .into_iter()
+            .map(|n| n.to_lowercase())
+            .collect();
         self.generated_outputs = state.generated_outputs;
     }
 
@@ -481,7 +490,14 @@ impl ModDatabase {
         if !data_dir.is_dir() {
             return plugins;
         }
-        let vanilla: HashSet<&str> = game.kind.vanilla_masters().iter().copied().collect();
+        // Vanilla master names lowercased for case-insensitive comparison.
+        let vanilla: HashSet<String> = game
+            .kind
+            .vanilla_masters()
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        // plugin_disabled stores lowercase names; compare with lowercase key.
         if let Ok(entries) = std::fs::read_dir(data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -502,8 +518,9 @@ impl ModDatabase {
                 } else {
                     continue;
                 };
-                let is_vanilla = vanilla.contains(name.as_str());
-                let enabled = !self.plugin_disabled.contains(&name);
+                let is_vanilla = vanilla.contains(&lower);
+                // Vanilla masters are always active; others check plugin_disabled.
+                let enabled = is_vanilla || !self.plugin_disabled.contains(&lower);
                 plugins.push(PluginFile {
                     name,
                     kind,
@@ -535,17 +552,18 @@ impl ModDatabase {
                 .unwrap_or(usize::MAX)
         });
 
-        // Apply saved order to non-vanilla plugins
-        let load_order_indices: HashMap<&str, usize> = self
+        // Apply saved order to non-vanilla plugins.
+        // plugin_load_order stores lowercase names; compare case-insensitively.
+        let load_order_indices: HashMap<String, usize> = self
             .plugin_load_order
             .iter()
             .enumerate()
-            .map(|(idx, name)| (name.as_str(), idx))
+            .map(|(idx, name)| (name.to_lowercase(), idx))
             .collect();
         let mut ordered_with_idx: Vec<(usize, PluginFile)> = Vec::new();
         let mut unordered: Vec<PluginFile> = Vec::new();
         for plugin in rest {
-            if let Some(idx) = load_order_indices.get(plugin.name.as_str()) {
+            if let Some(idx) = load_order_indices.get(&plugin.name.to_lowercase()) {
                 ordered_with_idx.push((*idx, plugin));
             } else {
                 unordered.push(plugin);
@@ -613,17 +631,31 @@ impl ModDatabase {
         }
     }
 
+    /// Mark a plugin as disabled (case-insensitive).
+    pub fn disable_plugin(&mut self, name: &str) {
+        self.plugin_disabled.insert(name.to_lowercase());
+    }
+
+    /// Mark a plugin as enabled (case-insensitive).
+    pub fn enable_plugin(&mut self, name: &str) {
+        self.plugin_disabled.remove(&name.to_lowercase());
+    }
+
     /// Update `plugin_load_order` and `plugin_disabled` from the given ordered list.
+    ///
+    /// Names are normalised to lowercase so comparisons in `scan_plugins` and
+    /// `get_ordered_plugins` are always case-insensitive.
     pub fn set_plugin_order(&mut self, plugins: &[PluginFile]) {
         self.plugin_load_order = plugins
             .iter()
             .filter(|p| !p.is_vanilla)
-            .map(|p| p.name.clone())
+            .map(|p| p.name.to_lowercase())
             .collect();
+        // Vanilla masters are never disabled; only track non-vanilla plugins.
         self.plugin_disabled = plugins
             .iter()
-            .filter(|p| !p.enabled)
-            .map(|p| p.name.clone())
+            .filter(|p| !p.is_vanilla && !p.enabled)
+            .map(|p| p.name.to_lowercase())
             .collect();
     }
 
@@ -633,7 +665,14 @@ impl ModDatabase {
     /// `Plugin.esp` (disabled).  A comment header is included for clarity.
     pub fn write_plugins_txt(&self, game: &Game) -> Result<(), String> {
         let Some(plugins_path) = game.plugins_txt_path() else {
-            return Ok(()); // Path unknown – skip silently
+            if game.kind.has_plugins_txt() {
+                log::warn!(
+                    "Cannot write plugins.txt for {}: Proton prefix not found or not yet initialised. \
+                     Run the game at least once to create the Wine prefix.",
+                    game.name
+                );
+            }
+            return Ok(());
         };
         if let Some(parent) = plugins_path.parent() {
             std::fs::create_dir_all(parent)
@@ -675,11 +714,13 @@ impl ModDatabase {
             if line.starts_with('#') || line.is_empty() {
                 continue;
             }
+            // Normalise to lowercase: Bethesda plugin names are case-insensitive
+            // but Linux filesystems are not.  All internal state uses lowercase.
             if let Some(name) = line.strip_prefix('*') {
-                order.push(name.to_string());
+                order.push(name.to_lowercase());
             } else {
-                order.push(line.to_string());
-                disabled.push(line.to_string());
+                order.push(line.to_lowercase());
+                disabled.push(line.to_lowercase());
             }
         }
         if !order.is_empty() {
@@ -865,6 +906,9 @@ mod tests {
             "plugin_disabled": ["A.esp", "A.esp", "B.esm"]
         }"#;
 
+        // Deserialized directly (bypassing load()), so mixed case is preserved.
+        // In practice ModDatabase::load() normalises to lowercase via
+        // apply_active_profile_state(), but that path isn't tested here.
         let db: ModDatabase = serde_json::from_str(json).unwrap();
         assert_eq!(db.plugin_disabled.len(), 2);
         assert!(db.plugin_disabled.contains("A.esp"));

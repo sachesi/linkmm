@@ -1203,8 +1203,8 @@ mod tests {
         let mut db = ModDatabase::default();
         add_mod(&game, &mut db, "base", "Data/Base.esm", b"m", true);
         add_mod(&game, &mut db, "addon", "Data/Addon.esp", b"p", true);
-        db.plugin_load_order = vec!["Addon.esp".to_string(), "Base.esm".to_string()];
-        db.plugin_disabled.insert("Addon.esp".to_string());
+        db.plugin_load_order = vec!["addon.esp".to_string(), "base.esm".to_string()];
+        db.plugin_disabled.insert("addon.esp".to_string());
 
         rebuild_deployment(&game, &mut db).unwrap();
         let plugins_txt = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
@@ -1286,13 +1286,13 @@ mod tests {
         let mut db = ModDatabase::default();
         add_mod(&game, &mut db, "plugins", "Data/SwitchTest.esp", b"x", true);
         rebuild_deployment(&game, &mut db).unwrap();
-        db.plugin_disabled.remove("SwitchTest.esp");
+        db.plugin_disabled.remove("switchtest.esp");
         db.write_plugins_txt(&game).unwrap();
         let default_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
         assert!(default_plugins.contains("*SwitchTest.esp"));
 
         db.switch_active_profile("profile_two");
-        db.plugin_disabled.insert("SwitchTest.esp".to_string());
+        db.plugin_disabled.insert("switchtest.esp".to_string());
         rebuild_deployment(&game, &mut db).unwrap();
         db.write_plugins_txt(&game).unwrap();
         let other_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();

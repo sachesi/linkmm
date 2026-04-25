@@ -1062,15 +1062,19 @@ fn start_nxm_download(
                 return Ok(format!("{file_name} (already downloaded)"));
             }
 
+            if nxm.is_expired() {
+                return Err("NXM download link has expired. Re-click the \"Mod Manager Download\" button on Nexus Mods to get a fresh link.".to_string());
+            }
+
             // Get download link using NXM key/expires if available, otherwise
             // fall back to the premium-only direct API
-            let links = match (&nxm.key, &nxm.expires) {
+            let links = match (&nxm.key, nxm.expires) {
                 (Some(key), Some(expires)) => client.get_download_links_nxm(
                     &nxm.game_domain,
                     nxm.mod_id as u32,
                     nxm.file_id,
                     key,
-                    expires,
+                    &expires.to_string(),
                 )?,
                 _ => client.get_download_links(&nxm.game_domain, nxm.mod_id as u32, nxm.file_id)?,
             };

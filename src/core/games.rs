@@ -95,6 +95,15 @@ impl GameKind {
         "Data"
     }
 
+    /// Whether this game uses the standard `plugins.txt` load-order format.
+    ///
+    /// Morrowind stores its plugin list in `Morrowind.ini` under `[Game Files]`,
+    /// not in a separate `plugins.txt`.  All other supported games use the
+    /// standard `*PluginName.ext` (enabled) / `PluginName.ext` (disabled) format.
+    pub fn has_plugins_txt(&self) -> bool {
+        !matches!(self, GameKind::Morrowind)
+    }
+
     pub fn all() -> Vec<GameKind> {
         vec![
             GameKind::SkyrimSE,
@@ -407,6 +416,9 @@ impl Game {
     ///
     /// Returns `None` when no matching directory is found.
     pub fn plugins_txt_dir(&self) -> Option<PathBuf> {
+        if !self.kind.has_plugins_txt() {
+            return None;
+        }
         let sub = self.kind.local_app_data_folder();
 
         match self.launcher_source {
@@ -419,8 +431,12 @@ impl Game {
                     .prefix_path
                     .clone()
                     .unwrap_or_else(crate::core::umu::default_wineprefix);
+
+                // UMU (and Wine/GE-Proton) place the prefix contents directly
+                // at WINEPREFIX, i.e. prefix/drive_c/... with no pfx/ layer.
+                // Some users point UMU at a Steam-style compatdata directory
+                // (which has a pfx/ subdirectory), so we check both.
                 let path = prefix
-                    .join("pfx")
                     .join("drive_c")
                     .join("users")
                     .join("steamuser")
@@ -430,18 +446,21 @@ impl Game {
                 if path.is_dir() {
                     return Some(path);
                 }
-                // Also try without the "pfx" subdirectory in case prefix points directly there
-                let path_alt = prefix
+                // Fallback: Steam-style prefix (compatdata/pfx/drive_c/...).
+                let path_pfx = prefix
+                    .join("pfx")
                     .join("drive_c")
                     .join("users")
                     .join("steamuser")
                     .join("AppData")
                     .join("Local")
                     .join(sub);
-                if path_alt.is_dir() {
-                    return Some(path_alt);
+                if path_pfx.is_dir() {
+                    return Some(path_pfx);
                 }
-                None
+                // Prefix not yet initialised by umu-run.  Return the expected
+                // path so write_plugins_txt can create the directory tree.
+                Some(path)
             }
             GameLauncherSource::Steam => {
                 let app_id = self.steam_instance_app_id()?;
@@ -454,7 +473,10 @@ impl Game {
                     .join("AppData")
                     .join("Local")
                     .join(sub);
-                if path.is_dir() { Some(path) } else { None }
+                // Return path even if the directory does not exist yet — the
+                // Proton prefix may not be fully initialised on a fresh install.
+                // write_plugins_txt creates the parent directories as needed.
+                Some(path)
             }
         }
     }
@@ -637,6 +659,88 @@ mod tests {
             },
         );
         assert_eq!(game.plugins_txt_dir(), Some(target));
+    }
+
+    #[test]
+    fn non_steam_plugins_resolution_prefers_native_umu_layout_over_pfx() {
+        // UMU's native layout is prefix/drive_c/... (no pfx/).
+        // If both layouts exist, the native one should win.
+        let temp = TempDir::new().unwrap();
+        let prefix = temp.path().join("prefix");
+        let local_appdata_sub = GameKind::SkyrimSE.local_app_data_folder();
+
+        let native_target = prefix
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("AppData")
+            .join("Local")
+            .join(local_appdata_sub);
+        std::fs::create_dir_all(&native_target).unwrap();
+
+        // Also create the pfx-style layout so we know the native one wins.
+        let pfx_target = prefix
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("AppData")
+            .join("Local")
+            .join(local_appdata_sub);
+        std::fs::create_dir_all(&pfx_target).unwrap();
+
+        let game = Game::new_non_steam_umu(
+            GameKind::SkyrimSE,
+            temp.path().join("root"),
+            UmuGameConfig {
+                exe_path: temp.path().join("SkyrimSE.exe"),
+                prefix_path: Some(prefix.clone()),
+                proton_path: None,
+            },
+        );
+        assert_eq!(game.plugins_txt_dir(), Some(native_target));
+    }
+
+    #[test]
+    fn plugins_txt_dir_returns_expected_path_even_when_not_yet_initialised() {
+        // On a fresh install the prefix/AppData dir may not exist yet.
+        // plugins_txt_dir should still return the expected path so the
+        // caller can create it.
+        let temp = TempDir::new().unwrap();
+        let prefix = temp.path().join("prefix"); // intentionally not created
+        let game = Game::new_non_steam_umu(
+            GameKind::SkyrimSE,
+            temp.path().join("root"),
+            UmuGameConfig {
+                exe_path: temp.path().join("SkyrimSE.exe"),
+                prefix_path: Some(prefix.clone()),
+                proton_path: None,
+            },
+        );
+        let expected = prefix
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("AppData")
+            .join("Local")
+            .join(GameKind::SkyrimSE.local_app_data_folder());
+        assert_eq!(game.plugins_txt_dir(), Some(expected));
+    }
+
+    #[test]
+    fn morrowind_has_no_plugins_txt() {
+        assert!(!GameKind::Morrowind.has_plugins_txt());
+        let game = Game::new_non_steam_umu(
+            GameKind::Morrowind,
+            PathBuf::from("/tmp/morrowind"),
+            UmuGameConfig {
+                exe_path: PathBuf::from("/tmp/morrowind/Morrowind.exe"),
+                prefix_path: None,
+                proton_path: None,
+            },
+        );
+        assert!(game.plugins_txt_dir().is_none());
+        assert!(game.plugins_txt_path().is_none());
     }
 
     #[test]

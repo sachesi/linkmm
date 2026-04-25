@@ -49,6 +49,20 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             status.set_vexpand(true);
             content_container.append(&status);
         }
+        Some(g) if !g.kind.has_plugins_txt() => {
+            sort_btn.set_sensitive(false);
+            sort_btn.set_tooltip_text(Some("Not supported for this game"));
+            let status = adw::StatusPage::builder()
+                .title("Load Order Not Supported")
+                .description(
+                    "Morrowind stores its plugin list in Morrowind.ini rather than plugins.txt.\n\
+                     Plugin order management is not yet supported for this game.",
+                )
+                .icon_name("dialog-information-symbolic")
+                .build();
+            status.set_vexpand(true);
+            content_container.append(&status);
+        }
         Some(g) => {
             sort_btn.set_tooltip_text(Some("Sort plugins using LOOT load order rules"));
             let game_rc = Rc::new(g.clone());
@@ -121,9 +135,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 let hint_c = reorder_hint.clone();
                 sort_btn.connect_clicked(move |_| {
                     let mut db = ModDatabase::load(&game_c);
-                    if db.plugin_load_order.is_empty() {
-                        db.sync_from_plugins_txt(&game_c);
-                    }
+                    db.sync_from_plugins_txt(&game_c);
                     db.sort_plugins_by_type(&game_c);
                     db.save(&game_c);
                     if let Err(e) = db.write_plugins_txt(&game_c) {
@@ -171,9 +183,10 @@ fn refresh_load_order_content(
     }
 
     let mut db = ModDatabase::load(game);
-    if db.plugin_load_order.is_empty() {
-        db.sync_from_plugins_txt(game);
-    }
+    // Always sync from plugins.txt so external changes (game launch, LOOT) are
+    // reflected immediately.  sync_from_plugins_txt is a no-op when the file
+    // doesn't exist or is empty, so the saved DB order is preserved as fallback.
+    db.sync_from_plugins_txt(game);
 
     let ordered_plugins = db.get_ordered_plugins(game);
     if ordered_plugins.is_empty() {
@@ -292,9 +305,9 @@ fn build_plugin_row(
             let enabled = btn.is_active();
             let mut db = ModDatabase::load(&game_c);
             if enabled {
-                db.plugin_disabled.remove(&plugin_name);
+                db.enable_plugin(&plugin_name);
             } else {
-                db.plugin_disabled.insert(plugin_name.clone());
+                db.disable_plugin(&plugin_name);
             }
             db.save(&game_c);
             let _ = db.write_plugins_txt(&game_c);
@@ -490,8 +503,8 @@ fn build_plugin_row(
                 let mut db = ModDatabase::load(&game_disable);
                 let ordered = db.get_ordered_plugins(&game_disable);
                 for p in &ordered {
-                    if !p.is_vanilla && !db.plugin_disabled.contains(&p.name) {
-                        db.plugin_disabled.insert(p.name.clone());
+                    if !p.is_vanilla {
+                        db.disable_plugin(&p.name);
                     }
                 }
                 db.save(&game_disable);

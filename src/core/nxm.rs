@@ -7,7 +7,22 @@ pub struct NxmUrl {
     pub mod_id: u64,
     pub file_id: u64,
     pub key: Option<String>,
-    pub expires: Option<String>,
+    /// Unix timestamp (seconds) after which the link is no longer valid, if provided.
+    pub expires: Option<u64>,
+}
+
+impl NxmUrl {
+    /// Returns `true` if the link has an expiry timestamp that is in the past.
+    pub fn is_expired(&self) -> bool {
+        let Some(exp) = self.expires else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now > exp
+    }
 }
 
 impl NxmUrl {
@@ -66,9 +81,8 @@ impl NxmUrl {
                             }
                         }
                         "expires" => {
-                            // Validate expires: must be a valid integer timestamp
-                            if v.parse::<u64>().is_ok() {
-                                expires = Some(v.to_string());
+                            if let Ok(ts) = v.parse::<u64>() {
+                                expires = Some(ts);
                             }
                         }
                         _ => {} // ignore unknown params (user_id, etc.)
@@ -99,7 +113,7 @@ mod tests {
         assert_eq!(nxm.mod_id, 266);
         assert_eq!(nxm.file_id, 725705);
         assert_eq!(nxm.key.as_deref(), Some("8WNi8WcqllkfAxbdkL3L0w"));
-        assert_eq!(nxm.expires.as_deref(), Some("1773066593"));
+        assert_eq!(nxm.expires, Some(1773066593u64));
     }
 
     #[test]
