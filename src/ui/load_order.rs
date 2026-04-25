@@ -304,6 +304,7 @@ fn build_plugin_row(
         enabled_btn.connect_toggled(move |btn| {
             let enabled = btn.is_active();
             let mut db = ModDatabase::load(&game_c);
+            db.sync_from_plugins_txt(&game_c);
             if enabled {
                 db.enable_plugin(&plugin_name);
             } else {
@@ -351,6 +352,7 @@ fn build_plugin_row(
         let search_q = search_query.to_string();
         up_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
+            db.sync_from_plugins_txt(&game_c);
             let ordered = db.get_ordered_plugins(&game_c);
             if let Ok(updated) =
                 ordering::move_up_by_id(&ordered, &plugin_name, pinned_prefix_len, |p| &p.name)
@@ -373,6 +375,7 @@ fn build_plugin_row(
         let search_q = search_query.to_string();
         down_btn.connect_clicked(move |_| {
             let mut db = ModDatabase::load(&game_c);
+            db.sync_from_plugins_txt(&game_c);
             let ordered = db.get_ordered_plugins(&game_c);
             if let Ok(updated) =
                 ordering::move_down_by_id(&ordered, &plugin_name, pinned_prefix_len, |p| &p.name)
@@ -539,7 +542,8 @@ fn show_move_to_position_dialog(
     reorder_hint: gtk4::Label,
     search_query: String,
 ) {
-    let db = ModDatabase::load(&game);
+    let mut db = ModDatabase::load(&game);
+    db.sync_from_plugins_txt(&game);
     let ordered = db.get_ordered_plugins(&game);
     let total = ordered.len();
     let Some(current_idx) = ordered.iter().position(|p| p.name == plugin_name) else {
@@ -564,6 +568,7 @@ fn show_move_to_position_dialog(
         current_idx + 1,
         move |target_idx| {
             let mut db = ModDatabase::load(&game);
+            db.sync_from_plugins_txt(&game);
             let ordered = db.get_ordered_plugins(&game);
             if let Ok(updated) = ordering::move_to_absolute_position_by_id(
                 &ordered,
