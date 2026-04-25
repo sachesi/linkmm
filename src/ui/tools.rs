@@ -639,6 +639,10 @@ fn default_profiles_for_name(name: &str) -> Vec<ToolRunProfile> {
 }
 
 /// Launch a tool in the selected game instance context.
+///
+/// Both Steam and UMU games go through the managed session path so that
+/// tool output (BodySlide meshes, Nemesis animations, etc.) is captured and
+/// registered as a generated-output package regardless of launcher type.
 fn launch_tool(
     game: &Game,
     tool: &ToolConfig,
@@ -646,17 +650,6 @@ fn launch_tool(
     btn: &gtk4::Button,
     toast_overlay: &adw::ToastOverlay,
 ) {
-    if game.launcher_source == GameLauncherSource::Steam {
-        let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
-        match crate::core::steam::launch_tool_with_proton(&tool.exe_path, &tool.arguments, app_id) {
-            Ok(_child) => {
-                toast_overlay.add_toast(adw::Toast::new("Tool launched via Steam/Proton"))
-            }
-            Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Launch failed: {e}"))),
-        }
-        return;
-    }
-
     let manager = global_runtime_manager();
     if let Some(active) = manager.current_tool_session(&game.id, &tool.id) {
         if let Err(e) = manager.stop_session(active.id) {

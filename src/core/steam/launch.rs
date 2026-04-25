@@ -249,7 +249,7 @@ fn build_flatpak_tool_command(
     Ok(command)
 }
 
-pub(super) fn split_launch_arguments(arguments: &str) -> Result<Vec<String>, String> {
+pub fn split_launch_arguments(arguments: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;

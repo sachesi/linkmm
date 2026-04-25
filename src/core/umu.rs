@@ -342,11 +342,13 @@ pub fn check_and_update_in_background(
 /// | `UMU_LOG`     | `"1"`                                                   |
 pub fn launch_with_umu(
     exe_path: &Path,
+    arguments: &str,
     steam_app_id: u32,
     prefix_path: Option<&Path>,
     proton_path: Option<&Path>,
 ) -> Result<std::process::Child, String> {
-    let mut command = build_umu_command(exe_path, steam_app_id, prefix_path, proton_path)?;
+    let mut command =
+        build_umu_command(exe_path, arguments, steam_app_id, prefix_path, proton_path)?;
     command
         .spawn()
         .map_err(|e| format!("Failed to spawn umu-run: {e}"))
@@ -354,6 +356,7 @@ pub fn launch_with_umu(
 
 pub fn build_umu_command(
     exe_path: &Path,
+    arguments: &str,
     steam_app_id: u32,
     prefix_path: Option<&Path>,
     proton_path: Option<&Path>,
@@ -395,6 +398,14 @@ pub fn build_umu_command(
         .env("PROTONPATH", proton_path_str.as_ref())
         .env("STORE", "none")
         .env("UMU_LOG", "1");
+
+    // Append tool/exe arguments after the executable path.
+    if !arguments.trim().is_empty() {
+        for arg in crate::core::steam::split_launch_arguments(arguments)? {
+            command.arg(arg);
+        }
+    }
+
     Ok(command)
 }
 

@@ -184,6 +184,7 @@ impl RuntimeSessionManager {
         let app_id = game.kind.primary_steam_app_id().unwrap_or(0);
         let command = crate::core::umu::build_umu_command(
             &umu.exe_path,
+            "",
             app_id,
             umu.prefix_path.as_deref(),
             umu.proton_path.as_deref(),
@@ -208,9 +209,6 @@ impl RuntimeSessionManager {
         tool: ToolConfig,
         run_profile: ToolRunProfile,
     ) -> Result<(u64, mpsc::Receiver<Result<ToolRunResult, String>>), String> {
-        if game.launcher_source == GameLauncherSource::Steam {
-            return Err("Steam tool launches are launch-only and not managed sessions".to_string());
-        }
         if self.current_tool_session(&game.id, &tool.id).is_some() {
             return Err(format!("Tool {} is already running", tool.name));
         }
@@ -236,13 +234,26 @@ impl RuntimeSessionManager {
             result.map(|_| ())
         });
 
-        let umu = game.validate_umu_setup()?;
-        let command = crate::core::umu::build_umu_command(
-            &tool.exe_path,
-            tool.app_id,
-            umu.prefix_path.as_deref(),
-            umu.proton_path.as_deref(),
-        )?;
+        let command = match game.launcher_source {
+            GameLauncherSource::NonSteamUmu => {
+                let umu = game.validate_umu_setup()?;
+                // Use the game's Steam App ID for GAMEID so umu-run applies the
+                // correct protonfixes for the game, not for the tool's (possibly
+                // unconfigured) app_id.
+                let app_id = game.kind.primary_steam_app_id().unwrap_or(tool.app_id);
+                crate::core::umu::build_umu_command(
+                    &tool.exe_path,
+                    &tool.arguments,
+                    app_id,
+                    umu.prefix_path.as_deref(),
+                    umu.proton_path.as_deref(),
+                )?
+            }
+            GameLauncherSource::Steam => {
+                let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
+                crate::core::steam::build_tool_command(&tool.exe_path, &tool.arguments, app_id)?
+            }
+        };
 
         let id = self
             .spawn_managed_session(SessionStart {
