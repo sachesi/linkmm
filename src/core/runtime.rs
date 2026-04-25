@@ -1,6 +1,6 @@
 use crate::core::config::{ToolConfig, ToolRunProfile};
 use crate::core::games::{Game, GameLauncherSource};
-use crate::core::mods::{ModDatabase, ModManager};
+use crate::core::mods::ModDatabase;
 use crate::core::tool_runs::{self, ToolRunResult};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
@@ -227,9 +227,8 @@ impl RuntimeSessionManager {
                 &run_profile_clone,
                 |_tool_cfg, _profile_cfg| Ok(status),
             );
-            if result.is_ok() {
-                let _ = ModManager::rebuild_all(&game_clone);
-            }
+            // run_tool_with_managed_outputs already calls rebuild_deployment and
+            // saves the db, so no additional rebuild is needed here.
             let _ = done_tx.send(result.clone());
             result.map(|_| ())
         });
