@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -14,16 +13,77 @@ use crate::core::games::Game;
 use crate::core::mods::{Mod, ModDatabase, ModManager};
 use crate::ui::ordering;
 
-const TOAST_TIMEOUT_SECONDS: u32 = 3;
-const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
+mod conflicts;
+use conflicts::{ConflictState, compute_conflict_states};
 
-#[derive(Debug, Clone, Default)]
-struct ConflictState {
-    overwrites: bool,
-    overwritten: bool,
-    files: BTreeSet<String>,
-    conflict_mods_by_file: BTreeMap<String, BTreeSet<String>>,
+const TOAST_TIMEOUT_SECONDS: u32 = 3;
+
+/// Shared page-level state captured by every closure in `build_mod_row`.
+/// Cloning this is one call instead of six.
+#[derive(Clone)]
+struct RowCtx {
+    game: Rc<Game>,
+    config: Rc<RefCell<AppConfig>>,
+    search: Rc<RefCell<String>>,
+    selected: Rc<RefCell<Option<String>>>,
+    container: gtk4::Box,
+    hint: gtk4::Label,
 }
+
+impl RowCtx {
+    fn refresh(&self) {
+        refresh_library_content_with_search(
+            &self.container,
+            &self.game,
+            Rc::clone(&self.config),
+            &self.search.borrow(),
+            Rc::clone(&self.search),
+            Rc::clone(&self.selected),
+            &self.hint,
+            false,
+        );
+    }
+}
+
+enum ReorderDir {
+    Up,
+    Down,
+}
+
+fn make_reorder_handler(
+    ctx: RowCtx,
+    mod_id: String,
+    dir: ReorderDir,
+) -> impl Fn(&gtk4::Button) {
+    move |_| {
+        let mut db = ModDatabase::load(&ctx.game);
+        let result = match dir {
+            ReorderDir::Up => ordering::move_up_by_id(&db.mods, &mod_id, 0, |m| &m.id),
+            ReorderDir::Down => ordering::move_down_by_id(&db.mods, &mod_id, 0, |m| &m.id),
+        };
+        if let Ok(updated) = result {
+            db.mods = updated;
+            db.save(&ctx.game);
+            ctx.refresh();
+            apply_library_reorder_deploy_async(&ctx.game);
+        }
+    }
+}
+
+fn make_bulk_toggle_handler(ctx: RowCtx, enable: bool) -> impl Fn(&gtk4::Button) {
+    move |_| {
+        let mut db = ModDatabase::load(&ctx.game);
+        for m in db.mods.iter_mut() {
+            m.enabled = enable;
+        }
+        db.save(&ctx.game);
+        if let Err(e) = ModManager::rebuild_all(&ctx.game) {
+            log::error!("Failed to rebuild deployment after bulk toggle: {e}");
+        }
+        ctx.refresh();
+    }
+}
+const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
 
 /// Build the full Library page for `game`.
 pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::Widget {
@@ -381,6 +441,15 @@ fn build_mod_row(
     reorder_hint: &gtk4::Label,
     conflict_state: Option<&ConflictState>,
 ) -> adw::SwitchRow {
+    let ctx = RowCtx {
+        game: Rc::clone(game),
+        config,
+        search: search_state,
+        selected: selected_mod_id,
+        container: container.clone(),
+        hint: reorder_hint.clone(),
+    };
+
     let row = adw::SwitchRow::builder()
         .title(&mod_entry.name)
         .active(mod_entry.enabled)
@@ -414,99 +483,37 @@ fn build_mod_row(
     }
 
     let mod_id = mod_entry.id.clone();
-    let game_clone = Rc::clone(game);
-
+    let game_toggle = Rc::clone(game);
     row.connect_active_notify(move |switch_row| {
         let enabled = switch_row.is_active();
-        if let Err(e) = ModManager::set_mod_enabled(&game_clone, &mod_id, enabled) {
+        if let Err(e) = ModManager::set_mod_enabled(&game_toggle, &mod_id, enabled) {
             log::error!("Failed to rebuild deployment after toggle: {e}");
             switch_row.set_active(!enabled);
         }
     });
 
-    // Move up / down
+    // ── Move up / down ────────────────────────────────────────────────────────
     let up_btn = gtk4::Button::new();
     up_btn.set_icon_name("go-up-symbolic");
     up_btn.set_valign(gtk4::Align::Center);
     up_btn.add_css_class("flat");
-    up_btn.set_tooltip_text(Some(if allow_reorder {
-        "Move up"
-    } else {
-        "Clear search to reorder"
-    }));
+    up_btn.set_tooltip_text(Some(if allow_reorder { "Move up" } else { "Clear search to reorder" }));
     up_btn.set_sensitive(allow_reorder && full_idx > 0);
 
     let down_btn = gtk4::Button::new();
     down_btn.set_icon_name("go-down-symbolic");
     down_btn.set_valign(gtk4::Align::Center);
     down_btn.add_css_class("flat");
-    down_btn.set_tooltip_text(Some(if allow_reorder {
-        "Move down"
-    } else {
-        "Clear search to reorder"
-    }));
+    down_btn.set_tooltip_text(Some(if allow_reorder { "Move down" } else { "Clear search to reorder" }));
     down_btn.set_sensitive(allow_reorder && full_idx + 1 < total);
 
     row.add_suffix(&up_btn);
     row.add_suffix(&down_btn);
 
-    {
-        let game_c = Rc::clone(game);
-        let container_c = container.clone();
-        let config_c = Rc::clone(&config);
-        let search_c = Rc::clone(&search_state);
-        let selected_c = Rc::clone(&selected_mod_id);
-        let hint_c = reorder_hint.clone();
-        let mod_id_c = mod_entry.id.clone();
-        up_btn.connect_clicked(move |_| {
-            let mut db = ModDatabase::load(&game_c);
-            if let Ok(updated) = ordering::move_up_by_id(&db.mods, &mod_id_c, 0, |m| &m.id) {
-                db.mods = updated;
-                db.save(&game_c);
-                refresh_library_content_with_search(
-                    &container_c,
-                    &game_c,
-                    Rc::clone(&config_c),
-                    &search_c.borrow(),
-                    Rc::clone(&search_c),
-                    Rc::clone(&selected_c),
-                    &hint_c,
-                    false,
-                );
-                apply_library_reorder_deploy_async(&game_c);
-            }
-        });
-    }
+    up_btn.connect_clicked(make_reorder_handler(ctx.clone(), mod_entry.id.clone(), ReorderDir::Up));
+    down_btn.connect_clicked(make_reorder_handler(ctx.clone(), mod_entry.id.clone(), ReorderDir::Down));
 
-    {
-        let game_c = Rc::clone(game);
-        let container_c = container.clone();
-        let config_c = Rc::clone(&config);
-        let search_c = Rc::clone(&search_state);
-        let selected_c = Rc::clone(&selected_mod_id);
-        let hint_c = reorder_hint.clone();
-        let mod_id_c = mod_entry.id.clone();
-        down_btn.connect_clicked(move |_| {
-            let mut db = ModDatabase::load(&game_c);
-            if let Ok(updated) = ordering::move_down_by_id(&db.mods, &mod_id_c, 0, |m| &m.id) {
-                db.mods = updated;
-                db.save(&game_c);
-                refresh_library_content_with_search(
-                    &container_c,
-                    &game_c,
-                    Rc::clone(&config_c),
-                    &search_c.borrow(),
-                    Rc::clone(&search_c),
-                    Rc::clone(&selected_c),
-                    &hint_c,
-                    false,
-                );
-                apply_library_reorder_deploy_async(&game_c);
-            }
-        });
-    }
-
-    // ── Uninstall button ─────────────────────────────────────────────────────
+    // ── Uninstall button ──────────────────────────────────────────────────────
     let delete_btn = gtk4::Button::new();
     delete_btn.set_icon_name("user-trash-symbolic");
     delete_btn.set_tooltip_text(Some("Uninstall mod"));
@@ -516,20 +523,14 @@ fn build_mod_row(
 
     let mod_id_del = mod_entry.id.clone();
     let mod_name_del = mod_entry.name.clone();
-    let game_del = Rc::clone(game);
-    let container_del = container.clone();
-    let config_del = Rc::clone(&config);
-    let search_del = Rc::clone(&search_state);
-    let selected_del = Rc::clone(&selected_mod_id);
-    let hint_del = reorder_hint.clone();
-
+    let ctx_del = ctx.clone();
     delete_btn.connect_clicked(move |btn| {
         let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
 
         let dialog = adw::AlertDialog::builder()
             .heading("Remove Mod?")
             .body(format!(
-                "“{}” will be permanently removed from disk.",
+                "\u{201c}{}\u{201d} will be permanently removed from disk.",
                 mod_name_del
             ))
             .build();
@@ -541,25 +542,20 @@ fn build_mod_row(
         dialog.set_close_response("cancel");
 
         let mod_id_c = mod_id_del.clone();
-        let game_c = Rc::clone(&game_del);
-        let container_c = container_del.clone();
-        let config_c = Rc::clone(&config_del);
-        let search_c = Rc::clone(&search_del);
-        let selected_c = Rc::clone(&selected_del);
-        let hint_dialog = hint_del.clone();
+        let ctx_c = ctx_del.clone();
         dialog.connect_response(None, move |_, response| {
             if response != "remove" {
                 return;
             }
-            let db = ModDatabase::load(&game_c);
+            let db = ModDatabase::load(&ctx_c.game);
             if let Some(m) = db.mods.iter().find(|m| m.id == mod_id_c) {
-                if let Err(e) = ModManager::uninstall_mod(&game_c, m) {
+                if let Err(e) = ModManager::uninstall_mod(&ctx_c.game, m) {
                     log::error!("Failed to uninstall mod: {e}");
                 } else {
                     // Keep downloaded archives on disk, but clear install marker
                     // so Downloads reflects that this mod is no longer installed.
-                    let mut cfg = config_c.borrow_mut();
-                    let gs = cfg.game_settings_mut(&game_c.id);
+                    let mut cfg = ctx_c.config.borrow_mut();
+                    let gs = cfg.game_settings_mut(&ctx_c.game.id);
                     if let Some(archive_name) = &m.archive_name {
                         gs.installed_archives
                             .retain(|archive| archive != archive_name);
@@ -576,46 +572,27 @@ fn build_mod_row(
                     cfg.save();
                 }
             }
-            if selected_c
-                .borrow()
-                .as_ref()
-                .map(|id| id == &mod_id_c)
-                .unwrap_or(false)
-            {
-                *selected_c.borrow_mut() = None;
+            if ctx_c.selected.borrow().as_ref().map(|id| id == &mod_id_c).unwrap_or(false) {
+                *ctx_c.selected.borrow_mut() = None;
             }
-            refresh_library_content_with_search(
-                &container_c,
-                &game_c,
-                Rc::clone(&config_c),
-                &search_c.borrow(),
-                Rc::clone(&search_c),
-                Rc::clone(&selected_c),
-                &hint_dialog,
-                false,
-            );
+            ctx_c.refresh();
         });
 
         dialog.present(parent.as_ref());
     });
 
-    // Left click selects a mod for conflict highlighting
+    // ── Left click: select mod for conflict highlighting ───────────────────────
     let left_click = gtk4::GestureClick::new();
     left_click.set_button(1);
     {
-        let game_sel = Rc::clone(game);
-        let container_sel = container.clone();
-        let config_sel = Rc::clone(&config);
-        let search_sel = Rc::clone(&search_state);
-        let selected_sel = Rc::clone(&selected_mod_id);
-        let hint_sel = reorder_hint.clone();
         let mod_id_sel = mod_entry.id.clone();
+        let ctx_sel = ctx.clone();
         // Use `released` (not `pressed`) so built-in SwitchRow controls process
         // the click first; refreshing immediately on press can swallow toggle
         // interactions and make row controls feel broken.
         left_click.connect_released(move |_, _, _, _| {
             {
-                let mut selected = selected_sel.borrow_mut();
+                let mut selected = ctx_sel.selected.borrow_mut();
                 if selected.as_ref() == Some(&mod_id_sel) {
                     // Clicking the same row again clears selection and returns
                     // conflict highlighting to the global blue mode.
@@ -626,24 +603,8 @@ fn build_mod_row(
             }
             // Defer refresh so switch/button default handlers run first; this
             // keeps row toggles and other left-click controls responsive.
-            let container_idle = container_sel.clone();
-            let game_idle = Rc::clone(&game_sel);
-            let config_idle = Rc::clone(&config_sel);
-            let search_idle = Rc::clone(&search_sel);
-            let selected_idle = Rc::clone(&selected_sel);
-            let hint_idle = hint_sel.clone();
-            gtk4::glib::idle_add_local_once(move || {
-                refresh_library_content_with_search(
-                    &container_idle,
-                    &game_idle,
-                    Rc::clone(&config_idle),
-                    &search_idle.borrow(),
-                    Rc::clone(&search_idle),
-                    Rc::clone(&selected_idle),
-                    &hint_idle,
-                    false,
-                );
-            });
+            let ctx_idle = ctx_sel.clone();
+            gtk4::glib::idle_add_local_once(move || ctx_idle.refresh());
         });
     }
     row.add_controller(left_click);
@@ -655,13 +616,8 @@ fn build_mod_row(
         let row_c = row.clone();
         let source_path = mod_entry.source_path.clone();
         let nexus_id = mod_entry.nexus_id;
-        let game_c = Rc::clone(game);
-        let container_rclick = container.clone();
-        let config_rclick = Rc::clone(&config);
-        let search_rclick = Rc::clone(&search_state);
-        let selected_rclick = Rc::clone(&selected_mod_id);
         let mod_id_rclick = mod_entry.id.clone();
-        let reorder_hint_rclick = reorder_hint.clone();
+        let ctx_rclick = ctx.clone();
         let conflict_entries = conflict_state
             .map(|state| {
                 state
@@ -744,7 +700,7 @@ fn build_mod_row(
             });
 
             let popover_nexus = popover.clone();
-            let game_nexus = Rc::clone(&game_c);
+            let game_nexus = Rc::clone(&ctx_rclick.game);
             open_nexus_item.connect_clicked(move |_| {
                 popover_nexus.popdown();
                 if let Some(id) = nexus_id {
@@ -794,12 +750,7 @@ fn build_mod_row(
 
             let popover_move = popover.clone();
             let row_move = row_c.clone();
-            let game_move = Rc::clone(&game_c);
-            let container_move = container_rclick.clone();
-            let config_move = Rc::clone(&config_rclick);
-            let search_move = Rc::clone(&search_rclick);
-            let selected_move = Rc::clone(&selected_rclick);
-            let hint_move = reorder_hint_rclick.clone();
+            let ctx_move = ctx_rclick.clone();
             let mod_id_move = mod_id_rclick.clone();
             move_item.connect_clicked(move |_| {
                 popover_move.popdown();
@@ -809,72 +760,23 @@ fn build_mod_row(
                     show_move_to_position_dialog_for_mod(
                         &window,
                         mod_id_move.clone(),
-                        Rc::clone(&game_move),
-                        container_move.clone(),
-                        Rc::clone(&config_move),
-                        Rc::clone(&search_move),
-                        Rc::clone(&selected_move),
-                        hint_move.clone(),
+                        ctx_move.clone(),
                     );
                 }
             });
 
             let popover_enable = popover.clone();
-            let game_enable = Rc::clone(&game_c);
-            let container_enable = container_rclick.clone();
-            let config_enable = Rc::clone(&config_rclick);
-            let search_enable = Rc::clone(&search_rclick);
-            let selected_enable = Rc::clone(&selected_rclick);
-            let hint_enable = reorder_hint_rclick.clone();
+            let ctx_enable = ctx_rclick.clone();
             enable_all_item.connect_clicked(move |_| {
                 popover_enable.popdown();
-                let mut db = ModDatabase::load(&game_enable);
-                for m in db.mods.iter_mut() {
-                    m.enabled = true;
-                }
-                db.save(&game_enable);
-                if let Err(e) = ModManager::rebuild_all(&game_enable) {
-                    log::error!("Failed to rebuild deployment after enable all: {e}");
-                }
-                refresh_library_content_with_search(
-                    &container_enable,
-                    &game_enable,
-                    Rc::clone(&config_enable),
-                    &search_enable.borrow(),
-                    Rc::clone(&search_enable),
-                    Rc::clone(&selected_enable),
-                    &hint_enable,
-                    false,
-                );
+                make_bulk_toggle_handler(ctx_enable.clone(), true)(&gtk4::Button::new());
             });
 
             let popover_disable = popover.clone();
-            let game_disable = Rc::clone(&game_c);
-            let container_disable = container_rclick.clone();
-            let config_disable = Rc::clone(&config_rclick);
-            let search_disable = Rc::clone(&search_rclick);
-            let selected_disable = Rc::clone(&selected_rclick);
-            let hint_disable = reorder_hint_rclick.clone();
+            let ctx_disable = ctx_rclick.clone();
             disable_all_item.connect_clicked(move |_| {
                 popover_disable.popdown();
-                let mut db = ModDatabase::load(&game_disable);
-                for m in db.mods.iter_mut() {
-                    m.enabled = false;
-                }
-                db.save(&game_disable);
-                if let Err(e) = ModManager::rebuild_all(&game_disable) {
-                    log::error!("Failed to rebuild deployment after disable all: {e}");
-                }
-                refresh_library_content_with_search(
-                    &container_disable,
-                    &game_disable,
-                    Rc::clone(&config_disable),
-                    &search_disable.borrow(),
-                    Rc::clone(&search_disable),
-                    Rc::clone(&selected_disable),
-                    &hint_disable,
-                    false,
-                );
+                make_bulk_toggle_handler(ctx_disable.clone(), false)(&gtk4::Button::new());
             });
 
             popover.popup();
@@ -885,19 +787,8 @@ fn build_mod_row(
     row
 }
 
-/// Show a modal dialog that lets the user type a position number for a mod.
-/// The valid range is 1 to the total number of installed mods.
-fn show_move_to_position_dialog_for_mod(
-    parent: &gtk4::Window,
-    mod_id: String,
-    game: Rc<Game>,
-    container: gtk4::Box,
-    config: Rc<RefCell<AppConfig>>,
-    search_state: Rc<RefCell<String>>,
-    selected_mod_id: Rc<RefCell<Option<String>>>,
-    reorder_hint: gtk4::Label,
-) {
-    let db = ModDatabase::load(&game);
+fn show_move_to_position_dialog_for_mod(parent: &gtk4::Window, mod_id: String, ctx: RowCtx) {
+    let db = ModDatabase::load(&ctx.game);
     let total = db.mods.len();
     if total == 0 {
         return;
@@ -906,252 +797,27 @@ fn show_move_to_position_dialog_for_mod(
         return;
     };
     let mod_name = db.mods[current_pos].name.clone();
+    let body = format!("Enter the new position for \"{mod_name}\".\nValid range: 1\u{2013}{total}.");
 
-    let body = format!("Enter the new position for \"{mod_name}\".\nValid range: 1–{total}.",);
-
-    let dialog = adw::AlertDialog::builder()
-        .heading("Move to Position")
-        .body(&body)
-        .build();
-
-    let spin = gtk4::SpinButton::with_range(1.0, total as f64, 1.0);
-    spin.set_value((current_pos + 1) as f64);
-    spin.set_numeric(true);
-    dialog.set_extra_child(Some(&spin));
-
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("move", "Move");
-    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("move"));
-    dialog.set_close_response("cancel");
-
-    dialog.connect_response(None, move |_, response| {
-        if response != "move" {
-            return;
-        }
-        let target_pos_1indexed = spin.value() as usize;
-        let target_idx = target_pos_1indexed.saturating_sub(1);
-
-        let mut db = ModDatabase::load(&game);
-        if let Ok(updated) =
-            ordering::move_to_absolute_position_by_id(&db.mods, &mod_id, target_idx, 0, |m| &m.id)
-        {
-            db.mods = updated;
-            db.save(&game);
-            refresh_library_content_with_search(
-                &container,
-                &game,
-                Rc::clone(&config),
-                &search_state.borrow(),
-                Rc::clone(&search_state),
-                Rc::clone(&selected_mod_id),
-                &reorder_hint,
-                false,
-            );
-            apply_library_reorder_deploy_async(&game);
-        }
-    });
-
-    dialog.present(Some(parent));
-}
-
-fn compute_conflict_states(
-    mods: &[Mod],
-    selected_id: Option<&str>,
-) -> HashMap<String, ConflictState> {
-    let global_states = compute_global_conflict_states(mods);
-
-    if let Some(selected_id) = selected_id {
-        let Some(selected_idx) = mods.iter().position(|m| m.id == selected_id) else {
-            return global_states;
-        };
-
-        let selected_files = collect_mod_target_files(&mods[selected_idx]);
-        if selected_files.is_empty() {
-            return global_states;
-        }
-
-        let mut states: HashMap<String, ConflictState> = HashMap::new();
-        for (idx, m) in mods.iter().enumerate() {
-            if idx == selected_idx {
-                continue;
-            }
-            let files = collect_mod_target_files(m);
-            if files.is_empty() {
-                continue;
-            }
-
-            let shared: BTreeSet<String> = selected_files.intersection(&files).cloned().collect();
-            if shared.is_empty() {
-                continue;
-            }
-
-            // With selection active: preserve green/red directionality by order.
-            if idx > selected_idx {
-                states.entry(m.id.clone()).or_default().overwrites = true;
-                states
-                    .entry(selected_id.to_string())
-                    .or_default()
-                    .overwritten = true;
-            } else {
-                states.entry(m.id.clone()).or_default().overwritten = true;
-                states
-                    .entry(selected_id.to_string())
-                    .or_default()
-                    .overwrites = true;
-            }
-
-            states
-                .entry(m.id.clone())
-                .or_default()
-                .files
-                .extend(shared.iter().cloned());
+    ordering::show_position_dialog(
+        parent,
+        "Move to Position",
+        &body,
+        1,
+        total,
+        current_pos + 1,
+        move |target_idx| {
+            let mut db = ModDatabase::load(&ctx.game);
+            if let Ok(updated) =
+                ordering::move_to_absolute_position_by_id(&db.mods, &mod_id, target_idx, 0, |m| &m.id)
             {
-                let entry = states.entry(m.id.clone()).or_default();
-                for file in &shared {
-                    entry
-                        .conflict_mods_by_file
-                        .entry(file.clone())
-                        .or_default()
-                        .insert(mods[selected_idx].name.clone());
-                }
+                db.mods = updated;
+                db.save(&ctx.game);
+                ctx.refresh();
+                apply_library_reorder_deploy_async(&ctx.game);
             }
-            states
-                .entry(selected_id.to_string())
-                .or_default()
-                .files
-                .extend(shared.iter().cloned());
-            {
-                let entry = states.entry(selected_id.to_string()).or_default();
-                for file in &shared {
-                    entry
-                        .conflict_mods_by_file
-                        .entry(file.clone())
-                        .or_default()
-                        .insert(m.name.clone());
-                }
-            }
-        }
-        // If selected mod has no conflicts, keep the global blue conflict mode.
-        if states.is_empty() {
-            global_states
-        } else {
-            states
-        }
-    } else {
-        global_states
-    }
-}
-
-fn compute_global_conflict_states(mods: &[Mod]) -> HashMap<String, ConflictState> {
-    let mut states: HashMap<String, ConflictState> = HashMap::new();
-    let all_files: Vec<BTreeSet<String>> = mods.iter().map(collect_mod_target_files).collect();
-
-    for i in 0..mods.len() {
-        if all_files[i].is_empty() {
-            continue;
-        }
-        for j in (i + 1)..mods.len() {
-            if all_files[j].is_empty() {
-                continue;
-            }
-            let shared: BTreeSet<String> =
-                all_files[i].intersection(&all_files[j]).cloned().collect();
-            if shared.is_empty() {
-                continue;
-            }
-
-            states
-                .entry(mods[i].id.clone())
-                .or_default()
-                .files
-                .extend(shared.iter().cloned());
-            {
-                let entry = states.entry(mods[i].id.clone()).or_default();
-                for file in &shared {
-                    entry
-                        .conflict_mods_by_file
-                        .entry(file.clone())
-                        .or_default()
-                        .insert(mods[j].name.clone());
-                }
-            }
-            states
-                .entry(mods[j].id.clone())
-                .or_default()
-                .files
-                .extend(shared.iter().cloned());
-            {
-                let entry = states.entry(mods[j].id.clone()).or_default();
-                for file in &shared {
-                    entry
-                        .conflict_mods_by_file
-                        .entry(file.clone())
-                        .or_default()
-                        .insert(mods[i].name.clone());
-                }
-            }
-        }
-    }
-
-    states
-}
-
-fn collect_mod_target_files(mod_entry: &Mod) -> BTreeSet<String> {
-    let mut files = BTreeSet::new();
-    let root = &mod_entry.source_path;
-    let data_dir = root.join("Data");
-
-    if data_dir.is_dir() {
-        collect_files_recursive(&data_dir, &data_dir, "data", &mut files);
-
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.file_name().map(|n| n == "Data").unwrap_or(false) {
-                    continue;
-                }
-                if path.is_dir() {
-                    collect_files_recursive(&path, root, "root", &mut files);
-                } else if path.is_file()
-                    && let Ok(rel) = path.strip_prefix(root)
-                {
-                    files.insert(normalize_relative_path("root", rel));
-                }
-            }
-        }
-    } else {
-        collect_files_recursive(root, root, "data", &mut files);
-    }
-
-    files
-}
-
-fn collect_files_recursive(base: &Path, root: &Path, prefix: &str, files: &mut BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, root, prefix, files);
-        } else if path.is_file()
-            && let Ok(rel) = path.strip_prefix(root)
-        {
-            files.insert(normalize_relative_path(prefix, rel));
-        }
-    }
-}
-
-fn normalize_relative_path(prefix: &str, rel: &Path) -> String {
-    let rel = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-        .to_lowercase();
-    format!("{prefix}/{rel}")
+        },
+    );
 }
 
 fn matches_query(value: &str, query: &str) -> bool {

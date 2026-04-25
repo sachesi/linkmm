@@ -185,6 +185,28 @@ impl GeneratedOutputPackage {
     }
 }
 
+// ── Per-profile state ─────────────────────────────────────────────────────────
+
+/// State that belongs to a single named profile.
+///
+/// `ModDatabase::profiles` stores one of these per profile ID.  The active
+/// profile's state is also mirrored into the flat fields on `ModDatabase`
+/// (plugin_load_order, plugin_disabled, generated_outputs, mod enabled/order)
+/// so the rest of the code can read it without looking up the map.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileState {
+    #[serde(default)]
+    pub mod_enabled: HashSet<String>,
+    #[serde(default)]
+    pub mod_order: Vec<String>,
+    #[serde(default)]
+    pub plugin_load_order: Vec<String>,
+    #[serde(default)]
+    pub plugin_disabled: HashSet<String>,
+    #[serde(default)]
+    pub generated_outputs: Vec<GeneratedOutputPackage>,
+}
+
 // ── ModDatabase ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,25 +214,34 @@ pub struct ModDatabase {
     #[serde(default = "default_active_profile_id")]
     pub active_profile_id: String,
     pub mods: Vec<Mod>,
-    #[serde(default)]
-    pub generated_outputs: Vec<GeneratedOutputPackage>,
-    /// Ordered mod IDs (legacy – kept for compatibility).
+    /// Ordered mod IDs (legacy – kept for TOML compatibility).
     pub load_order: Vec<String>,
-    /// Ordered plugin file names for the Load Order page.
+    /// Active profile's plugin load order (mirrored from profiles[active_profile_id]).
     #[serde(default)]
     pub plugin_load_order: Vec<String>,
-    /// Plugin file names that the user has explicitly *disabled* in the Load Order.
+    /// Active profile's disabled plugins (mirrored from profiles[active_profile_id]).
     #[serde(default)]
     pub plugin_disabled: HashSet<String>,
+    /// Active profile's generated output packages (mirrored from profiles[active_profile_id]).
     #[serde(default)]
+    pub generated_outputs: Vec<GeneratedOutputPackage>,
+
+    /// Per-profile persistent state.  Keyed by profile ID.
+    #[serde(default)]
+    pub profiles: HashMap<String, ProfileState>,
+
+    // ── Legacy flat per-profile fields (read-only for migration) ─────────────
+    // These were the old storage format.  They are deserialized from old files
+    // and migrated into `profiles` on first load.  They are never written.
+    #[serde(default, skip_serializing)]
     pub profile_mod_enabled: HashMap<String, HashSet<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub profile_mod_order: HashMap<String, Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub profile_plugin_load_order: HashMap<String, Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub profile_plugin_disabled: HashMap<String, HashSet<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub profile_generated_outputs: HashMap<String, Vec<GeneratedOutputPackage>>,
 }
 
@@ -223,6 +254,7 @@ impl Default for ModDatabase {
             load_order: Vec::new(),
             plugin_load_order: Vec::new(),
             plugin_disabled: HashSet::new(),
+            profiles: HashMap::new(),
             profile_mod_enabled: HashMap::new(),
             profile_mod_order: HashMap::new(),
             profile_plugin_load_order: HashMap::new(),
@@ -335,19 +367,60 @@ impl ModDatabase {
         }
     }
 
-    fn apply_active_profile_state(&mut self) {
-        let profile_id = self.active_profile_id.clone();
-        let enabled = self
+    /// Move data from legacy flat per-profile fields into `profiles`.
+    ///
+    /// Called once on load and on any direct construction that uses old fields.
+    /// Safe to call multiple times – profiles that already exist in `self.profiles`
+    /// are not overwritten.
+    fn migrate_legacy_profile_fields(&mut self) {
+        let legacy_ids: HashSet<String> = self
             .profile_mod_enabled
-            .get(&profile_id)
+            .keys()
+            .chain(self.profile_mod_order.keys())
+            .chain(self.profile_plugin_load_order.keys())
+            .chain(self.profile_plugin_disabled.keys())
+            .chain(self.profile_generated_outputs.keys())
             .cloned()
-            .unwrap_or_default();
+            .collect();
+
+        for id in legacy_ids {
+            if self.profiles.contains_key(&id) {
+                continue;
+            }
+            self.profiles.insert(
+                id.clone(),
+                ProfileState {
+                    mod_enabled: self.profile_mod_enabled.remove(&id).unwrap_or_default(),
+                    mod_order: self.profile_mod_order.remove(&id).unwrap_or_default(),
+                    plugin_load_order: self
+                        .profile_plugin_load_order
+                        .remove(&id)
+                        .unwrap_or_default(),
+                    plugin_disabled: self
+                        .profile_plugin_disabled
+                        .remove(&id)
+                        .unwrap_or_default(),
+                    generated_outputs: self
+                        .profile_generated_outputs
+                        .remove(&id)
+                        .unwrap_or_default(),
+                },
+            );
+        }
+    }
+
+    fn apply_active_profile_state(&mut self) {
+        self.migrate_legacy_profile_fields();
+        let profile_id = self.active_profile_id.clone();
+        let state = self.profiles.entry(profile_id).or_default().clone();
+
         for m in &mut self.mods {
-            m.enabled = enabled.contains(&m.id);
+            m.enabled = state.mod_enabled.contains(&m.id);
         }
 
-        if let Some(order) = self.profile_mod_order.get(&profile_id).cloned() {
-            let index: HashMap<String, usize> = order
+        if !state.mod_order.is_empty() {
+            let index: HashMap<String, usize> = state
+                .mod_order
                 .into_iter()
                 .enumerate()
                 .map(|(i, id)| (id, i))
@@ -361,40 +434,24 @@ impl ModDatabase {
             });
         }
 
-        self.plugin_load_order = self
-            .profile_plugin_load_order
-            .get(&profile_id)
-            .cloned()
-            .unwrap_or_default();
-        self.plugin_disabled = self
-            .profile_plugin_disabled
-            .get(&profile_id)
-            .cloned()
-            .unwrap_or_default();
-        self.generated_outputs = self
-            .profile_generated_outputs
-            .get(&profile_id)
-            .cloned()
-            .unwrap_or_default();
+        self.plugin_load_order = state.plugin_load_order;
+        self.plugin_disabled = state.plugin_disabled;
+        self.generated_outputs = state.generated_outputs;
     }
 
     fn persist_active_profile_state(&mut self) {
         let profile_id = self.active_profile_id.clone();
-        let enabled: HashSet<String> = self
+        let state = self.profiles.entry(profile_id).or_default();
+        state.mod_enabled = self
             .mods
             .iter()
             .filter(|m| m.enabled)
             .map(|m| m.id.clone())
             .collect();
-        let order: Vec<String> = self.mods.iter().map(|m| m.id.clone()).collect();
-        self.profile_mod_enabled.insert(profile_id.clone(), enabled);
-        self.profile_mod_order.insert(profile_id.clone(), order);
-        self.profile_plugin_load_order
-            .insert(profile_id.clone(), self.plugin_load_order.clone());
-        self.profile_plugin_disabled
-            .insert(profile_id.clone(), self.plugin_disabled.clone());
-        self.profile_generated_outputs
-            .insert(profile_id, self.generated_outputs.clone());
+        state.mod_order = self.mods.iter().map(|m| m.id.clone()).collect();
+        state.plugin_load_order = self.plugin_load_order.clone();
+        state.plugin_disabled = self.plugin_disabled.clone();
+        state.generated_outputs = self.generated_outputs.clone();
     }
 
     pub fn switch_active_profile(&mut self, profile_id: &str) {
