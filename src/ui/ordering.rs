@@ -109,6 +109,50 @@ pub fn move_to_position_by_index<T: Clone>(
     Ok(reordered)
 }
 
+/// Show a "Move to Position" `adw::AlertDialog` with a spin-button.
+///
+/// * `min_pos` / `max_pos` are 1-indexed human-readable bounds.
+/// * `current_pos` is the 1-indexed current position shown in the spinner.
+/// * `on_confirm` receives the 0-indexed target position chosen by the user.
+pub fn show_position_dialog<F>(
+    parent: &gtk4::Window,
+    heading: &str,
+    body: &str,
+    min_pos: usize,
+    max_pos: usize,
+    current_pos: usize,
+    on_confirm: F,
+) where
+    F: Fn(usize) + 'static,
+{
+    use libadwaita as adw;
+    use libadwaita::prelude::*;
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .build();
+
+    let spin = gtk4::SpinButton::with_range(min_pos as f64, max_pos as f64, 1.0);
+    spin.set_value(current_pos as f64);
+    spin.set_numeric(true);
+    dialog.set_extra_child(Some(&spin));
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("move", "Move");
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("move"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |_, response| {
+        if response == "move" {
+            on_confirm((spin.value() as usize).saturating_sub(1));
+        }
+    });
+
+    dialog.present(Some(parent));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

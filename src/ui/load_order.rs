@@ -536,59 +536,43 @@ fn show_move_to_position_dialog(
     let min_pos = pinned_prefix_len + 1;
     let body = if pinned_prefix_len > 0 {
         format!(
-            "Enter the new load order position for \"{plugin_name}\".\nValid range: {min_pos}–{total} (positions 1–{pinned_prefix_len} are vanilla masters).",
+            "Enter the new load order position for \"{plugin_name}\".\nValid range: {min_pos}\u{2013}{total} (positions 1\u{2013}{pinned_prefix_len} are vanilla masters).",
         )
     } else {
-        format!("Enter the new load order position for \"{plugin_name}\".\nValid range: 1–{total}.")
+        format!("Enter the new load order position for \"{plugin_name}\".\nValid range: 1\u{2013}{total}.")
     };
 
-    let dialog = adw::AlertDialog::builder()
-        .heading("Move to Position")
-        .body(&body)
-        .build();
-
-    let spin = gtk4::SpinButton::with_range(min_pos as f64, total as f64, 1.0);
-    spin.set_value((current_idx + 1) as f64);
-    spin.set_numeric(true);
-    dialog.set_extra_child(Some(&spin));
-
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("move", "Move");
-    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("move"));
-    dialog.set_close_response("cancel");
-
-    dialog.connect_response(None, move |_, response| {
-        if response != "move" {
-            return;
-        }
-
-        let target_idx = (spin.value() as usize).saturating_sub(1);
-        let mut db = ModDatabase::load(&game);
-        let ordered = db.get_ordered_plugins(&game);
-        if let Ok(updated) = ordering::move_to_absolute_position_by_id(
-            &ordered,
-            &plugin_name,
-            target_idx,
-            pinned_prefix_len,
-            |p| &p.name,
-        ) {
-            db.set_plugin_order(&updated);
-            db.save(&game);
-            let _ = db.write_plugins_txt(&game);
-        }
-
-        refresh_load_order_content(
-            &list_box,
-            &status_page,
-            &stack,
-            &reorder_hint,
-            &game,
-            &search_query,
-        );
-    });
-
-    dialog.present(Some(parent));
+    ordering::show_position_dialog(
+        parent,
+        "Move to Position",
+        &body,
+        min_pos,
+        total,
+        current_idx + 1,
+        move |target_idx| {
+            let mut db = ModDatabase::load(&game);
+            let ordered = db.get_ordered_plugins(&game);
+            if let Ok(updated) = ordering::move_to_absolute_position_by_id(
+                &ordered,
+                &plugin_name,
+                target_idx,
+                pinned_prefix_len,
+                |p| &p.name,
+            ) {
+                db.set_plugin_order(&updated);
+                db.save(&game);
+                let _ = db.write_plugins_txt(&game);
+            }
+            refresh_load_order_content(
+                &list_box,
+                &status_page,
+                &stack,
+                &reorder_hint,
+                &game,
+                &search_query,
+            );
+        },
+    );
 }
 
 fn matches_query(value: &str, query: &str) -> bool {
