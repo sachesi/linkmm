@@ -140,7 +140,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
         }
     }
 
-    let mut mod_entry = Mod::new(mod_name, mod_dir);
+    let mut mod_entry = Mod::new(mod_name, mod_dir.clone());
     mod_entry.installed_from_nexus = nexus_id.is_some();
     mod_entry.nexus_id = nexus_id;
     mod_entry.archive_name = archive_path
@@ -148,7 +148,20 @@ pub fn install_mod_from_archive_with_nexus_ticking(
         .map(|n| n.to_string_lossy().into_owned());
 
     let mut db = ModDatabase::load(game);
+    let old_dirs: Vec<PathBuf> = db
+        .mods
+        .iter()
+        .filter(|m| m.name == mod_name)
+        .map(|m| m.source_path.clone())
+        .collect();
     db.mods.retain(|m| m.name != mod_name);
+    for path in old_dirs {
+        if path != mod_dir && path.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                log::warn!("Failed to remove old mod directory {}: {e}", path.display());
+            }
+        }
+    }
     db.mods.push(mod_entry.clone());
     db.save(game);
 
@@ -728,13 +741,26 @@ pub fn install_mod_from_extracted(
     // FOMOD wizard) is finally dropped.
     extracted.cleanup();
 
-    let mut mod_entry = Mod::new(mod_name, mod_dir);
+    let mut mod_entry = Mod::new(mod_name, mod_dir.clone());
     mod_entry.installed_from_nexus = nexus_id.is_some();
     mod_entry.nexus_id = nexus_id;
     mod_entry.archive_name = archive_name.map(|s| s.to_owned());
 
     let mut db = ModDatabase::load(game);
+    let old_dirs: Vec<PathBuf> = db
+        .mods
+        .iter()
+        .filter(|m| m.name == mod_name)
+        .map(|m| m.source_path.clone())
+        .collect();
     db.mods.retain(|m| m.name != mod_name);
+    for path in old_dirs {
+        if path != mod_dir && path.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                log::warn!("Failed to remove old mod directory {}: {e}", path.display());
+            }
+        }
+    }
     db.mods.push(mod_entry.clone());
     db.save(game);
 
