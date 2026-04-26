@@ -215,7 +215,7 @@ fn refresh_load_order_content(
     if ordered_plugins.is_empty() {
         status_page.set_title("No Plugins Found");
         status_page.set_description(Some(
-            "No .esm / .esl / .esp files were found in the game's Data directory.\nInstall and deploy mods first, or check that the game path is correct.",
+            "No .esm / .esl / .esp files were found. Install mods and launch the game — mods are mounted automatically at launch.",
         ));
         status_page.set_icon_name(Some("format-justify-left-symbolic"));
         stack.set_visible_child_name("status");

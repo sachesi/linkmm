@@ -1,48 +1,5 @@
-use std::fs;
-use std::path::Path;
-
-use crate::core::games::Game;
-
-// ── Legacy symlink cleanup ────────────────────────────────────────────────────
-
-/// Remove all symlinks recursively from a directory tree.
-/// Used during migration from link-based deployment to FUSE VFS.
-pub fn purge_all_symlinks(dir: &Path) -> usize {
-    if !dir.is_dir() {
-        return 0;
-    }
-
-    let mut removed = 0;
-
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-
-            if path.is_symlink() {
-                if fs::remove_file(&path).is_ok() {
-                    removed += 1;
-                }
-            } else if path.is_dir() {
-                removed += purge_all_symlinks(&path);
-                let _ = fs::remove_dir(&path);
-            }
-        }
-    }
-
-    removed
-}
-
-/// Clean up legacy nested Data/Data/ directory if it exists.
-pub fn cleanup_legacy_nested_data(game: &Game) {
-    let legacy_nested = game.data_path.join("Data");
-    if legacy_nested.is_dir() {
-        let removed = purge_all_symlinks(&legacy_nested);
-        if removed > 0 {
-            log::info!("Cleaned up {} legacy symlinks from Data/Data/", removed);
-        }
-        let _ = fs::remove_dir(&legacy_nested);
-    }
-}
+// Retained only for the cross-filesystem move helper used in tests.
+// Symlink-based deployment has been replaced by FUSE VFS (src/core/vfs.rs).
 
 #[cfg(test)]
 mod tests {
@@ -66,11 +23,9 @@ mod tests {
             Err(err) if is_cross_device_link_error(&err) => {
                 fs::copy(src, dest)
                     .map_err(|e| format!("Failed to copy file while trying to {action}: {e}"))?;
-
                 if let Ok(metadata) = fs::metadata(src) {
                     let _ = fs::set_permissions(dest, metadata.permissions());
                 }
-
                 fs::remove_file(src).map_err(|e| {
                     format!("Failed to remove original file while trying to {action}: {e}")
                 })?;
@@ -85,20 +40,18 @@ mod tests {
     }
 
     #[test]
-    fn move_file_with_cross_fs_fallback_moves_file_and_creates_parent_dirs() {
+    fn move_file_creates_parent_dirs_and_moves() {
         let temp = TempDir::new().unwrap();
         let src = temp.path().join("source.txt");
         let dest = temp.path().join("nested").join("dest.txt");
-
         fs::write(&src, b"payload").unwrap();
         move_file_with_cross_fs_fallback(&src, &dest, "move test file").unwrap();
-
         assert!(!src.exists());
         assert_eq!(fs::read(&dest).unwrap(), b"payload");
     }
 
     #[test]
-    fn move_file_with_cross_fs_fallback_preserves_permissions_on_fallback_path() {
+    fn move_file_preserves_permissions() {
         let temp = TempDir::new().unwrap();
         let src = temp.path().join("src.txt");
         let dest = temp.path().join("dest").join("dst.txt");

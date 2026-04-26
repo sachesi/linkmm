@@ -4,6 +4,7 @@ use fuser::{
 };
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -225,14 +226,24 @@ impl Filesystem for ModUnionFs {
             return;
         };
         let path = read_path.clone();
-        match std::fs::read(&path) {
-            Ok(data) => {
-                let start = (offset as usize).min(data.len());
-                let end = (start + size as usize).min(data.len());
-                reply.data(&data[start..end]);
+        match std::fs::File::open(&path) {
+            Ok(mut f) => {
+                let mut buf = vec![0u8; size as usize];
+                if let Err(e) = f.seek(SeekFrom::Start(offset as u64)) {
+                    log::error!("VFS seek {}: {e}", path.display());
+                    reply.error(libc::EIO);
+                    return;
+                }
+                match f.read(&mut buf) {
+                    Ok(n) => reply.data(&buf[..n]),
+                    Err(e) => {
+                        log::error!("VFS read {}: {e}", path.display());
+                        reply.error(libc::EIO);
+                    }
+                }
             }
             Err(e) => {
-                log::error!("VFS read {}: {e}", path.display());
+                log::error!("VFS open {}: {e}", path.display());
                 reply.error(libc::EIO);
             }
         }

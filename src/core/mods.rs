@@ -531,11 +531,6 @@ impl ModManager {
         Ok(())
     }
 
-    pub fn rebuild_all(game: &Game) -> Result<(), String> {
-        let db = ModDatabase::load(game);
-        db.write_plugins_txt(game)
-    }
-
     pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
         let uuid = generate_mod_uuid();
         let dir = game.mods_dir().join(&uuid);
