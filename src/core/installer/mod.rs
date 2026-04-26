@@ -27,7 +27,7 @@ pub use heuristics::{
 };
 #[allow(unused_imports)]
 pub use install::{
-    install_mod_from_archive, install_mod_from_archive_with_nexus,
+    install_mod_from_archive_with_nexus,
     install_mod_from_archive_with_nexus_ticking, install_mod_from_extracted,
 };
 #[allow(unused_imports)]

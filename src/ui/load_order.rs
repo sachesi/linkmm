@@ -1,6 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
+use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -9,11 +11,11 @@ use crate::core::games::Game;
 use crate::core::mods::{ModDatabase, PluginFile};
 use crate::ui::ordering;
 
+const CLAMP_MARGIN: f64 = 12.0;
+const SCROLL_EDGE: f64 = 60.0;
+const SCROLL_SPEED: f64 = 12.0;
+
 /// Build the Load Order page for `game`.
-///
-/// Shows all `.esm` / `.esl` / `.esp` files found in the game's `Data`
-/// directory, ordered by `ModDatabase::get_ordered_plugins`.  Vanilla masters
-/// are pinned at the top and cannot be moved.
 pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -27,7 +29,6 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     search_entry.set_sensitive(game.is_some());
     header.pack_start(&search_entry);
 
-    // Sort button – sorts non-vanilla plugins using LOOT metadata.
     let sort_btn = gtk4::Button::new();
     sort_btn.set_icon_name("view-sort-ascending-symbolic");
     sort_btn.set_sensitive(game.is_some());
@@ -45,6 +46,20 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                 .title("No Game Selected")
                 .description("Select a game from the sidebar to manage its load order.")
                 .icon_name("applications-games-symbolic")
+                .build();
+            status.set_vexpand(true);
+            content_container.append(&status);
+        }
+        Some(g) if !g.kind.has_plugins_txt() => {
+            sort_btn.set_sensitive(false);
+            sort_btn.set_tooltip_text(Some("Not supported for this game"));
+            let status = adw::StatusPage::builder()
+                .title("Load Order Not Supported")
+                .description(
+                    "Morrowind stores its plugin list in Morrowind.ini rather than plugins.txt.\n\
+                     Plugin order management is not yet supported for this game.",
+                )
+                .icon_name("dialog-information-symbolic")
                 .build();
             status.set_vexpand(true);
             content_container.append(&status);
@@ -95,6 +110,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             {
                 let game_c = Rc::clone(&game_rc);
                 let list_c = list_box.clone();
+                let scrolled_c = scrolled.clone();
                 let status_c = status_page.clone();
                 let stack_c = stack.clone();
                 let search_c = Rc::clone(&search_query);
@@ -103,6 +119,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                     *search_c.borrow_mut() = entry.text().to_string();
                     refresh_load_order_content(
                         &list_c,
+                        &scrolled_c,
                         &status_c,
                         &stack_c,
                         &hint_c,
@@ -115,15 +132,14 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
             {
                 let game_c = Rc::clone(&game_rc);
                 let list_c = list_box.clone();
+                let scrolled_c = scrolled.clone();
                 let status_c = status_page.clone();
                 let stack_c = stack.clone();
                 let search_c = Rc::clone(&search_query);
                 let hint_c = reorder_hint.clone();
                 sort_btn.connect_clicked(move |_| {
                     let mut db = ModDatabase::load(&game_c);
-                    if db.plugin_load_order.is_empty() {
-                        db.sync_from_plugins_txt(&game_c);
-                    }
+                    db.sync_from_plugins_txt(&game_c);
                     db.sort_plugins_by_type(&game_c);
                     db.save(&game_c);
                     if let Err(e) = db.write_plugins_txt(&game_c) {
@@ -131,6 +147,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
                     }
                     refresh_load_order_content(
                         &list_c,
+                        &scrolled_c,
                         &status_c,
                         &stack_c,
                         &hint_c,
@@ -142,6 +159,7 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
 
             refresh_load_order_content(
                 &list_box,
+                &scrolled,
                 &status_page,
                 &stack,
                 &reorder_hint,
@@ -155,8 +173,28 @@ pub fn build_load_order_page(game: Option<&Game>) -> gtk4::Widget {
     toolbar_view.upcast()
 }
 
+// ── Per-row data for in-place DnD ─────────────────────────────────────────────
+
+struct DndPluginRow {
+    plugin_name: String,
+    row: adw::ActionRow,
+    index_label: gtk4::Label,
+    up_btn: gtk4::Button,
+    down_btn: gtk4::Button,
+}
+
+struct PluginRowResult {
+    row: adw::ActionRow,
+    index_label: gtk4::Label,
+    up_btn: gtk4::Button,
+    down_btn: gtk4::Button,
+    is_vanilla: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn refresh_load_order_content(
     list_box: &gtk4::ListBox,
+    scrolled: &gtk4::ScrolledWindow,
     status_page: &adw::StatusPage,
     stack: &gtk4::Stack,
     reorder_hint: &gtk4::Label,
@@ -171,9 +209,7 @@ fn refresh_load_order_content(
     }
 
     let mut db = ModDatabase::load(game);
-    if db.plugin_load_order.is_empty() {
-        db.sync_from_plugins_txt(game);
-    }
+    db.sync_from_plugins_txt(game);
 
     let ordered_plugins = db.get_ordered_plugins(game);
     if ordered_plugins.is_empty() {
@@ -203,17 +239,20 @@ fn refresh_load_order_content(
     }
 
     let pinned_prefix_len = ordered_plugins.iter().take_while(|p| p.is_vanilla).count();
+    let allow_reorder = !is_filtered;
+
+    let mut dnd_rows: Vec<DndPluginRow> = Vec::new();
 
     for plugin in &filtered {
         let Some(full_index) = ordered_plugins.iter().position(|p| p.name == plugin.name) else {
             continue;
         };
-        let row = build_plugin_row(
+        let result = build_plugin_row(
             plugin,
             full_index,
             ordered_plugins.len(),
             pinned_prefix_len,
-            !is_filtered,
+            allow_reorder,
             game,
             list_box,
             status_page,
@@ -221,11 +260,285 @@ fn refresh_load_order_content(
             reorder_hint,
             search_query,
         );
-        list_box.append(&row);
+        list_box.append(&result.row);
+        if !result.is_vanilla {
+            dnd_rows.push(DndPluginRow {
+                plugin_name: plugin.name.clone(),
+                row: result.row,
+                index_label: result.index_label,
+                up_btn: result.up_btn,
+                down_btn: result.down_btn,
+            });
+        }
     }
 
     stack.set_visible_child_name("list");
+
+    if allow_reorder && !dnd_rows.is_empty() {
+        let dnd_rows_rc = Rc::new(RefCell::new(dnd_rows));
+        setup_load_order_dnd(
+            list_box,
+            scrolled,
+            dnd_rows_rc,
+            Rc::clone(game),
+            pinned_prefix_len,
+            ordered_plugins.len(),
+        );
+    }
 }
+
+// ── Drag & drop for load order ────────────────────────────────────────────────
+
+fn clear_lo_dnd_indicator(indicator: &Rc<RefCell<Option<(gtk4::Widget, bool)>>>) {
+    if let Some((w, is_before)) = indicator.borrow_mut().take() {
+        if is_before {
+            w.remove_css_class("dnd-drop-before");
+        } else {
+            w.remove_css_class("dnd-drop-after");
+        }
+    }
+}
+
+fn setup_load_order_dnd(
+    list_box: &gtk4::ListBox,
+    scrolled: &gtk4::ScrolledWindow,
+    dnd_rows: Rc<RefCell<Vec<DndPluginRow>>>,
+    game: Rc<Game>,
+    pinned_prefix_len: usize,
+    total_plugins: usize,
+) {
+    let indicator: Rc<RefCell<Option<(gtk4::Widget, bool)>>> = Rc::new(RefCell::new(None));
+    let scroll_dir: Rc<Cell<i8>> = Rc::new(Cell::new(0));
+    let autoscroll_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+    let drop_target =
+        gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
+
+    // ── motion ────────────────────────────────────────────────────────────────
+    {
+        let list_box_m = list_box.clone();
+        let scrolled_m = scrolled.clone();
+        let scrolled_a = scrolled.clone();
+        let dnd_rows_m = Rc::clone(&dnd_rows);
+        let indicator_m = Rc::clone(&indicator);
+        let scroll_dir_m = Rc::clone(&scroll_dir);
+        let autoscroll_m = Rc::clone(&autoscroll_id);
+
+        drop_target.connect_motion(move |_, _x, y| {
+            let h = scrolled_m.height() as f64;
+            let new_dir: i8 = if y < SCROLL_EDGE {
+                -1
+            } else if y > h - SCROLL_EDGE {
+                1
+            } else {
+                0
+            };
+            let old_dir = scroll_dir_m.get();
+            scroll_dir_m.set(new_dir);
+            if old_dir == 0 && new_dir != 0 {
+                let scrolled_t = scrolled_a.clone();
+                let dir_t = Rc::clone(&scroll_dir_m);
+                let id = glib::timeout_add_local(Duration::from_millis(16), move || {
+                    let d = dir_t.get() as f64 * SCROLL_SPEED;
+                    let adj = scrolled_t.vadjustment();
+                    let max = (adj.upper() - adj.page_size()).max(0.0);
+                    adj.set_value((adj.value() + d).clamp(0.0, max));
+                    glib::ControlFlow::Continue
+                });
+                *autoscroll_m.borrow_mut() = Some(id);
+            } else if old_dir != 0 && new_dir == 0 {
+                if let Some(id) = autoscroll_m.borrow_mut().take() {
+                    id.remove();
+                }
+            }
+
+            let adj = scrolled_m.vadjustment();
+            let listbox_y = (y + adj.value() - CLAMP_MARGIN) as i32;
+
+            let rows = dnd_rows_m.borrow();
+            let (target_widget, is_before) = match list_box_m.row_at_y(listbox_y) {
+                Some(ref trow) => {
+                    let before = trow
+                        .compute_bounds(&list_box_m)
+                        .map_or(true, |b| listbox_y < (b.y() + b.height() / 2.0) as i32);
+                    (trow.clone().upcast::<gtk4::Widget>(), before)
+                }
+                None => match rows.last() {
+                    Some(last) => (last.row.clone().upcast::<gtk4::Widget>(), false),
+                    None => return gtk4::gdk::DragAction::MOVE,
+                },
+            };
+            drop(rows);
+
+            {
+                let mut ind = indicator_m.borrow_mut();
+                if let Some((prev_w, prev_before)) = ind.as_ref() {
+                    if *prev_before {
+                        prev_w.remove_css_class("dnd-drop-before");
+                    } else {
+                        prev_w.remove_css_class("dnd-drop-after");
+                    }
+                }
+                if is_before {
+                    target_widget.add_css_class("dnd-drop-before");
+                } else {
+                    target_widget.add_css_class("dnd-drop-after");
+                }
+                *ind = Some((target_widget, is_before));
+            }
+
+            gtk4::gdk::DragAction::MOVE
+        });
+    }
+
+    // ── leave ─────────────────────────────────────────────────────────────────
+    {
+        let indicator_l = Rc::clone(&indicator);
+        let autoscroll_l = Rc::clone(&autoscroll_id);
+        let scroll_dir_l = Rc::clone(&scroll_dir);
+        drop_target.connect_leave(move |_| {
+            clear_lo_dnd_indicator(&indicator_l);
+            if let Some(id) = autoscroll_l.borrow_mut().take() {
+                id.remove();
+            }
+            scroll_dir_l.set(0);
+        });
+    }
+
+    // ── drop ──────────────────────────────────────────────────────────────────
+    {
+        let list_box_d = list_box.clone();
+        let scrolled_d = scrolled.clone();
+        let dnd_rows_d = Rc::clone(&dnd_rows);
+        let game_d = Rc::clone(&game);
+        let indicator_d = Rc::clone(&indicator);
+        let autoscroll_d = Rc::clone(&autoscroll_id);
+        let scroll_dir_d = Rc::clone(&scroll_dir);
+
+        drop_target.connect_drop(move |_, value, _x, y| {
+            if let Some(id) = autoscroll_d.borrow_mut().take() {
+                id.remove();
+            }
+            scroll_dir_d.set(0);
+            clear_lo_dnd_indicator(&indicator_d);
+
+            let Ok(source_name) = value.get::<String>() else {
+                return false;
+            };
+
+            let adj = scrolled_d.vadjustment();
+            let listbox_y = (y + adj.value() - CLAMP_MARGIN) as i32;
+
+            // Determine source index in the dnd_rows (draggable / non-vanilla only)
+            let rows = dnd_rows_d.borrow();
+            let Some(dnd_source_idx) = rows.iter().position(|r| r.plugin_name == source_name)
+            else {
+                return false;
+            };
+
+            // Find target row under cursor
+            let dnd_target_idx = match list_box_d.row_at_y(listbox_y) {
+                Some(ref trow) => {
+                    let tptr = trow.upcast_ref::<glib::Object>().as_ptr() as usize;
+                    // Skip vanilla rows which aren't in dnd_rows; find in dnd_rows
+                    let row_pos = rows
+                        .iter()
+                        .position(|r| {
+                            r.row.upcast_ref::<glib::Object>().as_ptr() as usize == tptr
+                        });
+                    match row_pos {
+                        Some(pos) => {
+                            let before = trow
+                                .compute_bounds(&list_box_d)
+                                .map_or(true, |b| {
+                                    listbox_y < (b.y() + b.height() / 2.0) as i32
+                                });
+                            if before { pos } else { pos + 1 }
+                        }
+                        // Dropped on a vanilla row or unknown row → reject
+                        None => {
+                            // Check if it's a vanilla row (in the list but not in dnd_rows)
+                            // In that case we want to insert after all vanilla rows = index 0 in dnd_rows
+                            // For simplicity, reject drops on vanilla rows entirely.
+                            return true;
+                        }
+                    }
+                }
+                None => rows.len(), // below all rows → append at end
+            };
+            drop(rows);
+
+            if dnd_target_idx == dnd_source_idx || dnd_target_idx == dnd_source_idx + 1 {
+                return true;
+            }
+
+            let insert_idx =
+                ordering::insertion_index_after_removal(dnd_source_idx, dnd_target_idx);
+
+            let saved_scroll = adj.value();
+
+            // Move widget in ListBox
+            let mut rows = dnd_rows_d.borrow_mut();
+            let src_widget = rows[dnd_source_idx].row.clone().upcast::<gtk4::Widget>();
+            list_box_d.remove(&src_widget);
+            list_box_d.insert(&src_widget, (pinned_prefix_len + insert_idx) as i32);
+
+            // Reorder dnd_rows bookkeeping
+            let row_data = rows.remove(dnd_source_idx);
+            rows.insert(insert_idx, row_data);
+
+            // Update index labels and button sensitivity for all movable rows
+            for (i, r) in rows.iter().enumerate() {
+                let full_idx = pinned_prefix_len + i;
+                r.index_label.set_text(&format!("{}", full_idx + 1));
+                r.up_btn.set_sensitive(full_idx > pinned_prefix_len);
+                r.down_btn.set_sensitive(full_idx + 1 < total_plugins);
+            }
+
+            // Build the new full plugin order and persist
+            let new_order: Vec<String> = rows.iter().map(|r| r.plugin_name.clone()).collect();
+            drop(rows);
+
+            glib::idle_add_local_once(move || {
+                adj.set_value(saved_scroll);
+                let adj2 = adj.clone();
+                glib::idle_add_local_once(move || { adj2.set_value(saved_scroll); });
+            });
+
+            let game_c = Rc::clone(&game_d);
+            glib::idle_add_local_once(move || {
+                let mut db = ModDatabase::load(&game_c);
+                db.sync_from_plugins_txt(&game_c);
+                let ordered = db.get_ordered_plugins(&game_c);
+                // Build the reordered list: vanilla first, then new_order
+                let mut reordered: Vec<PluginFile> =
+                    ordered.iter().filter(|p| p.is_vanilla).cloned().collect();
+                for name in &new_order {
+                    if let Some(p) = ordered.iter().find(|p| &p.name == name) {
+                        reordered.push(p.clone());
+                    }
+                }
+                // Append any plugins not in new_order (edge case)
+                for p in &ordered {
+                    if !p.is_vanilla && !reordered.iter().any(|r| r.name == p.name) {
+                        reordered.push(p.clone());
+                    }
+                }
+                db.set_plugin_order(&reordered);
+                db.save(&game_c);
+                if let Err(e) = db.write_plugins_txt(&game_c) {
+                    log::warn!("Failed to write plugins.txt after DnD reorder: {e}");
+                }
+            });
+
+            true
+        });
+    }
+
+    scrolled.add_controller(drop_target);
+}
+
+// ── Plugin row builder ────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 fn build_plugin_row(
@@ -240,7 +553,7 @@ fn build_plugin_row(
     stack: &gtk4::Stack,
     reorder_hint: &gtk4::Label,
     search_query: &str,
-) -> adw::ActionRow {
+) -> PluginRowResult {
     let subtitle = if plugin.is_vanilla {
         format!("{} · Vanilla master (pinned)", plugin.kind.label())
     } else {
@@ -256,6 +569,45 @@ fn build_plugin_row(
     index_label.add_css_class("dim-label");
     index_label.add_css_class("numeric");
     index_label.set_width_chars(3);
+
+    // ── Drag handle (non-vanilla only) ────────────────────────────────────────
+    if !plugin.is_vanilla {
+        let handle = gtk4::Button::new();
+        handle.set_icon_name("list-drag-handle-symbolic");
+        handle.add_css_class("flat");
+        handle.add_css_class("drag-handle");
+        handle.set_valign(gtk4::Align::Center);
+        handle.set_sensitive(allow_reorder);
+        handle.set_tooltip_text(Some(if allow_reorder {
+            "Drag to reorder"
+        } else {
+            "Clear search to reorder"
+        }));
+        row.add_prefix(&handle);
+
+        if allow_reorder {
+            let drag_source = gtk4::DragSource::new();
+            drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
+            let content =
+                gtk4::gdk::ContentProvider::for_value(&plugin.name.to_value());
+            drag_source.set_content(Some(&content));
+
+            let row_begin = row.clone();
+            drag_source.connect_drag_begin(move |src, _| {
+                let paintable = gtk4::WidgetPaintable::new(Some(&row_begin));
+                src.set_icon(Some(&paintable), 16, 28);
+                row_begin.add_css_class("dnd-source");
+            });
+
+            let row_end = row.clone();
+            drag_source.connect_drag_end(move |_, _, _| {
+                row_end.remove_css_class("dnd-source");
+            });
+
+            handle.add_controller(drag_source);
+        }
+    }
+
     row.add_prefix(&index_label);
 
     let badge = gtk4::Label::new(Some(plugin.kind.label()));
@@ -269,7 +621,13 @@ fn build_plugin_row(
         lock.set_tooltip_text(Some("Vanilla master – cannot be moved or disabled"));
         lock.add_css_class("dim-label");
         row.add_suffix(&lock);
-        return row;
+        return PluginRowResult {
+            row,
+            index_label,
+            up_btn: gtk4::Button::new(), // placeholder, not used
+            down_btn: gtk4::Button::new(),
+            is_vanilla: true,
+        };
     }
 
     let enabled_btn = gtk4::CheckButton::new();
@@ -291,14 +649,29 @@ fn build_plugin_row(
         enabled_btn.connect_toggled(move |btn| {
             let enabled = btn.is_active();
             let mut db = ModDatabase::load(&game_c);
+            db.sync_from_plugins_txt(&game_c);
             if enabled {
-                db.plugin_disabled.remove(&plugin_name);
+                db.enable_plugin(&plugin_name);
             } else {
-                db.plugin_disabled.insert(plugin_name.clone());
+                db.disable_plugin(&plugin_name);
             }
             db.save(&game_c);
             let _ = db.write_plugins_txt(&game_c);
-            refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
+            // Refresh by re-fetching the scrolled window from the list's actual parent
+            if let Some(clamp) = list_c.parent()
+                && let Some(sw) = clamp.parent()
+                && let Ok(scrolled) = sw.downcast::<gtk4::ScrolledWindow>()
+            {
+                refresh_load_order_content(
+                    &list_c,
+                    &scrolled,
+                    &status_c,
+                    &stack_c,
+                    &hint_c,
+                    &game_c,
+                    &search_q,
+                );
+            }
         });
     }
     row.add_suffix(&enabled_btn);
@@ -337,16 +710,30 @@ fn build_plugin_row(
         let plugin_name = plugin.name.clone();
         let search_q = search_query.to_string();
         up_btn.connect_clicked(move |_| {
-            let mut db = ModDatabase::load(&game_c);
-            let ordered = db.get_ordered_plugins(&game_c);
-            if let Ok(updated) =
-                ordering::move_up_by_id(&ordered, &plugin_name, pinned_prefix_len, |p| &p.name)
-            {
-                db.set_plugin_order(&updated);
-                db.save(&game_c);
-                let _ = db.write_plugins_txt(&game_c);
+            if let Some(scrolled) = scrolled_from_list(&list_c) {
+                let mut db = ModDatabase::load(&game_c);
+                db.sync_from_plugins_txt(&game_c);
+                let ordered = db.get_ordered_plugins(&game_c);
+                if let Ok(updated) = ordering::move_up_by_id(
+                    &ordered,
+                    &plugin_name,
+                    pinned_prefix_len,
+                    |p| &p.name,
+                ) {
+                    db.set_plugin_order(&updated);
+                    db.save(&game_c);
+                    let _ = db.write_plugins_txt(&game_c);
+                }
+                refresh_load_order_content(
+                    &list_c,
+                    &scrolled,
+                    &status_c,
+                    &stack_c,
+                    &hint_c,
+                    &game_c,
+                    &search_q,
+                );
             }
-            refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
         });
     }
 
@@ -359,16 +746,30 @@ fn build_plugin_row(
         let plugin_name = plugin.name.clone();
         let search_q = search_query.to_string();
         down_btn.connect_clicked(move |_| {
-            let mut db = ModDatabase::load(&game_c);
-            let ordered = db.get_ordered_plugins(&game_c);
-            if let Ok(updated) =
-                ordering::move_down_by_id(&ordered, &plugin_name, pinned_prefix_len, |p| &p.name)
-            {
-                db.set_plugin_order(&updated);
-                db.save(&game_c);
-                let _ = db.write_plugins_txt(&game_c);
+            if let Some(scrolled) = scrolled_from_list(&list_c) {
+                let mut db = ModDatabase::load(&game_c);
+                db.sync_from_plugins_txt(&game_c);
+                let ordered = db.get_ordered_plugins(&game_c);
+                if let Ok(updated) = ordering::move_down_by_id(
+                    &ordered,
+                    &plugin_name,
+                    pinned_prefix_len,
+                    |p| &p.name,
+                ) {
+                    db.set_plugin_order(&updated);
+                    db.save(&game_c);
+                    let _ = db.write_plugins_txt(&game_c);
+                }
+                refresh_load_order_content(
+                    &list_c,
+                    &scrolled,
+                    &status_c,
+                    &stack_c,
+                    &hint_c,
+                    &game_c,
+                    &search_q,
+                );
             }
-            refresh_load_order_content(&list_c, &status_c, &stack_c, &hint_c, &game_c, &search_q);
         });
     }
 
@@ -464,18 +865,21 @@ fn build_plugin_row(
             let search_enable = search_q.clone();
             enable_all_item.connect_clicked(move |_| {
                 popover_enable.popdown();
-                let mut db = ModDatabase::load(&game_enable);
-                db.plugin_disabled.clear();
-                db.save(&game_enable);
-                let _ = db.write_plugins_txt(&game_enable);
-                refresh_load_order_content(
-                    &list_enable,
-                    &status_enable,
-                    &stack_enable,
-                    &hint_enable,
-                    &game_enable,
-                    &search_enable,
-                );
+                if let Some(scrolled) = scrolled_from_list(&list_enable) {
+                    let mut db = ModDatabase::load(&game_enable);
+                    db.plugin_disabled.clear();
+                    db.save(&game_enable);
+                    let _ = db.write_plugins_txt(&game_enable);
+                    refresh_load_order_content(
+                        &list_enable,
+                        &scrolled,
+                        &status_enable,
+                        &stack_enable,
+                        &hint_enable,
+                        &game_enable,
+                        &search_enable,
+                    );
+                }
             });
 
             let popover_disable = popover.clone();
@@ -487,23 +891,26 @@ fn build_plugin_row(
             let search_disable = search_q.clone();
             disable_all_item.connect_clicked(move |_| {
                 popover_disable.popdown();
-                let mut db = ModDatabase::load(&game_disable);
-                let ordered = db.get_ordered_plugins(&game_disable);
-                for p in &ordered {
-                    if !p.is_vanilla && !db.plugin_disabled.contains(&p.name) {
-                        db.plugin_disabled.insert(p.name.clone());
+                if let Some(scrolled) = scrolled_from_list(&list_disable) {
+                    let mut db = ModDatabase::load(&game_disable);
+                    let ordered = db.get_ordered_plugins(&game_disable);
+                    for p in &ordered {
+                        if !p.is_vanilla {
+                            db.disable_plugin(&p.name);
+                        }
                     }
+                    db.save(&game_disable);
+                    let _ = db.write_plugins_txt(&game_disable);
+                    refresh_load_order_content(
+                        &list_disable,
+                        &scrolled,
+                        &status_disable,
+                        &stack_disable,
+                        &hint_disable,
+                        &game_disable,
+                        &search_disable,
+                    );
                 }
-                db.save(&game_disable);
-                let _ = db.write_plugins_txt(&game_disable);
-                refresh_load_order_content(
-                    &list_disable,
-                    &status_disable,
-                    &stack_disable,
-                    &hint_disable,
-                    &game_disable,
-                    &search_disable,
-                );
             });
 
             popover.popup();
@@ -511,7 +918,21 @@ fn build_plugin_row(
     }
     row.add_controller(right_click);
 
-    row
+    PluginRowResult {
+        row,
+        index_label,
+        up_btn,
+        down_btn,
+        is_vanilla: false,
+    }
+}
+
+/// Walk up from a `ListBox` to find its ancestor `ScrolledWindow`.
+fn scrolled_from_list(list_box: &gtk4::ListBox) -> Option<gtk4::ScrolledWindow> {
+    list_box
+        .parent() // Clamp
+        .and_then(|p| p.parent()) // ScrolledWindow
+        .and_then(|p| p.downcast::<gtk4::ScrolledWindow>().ok())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -526,7 +947,8 @@ fn show_move_to_position_dialog(
     reorder_hint: gtk4::Label,
     search_query: String,
 ) {
-    let db = ModDatabase::load(&game);
+    let mut db = ModDatabase::load(&game);
+    db.sync_from_plugins_txt(&game);
     let ordered = db.get_ordered_plugins(&game);
     let total = ordered.len();
     let Some(current_idx) = ordered.iter().position(|p| p.name == plugin_name) else {
@@ -536,59 +958,47 @@ fn show_move_to_position_dialog(
     let min_pos = pinned_prefix_len + 1;
     let body = if pinned_prefix_len > 0 {
         format!(
-            "Enter the new load order position for \"{plugin_name}\".\nValid range: {min_pos}–{total} (positions 1–{pinned_prefix_len} are vanilla masters).",
+            "Enter the new load order position for \"{plugin_name}\".\nValid range: {min_pos}\u{2013}{total} (positions 1\u{2013}{pinned_prefix_len} are vanilla masters).",
         )
     } else {
-        format!("Enter the new load order position for \"{plugin_name}\".\nValid range: 1–{total}.")
+        format!("Enter the new load order position for \"{plugin_name}\".\nValid range: 1\u{2013}{total}.")
     };
 
-    let dialog = adw::AlertDialog::builder()
-        .heading("Move to Position")
-        .body(&body)
-        .build();
-
-    let spin = gtk4::SpinButton::with_range(min_pos as f64, total as f64, 1.0);
-    spin.set_value((current_idx + 1) as f64);
-    spin.set_numeric(true);
-    dialog.set_extra_child(Some(&spin));
-
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("move", "Move");
-    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("move"));
-    dialog.set_close_response("cancel");
-
-    dialog.connect_response(None, move |_, response| {
-        if response != "move" {
-            return;
-        }
-
-        let target_idx = (spin.value() as usize).saturating_sub(1);
-        let mut db = ModDatabase::load(&game);
-        let ordered = db.get_ordered_plugins(&game);
-        if let Ok(updated) = ordering::move_to_absolute_position_by_id(
-            &ordered,
-            &plugin_name,
-            target_idx,
-            pinned_prefix_len,
-            |p| &p.name,
-        ) {
-            db.set_plugin_order(&updated);
-            db.save(&game);
-            let _ = db.write_plugins_txt(&game);
-        }
-
-        refresh_load_order_content(
-            &list_box,
-            &status_page,
-            &stack,
-            &reorder_hint,
-            &game,
-            &search_query,
-        );
-    });
-
-    dialog.present(Some(parent));
+    ordering::show_position_dialog(
+        parent,
+        "Move to Position",
+        &body,
+        min_pos,
+        total,
+        current_idx + 1,
+        move |target_idx| {
+            if let Some(scrolled) = scrolled_from_list(&list_box) {
+                let mut db = ModDatabase::load(&game);
+                db.sync_from_plugins_txt(&game);
+                let ordered = db.get_ordered_plugins(&game);
+                if let Ok(updated) = ordering::move_to_absolute_position_by_id(
+                    &ordered,
+                    &plugin_name,
+                    target_idx,
+                    pinned_prefix_len,
+                    |p| &p.name,
+                ) {
+                    db.set_plugin_order(&updated);
+                    db.save(&game);
+                    let _ = db.write_plugins_txt(&game);
+                }
+                refresh_load_order_content(
+                    &list_box,
+                    &scrolled,
+                    &status_page,
+                    &stack,
+                    &reorder_hint,
+                    &game,
+                    &search_query,
+                );
+            }
+        },
+    );
 }
 
 fn matches_query(value: &str, query: &str) -> bool {

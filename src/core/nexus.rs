@@ -6,9 +6,6 @@ use std::time::{Duration, Instant};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-// These types and methods are part of the Nexus API client which will be used
-// in future download functionality. Suppress dead-code lints until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NexusUser {
     pub user_id: u64,
@@ -18,31 +15,7 @@ pub struct NexusUser {
     pub is_supporter: bool,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct NexusMod {
-    pub mod_id: u64,
-    pub name: String,
-    pub summary: Option<String>,
-    pub version: Option<String>,
-    pub author: Option<String>,
-}
-
-/// Richer mod info returned by list endpoints (trending, latest, etc.).
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct NexusModInfo {
-    pub mod_id: u64,
-    pub name: String,
-    pub summary: Option<String>,
-    pub version: Option<String>,
-    pub author: Option<String>,
-    pub endorsement_count: u64,
-    pub picture_url: Option<String>,
-}
-
 /// A downloadable file belonging to a Nexus mod.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NexusModFile {
     pub file_id: u64,
@@ -54,13 +27,6 @@ pub struct NexusModFile {
     pub file_name: String,
 }
 
-/// Non-sensitive counters for Nexus API behavior.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NexusTelemetry {
-    pub api_requests_saved_by_cache: u64,
-}
-
 // ── Private deserialization types ─────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -70,27 +36,6 @@ struct NexusUserResponse {
     email: String,
     is_premium: bool,
     is_supporter: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct NexusModResponse {
-    mod_id: u64,
-    name: String,
-    summary: Option<String>,
-    version: Option<String>,
-    author: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NexusModListItem {
-    mod_id: u64,
-    name: String,
-    summary: Option<String>,
-    version: Option<String>,
-    author: Option<String>,
-    #[serde(default)]
-    endorsement_count: u64,
-    picture_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,7 +86,6 @@ pub struct NexusClient {
     cache_hits: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl NexusClient {
     pub fn new(api_key: &str) -> Self {
         Self {
@@ -151,12 +95,6 @@ impl NexusClient {
             backoff_base_ms: 250,
             cache: Mutex::new(HashMap::new()),
             cache_hits: AtomicU64::new(0),
-        }
-    }
-
-    pub fn telemetry(&self) -> NexusTelemetry {
-        NexusTelemetry {
-            api_requests_saved_by_cache: self.cache_hits.load(Ordering::Relaxed),
         }
     }
 
@@ -272,48 +210,6 @@ impl NexusClient {
         })
     }
 
-    pub fn get_mod(&self, game_domain: &str, mod_id: u32) -> Result<NexusMod, String> {
-        let url = format!("https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}.json");
-        let data: NexusModResponse = self.get_json_cached(&url)?;
-        Ok(NexusMod {
-            mod_id: data.mod_id,
-            name: data.name,
-            summary: data.summary,
-            version: data.version,
-            author: data.author,
-        })
-    }
-
-    /// Fetch trending mods for the given game domain.
-    pub fn list_trending_mods(&self, game_domain: &str) -> Result<Vec<NexusModInfo>, String> {
-        self.fetch_mod_list(&format!(
-            "https://api.nexusmods.com/v1/games/{game_domain}/mods/trending.json"
-        ))
-    }
-
-    /// Fetch the ten most recently added mods for the given game domain.
-    pub fn list_latest_added_mods(&self, game_domain: &str) -> Result<Vec<NexusModInfo>, String> {
-        self.fetch_mod_list(&format!(
-            "https://api.nexusmods.com/v1/games/{game_domain}/mods/latest_added.json"
-        ))
-    }
-
-    fn fetch_mod_list(&self, url: &str) -> Result<Vec<NexusModInfo>, String> {
-        let data: Vec<NexusModListItem> = self.get_json_cached(url)?;
-        Ok(data
-            .into_iter()
-            .map(|m| NexusModInfo {
-                mod_id: m.mod_id,
-                name: m.name,
-                summary: m.summary,
-                version: m.version,
-                author: m.author,
-                endorsement_count: m.endorsement_count,
-                picture_url: m.picture_url,
-            })
-            .collect())
-    }
-
     /// List files available for the given mod.
     pub fn get_mod_files(
         &self,
@@ -375,55 +271,5 @@ impl NexusClient {
         let data: Vec<NexusDownloadLink> =
             serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
         Ok(data.into_iter().map(|l| (l.short_name, l.uri)).collect())
-    }
-
-    /// Return the public Nexus Mods page URL for the given mod.
-    pub fn mod_page_url(game_domain: &str, mod_id: u64) -> String {
-        format!("https://www.nexusmods.com/{game_domain}/mods/{mod_id}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn telemetry_defaults_to_zero() {
-        let client = NexusClient::new("abc");
-        assert_eq!(
-            client.telemetry(),
-            NexusTelemetry {
-                api_requests_saved_by_cache: 0
-            }
-        );
-    }
-
-    #[test]
-    fn mod_page_url_is_stable() {
-        assert_eq!(
-            NexusClient::mod_page_url("skyrimspecialedition", 123),
-            "https://www.nexusmods.com/skyrimspecialedition/mods/123"
-        );
-    }
-
-    #[test]
-    fn cache_can_store_and_hit_without_network() {
-        let client = NexusClient::new("abc");
-        {
-            let mut cache = client.cache.lock().unwrap();
-            cache.insert(
-                "https://example.test/item".to_string(),
-                CacheEntry {
-                    body: "{\"mod_id\":1,\"name\":\"X\",\"summary\":null,\"version\":null,\"author\":null}".to_string(),
-                    expires_at: Instant::now() + Duration::from_secs(10),
-                },
-            );
-        }
-
-        let parsed: NexusModResponse = client
-            .get_json_cached("https://example.test/item")
-            .expect("should parse cached json");
-        assert_eq!(parsed.mod_id, 1);
-        assert_eq!(client.telemetry().api_requests_saved_by_cache, 1);
     }
 }

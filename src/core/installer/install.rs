@@ -17,25 +17,6 @@ use super::paths::{
 };
 use super::types::*;
 
-/// Recursively collect all regular files under `dir`.
-#[allow(dead_code)]
-fn collect_fs_files(root: &Path, dir: &Path, result: &mut Vec<(String, PathBuf)>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_fs_files(root, &path, result);
-        } else if path.is_file()
-            && let Ok(rel) = path.strip_prefix(root)
-        {
-            let rel_str = normalize_path(&rel.to_string_lossy());
-            result.push((rel_str.to_lowercase(), path));
-        }
-    }
-}
-
 /// Recursively collect all entries (files and directories) under `dir`.
 fn collect_fs_entries(root: &Path, dir: &Path, result: &mut Vec<(String, String)>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -86,24 +67,6 @@ fn collect_matching_entries(
 }
 
 // ── Installation logic ────────────────────────────────────────────────────────
-
-/// Install a mod from an archive.
-#[allow(dead_code)]
-pub fn install_mod_from_archive(
-    archive_path: &Path,
-    game: &Game,
-    mod_name: &str,
-    strategy: &InstallStrategy,
-) -> Result<Mod, String> {
-    install_mod_from_archive_with_nexus_ticking(
-        archive_path,
-        game,
-        mod_name,
-        strategy,
-        None,
-        &|| {},
-    )
-}
 
 pub fn install_mod_from_archive_with_nexus(
     archive_path: &Path,
@@ -177,7 +140,8 @@ pub fn install_mod_from_archive_with_nexus_ticking(
         }
     }
 
-    let mut mod_entry = Mod::new(mod_name, mod_dir);
+    let mut mod_entry = Mod::new(mod_name, mod_dir.clone());
+    mod_entry.enabled = true;
     mod_entry.installed_from_nexus = nexus_id.is_some();
     mod_entry.nexus_id = nexus_id;
     mod_entry.archive_name = archive_path
@@ -185,7 +149,20 @@ pub fn install_mod_from_archive_with_nexus_ticking(
         .map(|n| n.to_string_lossy().into_owned());
 
     let mut db = ModDatabase::load(game);
+    let old_dirs: Vec<PathBuf> = db
+        .mods
+        .iter()
+        .filter(|m| m.name == mod_name)
+        .map(|m| m.source_path.clone())
+        .collect();
     db.mods.retain(|m| m.name != mod_name);
+    for path in old_dirs {
+        if path != mod_dir && path.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                log::warn!("Failed to remove old mod directory {}: {e}", path.display());
+            }
+        }
+    }
     db.mods.push(mod_entry.clone());
     db.save(game);
 
@@ -765,13 +742,27 @@ pub fn install_mod_from_extracted(
     // FOMOD wizard) is finally dropped.
     extracted.cleanup();
 
-    let mut mod_entry = Mod::new(mod_name, mod_dir);
+    let mut mod_entry = Mod::new(mod_name, mod_dir.clone());
+    mod_entry.enabled = true;
     mod_entry.installed_from_nexus = nexus_id.is_some();
     mod_entry.nexus_id = nexus_id;
     mod_entry.archive_name = archive_name.map(|s| s.to_owned());
 
     let mut db = ModDatabase::load(game);
+    let old_dirs: Vec<PathBuf> = db
+        .mods
+        .iter()
+        .filter(|m| m.name == mod_name)
+        .map(|m| m.source_path.clone())
+        .collect();
     db.mods.retain(|m| m.name != mod_name);
+    for path in old_dirs {
+        if path != mod_dir && path.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                log::warn!("Failed to remove old mod directory {}: {e}", path.display());
+            }
+        }
+    }
     db.mods.push(mod_entry.clone());
     db.save(game);
 

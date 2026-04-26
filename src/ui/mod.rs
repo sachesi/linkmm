@@ -25,6 +25,7 @@ pub mod setup_wizard;
 pub mod tools;
 
 pub fn build_ui(app: &libadwaita::Application) {
+    load_dnd_css();
     let config = Rc::new(RefCell::new(AppConfig::load_or_default()));
     let (window, on_setup_done) = build_main_window(app, Rc::clone(&config));
     window.present();
@@ -168,12 +169,7 @@ fn build_main_window(
                 }
                 return;
             }
-            let profile_id = config_c
-                .borrow()
-                .game_settings
-                .get(&g.id)
-                .map(|gs| gs.active_profile_id.clone());
-            if let Err(e) = manager.start_game_session(g.clone(), profile_id) {
+            if let Err(e) = manager.start_game_session(g.clone()) {
                 log::warn!("Could not launch {}: {e}", g.name);
             }
         });
@@ -756,6 +752,26 @@ fn show_game_picker(
     dialog.present();
 }
 
+// ── Drag & drop CSS ────────────────────────────────────────────────────────
+
+fn load_dnd_css() {
+    let css = gtk4::CssProvider::new();
+    css.load_from_string(
+        "row.dnd-source { opacity: 0.35; }
+         row.dnd-drop-before { border-top: 2px solid @accent_color; }
+         row.dnd-drop-after  { border-bottom: 2px solid @accent_color; }
+         .drag-handle { opacity: 0.4; min-width: 20px; }
+         .drag-handle:hover { opacity: 0.9; }",
+    );
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
 // ── About action ───────────────────────────────────────────────────────────
 
 fn register_about_action(app: &libadwaita::Application, window: &adw::ApplicationWindow) {
@@ -1062,15 +1078,19 @@ fn start_nxm_download(
                 return Ok(format!("{file_name} (already downloaded)"));
             }
 
+            if nxm.is_expired() {
+                return Err("NXM download link has expired. Re-click the \"Mod Manager Download\" button on Nexus Mods to get a fresh link.".to_string());
+            }
+
             // Get download link using NXM key/expires if available, otherwise
             // fall back to the premium-only direct API
-            let links = match (&nxm.key, &nxm.expires) {
+            let links = match (&nxm.key, nxm.expires) {
                 (Some(key), Some(expires)) => client.get_download_links_nxm(
                     &nxm.game_domain,
                     nxm.mod_id as u32,
                     nxm.file_id,
                     key,
-                    expires,
+                    &expires.to_string(),
                 )?,
                 _ => client.get_download_links(&nxm.game_domain, nxm.mod_id as u32, nxm.file_id)?,
             };

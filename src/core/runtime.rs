@@ -1,7 +1,5 @@
-use crate::core::config::{ToolConfig, ToolRunProfile};
+use crate::core::config::ToolConfig;
 use crate::core::games::{Game, GameLauncherSource};
-use crate::core::mods::{ModDatabase, ModManager};
-use crate::core::tool_runs::{self, ToolRunResult};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ExitStatus, Stdio};
@@ -49,7 +47,6 @@ pub struct ManagedSession {
     pub id: u64,
     pub kind: SessionKind,
     pub game_id: String,
-    pub profile_id: Option<String>,
     pub tool_id: Option<String>,
     pub launcher_source: GameLauncherSource,
     pub pid: Option<u32>,
@@ -75,7 +72,6 @@ type SessionCompletion = Box<dyn FnOnce(ExitStatus) -> Result<(), String> + Send
 struct SessionStart {
     kind: SessionKind,
     game_id: String,
-    profile_id: Option<String>,
     tool_id: Option<String>,
     launcher_source: GameLauncherSource,
     command: std::process::Command,
@@ -169,7 +165,6 @@ impl RuntimeSessionManager {
     pub fn start_game_session(
         &self,
         game: Game,
-        profile_id: Option<String>,
     ) -> Result<u64, String> {
         if game.launcher_source == GameLauncherSource::Steam {
             return Err(
@@ -184,6 +179,7 @@ impl RuntimeSessionManager {
         let app_id = game.kind.primary_steam_app_id().unwrap_or(0);
         let command = crate::core::umu::build_umu_command(
             &umu.exe_path,
+            "",
             app_id,
             umu.prefix_path.as_deref(),
             umu.proton_path.as_deref(),
@@ -192,7 +188,6 @@ impl RuntimeSessionManager {
         self.spawn_managed_session(SessionStart {
             kind: SessionKind::Game,
             game_id: game.id,
-            profile_id,
             tool_id: None,
             launcher_source: game.launcher_source,
             command,
@@ -204,51 +199,49 @@ impl RuntimeSessionManager {
     pub fn start_tool_session(
         &self,
         game: Game,
-        profile_id: String,
         tool: ToolConfig,
-        run_profile: ToolRunProfile,
-    ) -> Result<(u64, mpsc::Receiver<Result<ToolRunResult, String>>), String> {
-        if game.launcher_source == GameLauncherSource::Steam {
-            return Err("Steam tool launches are launch-only and not managed sessions".to_string());
-        }
+    ) -> Result<(u64, mpsc::Receiver<Result<(), String>>), String> {
         if self.current_tool_session(&game.id, &tool.id).is_some() {
             return Err(format!("Tool {} is already running", tool.name));
         }
 
-        let (done_tx, done_rx) = mpsc::channel::<Result<ToolRunResult, String>>();
-        let game_clone = game.clone();
-        let tool_clone = tool.clone();
-        let run_profile_clone = run_profile.clone();
+        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
 
         let completion: SessionCompletion = Box::new(move |status: ExitStatus| {
-            let mut db = ModDatabase::load(&game_clone);
-            let result = tool_runs::run_tool_with_managed_outputs(
-                &game_clone,
-                &mut db,
-                &tool_clone,
-                &run_profile_clone,
-                |_tool_cfg, _profile_cfg| Ok(status),
-            );
-            if result.is_ok() {
-                let _ = ModManager::rebuild_all(&game_clone);
-            }
+            let result = if status.success() {
+                Ok(())
+            } else {
+                Err(format!("Tool exited with non-zero status: {status}"))
+            };
             let _ = done_tx.send(result.clone());
-            result.map(|_| ())
+            result
         });
 
-        let umu = game.validate_umu_setup()?;
-        let command = crate::core::umu::build_umu_command(
-            &tool.exe_path,
-            tool.app_id,
-            umu.prefix_path.as_deref(),
-            umu.proton_path.as_deref(),
-        )?;
+        let command = match game.launcher_source {
+            GameLauncherSource::NonSteamUmu => {
+                let umu = game.validate_umu_setup()?;
+                // Use the game's Steam App ID for GAMEID so umu-run applies the
+                // correct protonfixes for the game, not for the tool's (possibly
+                // unconfigured) app_id.
+                let app_id = game.kind.primary_steam_app_id().unwrap_or(tool.app_id);
+                crate::core::umu::build_umu_command(
+                    &tool.exe_path,
+                    &tool.arguments,
+                    app_id,
+                    umu.prefix_path.as_deref(),
+                    umu.proton_path.as_deref(),
+                )?
+            }
+            GameLauncherSource::Steam => {
+                let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
+                crate::core::steam::build_tool_command(&tool.exe_path, &tool.arguments, app_id)?
+            }
+        };
 
         let id = self
             .spawn_managed_session(SessionStart {
                 kind: SessionKind::Tool,
                 game_id: game.id,
-                profile_id: Some(profile_id),
                 tool_id: Some(tool.id),
                 launcher_source: game.launcher_source,
                 command,
@@ -289,7 +282,6 @@ impl RuntimeSessionManager {
                         id,
                         kind: start.kind,
                         game_id: start.game_id,
-                        profile_id: start.profile_id,
                         tool_id: start.tool_id,
                         launcher_source: start.launcher_source,
                         pid,
@@ -432,7 +424,6 @@ mod tests {
             .spawn_managed_session(SessionStart {
                 kind: SessionKind::Tool,
                 game_id: "g".to_string(),
-                profile_id: Some("p".to_string()),
                 tool_id: Some("t".to_string()),
                 launcher_source: GameLauncherSource::NonSteamUmu,
                 command: cmd,
@@ -458,7 +449,6 @@ mod tests {
             .spawn_managed_session(SessionStart {
                 kind: SessionKind::Game,
                 game_id: "g".to_string(),
-                profile_id: None,
                 tool_id: None,
                 launcher_source: GameLauncherSource::NonSteamUmu,
                 command: cmd,
@@ -475,7 +465,7 @@ mod tests {
     fn steam_launches_are_not_managed_sessions() {
         let manager = RuntimeSessionManager::new();
         let game = Game::new_steam(crate::core::games::GameKind::SkyrimSE, "/tmp/game".into());
-        let err = manager.start_game_session(game, None).unwrap_err();
+        let err = manager.start_game_session(game).unwrap_err();
         assert!(err.contains("launch-only"));
     }
 }
