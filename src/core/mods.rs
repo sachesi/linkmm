@@ -84,16 +84,6 @@ fn default_deployer() -> String {
     "assets".to_string()
 }
 
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn default_active_profile_id() -> String {
-    "default".to_string()
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
@@ -133,133 +123,26 @@ impl Mod {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OwnedGeneratedFile {
-    pub relative_path: PathBuf,
-    pub captured_at: u64,
-    pub source_tool: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GeneratedOutputPackage {
-    pub id: String,
-    pub name: String,
-    pub tool_id: String,
-    pub run_profile: String,
-    #[serde(default = "default_active_profile_id")]
-    pub manager_profile_id: String,
-    pub source_path: PathBuf,
-    pub enabled: bool,
-    pub priority: i32,
-    #[serde(default = "default_deployer")]
-    pub deployer: String,
-    pub created_at: u64,
-    pub updated_at: u64,
-    #[serde(default)]
-    pub owned_files: Vec<OwnedGeneratedFile>,
-}
-
-impl GeneratedOutputPackage {
-    pub fn new(
-        name: impl Into<String>,
-        tool_id: impl Into<String>,
-        run_profile: impl Into<String>,
-        manager_profile_id: impl Into<String>,
-        source_path: PathBuf,
-    ) -> Self {
-        let ts = now_unix_secs();
-        Self {
-            id: generate_mod_uuid(),
-            name: name.into(),
-            tool_id: tool_id.into(),
-            run_profile: run_profile.into(),
-            manager_profile_id: manager_profile_id.into(),
-            source_path,
-            enabled: true,
-            priority: 0,
-            deployer: default_deployer(),
-            created_at: ts,
-            updated_at: ts,
-            owned_files: Vec::new(),
-        }
-    }
-}
-
-// ── Per-profile state ─────────────────────────────────────────────────────────
-
-/// State that belongs to a single named profile.
-///
-/// `ModDatabase::profiles` stores one of these per profile ID.  The active
-/// profile's state is also mirrored into the flat fields on `ModDatabase`
-/// (plugin_load_order, plugin_disabled, generated_outputs, mod enabled/order)
-/// so the rest of the code can read it without looking up the map.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProfileState {
-    #[serde(default)]
-    pub mod_enabled: HashSet<String>,
-    #[serde(default)]
-    pub mod_order: Vec<String>,
-    #[serde(default)]
-    pub plugin_load_order: Vec<String>,
-    #[serde(default)]
-    pub plugin_disabled: HashSet<String>,
-    #[serde(default)]
-    pub generated_outputs: Vec<GeneratedOutputPackage>,
-}
-
 // ── ModDatabase ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModDatabase {
-    #[serde(default = "default_active_profile_id")]
-    pub active_profile_id: String,
     pub mods: Vec<Mod>,
     /// Ordered mod IDs (legacy – kept for TOML compatibility).
     pub load_order: Vec<String>,
-    /// Active profile's plugin load order (mirrored from profiles[active_profile_id]).
     #[serde(default)]
     pub plugin_load_order: Vec<String>,
-    /// Active profile's disabled plugins (mirrored from profiles[active_profile_id]).
     #[serde(default)]
     pub plugin_disabled: HashSet<String>,
-    /// Active profile's generated output packages (mirrored from profiles[active_profile_id]).
-    #[serde(default)]
-    pub generated_outputs: Vec<GeneratedOutputPackage>,
-
-    /// Per-profile persistent state.  Keyed by profile ID.
-    #[serde(default)]
-    pub profiles: HashMap<String, ProfileState>,
-
-    // ── Legacy flat per-profile fields (read-only for migration) ─────────────
-    // These were the old storage format.  They are deserialized from old files
-    // and migrated into `profiles` on first load.  They are never written.
-    #[serde(default, skip_serializing)]
-    pub profile_mod_enabled: HashMap<String, HashSet<String>>,
-    #[serde(default, skip_serializing)]
-    pub profile_mod_order: HashMap<String, Vec<String>>,
-    #[serde(default, skip_serializing)]
-    pub profile_plugin_load_order: HashMap<String, Vec<String>>,
-    #[serde(default, skip_serializing)]
-    pub profile_plugin_disabled: HashMap<String, HashSet<String>>,
-    #[serde(default, skip_serializing)]
-    pub profile_generated_outputs: HashMap<String, Vec<GeneratedOutputPackage>>,
 }
 
 impl Default for ModDatabase {
     fn default() -> Self {
         Self {
-            active_profile_id: default_active_profile_id(),
             mods: Vec::new(),
-            generated_outputs: Vec::new(),
             load_order: Vec::new(),
             plugin_load_order: Vec::new(),
             plugin_disabled: HashSet::new(),
-            profiles: HashMap::new(),
-            profile_mod_enabled: HashMap::new(),
-            profile_mod_order: HashMap::new(),
-            profile_plugin_load_order: HashMap::new(),
-            profile_plugin_disabled: HashMap::new(),
-            profile_generated_outputs: HashMap::new(),
         }
     }
 }
@@ -330,8 +213,7 @@ impl ModDatabase {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(contents) => match toml::from_str::<ModDatabase>(&contents) {
-                    Ok(mut db) => {
-                        db.apply_active_profile_state();
+                    Ok(db) => {
                         return db;
                     }
                     Err(e) => {
@@ -347,15 +229,13 @@ impl ModDatabase {
     }
 
     pub fn save(&self, game: &Game) {
-        let mut snapshot = self.clone();
-        snapshot.persist_active_profile_state();
         let dir = game.config_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             log::error!("Failed to create game config directory: {e}");
             return;
         }
         let path = Self::db_path(game);
-        match toml::to_string_pretty(&snapshot) {
+        match toml::to_string_pretty(self) {
             Ok(contents) => {
                 if let Err(e) = std::fs::write(&path, contents) {
                     log::error!("Failed to write mods database: {e}");
@@ -368,107 +248,6 @@ impl ModDatabase {
     }
 
     /// Move data from legacy flat per-profile fields into `profiles`.
-    ///
-    /// Called once on load and on any direct construction that uses old fields.
-    /// Safe to call multiple times – profiles that already exist in `self.profiles`
-    /// are not overwritten.
-    fn migrate_legacy_profile_fields(&mut self) {
-        let legacy_ids: HashSet<String> = self
-            .profile_mod_enabled
-            .keys()
-            .chain(self.profile_mod_order.keys())
-            .chain(self.profile_plugin_load_order.keys())
-            .chain(self.profile_plugin_disabled.keys())
-            .chain(self.profile_generated_outputs.keys())
-            .cloned()
-            .collect();
-
-        for id in legacy_ids {
-            if self.profiles.contains_key(&id) {
-                continue;
-            }
-            self.profiles.insert(
-                id.clone(),
-                ProfileState {
-                    mod_enabled: self.profile_mod_enabled.remove(&id).unwrap_or_default(),
-                    mod_order: self.profile_mod_order.remove(&id).unwrap_or_default(),
-                    plugin_load_order: self
-                        .profile_plugin_load_order
-                        .remove(&id)
-                        .unwrap_or_default(),
-                    plugin_disabled: self
-                        .profile_plugin_disabled
-                        .remove(&id)
-                        .unwrap_or_default(),
-                    generated_outputs: self
-                        .profile_generated_outputs
-                        .remove(&id)
-                        .unwrap_or_default(),
-                },
-            );
-        }
-    }
-
-    fn apply_active_profile_state(&mut self) {
-        self.migrate_legacy_profile_fields();
-        let profile_id = self.active_profile_id.clone();
-        let state = self.profiles.entry(profile_id).or_default().clone();
-
-        for m in &mut self.mods {
-            m.enabled = state.mod_enabled.contains(&m.id);
-        }
-
-        if !state.mod_order.is_empty() {
-            let index: HashMap<String, usize> = state
-                .mod_order
-                .into_iter()
-                .enumerate()
-                .map(|(i, id)| (id, i))
-                .collect();
-            self.mods.sort_by_key(|m| {
-                (
-                    index.get(&m.id).copied().unwrap_or(usize::MAX),
-                    m.name.to_lowercase(),
-                    m.id.clone(),
-                )
-            });
-        }
-
-        // Normalise to lowercase so all plugin lookups are case-insensitive.
-        self.plugin_load_order = state
-            .plugin_load_order
-            .into_iter()
-            .map(|n| n.to_lowercase())
-            .collect();
-        self.plugin_disabled = state
-            .plugin_disabled
-            .into_iter()
-            .map(|n| n.to_lowercase())
-            .collect();
-        self.generated_outputs = state.generated_outputs;
-    }
-
-    fn persist_active_profile_state(&mut self) {
-        let profile_id = self.active_profile_id.clone();
-        let state = self.profiles.entry(profile_id).or_default();
-        state.mod_enabled = self
-            .mods
-            .iter()
-            .filter(|m| m.enabled)
-            .map(|m| m.id.clone())
-            .collect();
-        state.mod_order = self.mods.iter().map(|m| m.id.clone()).collect();
-        state.plugin_load_order = self.plugin_load_order.clone();
-        state.plugin_disabled = self.plugin_disabled.clone();
-        state.generated_outputs = self.generated_outputs.clone();
-    }
-
-    pub fn switch_active_profile(&mut self, profile_id: &str) {
-        self.persist_active_profile_state();
-        self.active_profile_id = profile_id.to_string();
-        self.apply_active_profile_state();
-    }
-
     pub fn scan_mods_dir(&mut self, game: &Game) {
         let mods_dir = game.mods_dir();
         if !mods_dir.is_dir() {
@@ -749,7 +528,6 @@ impl ModManager {
             return Err(format!("Unknown mod id: {mod_id}"));
         };
         target.enabled = enabled;
-        deployment::rebuild_deployment(game, &mut db)?;
         db.save(game);
         Ok(())
     }
@@ -757,14 +535,6 @@ impl ModManager {
     pub fn rebuild_all(game: &Game) -> Result<(), String> {
         let mut db = ModDatabase::load(game);
         deployment::rebuild_deployment(game, &mut db)
-    }
-
-    pub fn switch_profile(game: &Game, profile_id: &str) -> Result<(), String> {
-        let mut db = ModDatabase::load(game);
-        db.switch_active_profile(profile_id);
-        deployment::rebuild_deployment(game, &mut db)?;
-        db.save(game);
-        Ok(())
     }
 
     pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
@@ -778,26 +548,23 @@ impl ModManager {
     /// Fully uninstall a mod: remove its symlinks from the game directory,
     /// delete its files from disk, and remove its entry from the database.
     pub fn uninstall_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        // Undeploy first so no dangling symlinks remain in the game directory.
-        // Log but do not abort on undeploy failure – we still want to clean up
-        // the files and database record.
-        if let Err(e) = Self::disable_mod(game, mod_entry) {
-            log::warn!(
-                "Undeploy warning during uninstall of '{}': {e}",
-                mod_entry.name
-            );
+        // Remove from DB first so the deployment rebuild sees it as gone.
+        let mut db = ModDatabase::load(game);
+        db.mods.retain(|m| m.id != mod_entry.id);
+        db.save(game);
+
+        // Rebuild deployment to remove any symlinks pointing at this mod's files.
+        // Do this before deleting the source dir so remove_link_if_matches can
+        // verify link targets and clean up cleanly.
+        if let Err(e) = deployment::rebuild_deployment(game, &mut db) {
+            log::warn!("Link cleanup warning during uninstall of '{}': {e}", mod_entry.name);
         }
 
-        // Delete the mod's managed directory from disk.
+        // Now it is safe to delete the source files.
         if mod_entry.source_path.exists() {
             std::fs::remove_dir_all(&mod_entry.source_path)
                 .map_err(|e| format!("Failed to delete mod files for '{}': {e}", mod_entry.name))?;
         }
-
-        // Remove the mod entry from the database.
-        let mut db = ModDatabase::load(game);
-        db.mods.retain(|m| m.id != mod_entry.id);
-        db.save(game);
 
         Ok(())
     }
@@ -917,82 +684,6 @@ mod tests {
         let encoded = serde_json::to_string(&db).unwrap();
         assert_eq!(encoded.matches("A.esp").count(), 1);
         assert_eq!(encoded.matches("B.esm").count(), 1);
-    }
-
-    #[test]
-    fn apply_active_profile_state_restores_saved_mod_order_deterministically() {
-        let profile_id = "profile-a".to_string();
-        let mut db = ModDatabase {
-            active_profile_id: profile_id.clone(),
-            mods: vec![
-                Mod {
-                    id: "mod-c".to_string(),
-                    name: "Zulu".to_string(),
-                    version: None,
-                    enabled: false,
-                    priority: 0,
-                    nexus_id: None,
-                    source_path: PathBuf::from("/tmp/mod-c"),
-                    installed_from_nexus: false,
-                    archive_name: None,
-                    deployer: default_deployer(),
-                },
-                Mod {
-                    id: "mod-b".to_string(),
-                    name: "Alpha".to_string(),
-                    version: None,
-                    enabled: false,
-                    priority: 0,
-                    nexus_id: None,
-                    source_path: PathBuf::from("/tmp/mod-b"),
-                    installed_from_nexus: false,
-                    archive_name: None,
-                    deployer: default_deployer(),
-                },
-                Mod {
-                    id: "mod-a".to_string(),
-                    name: "Bravo".to_string(),
-                    version: None,
-                    enabled: false,
-                    priority: 0,
-                    nexus_id: None,
-                    source_path: PathBuf::from("/tmp/mod-a"),
-                    installed_from_nexus: false,
-                    archive_name: None,
-                    deployer: default_deployer(),
-                },
-                Mod {
-                    id: "mod-d".to_string(),
-                    name: "Alpha".to_string(),
-                    version: None,
-                    enabled: false,
-                    priority: 0,
-                    nexus_id: None,
-                    source_path: PathBuf::from("/tmp/mod-d"),
-                    installed_from_nexus: false,
-                    archive_name: None,
-                    deployer: default_deployer(),
-                },
-            ],
-            profile_mod_enabled: HashMap::from([(
-                profile_id.clone(),
-                HashSet::from(["mod-b".to_string(), "mod-d".to_string()]),
-            )]),
-            profile_mod_order: HashMap::from([(
-                profile_id,
-                vec!["mod-a".to_string(), "mod-c".to_string()],
-            )]),
-            ..ModDatabase::default()
-        };
-
-        db.apply_active_profile_state();
-
-        let ordered_ids: Vec<&str> = db.mods.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ordered_ids, vec!["mod-a", "mod-c", "mod-b", "mod-d"]);
-        assert!(db.mods[2].enabled);
-        assert!(db.mods[3].enabled);
-        assert!(!db.mods[0].enabled);
-        assert!(!db.mods[1].enabled);
     }
 
     #[test]

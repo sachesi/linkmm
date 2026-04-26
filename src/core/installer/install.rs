@@ -141,6 +141,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
     }
 
     let mut mod_entry = Mod::new(mod_name, mod_dir.clone());
+    mod_entry.enabled = true;
     mod_entry.installed_from_nexus = nexus_id.is_some();
     mod_entry.nexus_id = nexus_id;
     mod_entry.archive_name = archive_path
@@ -742,6 +743,7 @@ pub fn install_mod_from_extracted(
     extracted.cleanup();
 
     let mut mod_entry = Mod::new(mod_name, mod_dir.clone());
+    mod_entry.enabled = true;
     mod_entry.installed_from_nexus = nexus_id.is_some();
     mod_entry.nexus_id = nexus_id;
     mod_entry.archive_name = archive_name.map(|s| s.to_owned());

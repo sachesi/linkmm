@@ -25,27 +25,24 @@ struct DeploymentState {
 }
 
 impl DeploymentState {
-    fn path(game: &Game, profile_id: &str) -> PathBuf {
-        game.config_dir()
-            .join("profiles")
-            .join(profile_id)
-            .join(DEPLOY_STATE_FILE)
+    fn path(game: &Game) -> PathBuf {
+        game.config_dir().join(DEPLOY_STATE_FILE)
     }
 
-    fn load(game: &Game, profile_id: &str) -> Self {
-        let path = Self::path(game, profile_id);
+    fn load(game: &Game) -> Self {
+        let path = Self::path(game);
         let Ok(raw) = fs::read_to_string(path) else {
             return Self::default();
         };
         toml::from_str(&raw).unwrap_or_default()
     }
 
-    fn save(&self, game: &Game, profile_id: &str) -> Result<(), String> {
-        fs::create_dir_all(game.config_dir().join("profiles").join(profile_id))
+    fn save(&self, game: &Game) -> Result<(), String> {
+        fs::create_dir_all(game.config_dir())
             .map_err(|e| format!("Failed to create config dir for deployment state: {e}"))?;
         let raw = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize deployment state: {e}"))?;
-        fs::write(Self::path(game, profile_id), raw)
+        fs::write(Self::path(game), raw)
             .map_err(|e| format!("Failed to write deployment state: {e}"))?;
         Ok(())
     }
@@ -334,7 +331,7 @@ impl Deployer for AssetsDeployer {
 
     fn rebuild(&self, game: &Game, db: &mut ModDatabase) -> Result<(), String> {
         let desired = build_assets_plan(db, self.id());
-        apply_assets_plan(game, &db.active_profile_id, desired)
+        apply_assets_plan(game, desired)
     }
 }
 
@@ -365,30 +362,14 @@ fn build_assets_plan(db: &ModDatabase, deployer_id: &str) -> HashMap<PathBuf, De
             );
         }
     }
-    for output in db.generated_outputs.iter().filter(|o| {
-        o.enabled
-            && o.deployer.as_str() == deployer_id
-            && o.manager_profile_id == db.active_profile_id
-    }) {
-        for (dest, src) in collect_generated_output_destinations(output) {
-            desired.insert(
-                dest,
-                DesiredDeployment {
-                    source: src,
-                    owner_id: format!("generated:{}", output.id),
-                },
-            );
-        }
-    }
     desired
 }
 
 fn apply_assets_plan(
     game: &Game,
-    profile_id: &str,
     desired: HashMap<PathBuf, DesiredDeployment>,
 ) -> Result<(), String> {
-    let mut state = DeploymentState::load(game, profile_id);
+    let mut state = DeploymentState::load(game);
     let desired_set: HashSet<PathBuf> = desired.keys().cloned().collect();
 
     for (dest_rel, src_rel) in state.deployed.clone() {
@@ -428,7 +409,7 @@ fn apply_assets_plan(
     }
 
     restore_backups_not_in_desired(game, &mut state, &desired_set)?;
-    state.save(game, profile_id)
+    state.save(game)
 }
 
 fn restore_backups_not_in_desired(
@@ -505,15 +486,14 @@ fn ensure_path_ready_for_link(
 }
 
 fn move_file_with_cross_fs_fallback(src: &Path, dest: &Path, action: &str) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!("Failed to create destination directory while trying to {action}: {e}")
+        })?;
+    }
     match fs::rename(src, dest) {
         Ok(()) => Ok(()),
         Err(err) if is_cross_device_link_error(&err) => {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    format!("Failed to create destination directory while trying to {action}: {e}")
-                })?;
-            }
-
             fs::copy(src, dest)
                 .map_err(|e| format!("Failed to copy file while trying to {action}: {e}"))?;
 
@@ -543,14 +523,6 @@ fn collect_mod_destinations(mod_entry: &Mod) -> HashMap<PathBuf, PathBuf> {
     } else {
         collect_data_paths_recursive(&mod_entry.source_path, Path::new("Data"), &mut map);
     }
-    map
-}
-
-fn collect_generated_output_destinations(
-    output: &crate::core::mods::GeneratedOutputPackage,
-) -> HashMap<PathBuf, PathBuf> {
-    let mut map = HashMap::new();
-    collect_data_paths_recursive(&output.source_path, Path::new("Data"), &mut map);
     map
 }
 
@@ -1212,90 +1184,4 @@ mod tests {
         assert!(plugins_txt.contains("Addon.esp"));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn generated_outputs_participate_in_conflict_resolution_order() {
-        let temp = TempDir::new().unwrap();
-        let game = test_game(&temp);
-        let mut db = ModDatabase::default();
-        add_mod(
-            &game,
-            &mut db,
-            "base_mod",
-            "Data/textures/shared.dds",
-            b"mod",
-            true,
-        );
-
-        let generated_dir = game.mods_dir().join("generated_outputs").join("bodyslide");
-        fs::create_dir_all(generated_dir.join("textures")).unwrap();
-        fs::write(generated_dir.join("textures/shared.dds"), b"generated").unwrap();
-        let mut package = crate::core::mods::GeneratedOutputPackage::new(
-            "BodySlide Output",
-            "bodyslide",
-            "default",
-            db.active_profile_id.clone(),
-            generated_dir,
-        );
-        package.enabled = true;
-        db.generated_outputs.push(package);
-
-        rebuild_deployment(&game, &mut db).unwrap();
-        let winner = fs::read(game.data_path.join("textures/shared.dds")).unwrap();
-        assert_eq!(winner, b"generated");
-
-        db.generated_outputs[0].enabled = false;
-        rebuild_deployment(&game, &mut db).unwrap();
-        let winner_after = fs::read(game.data_path.join("textures/shared.dds")).unwrap();
-        assert_eq!(winner_after, b"mod");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn profile_switch_rebuilds_isolated_mod_state() {
-        let temp = TempDir::new().unwrap();
-        let game = test_game(&temp);
-        let mut db = ModDatabase::default();
-        add_mod(&game, &mut db, "a", "Data/textures/same.dds", b"a", true);
-        add_mod(&game, &mut db, "b", "Data/textures/same.dds", b"b", false);
-        db.save(&game);
-
-        rebuild_deployment(&game, &mut db).unwrap();
-        let winner_default = fs::read(game.data_path.join("textures/same.dds")).unwrap();
-        assert_eq!(winner_default, b"a");
-
-        db.switch_active_profile("second");
-        db.mods[0].enabled = false;
-        db.mods[1].enabled = true;
-        rebuild_deployment(&game, &mut db).unwrap();
-        db.save(&game);
-        let winner_second = fs::read(game.data_path.join("textures/same.dds")).unwrap();
-        assert_eq!(winner_second, b"b");
-
-        db.switch_active_profile("default");
-        rebuild_deployment(&game, &mut db).unwrap();
-        let winner_back = fs::read(game.data_path.join("textures/same.dds")).unwrap();
-        assert_eq!(winner_back, b"a");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn profile_switch_changes_plugins_txt_state() {
-        let temp = TempDir::new().unwrap();
-        let game = test_game(&temp);
-        let mut db = ModDatabase::default();
-        add_mod(&game, &mut db, "plugins", "Data/SwitchTest.esp", b"x", true);
-        rebuild_deployment(&game, &mut db).unwrap();
-        db.plugin_disabled.remove("switchtest.esp");
-        db.write_plugins_txt(&game).unwrap();
-        let default_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
-        assert!(default_plugins.contains("*SwitchTest.esp"));
-
-        db.switch_active_profile("profile_two");
-        db.plugin_disabled.insert("switchtest.esp".to_string());
-        rebuild_deployment(&game, &mut db).unwrap();
-        db.write_plugins_txt(&game).unwrap();
-        let other_plugins = fs::read_to_string(game.plugins_txt_path().unwrap()).unwrap();
-        assert!(other_plugins.lines().any(|l| l.trim() == "SwitchTest.esp"));
-    }
 }

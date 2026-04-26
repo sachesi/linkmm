@@ -216,10 +216,14 @@ pub(super) fn build_native_tool_command(
     command.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", steam_root);
     command.env("SteamAppId", app_id.to_string());
     command.env("SteamGameId", app_id.to_string());
+    command.env("STEAM_APPID", app_id.to_string());
     command.arg("run");
     command.arg(exe_path);
     for arg in split_launch_arguments(arguments)? {
         command.arg(arg);
+    }
+    if let Some(dir) = exe_path.parent() {
+        command.current_dir(dir);
     }
     Ok(command)
 }
@@ -239,12 +243,16 @@ fn build_flatpak_tool_command(
         .arg(format!("--env=STEAM_COMPAT_DATA_PATH={}", compatdata_path.display()))
         .arg(format!("--env=SteamAppId={app_id}"))
         .arg(format!("--env=SteamGameId={app_id}"))
+        .arg(format!("--env=STEAM_APPID={app_id}"))
         .arg(format!("--command={}", proton_script.display()))
         .arg("com.valvesoftware.Steam")
         .arg("run")
         .arg(exe_path);
     for arg in split_launch_arguments(arguments)? {
         command.arg(arg);
+    }
+    if let Some(dir) = exe_path.parent() {
+        command.arg(format!("--cwd={}", dir.display()));
     }
     Ok(command)
 }
