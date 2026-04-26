@@ -36,3 +36,5 @@ quick-xml = "0.37"
 libloot = "0.29.1"
 tar = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
+fuser = "0.14"
+libc = "0.2"

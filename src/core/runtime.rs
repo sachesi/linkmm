@@ -1,5 +1,7 @@
 use crate::core::config::ToolConfig;
 use crate::core::games::{Game, GameLauncherSource};
+use crate::core::mods::ModDatabase;
+use crate::core::vfs::{MountHandle, mount_mod_vfs};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ExitStatus, Stdio};
@@ -76,6 +78,7 @@ struct SessionStart {
     launcher_source: GameLauncherSource,
     command: std::process::Command,
     completion: Option<SessionCompletion>,
+    vfs_mount: Option<MountHandle>,
 }
 
 #[derive(Clone)]
@@ -175,6 +178,14 @@ impl RuntimeSessionManager {
             return Err("A game session is already active for this game instance".to_string());
         }
 
+        let db = ModDatabase::load(&game);
+        if let Err(e) = db.write_plugins_txt(&game) {
+            log::warn!("Failed to write plugins.txt before game launch: {e}");
+        }
+        let vfs_mount = mount_mod_vfs(&game, &db).map_err(|e| {
+            format!("Failed to mount mod VFS: {e}")
+        })?;
+
         let umu = game.validate_umu_setup()?;
         let app_id = game.kind.primary_steam_app_id().unwrap_or(0);
         let command = crate::core::umu::build_umu_command(
@@ -192,6 +203,7 @@ impl RuntimeSessionManager {
             launcher_source: game.launcher_source,
             command,
             completion: None,
+            vfs_mount: Some(vfs_mount),
         })
         .map(|(id, _)| id)
     }
@@ -238,6 +250,11 @@ impl RuntimeSessionManager {
             }
         };
 
+        let db = ModDatabase::load(&game);
+        let vfs_mount = mount_mod_vfs(&game, &db).map_err(|e| {
+            format!("Failed to mount mod VFS: {e}")
+        })?;
+
         let id = self
             .spawn_managed_session(SessionStart {
                 kind: SessionKind::Tool,
@@ -246,6 +263,7 @@ impl RuntimeSessionManager {
                 launcher_source: game.launcher_source,
                 command,
                 completion: Some(completion),
+                vfs_mount: Some(vfs_mount),
             })
             .map(|(id, _)| id)?;
 
@@ -305,6 +323,7 @@ impl RuntimeSessionManager {
 
         let manager = self.clone();
         let control_for_wait = Arc::clone(&control);
+        let vfs_mount = start.vfs_mount;
         std::thread::spawn(move || {
             let status_result = {
                 let mut child_guard = control_for_wait.child.lock().expect("child lock poisoned");
@@ -324,6 +343,8 @@ impl RuntimeSessionManager {
                 start.completion,
                 control_for_wait.stop_requested.load(Ordering::SeqCst),
             );
+            // VFS mount is dropped here, unmounting after process exits.
+            drop(vfs_mount);
         });
 
         Ok((id, control))
@@ -428,6 +449,7 @@ mod tests {
                 launcher_source: GameLauncherSource::NonSteamUmu,
                 command: cmd,
                 completion: None,
+                vfs_mount: None,
             })
             .unwrap();
         assert!(manager.any_active());
@@ -453,6 +475,7 @@ mod tests {
                 launcher_source: GameLauncherSource::NonSteamUmu,
                 command: cmd,
                 completion: None,
+                vfs_mount: None,
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));

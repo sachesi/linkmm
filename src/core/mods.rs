@@ -1,4 +1,3 @@
-use crate::core::deployment;
 use crate::core::games::Game;
 use libloot::{Game as LootGame, GameType as LootGameType};
 use serde::{Deserialize, Serialize};
@@ -533,8 +532,8 @@ impl ModManager {
     }
 
     pub fn rebuild_all(game: &Game) -> Result<(), String> {
-        let mut db = ModDatabase::load(game);
-        deployment::rebuild_deployment(game, &mut db)
+        let db = ModDatabase::load(game);
+        db.write_plugins_txt(game)
     }
 
     pub fn create_mod_directory(game: &Game) -> Result<PathBuf, String> {
@@ -545,22 +544,12 @@ impl ModManager {
         Ok(dir)
     }
 
-    /// Fully uninstall a mod: remove its symlinks from the game directory,
-    /// delete its files from disk, and remove its entry from the database.
+    /// Fully uninstall a mod: delete its files from disk and remove its DB entry.
     pub fn uninstall_mod(game: &Game, mod_entry: &Mod) -> Result<(), String> {
-        // Remove from DB first so the deployment rebuild sees it as gone.
         let mut db = ModDatabase::load(game);
         db.mods.retain(|m| m.id != mod_entry.id);
         db.save(game);
 
-        // Rebuild deployment to remove any symlinks pointing at this mod's files.
-        // Do this before deleting the source dir so remove_link_if_matches can
-        // verify link targets and clean up cleanly.
-        if let Err(e) = deployment::rebuild_deployment(game, &mut db) {
-            log::warn!("Link cleanup warning during uninstall of '{}': {e}", mod_entry.name);
-        }
-
-        // Now it is safe to delete the source files.
         if mod_entry.source_path.exists() {
             std::fs::remove_dir_all(&mod_entry.source_path)
                 .map_err(|e| format!("Failed to delete mod files for '{}': {e}", mod_entry.name))?;
@@ -772,22 +761,8 @@ mod tests {
         db.mods.push(mod_entry.clone());
         db.save(&game);
 
-        // Rebuild deployment so we can verify links are cleaned up.
-        ModManager::rebuild_all(&game).unwrap();
-        assert!(
-            game.data_path.join("textures").join("sky.dds").is_symlink()
-                || game.data_path.join("textures").join("sky.dds").exists(),
-            "link should exist before uninstall"
-        );
-
         // Uninstall.
         ModManager::uninstall_mod(&game, &mod_entry).unwrap();
-
-        // Symlinks cleaned up.
-        assert!(
-            !game.data_path.join("textures").join("sky.dds").exists(),
-            "symlink should be gone after uninstall"
-        );
         // Mod directory deleted.
         assert!(!mod_dir.exists(), "mod directory should be deleted");
         // Database entry removed.
