@@ -13,4 +13,5 @@ pub mod core {
     pub mod runtime;
     pub mod steam;
     pub mod umu;
+    pub mod vfs;
 }
