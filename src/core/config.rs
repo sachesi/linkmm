@@ -3,50 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Profile {
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ToolOutputMode {
-    DedicatedDirectory,
-    SnapshotGameData,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ToolPresetKind {
-    Generic,
-    BodySlide,
-    Pandora,
-    Nemesis,
-}
-
-fn default_tool_preset() -> ToolPresetKind {
-    ToolPresetKind::Generic
-}
-
-fn default_tool_output_mode() -> ToolOutputMode {
-    ToolOutputMode::SnapshotGameData
-}
-
-fn default_run_profile() -> String {
-    "default".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolRunProfile {
-    pub id: String,
-    pub name: String,
-    #[serde(default = "default_tool_output_mode")]
-    pub output_mode: ToolOutputMode,
-    #[serde(default)]
-    pub managed_output_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub generated_package_name: String,
-}
-
 /// Configuration for a single external tool (e.g., BodySlide, xEdit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolConfig {
@@ -61,68 +17,9 @@ pub struct ToolConfig {
     pub arguments: String,
     /// Steam App ID to determine which game's Proton prefix to use.
     pub app_id: u32,
-    #[serde(default = "default_tool_preset")]
-    pub preset: ToolPresetKind,
-    #[serde(default)]
-    pub run_profiles: Vec<ToolRunProfile>,
 }
 
-impl ToolConfig {
-    pub fn primary_profile(&self) -> ToolRunProfile {
-        if let Some(profile) = self.run_profiles.first() {
-            return profile.clone();
-        }
-        ToolRunProfile {
-            id: default_run_profile(),
-            name: "Default".to_string(),
-            output_mode: default_tool_output_mode(),
-            managed_output_dir: None,
-            generated_package_name: format!("{} Output", self.name),
-        }
-    }
-}
-
-impl Profile {
-    /// Create a new profile with a unique ID derived from the name and current time.
-    pub fn new(name: impl Into<String>) -> Self {
-        let name = name.into();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let slug: String = name
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect();
-        let id = format!("{}_{}", slug, timestamp);
-        Self { id, name }
-    }
-
-    pub fn default_profile() -> Self {
-        Self {
-            id: "default".to_string(),
-            name: "Default".to_string(),
-        }
-    }
-}
-
-fn default_profiles() -> Vec<Profile> {
-    vec![Profile::default_profile()]
-}
-
-fn default_true() -> bool {
-    true
-}
-
-pub fn default_active_profile_id() -> String {
-    "default".to_string()
-}
-
-/// Returns the default profiles list; used as a fallback when no game is active.
-pub fn default_active_profile_id_vec() -> Vec<Profile> {
-    default_profiles()
-}
+fn default_true() -> bool { true }
 
 // ── Per-game settings ─────────────────────────────────────────────────────────
 
@@ -141,12 +38,6 @@ pub struct GameSettings {
     /// archives.
     #[serde(default)]
     pub installed_archives: Vec<String>,
-    /// Mod profiles defined for this game.
-    #[serde(default = "default_profiles")]
-    pub profiles: Vec<Profile>,
-    /// The profile currently active for this game.
-    #[serde(default = "default_active_profile_id")]
-    pub active_profile_id: String,
     /// External tools configured for this game.
     #[serde(default)]
     pub tools: Vec<ToolConfig>,
@@ -157,8 +48,6 @@ impl Default for GameSettings {
         Self {
             app_data_dir: None,
             installed_archives: Vec::new(),
-            profiles: default_profiles(),
-            active_profile_id: default_active_profile_id(),
             tools: Vec::new(),
         }
     }
@@ -209,12 +98,6 @@ pub struct AppConfig {
     /// Migrated into `game_settings[*].installed_archives`.
     #[serde(default, skip_serializing)]
     pub installed_archives: Vec<String>,
-    /// Migrated into `game_settings[*].profiles`.
-    #[serde(default = "default_profiles", skip_serializing)]
-    pub profiles: Vec<Profile>,
-    /// Migrated into `game_settings[*].active_profile_id`.
-    #[serde(default = "default_active_profile_id", skip_serializing)]
-    pub active_profile_id: String,
 }
 
 impl Default for AppConfig {
@@ -235,8 +118,6 @@ impl Default for AppConfig {
             // Legacy fields – only meaningful during migration
             app_data_dir: None,
             installed_archives: Vec::new(),
-            profiles: default_profiles(),
-            active_profile_id: default_active_profile_id(),
         }
     }
 }
@@ -268,9 +149,8 @@ impl AppConfig {
     /// Migrate from the pre-per-game config format.
     ///
     /// If `game_settings` is empty but the old global fields (`app_data_dir`,
-    /// `installed_archives`, `profiles`, `active_profile_id`) are present,
-    /// copy them into the per-game settings for every configured game so no
-    /// data is lost on upgrade.
+    /// `installed_archives`) are present, copy them into the per-game settings
+    /// for every configured game so no data is lost on upgrade.
     fn migrate_legacy_global_settings(&mut self) {
         if !self.game_settings.is_empty() || self.games.is_empty() {
             return;
@@ -278,16 +158,6 @@ impl AppConfig {
         let legacy = GameSettings {
             app_data_dir: self.app_data_dir.clone(),
             installed_archives: self.installed_archives.clone(),
-            profiles: if self.profiles.is_empty() {
-                default_profiles()
-            } else {
-                self.profiles.clone()
-            },
-            active_profile_id: if self.active_profile_id.is_empty() {
-                default_active_profile_id()
-            } else {
-                self.active_profile_id.clone()
-            },
             tools: Vec::new(),
         };
         for game in &self.games {
@@ -460,8 +330,6 @@ mod tests {
             )],
             app_data_dir: Some(PathBuf::from("/data/linkmm")),
             installed_archives: vec!["mod.zip".to_string()],
-            profiles: vec![Profile::default_profile()],
-            active_profile_id: "default".to_string(),
             ..AppConfig::default()
         };
         cfg.migrate_legacy_global_settings();
