@@ -1,88 +1,27 @@
-use std::cell::RefCell;
-use std::path::Path;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::time::Duration;
 
-use gio;
+use glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
-use libadwaita::prelude::*;
 
 use crate::core::config::AppConfig;
 use crate::core::games::Game;
-use crate::core::mods::{Mod, ModDatabase, ModManager};
+use crate::core::mods::{ModDatabase, ModManager};
 use crate::ui::ordering;
 
 mod conflicts;
-use conflicts::{ConflictState, compute_conflict_states};
+mod mod_row;
+
+use conflicts::compute_conflict_states;
+use mod_row::{DndRowData, build_mod_row};
+
 
 const TOAST_TIMEOUT_SECONDS: u32 = 3;
-
-/// Shared page-level state captured by every closure in `build_mod_row`.
-/// Cloning this is one call instead of six.
-#[derive(Clone)]
-struct RowCtx {
-    game: Rc<Game>,
-    config: Rc<RefCell<AppConfig>>,
-    search: Rc<RefCell<String>>,
-    selected: Rc<RefCell<Option<String>>>,
-    container: gtk4::Box,
-    hint: gtk4::Label,
-}
-
-impl RowCtx {
-    fn refresh(&self) {
-        refresh_library_content_with_search(
-            &self.container,
-            &self.game,
-            Rc::clone(&self.config),
-            &self.search.borrow(),
-            Rc::clone(&self.search),
-            Rc::clone(&self.selected),
-            &self.hint,
-            false,
-        );
-    }
-}
-
-enum ReorderDir {
-    Up,
-    Down,
-}
-
-fn make_reorder_handler(
-    ctx: RowCtx,
-    mod_id: String,
-    dir: ReorderDir,
-) -> impl Fn(&gtk4::Button) {
-    move |_| {
-        let mut db = ModDatabase::load(&ctx.game);
-        let result = match dir {
-            ReorderDir::Up => ordering::move_up_by_id(&db.mods, &mod_id, 0, |m| &m.id),
-            ReorderDir::Down => ordering::move_down_by_id(&db.mods, &mod_id, 0, |m| &m.id),
-        };
-        if let Ok(updated) = result {
-            db.mods = updated;
-            db.save(&ctx.game);
-            ctx.refresh();
-            apply_library_reorder_deploy_async(&ctx.game);
-        }
-    }
-}
-
-fn make_bulk_toggle_handler(ctx: RowCtx, enable: bool) -> impl Fn(&gtk4::Button) {
-    move |_| {
-        let mut db = ModDatabase::load(&ctx.game);
-        for m in db.mods.iter_mut() {
-            m.enabled = enable;
-        }
-        db.save(&ctx.game);
-        if let Err(e) = ModManager::rebuild_all(&ctx.game) {
-            log::error!("Failed to rebuild deployment after bulk toggle: {e}");
-        }
-        ctx.refresh();
-    }
-}
+const CLAMP_MARGIN: f64 = 12.0;
+const SCROLL_EDGE: f64 = 60.0;
+const SCROLL_SPEED: f64 = 12.0;
 const STATUS_POPUP_HIDE_DELAY_MS: u64 = 900;
 
 /// Build the full Library page for `game`.
@@ -98,7 +37,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
     search_entry.set_width_chars(24);
     header.pack_start(&search_entry);
 
-    // Deploy button – applies all enabled mods by (re)linking their files
     let deploy_btn = gtk4::Button::with_label("Deploy");
     deploy_btn.add_css_class("suggested-action");
     deploy_btn.set_tooltip_text(Some(
@@ -192,7 +130,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
         });
     }
 
-    // Wire Deploy button: undeploy everything, then deploy all enabled mods
     {
         let game_c = Rc::clone(&game_rc);
         let container_c = list_container.clone();
@@ -212,9 +149,6 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
             status_progress_c.set_fraction(0.0);
             status_progress_c.set_text(Some("0%"));
 
-            // Defer the blocking deploy work to the next idle opportunity so
-            // the Revealer slide-down animation can start on this frame before
-            // the main thread is occupied.
             let game_c = Rc::clone(&game_c);
             let container_c = container_c.clone();
             let config_c = Rc::clone(&config_c);
@@ -265,6 +199,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_library_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
@@ -335,8 +270,10 @@ fn refresh_library_content_with_search(
         list_box.add_css_class("boxed-list");
         list_box.set_selection_mode(gtk4::SelectionMode::None);
 
+        let mut dnd_rows: Vec<DndRowData> = Vec::with_capacity(visible_mods.len());
+
         for (full_idx, mod_entry) in &visible_mods {
-            let row = build_mod_row(
+            let result = build_mod_row(
                 mod_entry,
                 *full_idx,
                 db.mods.len(),
@@ -349,7 +286,14 @@ fn refresh_library_content_with_search(
                 reorder_hint,
                 conflict_states.get(&mod_entry.id),
             );
-            list_box.append(&row);
+            list_box.append(&result.row);
+            dnd_rows.push(DndRowData {
+                mod_id: mod_entry.id.clone(),
+                row: result.row,
+                index_label: result.index_label,
+                up_btn: result.up_btn,
+                down_btn: result.down_btn,
+            });
         }
 
         let clamp = adw::Clamp::new();
@@ -366,6 +310,12 @@ fn refresh_library_content_with_search(
         scrolled.set_child(Some(&clamp));
 
         container.append(&scrolled);
+
+        if reorder_allowed {
+            let dnd_rows_rc = Rc::new(RefCell::new(dnd_rows));
+            setup_library_dnd(&list_box, &scrolled, dnd_rows_rc, Rc::clone(game));
+        }
+
         if let Some((value, _, _)) = previous_scroll {
             let scrolled_clone = scrolled.clone();
             gtk4::glib::idle_add_local_once(move || {
@@ -377,7 +327,228 @@ fn refresh_library_content_with_search(
     }
 }
 
-/// Toggle interactivity for Library controls during long deploy operations.
+// ── Drag & drop for the library list ─────────────────────────────────────────
+
+fn clear_lib_dnd_indicator(indicator: &Rc<RefCell<Option<(gtk4::Widget, bool)>>>) {
+    if let Some((w, is_before)) = indicator.borrow_mut().take() {
+        if is_before {
+            w.remove_css_class("dnd-drop-before");
+        } else {
+            w.remove_css_class("dnd-drop-after");
+        }
+    }
+}
+
+fn setup_library_dnd(
+    list_box: &gtk4::ListBox,
+    scrolled: &gtk4::ScrolledWindow,
+    dnd_rows: Rc<RefCell<Vec<DndRowData>>>,
+    game: Rc<Game>,
+) {
+    let indicator: Rc<RefCell<Option<(gtk4::Widget, bool)>>> = Rc::new(RefCell::new(None));
+    let scroll_dir: Rc<Cell<i8>> = Rc::new(Cell::new(0));
+    let autoscroll_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+    let drop_target =
+        gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
+
+    // ── motion ────────────────────────────────────────────────────────────────
+    {
+        let list_box_m = list_box.clone();
+        let scrolled_m = scrolled.clone();
+        let scrolled_a = scrolled.clone();
+        let dnd_rows_m = Rc::clone(&dnd_rows);
+        let indicator_m = Rc::clone(&indicator);
+        let scroll_dir_m = Rc::clone(&scroll_dir);
+        let autoscroll_m = Rc::clone(&autoscroll_id);
+
+        drop_target.connect_motion(move |_, _x, y| {
+            let h = scrolled_m.height() as f64;
+            let new_dir: i8 = if y < SCROLL_EDGE {
+                -1
+            } else if y > h - SCROLL_EDGE {
+                1
+            } else {
+                0
+            };
+            let old_dir = scroll_dir_m.get();
+            scroll_dir_m.set(new_dir);
+            if old_dir == 0 && new_dir != 0 {
+                let scrolled_t = scrolled_a.clone();
+                let dir_t = Rc::clone(&scroll_dir_m);
+                let id = glib::timeout_add_local(Duration::from_millis(16), move || {
+                    let d = dir_t.get() as f64 * SCROLL_SPEED;
+                    let adj = scrolled_t.vadjustment();
+                    let max = (adj.upper() - adj.page_size()).max(0.0);
+                    adj.set_value((adj.value() + d).clamp(0.0, max));
+                    glib::ControlFlow::Continue
+                });
+                *autoscroll_m.borrow_mut() = Some(id);
+            } else if old_dir != 0 && new_dir == 0 {
+                if let Some(id) = autoscroll_m.borrow_mut().take() {
+                    id.remove();
+                }
+            }
+
+            let adj = scrolled_m.vadjustment();
+            let listbox_y = (y + adj.value() - CLAMP_MARGIN) as i32;
+
+            let rows = dnd_rows_m.borrow();
+            let (target_widget, is_before) = match list_box_m.row_at_y(listbox_y) {
+                Some(ref trow) => {
+                    let before = trow
+                        .compute_bounds(&list_box_m)
+                        .map_or(true, |b| listbox_y < (b.y() + b.height() / 2.0) as i32);
+                    (trow.clone().upcast::<gtk4::Widget>(), before)
+                }
+                None => match rows.last() {
+                    Some(last) => (last.row.clone().upcast::<gtk4::Widget>(), false),
+                    None => return gtk4::gdk::DragAction::MOVE,
+                },
+            };
+            drop(rows);
+
+            {
+                let mut ind = indicator_m.borrow_mut();
+                if let Some((prev_w, prev_before)) = ind.as_ref() {
+                    if *prev_before {
+                        prev_w.remove_css_class("dnd-drop-before");
+                    } else {
+                        prev_w.remove_css_class("dnd-drop-after");
+                    }
+                }
+                if is_before {
+                    target_widget.add_css_class("dnd-drop-before");
+                } else {
+                    target_widget.add_css_class("dnd-drop-after");
+                }
+                *ind = Some((target_widget, is_before));
+            }
+
+            gtk4::gdk::DragAction::MOVE
+        });
+    }
+
+    // ── leave ─────────────────────────────────────────────────────────────────
+    {
+        let indicator_l = Rc::clone(&indicator);
+        let autoscroll_l = Rc::clone(&autoscroll_id);
+        let scroll_dir_l = Rc::clone(&scroll_dir);
+        drop_target.connect_leave(move |_| {
+            clear_lib_dnd_indicator(&indicator_l);
+            if let Some(id) = autoscroll_l.borrow_mut().take() {
+                id.remove();
+            }
+            scroll_dir_l.set(0);
+        });
+    }
+
+    // ── drop ──────────────────────────────────────────────────────────────────
+    {
+        let list_box_d = list_box.clone();
+        let scrolled_d = scrolled.clone();
+        let dnd_rows_d = Rc::clone(&dnd_rows);
+        let game_d = Rc::clone(&game);
+        let indicator_d = Rc::clone(&indicator);
+        let autoscroll_d = Rc::clone(&autoscroll_id);
+        let scroll_dir_d = Rc::clone(&scroll_dir);
+
+        drop_target.connect_drop(move |_, value, _x, y| {
+            if let Some(id) = autoscroll_d.borrow_mut().take() {
+                id.remove();
+            }
+            scroll_dir_d.set(0);
+            clear_lib_dnd_indicator(&indicator_d);
+
+            let Ok(source_id) = value.get::<String>() else {
+                return false;
+            };
+
+            let adj = scrolled_d.vadjustment();
+            let listbox_y = (y + adj.value() - CLAMP_MARGIN) as i32;
+
+            let mut rows = dnd_rows_d.borrow_mut();
+            let total = rows.len();
+
+            let Some(source_idx) = rows.iter().position(|r| r.mod_id == source_id) else {
+                return false;
+            };
+
+            let target_idx = match list_box_d.row_at_y(listbox_y) {
+                Some(ref trow) => {
+                    let tptr = trow.upcast_ref::<glib::Object>().as_ptr() as usize;
+                    let row_pos = rows
+                        .iter()
+                        .position(|r| {
+                            r.row.upcast_ref::<glib::Object>().as_ptr() as usize == tptr
+                        })
+                        .unwrap_or(total);
+                    let before = trow
+                        .compute_bounds(&list_box_d)
+                        .map_or(true, |b| listbox_y < (b.y() + b.height() / 2.0) as i32);
+                    if before { row_pos } else { row_pos + 1 }
+                }
+                None => total,
+            };
+
+            if target_idx == source_idx || target_idx == source_idx + 1 {
+                return true;
+            }
+
+            let insert_idx = ordering::insertion_index_after_removal(source_idx, target_idx);
+
+            let saved_scroll = adj.value();
+
+            let src_widget = rows[source_idx].row.clone().upcast::<gtk4::Widget>();
+            list_box_d.remove(&src_widget);
+            list_box_d.insert(&src_widget, insert_idx as i32);
+
+            let row_data = rows.remove(source_idx);
+            rows.insert(insert_idx, row_data);
+
+            let n = rows.len();
+            for (i, r) in rows.iter().enumerate() {
+                r.index_label.set_text(&format!("{}", i + 1));
+                r.up_btn.set_sensitive(i > 0);
+                r.down_btn.set_sensitive(i + 1 < n);
+            }
+
+            let new_order: Vec<String> = rows.iter().map(|r| r.mod_id.clone()).collect();
+            drop(rows);
+            let game_c = Rc::clone(&game_d);
+            // Restore scroll after GTK's DnD cleanup (which fires after this handler
+            // returns) resets the adjustment. Two nested idles cover two layout passes.
+            glib::idle_add_local_once(move || {
+                adj.set_value(saved_scroll);
+                let adj2 = adj.clone();
+                glib::idle_add_local_once(move || { adj2.set_value(saved_scroll); });
+            });
+            glib::idle_add_local_once(move || {
+                let mut db = ModDatabase::load(&game_c);
+                let mut new_mods = Vec::with_capacity(db.mods.len());
+                for id in &new_order {
+                    if let Some(m) = db.mods.iter().find(|m| &m.id == id) {
+                        new_mods.push(m.clone());
+                    }
+                }
+                for m in &db.mods {
+                    if !new_mods.iter().any(|nm| nm.id == m.id) {
+                        new_mods.push(m.clone());
+                    }
+                }
+                db.mods = new_mods;
+                db.save(&game_c);
+            });
+
+            true
+        });
+    }
+
+    scrolled.add_controller(drop_target);
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
 fn set_library_busy(
     search_entry: &gtk4::SearchEntry,
     deploy_btn: &gtk4::Button,
@@ -390,7 +561,6 @@ fn set_library_busy(
     content_container.set_sensitive(sensitive);
 }
 
-/// Process pending GTK events so status text updates are shown during long loops.
 fn flush_ui_events() {
     let context = gtk4::glib::MainContext::default();
     while context.pending() {
@@ -400,422 +570,9 @@ fn flush_ui_events() {
 
 fn hide_status_popup_later(status_revealer: gtk4::Revealer) {
     gtk4::glib::timeout_add_local_once(
-        std::time::Duration::from_millis(STATUS_POPUP_HIDE_DELAY_MS),
+        Duration::from_millis(STATUS_POPUP_HIDE_DELAY_MS),
         move || {
             status_revealer.set_reveal_child(false);
-        },
-    );
-}
-
-fn apply_library_reorder_deploy_async(game: &Rc<Game>) {
-    let game_bg = game.as_ref().clone();
-    let (tx, rx) = mpsc::channel::<Result<(), String>>();
-    std::thread::spawn(move || {
-        let _ = tx.send(ModManager::rebuild_all(&game_bg));
-    });
-
-    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        match rx.try_recv() {
-            Ok(Ok(())) => gtk4::glib::ControlFlow::Break,
-            Ok(Err(e)) => {
-                log::error!("Failed to rebuild deployment after reorder: {e}");
-                gtk4::glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => gtk4::glib::ControlFlow::Break,
-        }
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_mod_row(
-    mod_entry: &Mod,
-    full_idx: usize,
-    total: usize,
-    allow_reorder: bool,
-    game: &Rc<Game>,
-    container: &gtk4::Box,
-    config: Rc<RefCell<AppConfig>>,
-    search_state: Rc<RefCell<String>>,
-    selected_mod_id: Rc<RefCell<Option<String>>>,
-    reorder_hint: &gtk4::Label,
-    conflict_state: Option<&ConflictState>,
-) -> adw::SwitchRow {
-    let ctx = RowCtx {
-        game: Rc::clone(game),
-        config,
-        search: search_state,
-        selected: selected_mod_id,
-        container: container.clone(),
-        hint: reorder_hint.clone(),
-    };
-
-    let row = adw::SwitchRow::builder()
-        .title(&mod_entry.name)
-        .active(mod_entry.enabled)
-        .build();
-
-    // Subtitle: version and Nexus source indicator
-    let subtitle = match (&mod_entry.version, mod_entry.installed_from_nexus) {
-        (Some(v), true) => format!("{v} · From Nexus Mods"),
-        (Some(v), false) => v.clone(),
-        (None, true) => "From Nexus Mods".to_string(),
-        (None, false) => String::new(),
-    };
-    if !subtitle.is_empty() {
-        row.set_subtitle(&subtitle);
-    }
-
-    let index_label = gtk4::Label::new(Some(&format!("{}", full_idx + 1)));
-    index_label.add_css_class("dim-label");
-    index_label.add_css_class("numeric");
-    index_label.set_width_chars(3);
-    row.add_prefix(&index_label);
-
-    if let Some(state) = conflict_state {
-        if state.overwritten {
-            row.add_css_class("error");
-        } else if state.overwrites {
-            row.add_css_class("success");
-        } else if !state.files.is_empty() {
-            row.add_css_class("accent");
-        }
-    }
-
-    let mod_id = mod_entry.id.clone();
-    let game_toggle = Rc::clone(game);
-    row.connect_active_notify(move |switch_row| {
-        let enabled = switch_row.is_active();
-        if let Err(e) = ModManager::set_mod_enabled(&game_toggle, &mod_id, enabled) {
-            log::error!("Failed to rebuild deployment after toggle: {e}");
-            switch_row.set_active(!enabled);
-        }
-    });
-
-    // ── Move up / down ────────────────────────────────────────────────────────
-    let up_btn = gtk4::Button::new();
-    up_btn.set_icon_name("go-up-symbolic");
-    up_btn.set_valign(gtk4::Align::Center);
-    up_btn.add_css_class("flat");
-    up_btn.set_tooltip_text(Some(if allow_reorder { "Move up" } else { "Clear search to reorder" }));
-    up_btn.set_sensitive(allow_reorder && full_idx > 0);
-
-    let down_btn = gtk4::Button::new();
-    down_btn.set_icon_name("go-down-symbolic");
-    down_btn.set_valign(gtk4::Align::Center);
-    down_btn.add_css_class("flat");
-    down_btn.set_tooltip_text(Some(if allow_reorder { "Move down" } else { "Clear search to reorder" }));
-    down_btn.set_sensitive(allow_reorder && full_idx + 1 < total);
-
-    row.add_suffix(&up_btn);
-    row.add_suffix(&down_btn);
-
-    up_btn.connect_clicked(make_reorder_handler(ctx.clone(), mod_entry.id.clone(), ReorderDir::Up));
-    down_btn.connect_clicked(make_reorder_handler(ctx.clone(), mod_entry.id.clone(), ReorderDir::Down));
-
-    // ── Uninstall button ──────────────────────────────────────────────────────
-    let delete_btn = gtk4::Button::new();
-    delete_btn.set_icon_name("user-trash-symbolic");
-    delete_btn.set_tooltip_text(Some("Uninstall mod"));
-    delete_btn.add_css_class("flat");
-    delete_btn.set_valign(gtk4::Align::Center);
-    row.add_suffix(&delete_btn);
-
-    let mod_id_del = mod_entry.id.clone();
-    let mod_name_del = mod_entry.name.clone();
-    let ctx_del = ctx.clone();
-    delete_btn.connect_clicked(move |btn| {
-        let parent = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-
-        let dialog = adw::AlertDialog::builder()
-            .heading("Remove Mod?")
-            .body(format!(
-                "\u{201c}{}\u{201d} will be permanently removed from disk.",
-                mod_name_del
-            ))
-            .build();
-
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("remove", "Remove");
-        dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-
-        let mod_id_c = mod_id_del.clone();
-        let ctx_c = ctx_del.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response != "remove" {
-                return;
-            }
-            let db = ModDatabase::load(&ctx_c.game);
-            if let Some(m) = db.mods.iter().find(|m| m.id == mod_id_c) {
-                if let Err(e) = ModManager::uninstall_mod(&ctx_c.game, m) {
-                    log::error!("Failed to uninstall mod: {e}");
-                } else {
-                    // Keep downloaded archives on disk, but clear install marker
-                    // so Downloads reflects that this mod is no longer installed.
-                    let mut cfg = ctx_c.config.borrow_mut();
-                    let gs = cfg.game_settings_mut(&ctx_c.game.id);
-                    if let Some(archive_name) = &m.archive_name {
-                        gs.installed_archives
-                            .retain(|archive| archive != archive_name);
-                    } else {
-                        let mod_name_lower = m.name.to_lowercase();
-                        gs.installed_archives.retain(|archive| {
-                            let archive_stem = Path::new(archive)
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().to_lowercase())
-                                .unwrap_or_default();
-                            archive_stem != mod_name_lower
-                        });
-                    }
-                    cfg.save();
-                }
-            }
-            if ctx_c.selected.borrow().as_ref().map(|id| id == &mod_id_c).unwrap_or(false) {
-                *ctx_c.selected.borrow_mut() = None;
-            }
-            ctx_c.refresh();
-        });
-
-        dialog.present(parent.as_ref());
-    });
-
-    // ── Left click: select mod for conflict highlighting ───────────────────────
-    let left_click = gtk4::GestureClick::new();
-    left_click.set_button(1);
-    {
-        let mod_id_sel = mod_entry.id.clone();
-        let ctx_sel = ctx.clone();
-        // Use `released` (not `pressed`) so built-in SwitchRow controls process
-        // the click first; refreshing immediately on press can swallow toggle
-        // interactions and make row controls feel broken.
-        left_click.connect_released(move |_, _, _, _| {
-            {
-                let mut selected = ctx_sel.selected.borrow_mut();
-                if selected.as_ref() == Some(&mod_id_sel) {
-                    // Clicking the same row again clears selection and returns
-                    // conflict highlighting to the global blue mode.
-                    *selected = None;
-                } else {
-                    *selected = Some(mod_id_sel.clone());
-                }
-            }
-            // Defer refresh so switch/button default handlers run first; this
-            // keeps row toggles and other left-click controls responsive.
-            let ctx_idle = ctx_sel.clone();
-            gtk4::glib::idle_add_local_once(move || ctx_idle.refresh());
-        });
-    }
-    row.add_controller(left_click);
-
-    // ── Right-click context menu ──────────────────────────────────────────────
-    let right_click = gtk4::GestureClick::new();
-    right_click.set_button(3);
-    {
-        let row_c = row.clone();
-        let source_path = mod_entry.source_path.clone();
-        let nexus_id = mod_entry.nexus_id;
-        let mod_id_rclick = mod_entry.id.clone();
-        let ctx_rclick = ctx.clone();
-        let conflict_entries = conflict_state
-            .map(|state| {
-                state
-                    .conflict_mods_by_file
-                    .iter()
-                    .map(|(file, mods)| (file.clone(), mods.iter().cloned().collect::<Vec<_>>()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        right_click.connect_pressed(move |gesture, _, x, y| {
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-
-            let popover = gtk4::Popover::new();
-            popover.set_parent(&row_c);
-            let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
-            popover.set_pointing_to(Some(&rect));
-            popover.set_has_arrow(false);
-
-            let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-            menu_box.set_margin_top(4);
-            menu_box.set_margin_bottom(4);
-            menu_box.set_margin_start(4);
-            menu_box.set_margin_end(4);
-
-            let open_dir_item = gtk4::Button::with_label("Open Mod Directory");
-            open_dir_item.add_css_class("flat");
-            open_dir_item.set_halign(gtk4::Align::Fill);
-            open_dir_item.set_hexpand(true);
-            menu_box.append(&open_dir_item);
-
-            let open_nexus_item = gtk4::Button::with_label("Visit on Nexus Mods");
-            open_nexus_item.add_css_class("flat");
-            open_nexus_item.set_halign(gtk4::Align::Fill);
-            open_nexus_item.set_hexpand(true);
-            open_nexus_item.set_sensitive(nexus_id.is_some());
-            menu_box.append(&open_nexus_item);
-
-            let show_conflicts_item = gtk4::Button::with_label("Show Conflicting Files");
-            show_conflicts_item.add_css_class("flat");
-            show_conflicts_item.set_halign(gtk4::Align::Fill);
-            show_conflicts_item.set_hexpand(true);
-            show_conflicts_item.set_sensitive(!conflict_entries.is_empty());
-            menu_box.append(&show_conflicts_item);
-
-            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-            menu_box.append(&sep);
-
-            let move_item = gtk4::Button::with_label("Move to Position\u{2026}");
-            move_item.add_css_class("flat");
-            move_item.set_halign(gtk4::Align::Fill);
-            move_item.set_hexpand(true);
-            move_item.set_sensitive(allow_reorder);
-            move_item.set_tooltip_text(Some(if allow_reorder {
-                "Move to a specific precedence position"
-            } else {
-                "Clear search to reorder"
-            }));
-            menu_box.append(&move_item);
-
-            let enable_all_item = gtk4::Button::with_label("Enable All");
-            enable_all_item.add_css_class("flat");
-            enable_all_item.set_halign(gtk4::Align::Fill);
-            enable_all_item.set_hexpand(true);
-            menu_box.append(&enable_all_item);
-
-            let disable_all_item = gtk4::Button::with_label("Disable All");
-            disable_all_item.add_css_class("flat");
-            disable_all_item.set_halign(gtk4::Align::Fill);
-            disable_all_item.set_hexpand(true);
-            menu_box.append(&disable_all_item);
-
-            popover.set_child(Some(&menu_box));
-
-            let popover_dir = popover.clone();
-            let source_dir = source_path.clone();
-            open_dir_item.connect_clicked(move |_| {
-                popover_dir.popdown();
-                open_in_file_manager(&source_dir);
-            });
-
-            let popover_nexus = popover.clone();
-            let game_nexus = Rc::clone(&ctx_rclick.game);
-            open_nexus_item.connect_clicked(move |_| {
-                popover_nexus.popdown();
-                if let Some(id) = nexus_id {
-                    let uri = format!(
-                        "https://www.nexusmods.com/{}/mods/{}",
-                        game_nexus.kind.nexus_game_id(),
-                        id
-                    );
-                    let _ =
-                        gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-                }
-            });
-
-            let popover_conflicts = popover.clone();
-            let row_for_dialog = row_c.clone();
-            let conflict_entries_for_menu = conflict_entries.clone();
-            show_conflicts_item.connect_clicked(move |_| {
-                popover_conflicts.popdown();
-                if conflict_entries_for_menu.is_empty() {
-                    return;
-                }
-
-                let body = conflict_entries_for_menu
-                    .iter()
-                    .map(|(file, mods)| {
-                        if mods.is_empty() {
-                            format!("• {file}")
-                        } else {
-                            format!("• {file}\n  conflicts with: {}", mods.join(", "))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Conflicting Files")
-                    .body(&body)
-                    .build();
-                dialog.add_response("ok", "OK");
-                dialog.set_default_response(Some("ok"));
-                dialog.set_close_response("ok");
-                let parent = row_for_dialog
-                    .root()
-                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
-                dialog.present(parent.as_ref());
-            });
-
-            let popover_move = popover.clone();
-            let row_move = row_c.clone();
-            let ctx_move = ctx_rclick.clone();
-            let mod_id_move = mod_id_rclick.clone();
-            move_item.connect_clicked(move |_| {
-                popover_move.popdown();
-                if let Some(root) = row_move.root()
-                    && let Ok(window) = root.downcast::<gtk4::Window>()
-                {
-                    show_move_to_position_dialog_for_mod(
-                        &window,
-                        mod_id_move.clone(),
-                        ctx_move.clone(),
-                    );
-                }
-            });
-
-            let popover_enable = popover.clone();
-            let ctx_enable = ctx_rclick.clone();
-            enable_all_item.connect_clicked(move |_| {
-                popover_enable.popdown();
-                make_bulk_toggle_handler(ctx_enable.clone(), true)(&gtk4::Button::new());
-            });
-
-            let popover_disable = popover.clone();
-            let ctx_disable = ctx_rclick.clone();
-            disable_all_item.connect_clicked(move |_| {
-                popover_disable.popdown();
-                make_bulk_toggle_handler(ctx_disable.clone(), false)(&gtk4::Button::new());
-            });
-
-            popover.popup();
-        });
-    }
-    row.add_controller(right_click);
-
-    row
-}
-
-fn show_move_to_position_dialog_for_mod(parent: &gtk4::Window, mod_id: String, ctx: RowCtx) {
-    let db = ModDatabase::load(&ctx.game);
-    let total = db.mods.len();
-    if total == 0 {
-        return;
-    }
-    let Some(current_pos) = db.mods.iter().position(|m| m.id == mod_id) else {
-        return;
-    };
-    let mod_name = db.mods[current_pos].name.clone();
-    let body = format!("Enter the new position for \"{mod_name}\".\nValid range: 1\u{2013}{total}.");
-
-    ordering::show_position_dialog(
-        parent,
-        "Move to Position",
-        &body,
-        1,
-        total,
-        current_pos + 1,
-        move |target_idx| {
-            let mut db = ModDatabase::load(&ctx.game);
-            if let Ok(updated) =
-                ordering::move_to_absolute_position_by_id(&db.mods, &mod_id, target_idx, 0, |m| &m.id)
-            {
-                db.mods = updated;
-                db.save(&ctx.game);
-                ctx.refresh();
-                apply_library_reorder_deploy_async(&ctx.game);
-            }
         },
     );
 }
@@ -828,15 +585,7 @@ fn matches_query(value: &str, query: &str) -> bool {
     value.to_lowercase().contains(&trimmed.to_lowercase())
 }
 
-fn open_in_file_manager(path: &Path) {
-    let file = gio::File::for_path(path);
-    let uri = file.uri();
-    let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-}
-
-/// Show a brief in-app toast notification anchored to `widget`.
 fn show_toast(widget: &gtk4::Widget, message: &str) {
-    // Walk up to the nearest AdwToastOverlay
     let mut ancestor: Option<gtk4::Widget> = Some(widget.clone());
     while let Some(current) = ancestor {
         if let Ok(overlay) = current.clone().downcast::<adw::ToastOverlay>() {
@@ -847,7 +596,6 @@ fn show_toast(widget: &gtk4::Widget, message: &str) {
         }
         ancestor = current.parent();
     }
-    // Fallback: log to stderr
     log::info!("{message}");
 }
 
@@ -1014,7 +762,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("linkmm-conflict-fallback-test-{unique}"));
+        let root =
+            std::env::temp_dir().join(format!("linkmm-conflict-fallback-test-{unique}"));
         let mod_a = root.join("a");
         let mod_b = root.join("b");
         let mod_c = root.join("c");
@@ -1032,7 +781,6 @@ mod tests {
             sample_mod("c", "C", &mod_c.to_string_lossy()),
         ];
 
-        // Select C (no conflicts) -> A/B must still remain in blue-mode data.
         let states = compute_conflict_states(&mods, Some("c"));
         let a = states.get("a").unwrap();
         let b = states.get("b").unwrap();

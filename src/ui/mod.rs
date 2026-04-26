@@ -25,6 +25,7 @@ pub mod setup_wizard;
 pub mod tools;
 
 pub fn build_ui(app: &libadwaita::Application) {
+    load_dnd_css();
     let config = Rc::new(RefCell::new(AppConfig::load_or_default()));
     let (window, on_setup_done) = build_main_window(app, Rc::clone(&config));
     window.present();
@@ -168,12 +169,7 @@ fn build_main_window(
                 }
                 return;
             }
-            let profile_id = config_c
-                .borrow()
-                .game_settings
-                .get(&g.id)
-                .map(|gs| gs.active_profile_id.clone());
-            if let Err(e) = manager.start_game_session(g.clone(), profile_id) {
+            if let Err(e) = manager.start_game_session(g.clone()) {
                 log::warn!("Could not launch {}: {e}", g.name);
             }
         });
@@ -754,6 +750,26 @@ fn show_game_picker(
     toolbar_view.set_content(Some(&content_box));
     dialog.set_content(Some(&toolbar_view));
     dialog.present();
+}
+
+// ── Drag & drop CSS ────────────────────────────────────────────────────────
+
+fn load_dnd_css() {
+    let css = gtk4::CssProvider::new();
+    css.load_from_string(
+        "row.dnd-source { opacity: 0.35; }
+         row.dnd-drop-before { border-top: 2px solid @accent_color; }
+         row.dnd-drop-after  { border-bottom: 2px solid @accent_color; }
+         .drag-handle { opacity: 0.4; min-width: 20px; }
+         .drag-handle:hover { opacity: 0.9; }",
+    );
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 }
 
 // ── About action ───────────────────────────────────────────────────────────
