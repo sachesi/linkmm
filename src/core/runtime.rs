@@ -4,6 +4,8 @@ use crate::core::mods::ModDatabase;
 use crate::core::vfs::{MountHandle, mount_mod_vfs, mount_tool_vfs};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,13 +14,13 @@ use std::time::SystemTime;
 
 const MAX_LOG_LINES: usize = 600;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionKind {
     Game,
     Tool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionStatus {
     Starting,
     Running,
@@ -27,25 +29,25 @@ pub enum SessionStatus {
     Killed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionStream {
     Stdout,
     Stderr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionRunMode {
     FullyManaged,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionLogLine {
     pub stream: SessionStream,
     pub at: SystemTime,
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ManagedSession {
     pub id: u64,
     pub kind: SessionKind,
@@ -94,7 +96,34 @@ struct RuntimeSessionManagerInner {
     sessions: Mutex<HashMap<u64, SessionRecord>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct SessionRegistry {
+    sessions: Vec<ManagedSession>,
+}
+
+fn session_registry_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("linkmm")
+        .join("sessions.toml")
+}
+
 impl RuntimeSessionManager {
+    fn save_sessions(&self) {
+        let active_sessions: Vec<ManagedSession> = self.inner.sessions.lock().expect("lock").values()
+            .map(|s| s.session.clone())
+            .filter(|s| matches!(s.status, SessionStatus::Starting | SessionStatus::Running))
+            .collect();
+        
+        let registry = SessionRegistry { sessions: active_sessions };
+        if let Ok(content) = toml::to_string_pretty(&registry) {
+            let path = session_registry_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, content);
+        }
+    }
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RuntimeSessionManagerInner {
@@ -161,9 +190,20 @@ impl RuntimeSessionManager {
         control.stop_requested.store(true, Ordering::SeqCst);
         let mut child_guard = control.child.lock().expect("child lock poisoned");
         if let Some(child) = child_guard.as_mut() {
-            child
-                .kill()
-                .map_err(|e| format!("Failed to stop session {id}: {e}"))?;
+            #[cfg(unix)]
+            {
+                let pid = child.id();
+                // Send SIGTERM to the process group (negative PID)
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGTERM);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                child
+                    .kill()
+                    .map_err(|e| format!("Failed to stop session {id}: {e}"))?;
+            }
         }
         Ok(())
     }
@@ -172,11 +212,6 @@ impl RuntimeSessionManager {
         &self,
         game: Game,
     ) -> Result<u64, String> {
-        if game.launcher_source == GameLauncherSource::Steam {
-            return Err(
-                "Steam launches are launch-only and are not managed runtime sessions".to_string(),
-            );
-        }
         if self.current_game_session(&game.id).is_some() {
             return Err("A game session is already active for this game instance".to_string());
         }
@@ -189,15 +224,45 @@ impl RuntimeSessionManager {
             format!("Failed to mount mod VFS: {e}")
         })?;
 
-        let umu = game.validate_umu_setup()?;
-        let app_id = game.kind.primary_steam_app_id().unwrap_or(0);
-        let command = crate::core::umu::build_umu_command(
-            &umu.exe_path,
-            "",
-            app_id,
-            umu.prefix_path.as_deref(),
-            umu.proton_path.as_deref(),
-        )?;
+        let command = match game.launcher_source {
+            GameLauncherSource::NonSteamUmu => {
+                let umu = game.validate_umu_setup()?;
+                let app_id = game.kind.primary_steam_app_id().unwrap_or(0);
+                crate::core::umu::build_umu_command(
+                    &umu.exe_path,
+                    "",
+                    app_id,
+                    umu.prefix_path.as_deref(),
+                    umu.proton_path.as_deref(),
+                    "none",
+                )?
+            }
+            GameLauncherSource::Steam => {
+                let app_id = game.steam_instance_app_id().unwrap_or(0);
+                
+                let mut exe_path = None;
+                for exe in game.kind.expected_executable_names() {
+                    let path = game.root_path.join(exe);
+                    if path.exists() {
+                        exe_path = Some(path);
+                        break;
+                    }
+                }
+                let exe_path = exe_path.ok_or_else(|| "Could not find game executable in root path".to_string())?;
+
+                let (proton_path, compatdata_path) = crate::core::steam::proton::find_proton_for_game(app_id)?;
+                let prefix_path = compatdata_path.join("pfx");
+
+                crate::core::umu::build_umu_command(
+                    &exe_path,
+                    "",
+                    app_id,
+                    Some(&prefix_path),
+                    Some(&proton_path),
+                    "steam",
+                )?
+            }
+        };
 
         self.spawn_managed_session(
             SessionStart {
@@ -248,11 +313,22 @@ impl RuntimeSessionManager {
                     app_id,
                     umu.prefix_path.as_deref(),
                     umu.proton_path.as_deref(),
+                    "none",
                 )?
             }
             GameLauncherSource::Steam => {
                 let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
-                crate::core::steam::build_tool_command(&tool.exe_path, &tool.arguments, app_id)?
+                let (proton_path, compatdata_path) = crate::core::steam::proton::find_proton_for_game(app_id)?;
+                let prefix_path = compatdata_path.join("pfx");
+                
+                crate::core::umu::build_umu_command(
+                    &tool.exe_path,
+                    &tool.arguments,
+                    app_id,
+                    Some(&prefix_path),
+                    Some(&proton_path),
+                    "steam",
+                )?
             }
         };
 
@@ -288,6 +364,11 @@ impl RuntimeSessionManager {
     ) -> Result<(u64, Arc<SessionControl>), String> {
         start.command.stdout(Stdio::piped());
         start.command.stderr(Stdio::piped());
+
+        #[cfg(unix)]
+        {
+            start.command.process_group(0);
+        }
 
         let mut child = start
             .command
@@ -365,6 +446,7 @@ impl RuntimeSessionManager {
             drop(vfs_mount);
         });
 
+        self.save_sessions();
         Ok((id, control))
     }
 
@@ -403,6 +485,8 @@ impl RuntimeSessionManager {
             record.session.status = next_status;
             record.session.exit_code = exit_code;
         }
+        drop(sessions);
+        self.save_sessions();
     }
 
     fn spawn_log_reader<R: std::io::Read + Send + 'static>(

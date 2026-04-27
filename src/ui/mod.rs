@@ -138,17 +138,10 @@ fn build_main_window(
     play_btn.set_margin_end(12);
     play_btn.set_margin_bottom(8);
 
-    // Show the button for Steam games (known App ID) and UMU-configured games.
+    // Show the button if a game is selected.
     {
         let cfg = config.borrow();
-        play_btn.set_visible(
-            cfg.current_game()
-                .map(|g| {
-                    g.steam_instance_app_id().is_some()
-                        || g.launcher_source == GameLauncherSource::NonSteamUmu
-                })
-                .unwrap_or(false),
-        );
+        play_btn.set_visible(cfg.current_game_id.is_some());
     }
 
     {
@@ -156,12 +149,6 @@ fn build_main_window(
         play_btn.connect_clicked(move |_| {
             let game = config_c.borrow().current_game().cloned();
             let Some(g) = game else { return };
-            if g.launcher_source == GameLauncherSource::Steam {
-                if let Err(e) = crate::core::steam::launch_game(&g) {
-                    log::warn!("Could not launch {}: {e}", g.name);
-                }
-                return;
-            }
             let manager = global_runtime_manager();
             if let Some(session) = manager.current_game_session(&g.id) {
                 if let Err(e) = manager.stop_session(session.id) {
@@ -257,13 +244,8 @@ fn build_main_window(
             let current_game = config_t.borrow().current_game().cloned();
             if let Some(game) = current_game {
                 let game_session = manager.current_game_session(&game.id);
-                play_btn_t.set_visible(
-                    game.steam_instance_app_id().is_some()
-                        || game.launcher_source == GameLauncherSource::NonSteamUmu,
-                );
-                play_btn_t.set_label(if game.launcher_source == GameLauncherSource::Steam {
-                    "Launch"
-                } else if game_session.is_some() {
+                play_btn_t.set_visible(true);
+                play_btn_t.set_label(if game_session.is_some() {
                     "Stop"
                 } else {
                     "Play"
@@ -488,16 +470,8 @@ fn build_main_window(
             update_active_game_row(&active_game_row_r, None);
         }
 
-        // Show Play button for Steam games (has App ID) and UMU-configured games.
-        play_btn_r.set_visible(
-            game_info
-                .as_ref()
-                .map(|g| {
-                    g.steam_instance_app_id().is_some()
-                        || g.launcher_source == GameLauncherSource::NonSteamUmu
-                })
-                .unwrap_or(false),
-        );
+        // Show Play button if a game is selected.
+        play_btn_r.set_visible(game_info.is_some());
 
         // Rebuild Library page for the new game
         let new_library: gtk4::Widget = match &game_info {
