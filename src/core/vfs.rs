@@ -15,6 +15,7 @@ use crate::core::games::Game;
 use crate::core::mods::ModDatabase;
 
 const TTL: Duration = Duration::from_secs(1);
+pub const WHITEOUT_PREFIX: &str = ".linkmm_whiteout_";
 
 // ── Node types ────────────────────────────────────────────────────────────────
 
@@ -24,10 +25,15 @@ enum VfsNodeKind {
         children: HashMap<OsString, u64>,
     },
     File {
+        parent: u64,
         /// Path that can be opened without going through the FUSE mount.
         /// For real game files this is /proc/self/fd/<N>/relative; for mod
         /// files it is the absolute path under the mod's source directory.
         read_path: PathBuf,
+    },
+    /// A marker that this file has been deleted in the writable overlay.
+    Whiteout {
+        parent: u64,
     },
 }
 
@@ -147,9 +153,24 @@ impl ModUnionFs {
             if src.is_symlink() {
                 continue;
             }
-            let Ok(meta) = std::fs::metadata(&src) else { continue };
             let name = entry.file_name();
-            let name_lc = name.to_string_lossy().to_lowercase();
+            let name_str = name.to_string_lossy();
+            
+            // Handle whiteouts
+            if name_str.starts_with(WHITEOUT_PREFIX) {
+                let target_name = &name_str[WHITEOUT_PREFIX.len()..];
+                let target_name_lc = target_name.to_lowercase();
+                if let Some(ino) = self.child_ino_ci(parent_ino, &target_name_lc) {
+                    // Mark as whiteout in VFS
+                    if let Some(node) = self.nodes.get_mut(&ino) {
+                        node.kind = VfsNodeKind::Whiteout { parent: parent_ino };
+                    }
+                }
+                continue;
+            }
+
+            let Ok(meta) = std::fs::metadata(&src) else { continue };
+            let name_lc = name_str.to_lowercase();
             let existing = self.child_ino_ci(parent_ino, &name_lc);
 
             if meta.is_dir() {
@@ -176,7 +197,7 @@ impl ModUnionFs {
                             node.attr.size = size;
                             node.attr.mtime = mtime;
                             node.attr.blocks = blocks(size);
-                            node.kind = VfsNodeKind::File { read_path: src };
+                            node.kind = VfsNodeKind::File { parent: parent_ino, read_path: src };
                         }
                     }
                     None => {
@@ -184,7 +205,7 @@ impl ModUnionFs {
                         *next_ino += 1;
                         self.nodes.insert(ino, VfsNode {
                             attr: file_attr(ino, size, mtime, uid, gid, now),
-                            kind: VfsNodeKind::File { read_path: src },
+                            kind: VfsNodeKind::File { parent: parent_ino, read_path: src },
                         });
                         self.insert_child(parent_ino, name.clone(), ino);
                     }
@@ -215,19 +236,21 @@ impl ModUnionFs {
 
     /// Copy a file from the lower layer to the upper layer (copy-on-write).
     /// Returns the path in the upper layer.
-    fn cow_file(&self, ino: u64) -> Result<PathBuf, String> {
-        let upper = self.writable_upper.as_ref().ok_or_else(|| "No writable upper layer".to_string())?;
+    fn cow_file(&mut self, ino: u64) -> Result<PathBuf, String> {
+        let upper = self.writable_upper.as_ref().ok_or_else(|| "No writable upper layer".to_string())?.clone();
+        
         let node = self.nodes.get(&ino).ok_or_else(|| format!("Inode {ino} not found"))?;
-        let VfsNodeKind::File { read_path } = &node.kind else {
+        let VfsNodeKind::File { read_path, .. } = &node.kind else {
             return Err("Not a file".to_string());
         };
+        let read_path = read_path.clone();
 
         // Build the relative path from the mount root (inode 1) to this file.
         let rel = self.path_for_ino(ino).ok_or_else(|| format!("Cannot resolve path for inode {ino}"))?;
         let dest = upper.join(&rel);
 
         if dest.exists() {
-            // Already copied to upper layer
+            // Already copied to upper layer (or was newly created there)
             return Ok(dest);
         }
 
@@ -236,8 +259,15 @@ impl ModUnionFs {
                 .map_err(|e| format!("Failed to create upper dir {}: {e}", parent.display()))?;
         }
 
-        std::fs::copy(read_path, &dest)
+        std::fs::copy(&read_path, &dest)
             .map_err(|e| format!("Failed to copy {} to {}: {e}", read_path.display(), dest.display()))?;
+
+        // Update node to point to the new writable path
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            if let VfsNodeKind::File { ref mut read_path, .. } = node.kind {
+                *read_path = dest.clone();
+            }
+        }
 
         Ok(dest)
     }
@@ -248,35 +278,24 @@ impl ModUnionFs {
             return Some(PathBuf::new());
         }
         let node = self.nodes.get(&ino)?;
-        match &node.kind {
-            VfsNodeKind::Dir { parent, children: _ } => {
-                let parent_path = self.path_for_ino(*parent)?;
-                // Find the name of this inode in its parent's children
-                let parent_node = self.nodes.get(parent)?;
-                if let VfsNodeKind::Dir { children, .. } = &parent_node.kind {
-                    for (name, &child_ino) in children {
-                        if child_ino == ino {
-                            return Some(parent_path.join(name));
-                        }
-                    }
+        let parent = match &node.kind {
+            VfsNodeKind::Dir { parent, .. } => *parent,
+            VfsNodeKind::File { parent, .. } => *parent,
+        };
+
+        let mut path = self.path_for_ino(parent)?;
+        
+        // Find the name of this inode in its parent's children
+        let parent_node = self.nodes.get(&parent)?;
+        if let VfsNodeKind::Dir { children, .. } = &parent_node.kind {
+            for (name, &child_ino) in children {
+                if child_ino == ino {
+                    path.push(name);
+                    return Some(path);
                 }
-                None
-            }
-            VfsNodeKind::File { .. } => {
-                // Find the parent directory that contains this file
-                for (parent_ino, parent_node) in &self.nodes {
-                    if let VfsNodeKind::Dir { children, .. } = &parent_node.kind {
-                        for (name, &child_ino) in children {
-                            if child_ino == ino {
-                                let parent_path = self.path_for_ino(*parent_ino)?;
-                                return Some(parent_path.join(name));
-                            }
-                        }
-                    }
-                }
-                None
             }
         }
+        None
     }
 }
 
@@ -288,14 +307,26 @@ impl Filesystem for ModUnionFs {
             return;
         };
         match self.nodes.get(&ino) {
-            Some(node) => reply.entry(&TTL, &node.attr, 0),
+            Some(node) => {
+                if matches!(node.kind, VfsNodeKind::Whiteout { .. }) {
+                    reply.error(libc::ENOENT);
+                } else {
+                    reply.entry(&TTL, &node.attr, 0)
+                }
+            }
             None => reply.error(libc::ENOENT),
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         match self.nodes.get(&ino) {
-            Some(node) => reply.attr(&TTL, &node.attr),
+            Some(node) => {
+                if matches!(node.kind, VfsNodeKind::Whiteout { .. }) {
+                    reply.error(libc::ENOENT);
+                } else {
+                    reply.attr(&TTL, &node.attr)
+                }
+            }
             None => reply.error(libc::ENOENT),
         }
     }
@@ -315,30 +346,36 @@ impl Filesystem for ModUnionFs {
             reply.error(libc::ENOENT);
             return;
         };
-        let VfsNodeKind::File { read_path } = &node.kind else {
-            reply.error(libc::EISDIR);
-            return;
-        };
-        let path = read_path.clone();
-        match std::fs::File::open(&path) {
-            Ok(mut f) => {
-                let mut buf = vec![0u8; size as usize];
-                if let Err(e) = f.seek(SeekFrom::Start(offset as u64)) {
-                    log::error!("VFS seek {}: {e}", path.display());
-                    reply.error(libc::EIO);
-                    return;
-                }
-                match f.read(&mut buf) {
-                    Ok(n) => reply.data(&buf[..n]),
+        match &node.kind {
+            VfsNodeKind::File { read_path, .. } => {
+                let path = read_path.clone();
+                match std::fs::File::open(&path) {
+                    Ok(mut f) => {
+                        let mut buf = vec![0u8; size as usize];
+                        if let Err(e) = f.seek(SeekFrom::Start(offset as u64)) {
+                            log::error!("VFS seek {}: {e}", path.display());
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                        match f.read(&mut buf) {
+                            Ok(n) => reply.data(&buf[..n]),
+                            Err(e) => {
+                                log::error!("VFS read {}: {e}", path.display());
+                                reply.error(libc::EIO);
+                            }
+                        }
+                    }
                     Err(e) => {
-                        log::error!("VFS read {}: {e}", path.display());
+                        log::error!("VFS open {}: {e}", path.display());
                         reply.error(libc::EIO);
                     }
                 }
             }
-            Err(e) => {
-                log::error!("VFS open {}: {e}", path.display());
-                reply.error(libc::EIO);
+            VfsNodeKind::Whiteout { .. } => {
+                reply.error(libc::ENOENT);
+            }
+            _ => {
+                reply.error(libc::EISDIR);
             }
         }
     }
@@ -371,11 +408,16 @@ impl Filesystem for ModUnionFs {
             (parent_ino, FileType::Directory, "..".into()),
         ];
         for (name, &child_ino) in &children {
-            let kind = match self.nodes.get(&child_ino) {
-                Some(VfsNode { kind: VfsNodeKind::Dir { .. }, .. }) => FileType::Directory,
-                _ => FileType::RegularFile,
-            };
-            entries.push((child_ino, kind, name.clone()));
+            if let Some(node) = self.nodes.get(&child_ino) {
+                if matches!(node.kind, VfsNodeKind::Whiteout { .. }) {
+                    continue;
+                }
+                let kind = match &node.kind {
+                    VfsNodeKind::Dir { .. } => FileType::Directory,
+                    _ => FileType::RegularFile,
+                };
+                entries.push((child_ino, kind, name.clone()));
+            }
         }
 
         for (i, (entry_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
@@ -511,7 +553,7 @@ impl Filesystem for ModUnionFs {
                 let attr = file_attr(ino, 0, now, uid, gid, now);
                 self.nodes.insert(ino, VfsNode {
                     attr: attr.clone(),
-                    kind: VfsNodeKind::File { read_path: dest },
+                    kind: VfsNodeKind::File { parent, read_path: dest },
                 });
                 self.insert_child(parent, name.to_os_string(), ino);
                 reply.created(&TTL, &attr, 0, 0, 0);
@@ -595,6 +637,12 @@ impl Filesystem for ModUnionFs {
             }
         };
 
+        let name_lc = name.to_string_lossy().to_lowercase();
+        let Some(ino) = self.child_ino_ci(parent, &name_lc) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
         let parent_path = match self.path_for_ino(parent) {
             Some(p) => upper.join(p),
             None => {
@@ -604,25 +652,52 @@ impl Filesystem for ModUnionFs {
         };
 
         let dest = parent_path.join(name);
-        match std::fs::remove_file(&dest) {
-            Ok(()) => {
-                // Remove from inode map
-                let name_lc = name.to_string_lossy().to_lowercase();
-                if let Some(ino) = self.child_ino_ci(parent, &name_lc) {
-                    self.nodes.remove(&ino);
-                    if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
-                        self.nodes.get_mut(&parent)
-                    {
-                        children.retain(|k, _| k.to_string_lossy().to_lowercase() != name_lc);
-                    }
-                }
-                reply.ok();
-            }
-            Err(e) => {
+        
+        // If the file exists in the upper layer, delete it.
+        if dest.exists() {
+            if let Err(e) = std::fs::remove_file(&dest) {
                 log::error!("VFS unlink {}: {e}", dest.display());
                 reply.error(libc::EIO);
+                return;
             }
         }
+
+        // Check if this file exists in any lower layer.
+        // If it does, we need to create a whiteout marker in the upper layer.
+        // If it only existed in the upper layer (newly created), we just remove it from VFS.
+        let in_lower = match self.nodes.get(&ino) {
+            Some(VfsNode { kind: VfsNodeKind::File { read_path, .. }, .. }) => {
+                !read_path.starts_with(&upper)
+            }
+            _ => false,
+        };
+
+        if in_lower {
+            // Create whiteout marker file
+            let whiteout_path = parent_path.join(format!("{}{}", WHITEOUT_PREFIX, name.to_string_lossy()));
+            if let Some(p) = whiteout_path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            if let Err(e) = std::fs::File::create(&whiteout_path) {
+                log::error!("VFS unlink whiteout {}: {e}", whiteout_path.display());
+                reply.error(libc::EIO);
+                return;
+            }
+            // Update node to be a whiteout
+            if let Some(node) = self.nodes.get_mut(&ino) {
+                node.kind = VfsNodeKind::Whiteout { parent };
+            }
+        } else {
+            // Remove from VFS entirely
+            self.nodes.remove(&ino);
+            if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
+                self.nodes.get_mut(&parent)
+            {
+                children.retain(|k, _| k.to_string_lossy().to_lowercase() != name_lc);
+            }
+        }
+
+        reply.ok();
     }
 
     fn rename(
