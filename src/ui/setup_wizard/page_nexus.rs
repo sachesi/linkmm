@@ -54,7 +54,7 @@ pub(super) fn build_nexus_page(
 
     let link_btn = gtk4::LinkButton::builder()
         .label("Get your API key on NexusMods")
-        .uri("https://www.nexusmods.com/users/myaccount?tab=api+access")
+        .uri("https://www.nexusmods.com/settings/api-keys")
         .halign(gtk4::Align::Start)
         .build();
     page.append(&link_btn);
