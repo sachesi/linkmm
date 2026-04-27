@@ -346,9 +346,10 @@ pub fn launch_with_umu(
     steam_app_id: u32,
     prefix_path: Option<&Path>,
     proton_path: Option<&Path>,
+    store: &str,
 ) -> Result<std::process::Child, String> {
     let mut command =
-        build_umu_command(exe_path, arguments, steam_app_id, prefix_path, proton_path)?;
+        build_umu_command(exe_path, arguments, steam_app_id, prefix_path, proton_path, store)?;
     command
         .spawn()
         .map_err(|e| format!("Failed to spawn umu-run: {e}"))
@@ -360,6 +361,7 @@ pub fn build_umu_command(
     steam_app_id: u32,
     prefix_path: Option<&Path>,
     proton_path: Option<&Path>,
+    store: &str,
 ) -> Result<std::process::Command, String> {
     if !is_umu_available() {
         return Err(
@@ -387,7 +389,7 @@ pub fn build_umu_command(
     log::debug!("  WINEPREFIX = {}", wineprefix.display());
     log::debug!("  GAMEID     = {game_id}");
     log::debug!("  PROTONPATH = {proton_path_str}");
-    log::debug!("  STORE      = none");
+    log::debug!("  STORE      = {store}");
     log::debug!("  UMU_LOG    = 1");
 
     let mut command = std::process::Command::new(umu_run_path());
@@ -396,7 +398,7 @@ pub fn build_umu_command(
         .env("WINEPREFIX", &wineprefix)
         .env("GAMEID", &game_id)
         .env("PROTONPATH", proton_path_str.as_ref())
-        .env("STORE", "none")
+        .env("STORE", store)
         .env("UMU_LOG", "1");
 
     // Append tool/exe arguments after the executable path.

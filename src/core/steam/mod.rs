@@ -3,8 +3,7 @@ pub mod library;
 pub mod proton;
 
 pub use launch::{
-    build_tool_command, launch_game, launch_game_managed_command,
-    split_launch_arguments,
+    build_tool_command, split_launch_arguments,
 };
 pub use library::{
     DetectedSteamGame, SteamLibrary, detect_games, find_compatdata_path, find_game_path,
