@@ -98,7 +98,7 @@ pub fn build_library_page(game: &Game, config: Rc<RefCell<AppConfig>>) -> gtk4::
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-fn refresh_library_content_with_search(
+pub(crate) fn refresh_library_content_with_search(
     container: &gtk4::Box,
     game: &Rc<Game>,
     config: Rc<RefCell<AppConfig>>,
@@ -463,17 +463,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_mod(id: &str, name: &str, path: &str) -> Mod {
-        Mod {
-            id: id.to_string(),
-            name: name.to_string(),
-            version: None,
-            enabled: false,
-            priority: 0,
-            nexus_id: None,
-            source_path: PathBuf::from(path),
-            installed_from_nexus: false,
-            archive_name: None,
-        }
+        let mut m = Mod::new(name.to_string(), PathBuf::from(path));
+        m.id = id.to_string();
+        m
     }
 
     #[test]

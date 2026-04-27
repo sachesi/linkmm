@@ -104,67 +104,6 @@ fn launch_game_managed_flatpak_command(app_id: u32) -> std::process::Command {
     command
 }
 
-/// Launch an external tool through Proton, automatically selecting native or Flatpak backend.
-pub fn launch_tool_with_proton(
-    exe_path: &PathBuf,
-    arguments: &str,
-    app_id: u32,
-) -> Result<std::process::Child, String> {
-    let (proton_path, compatdata_path) = find_proton_for_game(app_id)?;
-    let proton_script = proton_path.join("proton");
-
-    if !proton_script.exists() {
-        return Err(format!("Proton script not found at {}", proton_script.display()));
-    }
-    if !exe_path.exists() {
-        return Err(format!("Executable not found at {}", exe_path.display()));
-    }
-
-    let steam_root =
-        find_steam_root().ok_or_else(|| "Could not find Steam installation".to_string())?;
-
-    log::info!(
-        "Launching tool {} with Proton from {}",
-        exe_path.display(),
-        proton_path.display()
-    );
-    log::debug!("Using compatdata: {}", compatdata_path.display());
-
-    let is_flatpak = is_path_in_flatpak(&proton_path) || is_path_in_flatpak(&compatdata_path);
-
-    if is_flatpak {
-        log::info!("Detected Flatpak Steam, using flatpak wrapper");
-        let mut command = build_flatpak_tool_command(
-            &proton_script,
-            exe_path,
-            arguments,
-            &steam_root,
-            &compatdata_path,
-            app_id,
-        )?;
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-        log::debug!("Executing flatpak command: {:?}", command);
-        command.spawn().map_err(|e| format!("Failed to spawn Flatpak process: {e}"))
-    } else {
-        log::debug!("Using native Steam launch");
-        let mut command = std::process::Command::new(&proton_script);
-        command.env("STEAM_COMPAT_DATA_PATH", &compatdata_path);
-        command.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &steam_root);
-        command.env("SteamAppId", app_id.to_string());
-        command.env("SteamGameId", app_id.to_string());
-        command.arg("run");
-        command.arg(exe_path);
-        for arg in split_launch_arguments(arguments)? {
-            command.arg(arg);
-        }
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-        log::debug!("Executing: {:?}", command);
-        command.spawn().map_err(|e| format!("Failed to spawn Proton process: {e}"))
-    }
-}
-
 /// Build a tool launch command without spawning (useful for testing or managed sessions).
 pub fn build_tool_command(
     exe_path: &PathBuf,

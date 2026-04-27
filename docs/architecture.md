@@ -1,140 +1,34 @@
-# Architecture
+# linkmm Architecture
 
-## 1. Deterministic rebuild engine
+LinkMM uses a FUSE-based virtual filesystem (VFS) to manage Bethesda game mods on Linux.
 
-Deployment is computed from state and applied by deployers:
+## 1. VFS Model (FUSE)
 
-- `AssetsDeployer` for file payload
-- `PluginsDeployer` for `plugins.txt`
+Instead of symlinking or hardlinking files into the game directory, LinkMM mounts a union filesystem at launch.
 
-No per-action imperative deploy/undeploy flow is the source of truth.
+- **Read-only union:** Merges the game's base `Data` directory with all enabled mods.
+- **Priority-based:** Mods with higher priority (lower in the list) override files from lower-priority mods or the base game.
+- **Case-insensitive:** Built-in support for case-insensitive lookups, as required by Bethesda engines.
+- **Zero deployment time:** No files are moved or linked when enabling/disabling mods; the VFS is rebuilt instantly at launch.
 
-## 2. Profile-scoped state
+## 2. Tool Sessions & Writable Overlay
 
-`ModDatabase` stores active profile plus profile maps for:
+External tools (BodySlide, Nemesis, etc.) often need to write new files into the `Data` directory.
 
-- mod enabled/order
-- plugin order/disabled
-- generated output package lists
+- **Copy-on-Write (CoW):** When a tool is launched, the VFS includes a writable "upper" layer (a scratch directory). Any file modifications or new files are stored there.
+- **Mod Creation:** After the tool exits, LinkMM detects changes in the scratch directory and offers to save them as a new mod.
 
-Deployment state (`deployment_state.toml`) is also profile-scoped under game config profile paths.
+## 3. Mod Database
 
-## 3. Generated output packages
+The state is stored in `mods.toml` within the game's configuration folder.
 
-Generated files from external tools are tracked as packages with owned-file metadata.
+- **Mod list:** Metadata about installed mods, their source paths, and enabled status.
+- **Plugin order:** `plugins.txt` management and load order sorting.
 
-Sources:
+## 4. Runtime Manager
 
-- explicit output dir registration
-- snapshot/diff capture
-- unmanaged adoption from `Data/`
+`RuntimeSessionManager` handles the lifecycle of game and tool processes.
 
-## 4. Tool orchestration
-
-`tool_runs` orchestrates:
-
-- adapter selection
-- preflight validation
-- execution
-- capture/import
-- rebuild
-
-Adapters (`tool_adapters`) hold tool-specific policy:
-
-- defaults
-- validation
-- output classification
-- unmanaged detection heuristics
-
-## 5. Game kind vs game instance
-
-Game entries are instance-based, not kind-keyed:
-
-- each managed game has a stable unique `id`
-- `GameKind` defines family/type only (Skyrim SE, Fallout 4, etc.)
-- multiple instances of the same `GameKind` are valid and supported
-
-Examples:
-
-- Skyrim SE (Steam)
-- Skyrim SE (Non-Steam / UMU)
-- Skyrim SE (Non-Steam / UMU, custom prefix)
-
-## 6. Launcher-source contract
-
-Each game instance has explicit `launcher_source`:
-
-- `Steam`
-- `NonSteamUmu`
-
-This source drives:
-
-- game launch backend
-- tool launch backend
-- `%LOCALAPPDATA%`/`plugins.txt` resolution
-- per-instance launcher preferences in UI
-
-No launch behavior is inferred from optional fields alone.
-
-## 7. Managed runtime sessions (UMU/direct only)
-
-Only directly-owned launches run through `core::runtime::RuntimeSessionManager`:
-
-- Non-Steam UMU game launches
-- Non-Steam UMU tool launches
-
-The manager is the single source of truth for launch state and stores:
-
-- stable session id
-- session kind (`Game` or `Tool`)
-- game instance id
-- profile id (when known)
-- tool id (tool sessions)
-- launcher source (`Steam` / `NonSteamUmu`)
-- tracked pid
-- start time
-- status (`Starting`, `Running`, `Exited`, `Failed`, `Killed`)
-- exit code
-
-It also owns per-session rolling log buffers for stdout/stderr capture.
-
-## 8. Stop semantics
-
-- Tool sessions are launched as tracked child processes and can be stopped from LinkMM.
-- Non-Steam UMU game sessions are launched as tracked child processes and can be stopped from LinkMM.
-- Steam game sessions are launch-only (not runtime-owned) with backend-specific launch commands:
-  - native Steam installs: `steam -applaunch <app_id>`
-  - Flatpak Steam installs: `flatpak run com.valvesoftware.Steam -applaunch <app_id>`
-- Steam Stop semantics are intentionally not exposed as exact process ownership in LinkMM runtime.
-
-## 9. UI state ownership and page lifecycle
-
-LinkMM UI now treats navigation pages as long-lived widgets instead of recreating
-them on every tab switch.
-
-- Main navigation uses a stable `gtk4::Stack` with cached page instances.
-- Tab switching changes visible child only; it must not rebuild full page trees.
-- Expensive refreshes (scan/reload) are explicit page actions, not implicit side effects of navigation.
-
-State ownership contract:
-
-- **App-global/shared state**
-  - long-running operation status (install busy / navigation lock)
-  - whether navigation/game switching actions are allowed
-  - global status surfaces that remain truthful regardless of current tab
-- **Page-local state**
-  - search text, scroll position, local selection/focus for list interactions
-  - transient row-level controls and expansion/selection context
-
-Long-running operations (install/deploy/runtime) must never rely solely on an
-ephemeral page instance. If a status is critical for safety or user trust, it
-must be represented in shared state and rendered consistently across navigation.
-
-List/view update rule for Library and Load Order:
-
-- Prefer targeted state updates where possible.
-- If a list rebuild is required, preserve user context (scroll/focus/search) and
-  avoid unrelated resets/jumping.
-- Reordering actions operate on authoritative full-order lists only; when search
-  filtering is active, reorder affordances are disabled until the filter is
-  cleared.
+- **Sandboxing:** Commands are built using Proton (for Steam) or UMU (for non-Steam) to ensure they run in the correct Wine prefix.
+- **VFS Lifecycle:** The VFS is mounted just before the process starts and is automatically unmounted when the process exits.
+- **Log Streaming:** Stdout/stderr from the game or tool is captured and displayed in the UI.

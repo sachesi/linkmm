@@ -1,43 +1,21 @@
 # User workflows
 
-## Profiles
+## Mod Management
 
-1. Select active profile.
-2. Enable/order mods for that profile.
-3. Rebuild/deploy.
-4. Switch profiles to move between isolated setups.
+1. **Install Mods:** Drag and drop archives or use the "Install" button to add mods to the library.
+2. **Enable/Disable:** Use the toggle switch on each mod row.
+3. **Ordering:** Drag and drop mods to change their priority. Higher priority mods (bottom of the list) override lower ones.
+4. **Plugin Management:** View and sort your plugin load order in the "Load Order" tab.
 
-## Tool runs
+## Launching the Game
 
-1. Configure tool and run profile.
-2. Launch tool from Tools page (Run).
-3. LinkMM validates configuration.
-4. While running, the launch action becomes Stop and output logs stream live.
-5. On success, output is captured into managed generated package.
-6. Deployment is rebuilt automatically.
-7. If stopped by the user, the session is marked killed and UI unlocks when shutdown completes.
+1. **Automatic VFS:** Simply click "Play". LinkMM automatically mounts the FUSE VFS with your current mod selection.
+2. **Launch:** The game starts via Proton/UMU in its dedicated prefix.
+3. **Cleanup:** When the game exits, the VFS is unmounted automatically.
 
-## Game sessions
+## Using External Tools
 
-1. Press Play for the active game instance.
-2. Launch runs as a managed session (Steam or Non-Steam UMU backend based on instance source).
-3. While active, Play becomes Stop for that instance.
-4. Session state and live logs are shown in the main UI.
-5. On exit (natural or stopped), session state finalizes and lock state clears.
-6. On some Steam/Flatpak setups LinkMM tracks a delegated Steam session state
-   (handoff acknowledged, best-effort stop) when a stable long-lived child process
-   is not directly ownable.
-7. If delegated Steam tracking is active, the control is shown as “Stop Tracking”.
-
-## UI lock during active sessions
-
-- When any managed game/tool session is active, LinkMM enters a controlled lock state.
-- Game switching, profile switching, and navigation that could change deployment context are disabled.
-- Stop actions and live logs remain accessible during lock state.
-
-## Generated outputs
-
-- View profile-scoped generated output packages in Tools page.
-- Remove a package to undeploy its output and rebuild.
-- Run stale cleanup for missing package sources.
-- Adopt unmanaged files into managed packages when detection finds candidates.
+1. **Configuration:** Add tools (BodySlide, xEdit, etc.) in the "Tools" tab by selecting their executable.
+2. **Launch:** Click "Run" on a tool. It launches with a writable VFS overlay.
+3. **Output Capture:** Any files created or modified by the tool are captured in a scratch directory.
+4. **Save Changes:** After the tool exits, a dialog appears asking if you want to keep the new files as a new mod entry.

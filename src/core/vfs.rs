@@ -1,12 +1,14 @@
 use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, Request,
+    ReplyDirectory, ReplyEntry, ReplyCreate, Request, TimeOrNow,
 };
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::core::games::Game;
@@ -41,10 +43,25 @@ struct ModUnionFs {
     /// Keeps the real game Data/ directory fd alive so we can reach its files
     /// via /proc/self/fd/<N>/... after we mount on top of it.
     _real_dir_handle: Option<std::fs::File>,
+    /// When `Some`, this is a writable overlay mount for tool sessions.
+    /// The upper layer is a staging directory where new/changed files are
+    /// written.  The lower layer is the read-only union of game + mods.
+    writable_upper: Option<PathBuf>,
+    /// Flag set when the tool process exits, so we can stop accepting writes.
+    session_ended: Arc<AtomicBool>,
 }
 
 impl ModUnionFs {
     fn build(game: &Game, db: &ModDatabase) -> Result<Self, String> {
+        Self::build_with_upper(game, db, None, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn build_with_upper(
+        game: &Game,
+        db: &ModDatabase,
+        writable_upper: Option<PathBuf>,
+        session_ended: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         let now = SystemTime::now();
@@ -64,6 +81,8 @@ impl ModUnionFs {
         let mut fs = ModUnionFs {
             nodes: HashMap::new(),
             _real_dir_handle: real_dir_handle,
+            writable_upper,
+            session_ended,
         };
 
         // Root inode = 1 (required by FUSE spec)
@@ -90,10 +109,19 @@ impl ModUnionFs {
             }
         }
 
+        // Upper layer (writable staging) — highest priority, overrides everything
+        let upper_path = fs.writable_upper.clone();
+        if let Some(ref upper) = upper_path {
+            if upper.is_dir() {
+                fs.overlay(upper, 1, &mut next_ino, uid, gid, now)?;
+            }
+        }
+
         log::debug!(
-            "VFS built: {} inodes for {} enabled mods",
+            "VFS built: {} inodes for {} enabled mods, writable_upper={}",
             fs.nodes.len(),
-            db.mods.iter().filter(|m| m.enabled).count()
+            db.mods.iter().filter(|m| m.enabled).count(),
+            fs.writable_upper.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string())
         );
         Ok(fs)
     }
@@ -182,6 +210,72 @@ impl ModUnionFs {
             self.nodes.get_mut(&parent)
         {
             children.insert(name, child);
+        }
+    }
+
+    /// Copy a file from the lower layer to the upper layer (copy-on-write).
+    /// Returns the path in the upper layer.
+    fn cow_file(&self, ino: u64) -> Result<PathBuf, String> {
+        let upper = self.writable_upper.as_ref().ok_or_else(|| "No writable upper layer".to_string())?;
+        let node = self.nodes.get(&ino).ok_or_else(|| format!("Inode {ino} not found"))?;
+        let VfsNodeKind::File { read_path } = &node.kind else {
+            return Err("Not a file".to_string());
+        };
+
+        // Build the relative path from the mount root (inode 1) to this file.
+        let rel = self.path_for_ino(ino).ok_or_else(|| format!("Cannot resolve path for inode {ino}"))?;
+        let dest = upper.join(&rel);
+
+        if dest.exists() {
+            // Already copied to upper layer
+            return Ok(dest);
+        }
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create upper dir {}: {e}", parent.display()))?;
+        }
+
+        std::fs::copy(read_path, &dest)
+            .map_err(|e| format!("Failed to copy {} to {}: {e}", read_path.display(), dest.display()))?;
+
+        Ok(dest)
+    }
+
+    /// Resolve the relative path from root (inode 1) to the given inode.
+    fn path_for_ino(&self, ino: u64) -> Option<PathBuf> {
+        if ino == 1 {
+            return Some(PathBuf::new());
+        }
+        let node = self.nodes.get(&ino)?;
+        match &node.kind {
+            VfsNodeKind::Dir { parent, children: _ } => {
+                let parent_path = self.path_for_ino(*parent)?;
+                // Find the name of this inode in its parent's children
+                let parent_node = self.nodes.get(parent)?;
+                if let VfsNodeKind::Dir { children, .. } = &parent_node.kind {
+                    for (name, &child_ino) in children {
+                        if child_ino == ino {
+                            return Some(parent_path.join(name));
+                        }
+                    }
+                }
+                None
+            }
+            VfsNodeKind::File { .. } => {
+                // Find the parent directory that contains this file
+                for (parent_ino, parent_node) in &self.nodes {
+                    if let VfsNodeKind::Dir { children, .. } = &parent_node.kind {
+                        for (name, &child_ino) in children {
+                            if child_ino == ino {
+                                let parent_path = self.path_for_ino(*parent_ino)?;
+                                return Some(parent_path.join(name));
+                            }
+                        }
+                    }
+                }
+                None
+            }
         }
     }
 }
@@ -299,6 +393,393 @@ impl Filesystem for ModUnionFs {
     fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         reply.opened(0, 0);
     }
+
+    // ── Write operations (only when writable_upper is set) ──────────────────
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        if self.session_ended.load(Ordering::SeqCst) {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        if self.writable_upper.is_none() {
+            reply.error(libc::EROFS);
+            return;
+        }
+
+        // Copy-on-write: ensure the file exists in the upper layer
+        let dest = match self.cow_file(ino) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("VFS write cow_file failed: {e}");
+                reply.error(libc::EIO);
+                return;
+            }
+        };
+
+        match std::fs::OpenOptions::new().write(true).open(&dest) {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.seek(SeekFrom::Start(offset as u64)) {
+                    log::error!("VFS write seek {}: {e}", dest.display());
+                    reply.error(libc::EIO);
+                    return;
+                }
+                match f.write(data) {
+                    Ok(n) => {
+                        // Update inode attributes
+                        if let Some(node) = self.nodes.get_mut(&ino) {
+                            if let Ok(meta) = std::fs::metadata(&dest) {
+                                node.attr.size = meta.len();
+                                node.attr.mtime = meta.modified().unwrap_or(SystemTime::now());
+                                node.attr.blocks = blocks(meta.len());
+                            }
+                        }
+                        reply.written(n as u32);
+                    }
+                    Err(e) => {
+                        log::error!("VFS write {}: {e}", dest.display());
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("VFS open for write {}: {e}", dest.display());
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if self.session_ended.load(Ordering::SeqCst) {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        let upper = match &self.writable_upper {
+            Some(u) => u.clone(),
+            None => {
+                reply.error(libc::EROFS);
+                return;
+            }
+        };
+
+        // Resolve parent directory path in upper layer
+        let parent_path = match self.path_for_ino(parent) {
+            Some(p) => upper.join(p),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let dest = parent_path.join(name);
+        if let Some(parent_dir) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent_dir) {
+                log::error!("VFS create mkdir {}: {e}", parent_dir.display());
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        match std::fs::File::create(&dest) {
+            Ok(_) => {
+                let uid = unsafe { libc::getuid() };
+                let gid = unsafe { libc::getgid() };
+                let now = SystemTime::now();
+                let ino = self.nodes.len() as u64 + 1; // simple allocation
+                let attr = file_attr(ino, 0, now, uid, gid, now);
+                self.nodes.insert(ino, VfsNode {
+                    attr: attr.clone(),
+                    kind: VfsNodeKind::File { read_path: dest },
+                });
+                self.insert_child(parent, name.to_os_string(), ino);
+                reply.created(&TTL, &attr, 0, 0, 0);
+            }
+            Err(e) => {
+                log::error!("VFS create {}: {e}", dest.display());
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        if self.session_ended.load(Ordering::SeqCst) {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        let upper = match &self.writable_upper {
+            Some(u) => u.clone(),
+            None => {
+                reply.error(libc::EROFS);
+                return;
+            }
+        };
+
+        let parent_path = match self.path_for_ino(parent) {
+            Some(p) => upper.join(p),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let dest = parent_path.join(name);
+        match std::fs::create_dir(&dest) {
+            Ok(()) => {
+                let uid = unsafe { libc::getuid() };
+                let gid = unsafe { libc::getgid() };
+                let now = SystemTime::now();
+                let ino = self.nodes.len() as u64 + 1;
+                let attr = dir_attr(ino, uid, gid, now);
+                self.nodes.insert(ino, VfsNode {
+                    attr: attr.clone(),
+                    kind: VfsNodeKind::Dir { parent, children: HashMap::new() },
+                });
+                self.insert_child(parent, name.to_os_string(), ino);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => {
+                log::error!("VFS mkdir {}: {e}", dest.display());
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn unlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if self.session_ended.load(Ordering::SeqCst) {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        let upper = match &self.writable_upper {
+            Some(u) => u.clone(),
+            None => {
+                reply.error(libc::EROFS);
+                return;
+            }
+        };
+
+        let parent_path = match self.path_for_ino(parent) {
+            Some(p) => upper.join(p),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let dest = parent_path.join(name);
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {
+                // Remove from inode map
+                let name_lc = name.to_string_lossy().to_lowercase();
+                if let Some(ino) = self.child_ino_ci(parent, &name_lc) {
+                    self.nodes.remove(&ino);
+                    if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
+                        self.nodes.get_mut(&parent)
+                    {
+                        children.retain(|k, _| k.to_string_lossy().to_lowercase() != name_lc);
+                    }
+                }
+                reply.ok();
+            }
+            Err(e) => {
+                log::error!("VFS unlink {}: {e}", dest.display());
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if self.session_ended.load(Ordering::SeqCst) {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        let upper = match &self.writable_upper {
+            Some(u) => u.clone(),
+            None => {
+                reply.error(libc::EROFS);
+                return;
+            }
+        };
+
+        let old_parent_path = match self.path_for_ino(parent) {
+            Some(p) => upper.join(p),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let new_parent_path = match self.path_for_ino(newparent) {
+            Some(p) => upper.join(p),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let old_path = old_parent_path.join(name);
+        let new_path = new_parent_path.join(newname);
+
+        match std::fs::rename(&old_path, &new_path) {
+            Ok(()) => {
+                // Update inode map: remove old entry, add new
+                let name_lc = name.to_string_lossy().to_lowercase();
+                if let Some(ino) = self.child_ino_ci(parent, &name_lc) {
+                    self.nodes.remove(&ino);
+                    if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
+                        self.nodes.get_mut(&parent)
+                    {
+                        children.retain(|k, _| k.to_string_lossy().to_lowercase() != name_lc);
+                    }
+                    self.insert_child(newparent, newname.to_os_string(), ino);
+                }
+                reply.ok();
+            }
+            Err(e) => {
+                log::error!("VFS rename {} -> {}: {e}", old_path.display(), new_path.display());
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: fuser::ReplyAttr,
+    ) {
+        if self.session_ended.load(Ordering::SeqCst) {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        if self.writable_upper.is_none() && (size.is_some() || mtime.is_some()) {
+            reply.error(libc::EROFS);
+            return;
+        }
+
+        // If we are modifying attributes that affect the file on disk (size, mtime),
+        // we must ensure the file exists in the upper layer via CoW.
+        if size.is_some() || mtime.is_some() {
+            let dest = match self.cow_file(ino) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("VFS setattr cow_file failed: {e}");
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
+
+            if let Some(new_size) = size {
+                if let Err(e) = std::fs::OpenOptions::new().write(true).open(&dest).and_then(|f| f.set_len(new_size)) {
+                    log::error!("VFS setattr truncate {} to {}: {e}", dest.display(), new_size);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
+
+            if let Some(new_mtime) = mtime {
+                let time = match new_mtime {
+                    TimeOrNow::Now => SystemTime::now(),
+                    TimeOrNow::SpecificTime(t) => t,
+                };
+                // Note: filetime or similar could be used for more precision, but std::fs::set_modified works too
+                if let Err(e) = std::fs::OpenOptions::new().write(true).open(&dest).and_then(|f| f.set_modified(time)) {
+                    log::warn!("VFS setattr set_modified {}: {e}", dest.display());
+                }
+            }
+
+            // Sync node attributes from disk
+            if let Some(node) = self.nodes.get_mut(&ino) {
+                if let Ok(meta) = std::fs::metadata(&dest) {
+                    node.attr.size = meta.len();
+                    node.attr.mtime = meta.modified().unwrap_or(SystemTime::now());
+                    node.attr.blocks = blocks(meta.len());
+                }
+            }
+        }
+
+        match self.nodes.get(&ino) {
+            Some(node) => reply.attr(&TTL, &node.attr),
+            None => reply.error(libc::ENOENT),
+        }
+    }
+
+    fn statfs(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        reply: fuser::ReplyStatfs,
+    ) {
+        reply.statfs(
+            1_000_000, // blocks
+            500_000,   // bfree
+            500_000,   // bavail
+            100_000,   // files
+            50_000,    // ffree
+            4096,      // bsize
+            255,       // namelen
+            4096,      // frsize
+        );
+    }
 }
 
 // ── Attribute helpers ─────────────────────────────────────────────────────────
@@ -352,6 +833,12 @@ fn blocks(size: u64) -> u64 {
 pub struct MountHandle {
     _session: BackgroundSession,
     pub mountpoint: PathBuf,
+    /// When `Some`, this is a writable overlay mount for tool sessions.
+    /// The upper layer is a staging directory where new/changed files are
+    /// written.  The lower layer is the read-only union of game + mods.
+    pub writable_upper: Option<PathBuf>,
+    /// Flag set when the tool process exits, so we can stop accepting writes.
+    pub session_ended: Arc<AtomicBool>,
 }
 
 /// Mount a read-only union VFS of all enabled mods at `game.data_path`.
@@ -383,12 +870,62 @@ pub fn mount_mod_vfs(game: &Game, db: &ModDatabase) -> Result<MountHandle, Strin
         .map_err(|e| format!("Failed to mount mod VFS at {}: {e}", mountpoint.display()))?;
 
     log::info!("Mounted mod VFS at {}", mountpoint.display());
-    Ok(MountHandle { _session: session, mountpoint })
+    Ok(MountHandle { _session: session, mountpoint, writable_upper: None, session_ended: Arc::new(AtomicBool::new(false)) })
+}
+
+/// Mount a writable overlay VFS for tool sessions.
+///
+/// The lower layer is the read-only union of game Data/ + enabled mods.
+/// The upper layer is a fresh staging directory (`mods_dir/tool_scratch/<tool_id>/`)
+/// where the tool can write new/changed files.
+///
+/// The mount is automatically torn down when the returned handle is dropped.
+pub fn mount_tool_vfs(
+    game: &Game,
+    db: &ModDatabase,
+    tool_id: &str,
+) -> Result<MountHandle, String> {
+    let mountpoint = game.data_path.clone();
+
+    if !mountpoint.exists() {
+        std::fs::create_dir_all(&mountpoint)
+            .map_err(|e| format!("Cannot create game Data dir: {e}"))?;
+    }
+
+    // Create staging directory for this tool session
+    let scratch_dir = game.mods_dir().join("tool_scratch").join(tool_id);
+    std::fs::create_dir_all(&scratch_dir)
+        .map_err(|e| format!("Failed to create tool scratch dir: {e}"))?;
+
+    let session_ended = Arc::new(AtomicBool::new(false));
+
+    let fs = ModUnionFs::build_with_upper(
+        game,
+        db,
+        Some(scratch_dir.clone()),
+        Arc::clone(&session_ended),
+    )?;
+
+    let options = &[
+        MountOption::RW,
+        MountOption::FSName("linkmm".to_string()),
+        MountOption::Subtype("toolvfs".to_string()),
+        MountOption::AutoUnmount,
+        MountOption::NoDev,
+        MountOption::NoSuid,
+        MountOption::NoExec,
+    ];
+
+    let session = fuser::spawn_mount2(fs, &mountpoint, options)
+        .map_err(|e| format!("Failed to mount tool VFS at {}: {e}", mountpoint.display()))?;
+
+    log::info!("Mounted tool VFS at {} (writable upper: {})", mountpoint.display(), scratch_dir.display());
+    Ok(MountHandle { _session: session, mountpoint, writable_upper: Some(scratch_dir), session_ended })
 }
 
 impl Drop for MountHandle {
     fn drop(&mut self) {
-        log::info!("Unmounting mod VFS at {}", self.mountpoint.display());
+        log::info!("Unmounting VFS at {}", self.mountpoint.display());
     }
 }
 

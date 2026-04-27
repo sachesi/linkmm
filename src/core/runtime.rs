@@ -1,9 +1,10 @@
 use crate::core::config::ToolConfig;
 use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::ModDatabase;
-use crate::core::vfs::{MountHandle, mount_mod_vfs};
+use crate::core::vfs::{MountHandle, mount_mod_vfs, mount_tool_vfs};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -56,6 +57,8 @@ pub struct ManagedSession {
     pub status: SessionStatus,
     pub exit_code: Option<i32>,
     pub run_mode: SessionRunMode,
+    /// Writable overlay staging directory for tool sessions (None for game sessions).
+    pub scratch_dir: Option<PathBuf>,
 }
 
 struct SessionControl {
@@ -196,15 +199,18 @@ impl RuntimeSessionManager {
             umu.proton_path.as_deref(),
         )?;
 
-        self.spawn_managed_session(SessionStart {
-            kind: SessionKind::Game,
-            game_id: game.id,
-            tool_id: None,
-            launcher_source: game.launcher_source,
-            command,
-            completion: None,
-            vfs_mount: Some(vfs_mount),
-        })
+        self.spawn_managed_session(
+            SessionStart {
+                kind: SessionKind::Game,
+                game_id: game.id,
+                tool_id: None,
+                launcher_source: game.launcher_source,
+                command,
+                completion: None,
+                vfs_mount: Some(vfs_mount),
+            },
+            None,
+        )
         .map(|(id, _)| id)
     }
 
@@ -251,20 +257,25 @@ impl RuntimeSessionManager {
         };
 
         let db = ModDatabase::load(&game);
-        let vfs_mount = mount_mod_vfs(&game, &db).map_err(|e| {
-            format!("Failed to mount mod VFS: {e}")
+        // Use writable overlay VFS for tool sessions so tools can write output files
+        let vfs_mount = mount_tool_vfs(&game, &db, &tool.id).map_err(|e| {
+            format!("Failed to mount tool VFS: {e}")
         })?;
 
+        let scratch_dir = vfs_mount.writable_upper.clone();
         let id = self
-            .spawn_managed_session(SessionStart {
-                kind: SessionKind::Tool,
-                game_id: game.id,
-                tool_id: Some(tool.id),
-                launcher_source: game.launcher_source,
-                command,
-                completion: Some(completion),
-                vfs_mount: Some(vfs_mount),
-            })
+            .spawn_managed_session(
+                SessionStart {
+                    kind: SessionKind::Tool,
+                    game_id: game.id,
+                    tool_id: Some(tool.id),
+                    launcher_source: game.launcher_source,
+                    command,
+                    completion: Some(completion),
+                    vfs_mount: Some(vfs_mount),
+                },
+                scratch_dir,
+            )
             .map(|(id, _)| id)?;
 
         Ok((id, done_rx))
@@ -273,6 +284,7 @@ impl RuntimeSessionManager {
     fn spawn_managed_session(
         &self,
         mut start: SessionStart,
+        scratch_dir: Option<PathBuf>,
     ) -> Result<(u64, Arc<SessionControl>), String> {
         start.command.stdout(Stdio::piped());
         start.command.stderr(Stdio::piped());
@@ -307,6 +319,7 @@ impl RuntimeSessionManager {
                         status: SessionStatus::Running,
                         exit_code: None,
                         run_mode: SessionRunMode::FullyManaged,
+                        scratch_dir,
                     },
                     logs: VecDeque::new(),
                     control: Arc::clone(&control),
@@ -336,6 +349,11 @@ impl RuntimeSessionManager {
                             .map_err(|e| format!("Failed waiting for managed session: {e}"))
                     })
             };
+
+            // Signal the VFS that the session has ended (stops accepting writes)
+            if let Some(ref mount) = vfs_mount {
+                mount.session_ended.store(true, Ordering::SeqCst);
+            }
 
             manager.finish_session(
                 id,
@@ -442,15 +460,18 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg("sleep 5");
         let (id, _) = manager
-            .spawn_managed_session(SessionStart {
-                kind: SessionKind::Tool,
-                game_id: "g".to_string(),
-                tool_id: Some("t".to_string()),
-                launcher_source: GameLauncherSource::NonSteamUmu,
-                command: cmd,
-                completion: None,
-                vfs_mount: None,
-            })
+            .spawn_managed_session(
+                SessionStart {
+                    kind: SessionKind::Tool,
+                    game_id: "g".to_string(),
+                    tool_id: Some("t".to_string()),
+                    launcher_source: GameLauncherSource::NonSteamUmu,
+                    command: cmd,
+                    completion: None,
+                    vfs_mount: None,
+                },
+                None,
+            )
             .unwrap();
         assert!(manager.any_active());
         manager.stop_session(id).unwrap();
@@ -468,15 +489,18 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg("echo out; echo err 1>&2");
         let (id, _) = manager
-            .spawn_managed_session(SessionStart {
-                kind: SessionKind::Game,
-                game_id: "g".to_string(),
-                tool_id: None,
-                launcher_source: GameLauncherSource::NonSteamUmu,
-                command: cmd,
-                completion: None,
-                vfs_mount: None,
-            })
+            .spawn_managed_session(
+                SessionStart {
+                    kind: SessionKind::Game,
+                    game_id: "g".to_string(),
+                    tool_id: None,
+                    launcher_source: GameLauncherSource::NonSteamUmu,
+                    command: cmd,
+                    completion: None,
+                    vfs_mount: None,
+                },
+                None,
+            )
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let logs = manager.session_logs(id);

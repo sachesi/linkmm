@@ -3,7 +3,7 @@ pub mod library;
 pub mod proton;
 
 pub use launch::{
-    build_tool_command, launch_game, launch_game_managed_command, launch_tool_with_proton,
+    build_tool_command, launch_game, launch_game_managed_command,
     split_launch_arguments,
 };
 pub use library::{

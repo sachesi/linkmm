@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use glib;
@@ -432,6 +432,7 @@ fn launch_tool(
     let tool_id = tool.id.clone();
     let tool_name = tool.name.clone();
     let toast_overlay_c = toast_overlay.clone();
+    let game_for_closure = game.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
         let manager = global_runtime_manager();
         if let Some(s) = manager.current_tool_session(&game_id, &tool_id)
@@ -461,7 +462,137 @@ fn launch_tool(
             if let Some(rb) = rebuild.upgrade() {
                 (rb.borrow())();
             }
+
+            // Handle scratch dir after session ends
+            let manager = global_runtime_manager();
+            let sessions = manager.sessions();
+            let session = sessions.iter().find(|s| s.id == session_id).cloned();
+            if let Some(session) = session {
+                if let Some(scratch_dir) = session.scratch_dir.clone() {
+                    if scratch_dir.exists() {
+                        let has_content = scratch_dir
+                            .read_dir()
+                            .ok()
+                            .map(|mut iter| iter.next().is_some())
+                            .unwrap_or(false);
+                        if has_content {
+                            show_keep_discard_dialog(
+                                game_for_closure.clone(),
+                                tool_id.clone(),
+                                tool_name.clone(),
+                                scratch_dir,
+                                toast_overlay_c.clone(),
+                            );
+                        } else {
+                            let _ = std::fs::remove_dir_all(&scratch_dir);
+                        }
+                    }
+                }
+            }
         }
         glib::ControlFlow::Break
     });
+}
+
+fn show_keep_discard_dialog(
+    game: Game,
+    _tool_id: String,
+    tool_name: String,
+    scratch_dir: PathBuf,
+    toast_overlay: adw::ToastOverlay,
+) {
+    let dialog = adw::Dialog::new();
+    dialog.set_title("Tool Output");
+
+    let toolbar_view = adw::ToolbarView::new();
+    let header = adw::HeaderBar::new();
+    header.set_show_title(false);
+    toolbar_view.add_top_bar(&header);
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let status = adw::StatusPage::builder()
+        .title(format!("{} created new files", tool_name))
+        .description(
+            "The tool wrote files to the game Data directory. What should happen to them?",
+        )
+        .build();
+    content.append(&status);
+
+    let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    btn_box.set_halign(gtk4::Align::End);
+    btn_box.set_margin_top(12);
+
+    let discard_btn = gtk4::Button::with_label("Discard");
+    discard_btn.add_css_class("destructive-action");
+    let keep_btn = gtk4::Button::with_label("Keep as Mod");
+    keep_btn.add_css_class("suggested-action");
+
+    btn_box.append(&discard_btn);
+    btn_box.append(&keep_btn);
+    content.append(&btn_box);
+
+    toolbar_view.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar_view));
+
+    let dialog_clone = dialog.clone();
+    let toast_overlay_c = toast_overlay.clone();
+    let scratch_dir_c = scratch_dir.clone();
+    let tool_name_c = tool_name.clone();
+    discard_btn.connect_clicked(move |_| {
+        let _ = std::fs::remove_dir_all(&scratch_dir_c);
+        toast_overlay_c.add_toast(adw::Toast::new(&format!("{} output discarded", tool_name_c)));
+        dialog_clone.close();
+    });
+
+    let dialog_clone2 = dialog.clone();
+    let toast_overlay_c2 = toast_overlay.clone();
+    let game_c2 = game.clone();
+    let scratch_dir_c2 = scratch_dir.clone();
+    let tool_name_c2 = tool_name.clone();
+    keep_btn.connect_clicked(move |_| {
+        match create_mod_from_scratch(&game_c2, &scratch_dir_c2, &tool_name_c2) {
+            Ok(_mod_name) => {
+                toast_overlay_c2.add_toast(adw::Toast::new(&format!(
+                    "Created mod '{}' from tool output",
+                    tool_name_c2
+                )));
+            }
+            Err(e) => {
+                toast_overlay_c2.add_toast(adw::Toast::new(&format!("Failed to create mod: {e}")));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&scratch_dir_c2);
+        dialog_clone2.close();
+    });
+
+    if let Some(window) = toast_overlay
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+    {
+        dialog.present(Some(&window));
+    }
+}
+
+fn create_mod_from_scratch(game: &Game, scratch_dir: &Path, tool_name: &str) -> Result<String, String> {
+    let mod_dir = crate::core::mods::ModManager::create_mod_directory(game)?;
+    let data_dir = mod_dir.join("Data");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create Data dir: {e}"))?;
+    crate::core::installer::extract::move_dir_contents(scratch_dir, &data_dir)?;
+
+    let mod_name = format!("{} Output", tool_name);
+    let mut mod_entry = crate::core::mods::Mod::new(mod_name.clone(), mod_dir);
+    mod_entry.enabled = true;
+    mod_entry.installed_from_nexus = false;
+
+    let mut db = crate::core::mods::ModDatabase::load(game);
+    db.mods.push(mod_entry);
+    db.save(game);
+
+    Ok(mod_name)
 }

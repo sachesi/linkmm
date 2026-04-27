@@ -1,7 +1,6 @@
 pub mod core {
     pub mod archive;
     pub mod config;
-    pub mod deployment;
     pub mod download;
     pub mod download_state;
     pub mod games;

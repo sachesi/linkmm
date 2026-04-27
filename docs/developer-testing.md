@@ -2,38 +2,31 @@
 
 ## Test commands
 
-Core/domain tests without UI feature:
+Run core domain tests:
 
 ```bash
-cargo test --lib --no-default-features
+cargo test --lib
 ```
 
-UI + full app:
+Run all tests (including UI):
 
 ```bash
 cargo test
 ```
 
-## Domain vs UI boundaries
+## Architecture Boundaries
 
-- Domain logic lives in `src/core`.
-- UI state/actions live in `src/ui`.
-- Add behavior tests in core modules whenever possible.
+- **Core (`src/core`)**: Contains the FUSE VFS, mod database management, Steam/UMU integration, and the runtime session manager. This layer should be kept independent of GTK.
+- **UI (`src/ui`)**: GTK4/libadwaita components and views.
 
-## Adding new tool adapters
+## VFS Testing
 
-1. Add adapter implementation in `src/core/tool_adapters.rs`.
-2. Define defaults (`default_profiles`).
-3. Add validation + classification + unmanaged detection.
-4. Add tests for preset and validation behavior.
+When testing changes to `src/core/vfs.rs`, ensure that:
+- Case-insensitivity is maintained for all lookups.
+- File priority is correctly handled (higher priority mods override lower ones).
+- Writable overlay (CoW) correctly captures modifications in the scratch directory.
 
-## Profile-scoped state rules
+## Plugin / Load Order
 
-When changing domain logic, ensure changes are scoped to active profile:
-
-- mod state
-- plugin state
-- generated outputs
-- deployment state/backups/ownership
-
-Never introduce global mutable behavior that bypasses active profile context.
+- Plugin state is managed via `src/core/mods.rs`.
+- `plugins.txt` is the source of truth for the game; LinkMM synchronizes state to this file before launch.
