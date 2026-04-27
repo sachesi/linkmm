@@ -57,20 +57,34 @@ pub fn build_settings_page(
         .title("API Key")
         .show_apply_button(true)
         .build();
+let get_key_btn = gtk4::Button::builder()
+    .label("Get your API key on NexusMods")
+    .halign(gtk4::Align::Start)
+    .css_classes(["flat", "accent"])
+    .build();
+get_key_btn.connect_clicked(|_| {
+    let _ = gtk4::gio::AppInfo::launch_default_for_uri("https://www.nexusmods.com/settings/api-keys", None::<&gtk4::gio::AppLaunchContext>);
+});
 
-    let get_key_row = adw::ActionRow::builder()
-        .title("Get your API key on NexusMods")
-        .activatable(true)
-        .build();
-    let external_icon = gtk4::Image::from_icon_name("external-link-symbolic");
-    get_key_row.add_suffix(&external_icon);
-    get_key_row.connect_activated(|_| {
-        let _ = gtk4::gio::AppInfo::launch_default_for_uri("https://www.nexusmods.com/settings/api-keys", None::<&gtk4::gio::AppLaunchContext>);
+let update_link_visibility = {
+    let btn = get_key_btn.clone();
+    let entry = api_key_row.clone();
+    move || {
+        btn.set_visible(entry.text().is_empty());
+    }
+};
+...
+nexus_group.add(&api_key_row);
+nexus_group.add(&get_key_btn);
+content_box.append(&nexus_group);
+
+        move |_| update()
     });
 
     if let Some(key) = config.borrow().nexus_api_key.as_deref() {
         api_key_row.set_text(key);
     }
+    update_link_visibility();
 
     {
         let config_clone = Rc::clone(&config);
