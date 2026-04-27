@@ -202,7 +202,7 @@ fn read_archive_files_bytes_non_zip(
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&tmp);
+        crate::core::io::rm_rf(&tmp);
     } else {
         let target_set: std::collections::HashMap<String, String> = target_to_req
             .iter()
@@ -270,7 +270,7 @@ fn read_archive_file_bytes_non_zip(
                 )
             })
         })();
-        let _ = std::fs::remove_dir_all(&tmp);
+        crate::core::io::rm_rf(&tmp);
         result
     } else {
         let mut reader = open_7z_reader(archive_path)?;

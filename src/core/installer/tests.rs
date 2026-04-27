@@ -811,7 +811,7 @@ fn tempdir() -> PathBuf {
     static CTR: AtomicU32 = AtomicU32::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("linkmm_test_{}_{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    crate::core::io::rm_rf(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

@@ -54,7 +54,7 @@ pub fn download_file(
         downloaded += n as u64;
         if !on_progress(downloaded, total) {
             drop(out);
-            let _ = std::fs::remove_file(&part_path);
+            crate::core::io::rm_file(&part_path);
             return Err(DOWNLOAD_CANCELLED_ERROR.to_string());
         }
     }
