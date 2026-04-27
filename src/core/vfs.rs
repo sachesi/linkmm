@@ -279,6 +279,7 @@ impl ModUnionFs {
         let parent = match &node.kind {
             VfsNodeKind::Dir { parent, .. } => *parent,
             VfsNodeKind::File { parent, .. } => *parent,
+            VfsNodeKind::Whiteout { parent } => *parent,
         };
 
         let mut path = self.path_for_ino(parent)?;
@@ -766,12 +767,12 @@ impl Filesystem for ModUnionFs {
                 // Update VFS state
                 if let Some(VfsNode { kind, .. }) = self.nodes.get_mut(&ino) {
                     match kind {
-                        VfsNodeKind::Dir { ref mut parent, .. } => *parent = newparent,
-                        VfsNodeKind::File { ref mut parent, ref mut read_path, .. } => {
+                        VfsNodeKind::Dir { parent, .. } => *parent = newparent,
+                        VfsNodeKind::File { parent, read_path, .. } => {
                             *parent = newparent;
                             *read_path = new_path;
                         }
-                        VfsNodeKind::Whiteout { ref mut parent } => *parent = newparent,
+                        VfsNodeKind::Whiteout { parent } => *parent = newparent,
                     }
                 }
 
