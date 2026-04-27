@@ -1081,13 +1081,28 @@ pub fn mount_mod_vfs(game: &Game, db: &ModDatabase) -> Result<MountHandle, Strin
 
     let options = &[
         MountOption::RO,
+        MountOption::AllowOther,
+        MountOption::DefaultPermissions,
         MountOption::FSName("linkmm".to_string()),
-        MountOption::Subtype("modvfs".to_string()),
-        MountOption::AutoUnmount,
         MountOption::NoDev,
         MountOption::NoSuid,
         MountOption::NoExec,
+        MountOption::CUSTOM("nonempty".to_string()),
     ];
+
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    log::debug!("VFS Mount Environment PATH: {}", path_env);
+    
+    let fusermount_check = std::process::Command::new("which")
+        .arg("fusermount3")
+        .output();
+    match fusermount_check {
+        Ok(out) if out.status.success() => log::debug!("VFS found fusermount3 at: {}", String::from_utf8_lossy(&out.stdout).trim()),
+        _ => log::warn!("VFS COULD NOT FIND fusermount3 in PATH!"),
+    }
+
+    log::info!("Mounting VFS (RO) at {}", mountpoint.display());
+    let mountpoint = mountpoint.canonicalize().unwrap_or(mountpoint);
 
     let session = fuser::spawn_mount2(fs, &mountpoint, options)
         .map_err(|e| format!("Failed to mount mod VFS at {}: {e}", mountpoint.display()))?;
@@ -1130,17 +1145,23 @@ pub fn mount_tool_vfs(
     )?;
 
     let options = &[
-        MountOption::RW,
-        MountOption::FSName("linkmm".to_string()),
-        MountOption::Subtype("toolvfs".to_string()),
-        MountOption::AutoUnmount,
+        MountOption::AllowOther,
+        MountOption::DefaultPermissions,
+        MountOption::FSName("linkmm-tool".to_string()),
         MountOption::NoDev,
         MountOption::NoSuid,
         MountOption::NoExec,
+        MountOption::CUSTOM("nonempty".to_string()),
     ];
+
+    log::info!("Mounting VFS (RW) at {}", mountpoint.display());
+    if !mountpoint.exists() {
+        return Err(format!("Mountpoint does not exist: {}", mountpoint.display()));
+    }
 
     let session = fuser::spawn_mount2(fs, &mountpoint, options)
         .map_err(|e| format!("Failed to mount tool VFS at {}: {e}", mountpoint.display()))?;
+
 
     log::info!("Mounted tool VFS at {} (writable upper: {})", mountpoint.display(), scratch_dir.display());
     Ok(MountHandle { _session: session, mountpoint, writable_upper: Some(scratch_dir), session_ended })

@@ -13,6 +13,8 @@ use crate::core::config::AppConfig;
 use crate::core::games::GameLauncherSource;
 use crate::core::mods::ModDatabase;
 use crate::core::runtime::global_runtime_manager;
+use crate::core::umu;
+
 
 pub mod downloads;
 pub mod library;
@@ -146,6 +148,7 @@ fn build_main_window(
 
     {
         let config_c = Rc::clone(&config);
+        let play_btn_c = play_btn.clone();
         play_btn.connect_clicked(move |_| {
             let game = config_c.borrow().current_game().cloned();
             let Some(g) = game else { return };
@@ -156,6 +159,76 @@ fn build_main_window(
                 }
                 return;
             }
+
+            if !umu::is_umu_available() {
+                // umu-run is required but missing. Show download dialog.
+                let window = play_btn_c.root().and_then(|r| r.downcast::<adw::Window>().ok());
+                let Some(parent) = window else { return };
+
+                let progress_dialog = adw::Window::builder()
+                    .title("Downloading UMU Launcher")
+                    .modal(true)
+                    .transient_for(&parent)
+                    .default_width(400)
+                    .default_height(150)
+                    .deletable(false)
+                    .build();
+
+                let pbox = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+                pbox.set_margin_start(24);
+                pbox.set_margin_end(24);
+                pbox.set_margin_top(24);
+                pbox.set_margin_bottom(24);
+                pbox.set_valign(gtk4::Align::Center);
+
+                let plabel = gtk4::Label::new(Some("Downloading umu-launcher… LinkMM requires it to manage game processes."));
+                plabel.set_wrap(true);
+                let pbar = gtk4::ProgressBar::new();
+                pbar.set_show_text(true);
+
+                pbox.append(&plabel);
+                pbox.append(&pbar);
+                progress_dialog.set_content(Some(&pbox));
+                progress_dialog.present();
+
+                let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+                std::thread::spawn(move || {
+                    let result = umu::ensure_umu_available(None, |_downloaded, _total| true);
+                    let _ = tx.send(result.map(|(tag, _path)| tag));
+                });
+
+                let config_t = Rc::clone(&config_c);
+                let pbar_t = pbar.clone();
+                let dialog_t = progress_dialog.clone();
+                let game_t = g.clone();
+                glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                    pbar_t.pulse();
+                    match rx.try_recv() {
+                        Ok(Ok(new_tag)) => {
+                            dialog_t.destroy();
+                            config_t.borrow_mut().umu_installed_version = Some(new_tag);
+                            config_t.borrow().save();
+                            // Launch game after successful download
+                            if let Err(e) = manager.start_game_session(game_t.clone()) {
+                                log::warn!("Could not launch {}: {e}", game_t.name);
+                            }
+                            glib::ControlFlow::Break
+                        }
+                        Ok(Err(e)) => {
+                            dialog_t.destroy();
+                            log::error!("Failed to download umu-launcher: {e}");
+                            glib::ControlFlow::Break
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            dialog_t.destroy();
+                            glib::ControlFlow::Break
+                        }
+                    }
+                });
+                return;
+            }
+
             if let Err(e) = manager.start_game_session(g.clone()) {
                 log::warn!("Could not launch {}: {e}", g.name);
             }
