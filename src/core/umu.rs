@@ -319,6 +319,14 @@ pub fn build_umu_command(
     };
 
     let mut command = std::process::Command::new(umu_run_path());
+
+    // Sanitize environment to prevent container/AppImage leakage
+    command.env_remove("APPIMAGE");
+    command.env_remove("APPDIR");
+    command.env_remove("DESKTOPINTEGRATION");
+    command.env_remove("LD_LIBRARY_PATH");
+    command.env_remove("LD_PRELOAD");
+
     command
         .current_dir(exe_path.parent().unwrap_or_else(|| Path::new("/")))
         .arg(exe_path)
