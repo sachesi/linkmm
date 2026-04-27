@@ -644,35 +644,6 @@ pub fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| format!("Failed to create destination {}: {e}", dst.display()))?;
-    for entry in
-        std::fs::read_dir(src).map_err(|e| format!("Failed to read {}: {e}", src.display()))?
-    {
-        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir_contents(&from, &to)?;
-        } else {
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    format!("Failed to create parent dir {}: {e}", parent.display())
-                })?;
-            }
-            std::fs::copy(&from, &to).map_err(|e| {
-                format!(
-                    "Failed to copy extracted file {} -> {}: {e}",
-                    from.display(),
-                    to.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
 /// Recursively rename every file and directory under `dir` to lowercase.
 ///
 /// This is required on Linux (case-sensitive filesystem) because the game
