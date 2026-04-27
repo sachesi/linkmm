@@ -625,7 +625,7 @@ pub fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
         if from.is_dir() {
             if std::fs::rename(&from, &to).is_err() {
                 move_dir_contents(&from, &to)?;
-                let _ = std::fs::remove_dir_all(&from);
+                crate::core::io::rm_rf(&from);
             }
         } else {
             // It is a file or a symlink. We do not support symlinks in VFS, but we handle them.
@@ -637,7 +637,7 @@ pub fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
                 std::fs::copy(&from, &to).map_err(|e| {
                     format!("Failed to move {} → {}: {e}", from.display(), to.display())
                 })?;
-                let _ = std::fs::remove_file(&from);
+                crate::core::io::rm_file(&from);
             }
         }
     }
@@ -861,7 +861,7 @@ impl ExtractedArchive {
         if let Err(e) = extract_result {
             // Clean up the temp dir on failure so we do not leave orphaned
             // hidden directories in the mods folder.
-            let _ = std::fs::remove_dir_all(&dir);
+            crate::core::io::rm_rf(&dir);
             return Err(e);
         }
 
@@ -920,7 +920,7 @@ impl ExtractedArchive {
         };
 
         if let Err(e) = extract_result {
-            let _ = std::fs::remove_dir_all(&dir);
+            crate::core::io::rm_rf(&dir);
             return Err(e);
         }
 

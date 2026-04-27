@@ -1254,7 +1254,7 @@ fn delete_all_archives(config: &Rc<RefCell<AppConfig>>, game: &Rc<Option<Game>>)
                 .map(|e| e.to_lowercase())
                 .unwrap_or_default();
             if ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
-                let _ = std::fs::remove_file(&path);
+                crate::core::io::rm_file(&path);
             }
         }
     }
@@ -1417,7 +1417,7 @@ mod tests {
         let n = CTR.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("linkmm_downloads_test_{}_{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::core::io::rm_rf(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

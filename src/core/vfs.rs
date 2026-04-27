@@ -5,6 +5,7 @@ use fuser::{
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -876,16 +877,41 @@ impl Filesystem for ModUnionFs {
         _ino: u64,
         reply: fuser::ReplyStatfs,
     ) {
-        reply.statfs(
-            1_000_000, // blocks
-            500_000,   // bfree
-            500_000,   // bavail
-            100_000,   // files
-            50_000,    // ffree
-            4096,      // bsize
-            255,       // namelen
-            4096,      // frsize
-        );
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let res = if let Some(upper) = &self.writable_upper {
+            let path = std::ffi::CString::new(upper.as_os_str().as_bytes()).unwrap();
+            unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) }
+        } else if let Some(ref f) = self._real_dir_handle {
+            unsafe { libc::fstatfs(f.as_raw_fd(), stats.as_mut_ptr()) }
+        } else {
+            -1
+        };
+
+        if res == 0 {
+            let stats = unsafe { stats.assume_init() };
+            reply.statfs(
+                stats.f_blocks as u64,
+                stats.f_bfree as u64,
+                stats.f_bavail as u64,
+                stats.f_files as u64,
+                stats.f_ffree as u64,
+                stats.f_bsize as u32,
+                255,
+                stats.f_frsize as u32,
+            );
+        } else {
+            // Fallback to mock values if statfs fails
+            reply.statfs(
+                1_000_000, // blocks
+                500_000,   // bfree
+                500_000,   // bavail
+                100_000,   // files
+                50_000,    // ffree
+                4096,      // bsize
+                255,       // namelen
+                4096,      // frsize
+            );
+        }
     }
 }
 

@@ -484,7 +484,7 @@ fn launch_tool(
                                 toast_overlay_c.clone(),
                             );
                         } else {
-                            let _ = std::fs::remove_dir_all(&scratch_dir);
+                            crate::core::io::rm_rf(&scratch_dir);
                         }
                     }
                 }
@@ -544,7 +544,7 @@ fn show_keep_discard_dialog(
     let scratch_dir_c = scratch_dir.clone();
     let tool_name_c = tool_name.clone();
     discard_btn.connect_clicked(move |_| {
-        let _ = std::fs::remove_dir_all(&scratch_dir_c);
+        crate::core::io::rm_rf(&scratch_dir_c);
         toast_overlay_c.add_toast(adw::Toast::new(&format!("{} output discarded", tool_name_c)));
         dialog_clone.close();
     });
@@ -566,7 +566,7 @@ fn show_keep_discard_dialog(
                 toast_overlay_c2.add_toast(adw::Toast::new(&format!("Failed to create mod: {e}")));
             }
         }
-        let _ = std::fs::remove_dir_all(&scratch_dir_c2);
+        crate::core::io::rm_rf(&scratch_dir_c2);
         dialog_clone2.close();
     });
 

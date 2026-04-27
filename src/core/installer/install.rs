@@ -114,7 +114,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
         }
         InstallStrategy::Fomod(files) => {
             if files.is_empty() {
-                let _ = std::fs::remove_dir_all(&mod_dir);
+                crate::core::io::rm_rf(&mod_dir);
                 return Err("No files selected for installation. FOMOD configuration may be invalid or no options were selected.".to_string());
             }
 
@@ -129,7 +129,7 @@ pub fn install_mod_from_archive_with_nexus_ticking(
                 .and_then(|mut entries| entries.next())
                 .is_some();
             if !has_files {
-                let _ = std::fs::remove_dir_all(&mod_dir);
+                crate::core::io::rm_rf(&mod_dir);
                 return Err(
                     "No files were installed. FOMOD file paths may not match archive contents."
                         .to_string(),
@@ -467,7 +467,7 @@ pub(super) fn install_fomod(
             let tmp = create_temp_extract_dir()?;
             extract_archive_with_7z(archive_path, &tmp)?;
             let result = install_fomod_files_from_dir(&tmp, dest_dir, files);
-            let _ = std::fs::remove_dir_all(&tmp);
+            crate::core::io::rm_rf(&tmp);
             return result;
         }
 
@@ -701,7 +701,7 @@ pub fn install_mod_from_extracted(
         InstallStrategy::Data => install_data_from_extracted(extracted, &mod_dir, tick),
         InstallStrategy::Fomod(files) => {
             if files.is_empty() {
-                let _ = std::fs::remove_dir_all(&mod_dir);
+                crate::core::io::rm_rf(&mod_dir);
                 return Err(
                     "No files selected for installation. FOMOD configuration may be \
                      invalid or no options were selected."
@@ -720,7 +720,7 @@ pub fn install_mod_from_extracted(
                 .and_then(|mut entries| entries.next())
                 .is_some();
             if !has_files {
-                let _ = std::fs::remove_dir_all(&mod_dir);
+                crate::core::io::rm_rf(&mod_dir);
                 return Err("No files were installed. FOMOD file paths may not match \
                      archive contents."
                     .to_string());
@@ -732,7 +732,7 @@ pub fn install_mod_from_extracted(
     };
 
     if let Err(e) = result {
-        let _ = std::fs::remove_dir_all(&mod_dir);
+        crate::core::io::rm_rf(&mod_dir);
         return Err(e);
     }
 
@@ -868,7 +868,7 @@ fn move_from_extracted_to(
                 std::fs::copy(&src, &dst).map_err(|e| {
                     format!("Failed to move {} → {}: {e}", src.display(), dst.display())
                 })?;
-                let _ = std::fs::remove_file(&src);
+                crate::core::io::rm_file(&src);
             }
         }
     }
