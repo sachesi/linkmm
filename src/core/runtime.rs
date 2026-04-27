@@ -216,6 +216,11 @@ impl RuntimeSessionManager {
             return Err("A game session is already active for this game instance".to_string());
         }
 
+        // Ensure UMU is available before proceeding
+        if !crate::core::umu::is_umu_available() {
+            return Err("umu-launcher is not installed. Please try again or check settings.".to_string());
+        }
+
         let db = ModDatabase::load(&game);
         if let Err(e) = db.write_plugins_txt(&game) {
             log::warn!("Failed to write plugins.txt before game launch: {e}");
@@ -235,11 +240,12 @@ impl RuntimeSessionManager {
                     umu.prefix_path.as_deref(),
                     umu.proton_path.as_deref(),
                     "none",
+                    None,
                 )?
-            }
-            GameLauncherSource::Steam => {
+                }
+                GameLauncherSource::Steam => {
                 let app_id = game.steam_instance_app_id().unwrap_or(0);
-                
+
                 let mut exe_path = None;
                 for exe in game.kind.expected_executable_names() {
                     let path = game.root_path.join(exe);
@@ -260,9 +266,12 @@ impl RuntimeSessionManager {
                     Some(&prefix_path),
                     Some(&proton_path),
                     "steam",
+                    crate::core::steam::library::find_steam_root().as_deref(),
                 )?
-            }
-        };
+                }
+
+                };
+
 
         self.spawn_managed_session(
             SessionStart {
@@ -314,13 +323,14 @@ impl RuntimeSessionManager {
                     umu.prefix_path.as_deref(),
                     umu.proton_path.as_deref(),
                     "none",
+                    None,
                 )?
-            }
-            GameLauncherSource::Steam => {
+                }
+                GameLauncherSource::Steam => {
                 let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
                 let (proton_path, compatdata_path) = crate::core::steam::proton::find_proton_for_game(app_id)?;
                 let prefix_path = compatdata_path.join("pfx");
-                
+
                 crate::core::umu::build_umu_command(
                     &tool.exe_path,
                     &tool.arguments,
@@ -328,9 +338,12 @@ impl RuntimeSessionManager {
                     Some(&prefix_path),
                     Some(&proton_path),
                     "steam",
+                    crate::core::steam::library::find_steam_root().as_deref(),
                 )?
-            }
-        };
+                }
+
+                };
+
 
         let db = ModDatabase::load(&game);
         // Use writable overlay VFS for tool sessions so tools can write output files
@@ -374,6 +387,7 @@ impl RuntimeSessionManager {
             .command
             .spawn()
             .map_err(|e| format!("Failed to spawn managed session: {e}"))?;
+        
         let pid = Some(child.id());
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();

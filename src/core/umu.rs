@@ -347,9 +347,10 @@ pub fn launch_with_umu(
     prefix_path: Option<&Path>,
     proton_path: Option<&Path>,
     store: &str,
+    steam_root: Option<&Path>,
 ) -> Result<std::process::Child, String> {
     let mut command =
-        build_umu_command(exe_path, arguments, steam_app_id, prefix_path, proton_path, store)?;
+        build_umu_command(exe_path, arguments, steam_app_id, prefix_path, proton_path, store, steam_root)?;
     command
         .spawn()
         .map_err(|e| format!("Failed to spawn umu-run: {e}"))
@@ -362,6 +363,7 @@ pub fn build_umu_command(
     prefix_path: Option<&Path>,
     proton_path: Option<&Path>,
     store: &str,
+    steam_root: Option<&Path>,
 ) -> Result<std::process::Command, String> {
     if !is_umu_available() {
         return Err(
@@ -399,6 +401,11 @@ pub fn build_umu_command(
         .env("PROTONPATH", proton_path_str.as_ref())
         .env("STORE", store)
         .env("UMU_LOG", "1");
+    
+    let steam_root_owned = crate::core::steam::library::find_steam_root();
+    if let Some(root) = steam_root.or_else(|| steam_root_owned.as_deref()) {
+        command.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", root);
+    }
 
     // Append tool/exe arguments after the executable path.
     if !arguments.trim().is_empty() {
