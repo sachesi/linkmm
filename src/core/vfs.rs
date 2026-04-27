@@ -55,6 +55,8 @@ struct ModUnionFs {
     writable_upper: Option<PathBuf>,
     /// Flag set when the tool process exits, so we can stop accepting writes.
     session_ended: Arc<AtomicBool>,
+    /// Next available inode number.
+    next_ino: u64,
 }
 
 impl ModUnionFs {
@@ -89,6 +91,7 @@ impl ModUnionFs {
             _real_dir_handle: real_dir_handle,
             writable_upper,
             session_ended,
+            next_ino: 2,
         };
 
         // Root inode = 1 (required by FUSE spec)
@@ -97,11 +100,9 @@ impl ModUnionFs {
             kind: VfsNodeKind::Dir { parent: 1, children: HashMap::new() },
         });
 
-        let mut next_ino = 2u64;
-
         // Layer 0: real game Data/ (lowest priority — every mod overrides it)
         if !game_proc_path.as_os_str().is_empty() {
-            fs.overlay(&game_proc_path, 1, &mut next_ino, uid, gid, now)?;
+            fs.overlay(&game_proc_path, 1, uid, gid, now)?;
         }
 
         // Layers 1‥N: enabled mods, ascending priority (highest number wins)
@@ -111,7 +112,7 @@ impl ModUnionFs {
             let mod_data = m.source_path.join("Data");
             let root = if mod_data.is_dir() { mod_data } else { m.source_path.clone() };
             if root.is_dir() {
-                fs.overlay(&root, 1, &mut next_ino, uid, gid, now)?;
+                fs.overlay(&root, 1, uid, gid, now)?;
             }
         }
 
@@ -119,7 +120,7 @@ impl ModUnionFs {
         let upper_path = fs.writable_upper.clone();
         if let Some(ref upper) = upper_path {
             if upper.is_dir() {
-                fs.overlay(upper, 1, &mut next_ino, uid, gid, now)?;
+                fs.overlay(upper, 1, uid, gid, now)?;
             }
         }
 
@@ -132,13 +133,10 @@ impl ModUnionFs {
         Ok(fs)
     }
 
-    /// Merge `src_dir` into the VFS directory at `parent_ino`.
-    /// Higher-priority files silently replace lower-priority ones.
     fn overlay(
         &mut self,
         src_dir: &Path,
         parent_ino: u64,
-        next_ino: &mut u64,
         uid: u32,
         gid: u32,
         now: SystemTime,
@@ -177,8 +175,8 @@ impl ModUnionFs {
                 let child_ino = match existing {
                     Some(ino) => ino,
                     None => {
-                        let ino = *next_ino;
-                        *next_ino += 1;
+                        let ino = self.next_ino;
+                        self.next_ino += 1;
                         self.nodes.insert(ino, VfsNode {
                             attr: dir_attr(ino, uid, gid, now),
                             kind: VfsNodeKind::Dir { parent: parent_ino, children: HashMap::new() },
@@ -187,7 +185,7 @@ impl ModUnionFs {
                         ino
                     }
                 };
-                self.overlay(&src, child_ino, next_ino, uid, gid, now)?;
+                self.overlay(&src, child_ino, uid, gid, now)?;
             } else if meta.is_file() {
                 let size = meta.len();
                 let mtime = meta.modified().unwrap_or(now);
@@ -201,8 +199,8 @@ impl ModUnionFs {
                         }
                     }
                     None => {
-                        let ino = *next_ino;
-                        *next_ino += 1;
+                        let ino = self.next_ino;
+                        self.next_ino += 1;
                         self.nodes.insert(ino, VfsNode {
                             attr: file_attr(ino, size, mtime, uid, gid, now),
                             kind: VfsNodeKind::File { parent: parent_ino, read_path: src },
@@ -549,7 +547,8 @@ impl Filesystem for ModUnionFs {
                 let uid = unsafe { libc::getuid() };
                 let gid = unsafe { libc::getgid() };
                 let now = SystemTime::now();
-                let ino = self.nodes.len() as u64 + 1; // simple allocation
+                let ino = self.next_ino;
+                self.next_ino += 1;
                 let attr = file_attr(ino, 0, now, uid, gid, now);
                 self.nodes.insert(ino, VfsNode {
                     attr: attr.clone(),
@@ -601,7 +600,8 @@ impl Filesystem for ModUnionFs {
                 let uid = unsafe { libc::getuid() };
                 let gid = unsafe { libc::getgid() };
                 let now = SystemTime::now();
-                let ino = self.nodes.len() as u64 + 1;
+                let ino = self.next_ino;
+                self.next_ino += 1;
                 let attr = dir_attr(ino, uid, gid, now);
                 self.nodes.insert(ino, VfsNode {
                     attr: attr.clone(),
@@ -723,37 +723,68 @@ impl Filesystem for ModUnionFs {
             }
         };
 
-        let old_parent_path = match self.path_for_ino(parent) {
-            Some(p) => upper.join(p),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-        let new_parent_path = match self.path_for_ino(newparent) {
-            Some(p) => upper.join(p),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
+        let name_lc = name.to_string_lossy().to_lowercase();
+        let Some(ino) = self.child_ino_ci(parent, &name_lc) else {
+            reply.error(libc::ENOENT);
+            return;
         };
 
-        let old_path = old_parent_path.join(name);
-        let new_path = new_parent_path.join(newname);
+        // If it is a file from lower layer, we must CoW it first so it exists in upper
+        let is_dir = matches!(self.nodes.get(&ino), Some(VfsNode { kind: VfsNodeKind::Dir { .. }, .. }));
+        if !is_dir {
+            if let Err(e) = self.cow_file(ino) {
+                log::error!("VFS rename cow_file failed: {e}");
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        let old_rel = match self.path_for_ino(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let old_path = upper.join(&old_rel);
+
+        let new_parent_rel = match self.path_for_ino(newparent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let new_path = upper.join(new_parent_rel).join(newname);
+
+        if let Some(p) = new_path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
 
         match std::fs::rename(&old_path, &new_path) {
             Ok(()) => {
-                // Update inode map: remove old entry, add new
-                let name_lc = name.to_string_lossy().to_lowercase();
-                if let Some(ino) = self.child_ino_ci(parent, &name_lc) {
-                    self.nodes.remove(&ino);
-                    if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
-                        self.nodes.get_mut(&parent)
-                    {
-                        children.retain(|k, _| k.to_string_lossy().to_lowercase() != name_lc);
+                // Update VFS state
+                if let Some(VfsNode { kind, .. }) = self.nodes.get_mut(&ino) {
+                    match kind {
+                        VfsNodeKind::Dir { ref mut parent, .. } => *parent = newparent,
+                        VfsNodeKind::File { ref mut parent, ref mut read_path, .. } => {
+                            *parent = newparent;
+                            *read_path = new_path;
+                        }
+                        VfsNodeKind::Whiteout { ref mut parent } => *parent = newparent,
                     }
-                    self.insert_child(newparent, newname.to_os_string(), ino);
                 }
+
+                // Remove from old parent children
+                if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
+                    self.nodes.get_mut(&parent)
+                {
+                    children.retain(|k, _| k.to_string_lossy().to_lowercase() != name_lc);
+                }
+                
+                // Add to new parent children
+                self.insert_child(newparent, newname.to_os_string(), ino);
+                
                 reply.ok();
             }
             Err(e) => {
