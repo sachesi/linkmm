@@ -189,7 +189,7 @@ pub(super) fn build_mod_row(
     row.connect_active_notify(move |switch_row| {
         let enabled = switch_row.is_active();
         if let Err(e) = ModManager::set_mod_enabled(&game_toggle, &mod_id, enabled) {
-            log::error!("Failed to rebuild deployment after toggle: {e}");
+            log::error!("Failed to update mod state: {e}");
             switch_row.set_active(!enabled);
         }
     });

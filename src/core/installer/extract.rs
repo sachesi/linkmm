@@ -611,7 +611,7 @@ pub(super) fn create_temp_extract_dir_in(parent: &Path) -> Result<PathBuf, Strin
 
 /// Move all immediate children of `src` into `dst`, using `rename` when
 /// possible and falling back to copy + delete for cross-device moves.
-pub(super) fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
+pub fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst)
         .map_err(|e| format!("Failed to create destination {}: {e}", dst.display()))?;
     for entry in

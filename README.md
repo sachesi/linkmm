@@ -1,71 +1,43 @@
 # LinkMM
 
-LinkMM is a Linux-first Bethesda mod manager built around **deterministic, state-driven rebuilds**.
+LinkMM is a modern mod manager for Bethesda games (Skyrim, Fallout, etc.) designed for Linux. It uses a FUSE-based virtual filesystem to provide a "zero-deployment" experience.
 
-## Core model
+## Key Features
 
-LinkMM does not deploy incrementally per action. Instead, it always recomputes game deployment from current state:
+- **FUSE Virtual Filesystem**: Enable/disable mods instantly. No symlinks, no file copying, and no risk of corrupting your game directory.
+- **Proton & UMU Integration**: Seamlessly launch games and Windows-native tools using Steam's Proton or the Unified Moe Union (UMU) launcher.
+- **Writable Overlay for Tools**: Run tools like BodySlide, Nemesis, or xEdit directly against your modded setup. Changes are captured and can be saved as new mods.
+- **Native GTK4 UI**: A clean, modern interface built with Libadwaita that follows GNOME HIG.
+- **Nexus Mods Integration**: Handle `nxm://` links and manage your Nexus downloads directly.
 
-- active game profile
-- profile-local mod enabled/order state
-- profile-local plugin state
-- profile-local generated output packages
-- deployer rules (assets + plugins)
+## Documentation
 
-The final game folder is derived from this state only, not interaction history.
+- [Architecture Overview](docs/architecture.md) — How the VFS and runtime work.
+- [User Workflows](docs/user-workflows.md) — How to manage mods and tools.
+- [Developer Guide](docs/developer-testing.md) — Testing and development boundaries.
 
-## Profiles / instances
+## Getting Started
 
-Profiles are first-class state containers per game. Each profile owns:
+### Prerequisites
 
-- mod enabled/disabled and ordering
-- plugin order + disabled list
-- generated output package associations
-- deployment ownership / backup state (profile-scoped)
+- `rustc` and `cargo` (latest stable)
+- `libadwaita` and `gtk4` development headers
+- `libfuse3` (required for the VFS)
 
-Switching profile triggers a rebuild for that profile and isolates state from other profiles.
-
-## Generated outputs
-
-External tools (BodySlide, Pandora, Nemesis, etc.) are managed through generated output packages:
-
-- explicit output-directory capture
-- snapshot/diff capture for direct `Data/` writers
-- ownership tracking per generated file
-- deterministic inclusion in deployment and conflict resolution
-- remove/cleanup/adopt workflows
-
-## Tool runs
-
-Tool launch goes through managed orchestration:
-
-1. adapter + preflight validation
-2. run execution
-3. output capture/import (mode-dependent)
-4. package update/replace
-5. deployment rebuild
-
-Tool adapters provide presets, validation and detection logic.
-
-## Repository layout
-
-- `src/core/*` — domain logic (deployment, mods, profiles, plugins, generated outputs, adapters, tool runs)
-- `src/ui/*` — GTK/libadwaita UI
-- `src/lib.rs` — core module entry for domain-oriented testing/use
-- `src/main.rs` — UI app binary
-
-## Running tests
-
-Headless core-oriented tests (no UI feature):
+### Running
 
 ```bash
-cargo test --lib --no-default-features
+cargo run
 ```
 
-Full app build/tests (requires GTK/libadwaita development packages):
+### Testing
 
 ```bash
 cargo test
 ```
 
-See `docs/developer-testing.md` for contribution/testing details.
+## Project Structure
+
+- `src/core/`: The "brains" of the app. Handles VFS, game detection, and process management.
+- `src/ui/`: The user interface components.
+- `docs/`: Technical and user documentation.

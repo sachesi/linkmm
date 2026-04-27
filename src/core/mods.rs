@@ -127,8 +127,6 @@ impl Mod {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModDatabase {
     pub mods: Vec<Mod>,
-    /// Ordered mod IDs (legacy – kept for TOML compatibility).
-    pub load_order: Vec<String>,
     #[serde(default)]
     pub plugin_load_order: Vec<String>,
     #[serde(default)]
@@ -139,7 +137,6 @@ impl Default for ModDatabase {
     fn default() -> Self {
         Self {
             mods: Vec::new(),
-            load_order: Vec::new(),
             plugin_load_order: Vec::new(),
             plugin_disabled: HashSet::new(),
         }
@@ -246,7 +243,7 @@ impl ModDatabase {
         }
     }
 
-    /// Move data from legacy flat per-profile fields into `profiles`.
+    /// Scan the mods directory for extracted mods and update the database.
     pub fn scan_mods_dir(&mut self, game: &Game) {
         let mods_dir = game.mods_dir();
         if !mods_dir.is_dir() {

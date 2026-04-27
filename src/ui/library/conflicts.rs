@@ -4,14 +4,14 @@ use std::path::Path;
 use crate::core::mods::Mod;
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct ConflictState {
+pub(crate) struct ConflictState {
     pub(super) overwrites: bool,
     pub(super) overwritten: bool,
     pub(super) files: BTreeSet<String>,
     pub(super) conflict_mods_by_file: BTreeMap<String, BTreeSet<String>>,
 }
 
-pub(super) fn compute_conflict_states(
+pub(crate) fn compute_conflict_states(
     mods: &[Mod],
     selected_id: Option<&str>,
 ) -> HashMap<String, ConflictState> {
