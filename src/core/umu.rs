@@ -326,7 +326,9 @@ pub fn build_umu_command(
         .env("GAMEID", &game_id)
         .env("PROTONPATH", proton_path_str.as_ref())
         .env("STORE", store)
-        .env("UMU_LOG", "1");
+        .env("UMU_LOG", "1")
+        .env("STEAM_COMPAT_APP_ID", steam_app_id.to_string())
+        .env("SteamAppId", steam_app_id.to_string());
     
     let steam_root_owned = crate::core::steam::library::find_steam_root();
     if let Some(root) = steam_root.or_else(|| steam_root_owned.as_deref()) {
