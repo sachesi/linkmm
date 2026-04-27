@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::core::games::Game;
 use crate::core::mods::ModDatabase;
+use crate::core::vfs_cache::{CachedNode, ModMetadata, VfsMetadataCache, scan_directory_cached};
 
 const TTL: Duration = Duration::from_secs(1);
 pub const WHITEOUT_PREFIX: &str = ".linkmm_whiteout_";
@@ -106,15 +107,46 @@ impl ModUnionFs {
             fs.overlay(&game_proc_path, 1, uid, gid, now)?;
         }
 
+        let cache_path = game.config_dir().join("vfs_metadata.toml");
+        let mut cache = VfsMetadataCache::load(&cache_path);
+        let mut cache_updated = false;
+
         // Layers 1‥N: enabled mods, ascending priority (highest number wins)
         let mut mods: Vec<_> = db.mods.iter().filter(|m| m.enabled).collect();
         mods.sort_by_key(|m| m.priority);
         for m in mods {
             let mod_data = m.source_path.join("Data");
             let root = if mod_data.is_dir() { mod_data } else { m.source_path.clone() };
-            if root.is_dir() {
-                fs.overlay(&root, 1, uid, gid, now)?;
+            if !root.is_dir() {
+                continue;
             }
+
+            let root_mtime = root.metadata().and_then(|m| m.modified()).unwrap_or(now);
+            
+            let use_cache = if let Some(meta) = cache.mods.get(&m.id) {
+                meta.root_mtime == root_mtime
+            } else {
+                false
+            };
+
+            if use_cache {
+                let nodes = &cache.mods.get(&m.id).unwrap().nodes;
+                fs.overlay_cached(nodes, &root, 1, uid, gid, now)?;
+            } else {
+                log::debug!("Cache miss for mod {}, scanning {}", m.id, root.display());
+                let nodes = scan_directory_cached(&root);
+                fs.overlay_cached(&nodes, &root, 1, uid, gid, now)?;
+                cache.mods.insert(m.id.clone(), ModMetadata {
+                    mod_id: m.id.clone(),
+                    root_mtime,
+                    nodes,
+                });
+                cache_updated = true;
+            }
+        }
+
+        if cache_updated {
+            cache.save(&cache_path);
         }
 
         // Upper layer (writable staging) — highest priority, overrides everything
@@ -207,6 +239,64 @@ impl ModUnionFs {
                             kind: VfsNodeKind::File { parent: parent_ino, read_path: src },
                         });
                         self.insert_child(parent_ino, name.clone(), ino);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively apply cached metadata nodes to the VFS.
+    fn overlay_cached(
+        &mut self,
+        nodes: &[CachedNode],
+        base_path: &Path,
+        parent_ino: u64,
+        uid: u32,
+        gid: u32,
+        now: SystemTime,
+    ) -> Result<(), String> {
+        for node in nodes {
+            let name = OsString::from(&node.name);
+            let name_lc = node.name.to_lowercase();
+            let existing = self.child_ino_ci(parent_ino, &name_lc);
+            let src = base_path.join(&name);
+
+            if node.is_dir {
+                let child_ino = match existing {
+                    Some(ino) => ino,
+                    None => {
+                        let ino = self.next_ino;
+                        self.next_ino += 1;
+                        self.nodes.insert(ino, VfsNode {
+                            attr: dir_attr(ino, uid, gid, now),
+                            kind: VfsNodeKind::Dir { parent: parent_ino, children: HashMap::new() },
+                        });
+                        self.insert_child(parent_ino, name, ino);
+                        ino
+                    }
+                };
+                if let Some(ref children) = node.children {
+                    self.overlay_cached(children, &src, child_ino, uid, gid, now)?;
+                }
+            } else {
+                match existing {
+                    Some(ino) => {
+                        if let Some(vfs_node) = self.nodes.get_mut(&ino) {
+                            vfs_node.attr.size = node.size;
+                            vfs_node.attr.mtime = node.mtime;
+                            vfs_node.attr.blocks = blocks(node.size);
+                            vfs_node.kind = VfsNodeKind::File { parent: parent_ino, read_path: src };
+                        }
+                    }
+                    None => {
+                        let ino = self.next_ino;
+                        self.next_ino += 1;
+                        self.nodes.insert(ino, VfsNode {
+                            attr: file_attr(ino, node.size, node.mtime, uid, gid, now),
+                            kind: VfsNodeKind::File { parent: parent_ino, read_path: src },
+                        });
+                        self.insert_child(parent_ino, name, ino);
                     }
                 }
             }
