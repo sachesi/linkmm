@@ -365,8 +365,7 @@ pub fn build_umu_command(
 ) -> Result<std::process::Command, String> {
     if !is_umu_available() {
         return Err(
-            "umu-run is not installed. Configure a non-Steam game first to trigger the download."
-                .to_string(),
+            "umu-run is not installed. LinkMM requires it to manage game processes.".to_string(),
         );
     }
 
