@@ -52,20 +52,37 @@ pub(super) fn build_nexus_page(
     }
     page.append(&desc_label);
 
-    let link_btn = gtk4::LinkButton::builder()
+    let get_key_btn = gtk4::Button::builder()
         .label("Get your API key on NexusMods")
-        .uri("https://www.nexusmods.com/settings/api-keys")
         .halign(gtk4::Align::Start)
+        .css_classes(["flat", "accent"])
         .build();
-    page.append(&link_btn);
+    get_key_btn.connect_clicked(|_| {
+        let _ = gtk4::gio::AppInfo::launch_default_for_uri("https://www.nexusmods.com/settings/api-keys", None::<&gtk4::gio::AppLaunchContext>);
+    });
+    page.append(&get_key_btn);
 
     let prefs_group = adw::PreferencesGroup::new();
     let api_key_row = adw::PasswordEntryRow::builder().title("API Key").build();
+
+    let update_link_visibility = {
+        let btn = get_key_btn.clone();
+        let entry = api_key_row.clone();
+        move || {
+            btn.set_visible(entry.text().is_empty());
+        }
+    };
+
+    api_key_row.connect_changed({
+        let update = update_link_visibility.clone();
+        move |_| update()
+    });
 
     // Pre-fill the key if one is already configured
     if let Some(ref key) = existing_key {
         api_key_row.set_text(key);
     }
+    update_link_visibility();
 
     prefs_group.add(&api_key_row);
     page.append(&prefs_group);
