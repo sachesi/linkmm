@@ -619,12 +619,17 @@ pub fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
         let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if std::fs::rename(&from, &to).is_err() {
-            if from.is_dir() {
-                copy_dir_contents(&from, &to)?;
+        let name = entry.file_name();
+        let to = dst.join(&name);
+
+        if from.is_dir() {
+            if std::fs::rename(&from, &to).is_err() {
+                move_dir_contents(&from, &to)?;
                 let _ = std::fs::remove_dir_all(&from);
-            } else if from.is_file() {
+            }
+        } else {
+            // It is a file or a symlink. We do not support symlinks in VFS, but we handle them.
+            if std::fs::rename(&from, &to).is_err() {
                 if let Some(parent) = to.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Failed to create parent dir: {e}"))?;
@@ -650,7 +655,7 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
         let to = dst.join(entry.file_name());
         if from.is_dir() {
             copy_dir_contents(&from, &to)?;
-        } else if from.is_file() {
+        } else {
             if let Some(parent) = to.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     format!("Failed to create parent dir {}: {e}", parent.display())
