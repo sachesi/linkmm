@@ -86,6 +86,19 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
     scrolled.set_hscrollbar_policy(gtk4::PolicyType::Automatic);
     scrolled.set_child(Some(&text_view));
 
+    // ── Sticky Scroll Logic ──────────────────────────────────────────────
+    let vadj = scrolled.vadjustment();
+    vadj.connect_changed(|adj| {
+        let value = adj.value();
+        let upper = adj.upper();
+        let page_size = adj.page_size();
+        
+        // If we are within 50px of the bottom, snap to bottom on change.
+        if (upper - page_size - value) < 50.0 {
+            adj.set_value(upper - page_size);
+        }
+    });
+
     toolbar_view.set_content(Some(&scrolled));
     win.set_content(Some(&toolbar_view));
 
@@ -105,7 +118,6 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
         let tag_warn_c = tag_warn.clone();
         let tag_info_c = tag_info.clone();
         let tag_time_c = tag_time.clone();
-        let scrolled_c = scrolled.clone();
 
         move || {
             let entries = logger::get_logs();
@@ -162,9 +174,11 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
 
             *rendered_count_c.borrow_mut() = entries.len();
 
-            // Auto-scroll to bottom
-            let vadj = scrolled_c.vadjustment();
-            vadj.set_value(vadj.upper() - vadj.page_size());
+            // Auto-scroll to bottom after GTK finishes layout
+            let vadj = scrolled.vadjustment();
+            glib::idle_add_local_once(move || {
+                vadj.set_value(vadj.upper() - vadj.page_size());
+            });
         }
     };
 
