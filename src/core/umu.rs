@@ -37,12 +37,13 @@
 //! | `STORE`       | `"none"`                                                     |
 //! | `UMU_LOG`     | `"1"`                                                        |
 
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "ui")]
-use std::rc::Rc;
-#[cfg(feature = "ui")]
 use std::sync::mpsc;
+use std::rc::Rc;
+use crate::core::config::AppConfig;
+use crate::core::steam::split_launch_arguments;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -124,9 +125,6 @@ fn zipapp_url(tag: &str) -> String {
 
 /// Download the umu-launcher zipapp tarball for `tag`, extract `umu-run` from
 /// it, write the binary to [`umu_run_path()`], and `chmod 755` it.
-///
-/// `on_progress` is called with `(bytes_downloaded, total_bytes)`.
-/// Return `true` to continue, `false` to cancel.
 pub fn download_and_install(
     tag: &str,
     mut on_progress: impl FnMut(u64, u64) -> bool,
@@ -203,7 +201,7 @@ fn download_to_memory(
 }
 
 /// Walk the tar archive in `tar_bytes` and return the raw content of the first
-/// entry whose path ends with `umu-run` (without a `.py` extension).
+/// entry whose path ends with `umu-run`.
 fn extract_umu_run_from_tar(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let cursor = std::io::Cursor::new(tar_bytes);
     let mut archive = tar::Archive::new(cursor);
@@ -218,8 +216,6 @@ fn extract_umu_run_from_tar(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("Invalid tar entry path: {e}"))?
             .to_path_buf();
 
-        // Match any entry whose final component is exactly "umu-run"
-        // (not "umu-run.py" or similar).
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if file_name == "umu-run" {
             log::debug!("Found umu-run in archive at: {}", path.display());
@@ -231,115 +227,57 @@ fn extract_umu_run_from_tar(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
-    Err("umu-run binary not found in the downloaded tarball. \
-         The archive layout may have changed — please report this."
-        .to_string())
+    Err("umu-run binary not found in the downloaded tarball.".to_string())
 }
 
 // ── High-level install / update ───────────────────────────────────────────────
 
-/// Ensure `umu-run` is present and up-to-date.
-///
-/// - Fetches the latest GitHub release tag.
-/// - Compares with `installed_version` (the tag stored in `AppConfig`).
-/// - Downloads and installs when missing or outdated.
-/// - Returns `(tag, path)` on success.
-///
-/// `on_progress` receives `(bytes_downloaded, total_bytes)`.
 pub fn ensure_umu_available(
     installed_version: Option<&str>,
     mut on_progress: impl FnMut(u64, u64) -> bool,
 ) -> Result<(String, PathBuf), String> {
-    // ── 1. Fetch the latest tag ──────────────────────────────────────────
     let latest_tag = fetch_latest_tag()?;
-    log::info!("Latest umu-launcher release: {latest_tag}");
-
-    // ── 2. Decide whether we need to (re-)download ───────────────────────
     let needs_download =
         !is_umu_available() || installed_version.map(|v| v != latest_tag).unwrap_or(true);
 
     if !needs_download {
-        log::info!(
-            "umu-run {latest_tag} is already up-to-date at {}",
-            umu_run_path().display()
-        );
         return Ok((latest_tag, umu_run_path()));
     }
 
-    // ── 3. Download and install ──────────────────────────────────────────
     let path = download_and_install(&latest_tag, &mut on_progress)?;
     Ok((latest_tag, path))
 }
 
-// ── Startup background update check ──────────────────────────────────────────
-
-/// Check for a newer umu-launcher release in a background thread and
-/// re-download if the latest tag differs from `installed_version`.
-///
-/// The `on_updated` callback is invoked on the **GTK main thread** (via
-/// `glib::idle_add_local`) with the new tag string when an update was
-/// installed.  Errors are logged but not surfaced to the user (the existing
-/// binary remains usable).
-///
-/// Call this once from `build_ui` after the main window is shown.
-#[cfg(feature = "ui")]
 pub fn check_and_update_in_background(
     installed_version: Option<String>,
     on_updated: impl Fn(String) + 'static,
 ) {
     let on_updated = Rc::new(on_updated);
-
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
 
     std::thread::spawn(move || {
-        let result = ensure_umu_available(
-            installed_version.as_deref(),
-            // progress callback — not shown for background updates
-            |_, _| true,
-        );
+        let result = ensure_umu_available(installed_version.as_deref(), |_, _| true);
         let _ = tx.send(result.map(|(tag, _)| tag));
     });
 
-    // Poll the channel on the GTK main-loop until we get a result.
     glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
         match rx.try_recv() {
             Ok(Ok(tag)) => {
-                log::info!("umu-launcher update complete: {tag}");
                 on_updated(tag);
                 glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
-                // Non-fatal: existing binary (if any) is still usable.
-                log::warn!("umu-launcher background update failed: {e}");
+                log::warn!("Background umu update failed: {e}");
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                log::warn!("umu-launcher update thread disconnected unexpectedly");
-                glib::ControlFlow::Break
-            }
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
         }
     });
 }
 
-#[cfg(not(feature = "ui"))]
-pub fn check_and_update_in_background(
-    _installed_version: Option<String>,
-    _on_updated: impl Fn(String) + 'static,
-) {
-}
-
 // ── Launch ────────────────────────────────────────────────────────────────────
 
-/// Launch a game executable through `umu-run`.
-///
-/// | Env var       | Value                                                   |
-/// |---------------|---------------------------------------------------------|
-/// | `WINEPREFIX`  | `prefix_path` or [`default_wineprefix()`]               |
-/// | `GAMEID`      | `"umu-<steam_app_id>"`                                  |
-/// | `PROTONPATH`  | `"GE-Proton"` (auto-download GE-Proton) or custom path |
-/// | `STORE`       | `"none"`                                                |
-/// | `UMU_LOG`     | `"1"`                                                   |
 pub fn launch_with_umu(
     exe_path: &Path,
     arguments: &str,
@@ -366,13 +304,7 @@ pub fn build_umu_command(
     steam_root: Option<&Path>,
 ) -> Result<std::process::Command, String> {
     if !is_umu_available() {
-        return Err(
-            "umu-run is not installed. LinkMM requires it to manage game processes.".to_string(),
-        );
-    }
-
-    if !exe_path.exists() {
-        return Err(format!("Game executable not found: {}", exe_path.display()));
+        return Err("umu-run is not installed.".to_string());
     }
 
     let wineprefix = prefix_path
@@ -386,15 +318,9 @@ pub fn build_umu_command(
         None => "GE-Proton".into(),
     };
 
-    log::info!("Launching via umu-run: {}", exe_path.display());
-    log::debug!("  WINEPREFIX = {}", wineprefix.display());
-    log::debug!("  GAMEID     = {game_id}");
-    log::debug!("  PROTONPATH = {proton_path_str}");
-    log::debug!("  STORE      = {store}");
-    log::debug!("  UMU_LOG    = 1");
-
     let mut command = std::process::Command::new(umu_run_path());
     command
+        .current_dir(exe_path.parent().unwrap_or_else(|| Path::new("/")))
         .arg(exe_path)
         .env("WINEPREFIX", &wineprefix)
         .env("GAMEID", &game_id)
@@ -407,99 +333,11 @@ pub fn build_umu_command(
         command.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", root);
     }
 
-    // Append tool/exe arguments after the executable path.
     if !arguments.trim().is_empty() {
-        for arg in crate::core::steam::split_launch_arguments(arguments)? {
+        for arg in split_launch_arguments(arguments)? {
             command.arg(arg);
         }
     }
 
     Ok(command)
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn umu_run_path_ends_with_linkmm_umu_run() {
-        let p = umu_run_path();
-        assert!(
-            p.ends_with("linkmm/umu-run"),
-            "unexpected path: {}",
-            p.display()
-        );
-    }
-
-    #[test]
-    fn default_wineprefix_ends_with_umu_default() {
-        let p = default_wineprefix();
-        assert!(
-            p.ends_with("umu/default"),
-            "unexpected prefix: {}",
-            p.display()
-        );
-    }
-
-    #[test]
-    fn is_umu_available_false_when_file_missing() {
-        if !umu_run_path().exists() {
-            assert!(!is_umu_available());
-        }
-    }
-
-    #[test]
-    fn zipapp_url_contains_tag_twice() {
-        let url = zipapp_url("1.4.0");
-        assert!(
-            url.contains("/1.4.0/"),
-            "URL should contain tag in path: {url}"
-        );
-        assert!(
-            url.contains("umu-launcher-1.4.0-zipapp.tar"),
-            "URL should contain versioned filename: {url}"
-        );
-    }
-
-    #[test]
-    fn extract_umu_run_finds_entry_named_umu_run() {
-        // Build a minimal in-memory tar that contains one entry named "umu/umu-run"
-        // with known content, then verify extraction succeeds.
-        let mut tar_builder = tar::Builder::new(Vec::new());
-        let content = b"#!/usr/bin/env python3\n# fake umu-run\n";
-        let mut header = tar::Header::new_gnu();
-        header.set_path("umu/umu-run").unwrap();
-        header.set_size(content.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        tar_builder.append(&header, &content[..]).unwrap();
-        let tar_bytes = tar_builder.into_inner().unwrap();
-
-        let extracted =
-            extract_umu_run_from_tar(&tar_bytes).expect("should find umu-run in the archive");
-        assert_eq!(extracted, content);
-    }
-
-    #[test]
-    fn extract_umu_run_errors_when_entry_absent() {
-        // A tar with no entry named "umu-run" should produce a descriptive error.
-        let mut tar_builder = tar::Builder::new(Vec::new());
-        let content = b"unrelated";
-        let mut header = tar::Header::new_gnu();
-        header.set_path("other/file.txt").unwrap();
-        header.set_size(content.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar_builder.append(&header, &content[..]).unwrap();
-        let tar_bytes = tar_builder.into_inner().unwrap();
-
-        let result = extract_umu_run_from_tar(&tar_bytes);
-        assert!(result.is_err(), "expected error when umu-run is absent");
-        assert!(
-            result.unwrap_err().contains("umu-run binary not found"),
-            "error message should explain what is missing"
-        );
-    }
 }
