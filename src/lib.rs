@@ -14,4 +14,5 @@ pub mod core {
     pub mod steam;
     pub mod umu;
     pub mod vfs;
+    pub mod vfs_cache;
 }
