@@ -1,5 +1,6 @@
 target/
 debug/
+result/
 
 # backups
 **/*.rs.bk
