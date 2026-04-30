@@ -1,4 +1,4 @@
-use crate::core::config::ToolConfig;
+use crate::core::config::{AppConfig, ToolConfig};
 use crate::core::games::{Game, GameLauncherSource};
 use crate::core::mods::ModDatabase;
 use crate::core::vfs::{MountHandle, mount_mod_vfs, mount_tool_vfs};
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_LOG_LINES: usize = 600;
 
@@ -110,12 +110,19 @@ fn session_registry_path() -> PathBuf {
 
 impl RuntimeSessionManager {
     fn save_sessions(&self) {
-        let active_sessions: Vec<ManagedSession> = self.inner.sessions.lock().expect("lock").values()
+        let active_sessions: Vec<ManagedSession> = self
+            .inner
+            .sessions
+            .lock()
+            .expect("lock")
+            .values()
             .map(|s| s.session.clone())
             .filter(|s| matches!(s.status, SessionStatus::Starting | SessionStatus::Running))
             .collect();
-        
-        let registry = SessionRegistry { sessions: active_sessions };
+
+        let registry = SessionRegistry {
+            sessions: active_sessions,
+        };
         if let Ok(content) = toml::to_string_pretty(&registry) {
             let path = session_registry_path();
             if let Some(parent) = path.parent() {
@@ -208,29 +215,34 @@ impl RuntimeSessionManager {
         Ok(())
     }
 
-    pub fn start_game_session(
-        &self,
-        game: Game,
-    ) -> Result<u64, String> {
+    pub fn start_game_session(&self, game: Game) -> Result<u64, String> {
         if self.current_game_session(&game.id).is_some() {
             return Err("A game session is already active for this game instance".to_string());
         }
-
-        // Ensure UMU is available before proceeding
-        if !crate::core::umu::is_umu_available() {
-            return Err("umu-launcher is not installed. Please try again or check settings.".to_string());
+        if game.launcher_source == GameLauncherSource::Steam
+            && !game.kind.is_phase1_steam_redirector_target()
+        {
+            return Err(format!(
+                "Phase 1 Steam session support is currently limited to Skyrim SE/AE. {} is not enabled yet.",
+                game.kind.display_name()
+            ));
         }
 
         let db = ModDatabase::load(&game);
         if let Err(e) = db.write_plugins_txt(&game) {
             log::warn!("Failed to write plugins.txt before game launch: {e}");
         }
-        let vfs_mount = mount_mod_vfs(&game, &db).map_err(|e| {
-            format!("Failed to mount mod VFS: {e}")
-        })?;
+        let vfs_mount =
+            mount_mod_vfs(&game, &db).map_err(|e| format!("Failed to mount mod VFS: {e}"))?;
 
         let command = match game.launcher_source {
             GameLauncherSource::NonSteamUmu => {
+                if !crate::core::umu::is_umu_available() {
+                    return Err(
+                        "umu-launcher is not installed. Please try again or check settings."
+                            .to_string(),
+                    );
+                }
                 let umu = game.validate_umu_setup()?;
                 let app_id = game.kind.primary_steam_app_id().unwrap_or(0);
                 crate::core::umu::build_umu_command(
@@ -242,36 +254,17 @@ impl RuntimeSessionManager {
                     "none",
                     None,
                 )?
-                }
-                GameLauncherSource::Steam => {
+            }
+            GameLauncherSource::Steam => {
                 let app_id = game.steam_instance_app_id().unwrap_or(0);
+                let preferred_exe = AppConfig::load_or_default()
+                    .game_settings_ref(&game.id)
+                    .and_then(|settings| settings.steam_redirect_exe.clone());
+                let exe_path = resolve_phase1_steam_exe_path(&game, preferred_exe.as_deref())?;
 
-                let mut exe_path = None;
-                for exe in game.kind.expected_executable_names() {
-                    let path = game.root_path.join(exe);
-                    if path.exists() {
-                        exe_path = Some(path);
-                        break;
-                    }
-                }
-                let exe_path = exe_path.ok_or_else(|| "Could not find game executable in root path".to_string())?;
-
-                let (proton_path, compatdata_path) = crate::core::steam::proton::find_proton_for_game(app_id)?;
-                let prefix_path = compatdata_path.join("pfx");
-
-                crate::core::umu::build_umu_command(
-                    &exe_path,
-                    "",
-                    app_id,
-                    Some(&prefix_path),
-                    Some(&proton_path),
-                    "steam",
-                    crate::core::steam::library::find_steam_root().as_deref(),
-                )?
-                }
-
-                };
-
+                crate::core::steam::build_game_command(&exe_path, app_id)?
+            }
+        };
 
         self.spawn_managed_session(
             SessionStart {
@@ -325,10 +318,11 @@ impl RuntimeSessionManager {
                     "none",
                     None,
                 )?
-                }
-                GameLauncherSource::Steam => {
+            }
+            GameLauncherSource::Steam => {
                 let app_id = game.steam_instance_app_id().unwrap_or(tool.app_id);
-                let (proton_path, compatdata_path) = crate::core::steam::proton::find_proton_for_game(app_id)?;
+                let (proton_path, compatdata_path) =
+                    crate::core::steam::proton::find_proton_for_game(app_id)?;
                 let prefix_path = compatdata_path.join("pfx");
 
                 crate::core::umu::build_umu_command(
@@ -340,16 +334,13 @@ impl RuntimeSessionManager {
                     "steam",
                     crate::core::steam::library::find_steam_root().as_deref(),
                 )?
-                }
-
-                };
-
+            }
+        };
 
         let db = ModDatabase::load(&game);
         // Use writable overlay VFS for tool sessions so tools can write output files
-        let vfs_mount = mount_tool_vfs(&game, &db, &tool.id).map_err(|e| {
-            format!("Failed to mount tool VFS: {e}")
-        })?;
+        let vfs_mount = mount_tool_vfs(&game, &db, &tool.id)
+            .map_err(|e| format!("Failed to mount tool VFS: {e}"))?;
 
         let scratch_dir = vfs_mount.writable_upper.clone();
         let id = self
@@ -387,7 +378,7 @@ impl RuntimeSessionManager {
             .command
             .spawn()
             .map_err(|e| format!("Failed to spawn managed session: {e}"))?;
-        
+
         let pid = Some(child.id());
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -439,9 +430,18 @@ impl RuntimeSessionManager {
                     .take()
                     .ok_or_else(|| "Session process handle missing".to_string())
                     .and_then(|mut child| {
+                        let child_pid = child.id();
                         child
                             .wait()
                             .map_err(|e| format!("Failed waiting for managed session: {e}"))
+                            .and_then(|status| {
+                                #[cfg(unix)]
+                                wait_for_process_group_exit(
+                                    child_pid,
+                                    control_for_wait.stop_requested.load(Ordering::SeqCst),
+                                )?;
+                                Ok(status)
+                            })
                     })
             };
 
@@ -537,6 +537,165 @@ impl RuntimeSessionManager {
     }
 }
 
+#[cfg(unix)]
+fn wait_for_process_group_exit(pgid: u32, stop_requested: bool) -> Result<(), String> {
+    let start = Instant::now();
+    let mut sigkill_sent = false;
+
+    while process_group_exists(pgid) {
+        if stop_requested && !sigkill_sent && start.elapsed() >= Duration::from_secs(5) {
+            unsafe {
+                libc::kill(-(pgid as i32), libc::SIGKILL);
+            }
+            sigkill_sent = true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_group_exists(pgid: u32) -> bool {
+    unsafe { libc::kill(-(pgid as i32), 0) == 0 }
+}
+
+fn resolve_phase1_steam_exe_path(
+    game: &Game,
+    preferred_exe: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(preferred) = preferred_exe {
+        let preferred_path = game.root_path.join(preferred);
+        if preferred_path.exists() {
+            return Ok(preferred_path);
+        }
+    }
+
+    for exe in game.kind.phase1_steam_launch_candidates() {
+        let path = game.root_path.join(exe);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    Err("Could not find game executable in root path".to_string())
+}
+
+fn resolve_phase1_steam_game(
+    config: &AppConfig,
+    app_id: u32,
+    requested_game_id: Option<&str>,
+) -> Result<Game, String> {
+    let mut matches: Vec<Game> = config
+        .games
+        .iter()
+        .filter(|game| {
+            game.launcher_source == GameLauncherSource::Steam
+                && game.steam_instance_app_id() == Some(app_id)
+                && game.kind.is_phase1_steam_redirector_target()
+        })
+        .cloned()
+        .collect();
+
+    if matches.is_empty() {
+        return Err(format!(
+            "No configured phase-1 Steam game instance found for app id {app_id}."
+        ));
+    }
+
+    if let Some(requested_game_id) = requested_game_id {
+        return matches
+            .into_iter()
+            .find(|game| game.id == requested_game_id)
+            .ok_or_else(|| {
+                format!(
+                    "Configured game id {requested_game_id} does not match any phase-1 Steam game instance for app id {app_id}."
+                )
+            });
+    }
+
+    if let Some(current_id) = config.current_game_id.as_deref()
+        && let Some(game) = matches.iter().find(|game| game.id == current_id)
+    {
+        return Ok(game.clone());
+    }
+
+    if let Ok(current_dir) = std::env::current_dir()
+        && let Some(game) = matches.iter().find(|game| game.root_path == current_dir)
+    {
+        return Ok(game.clone());
+    }
+
+    if matches.len() == 1 {
+        return Ok(matches.remove(0));
+    }
+
+    Err(format!(
+        "Multiple configured phase-1 Steam game instances match app id {app_id}. Use a launch option generated for one exact configured game instance."
+    ))
+}
+
+pub fn run_phase1_steam_session(
+    app_id: u32,
+    requested_game_id: Option<&str>,
+) -> Result<i32, String> {
+    let mut config = AppConfig::load_or_default();
+    config.apply_mods_base_dirs();
+    let game = resolve_phase1_steam_game(&config, app_id, requested_game_id)?;
+    let manager = global_runtime_manager();
+    let id = manager.start_game_session(game)?;
+
+    loop {
+        let session = manager
+            .sessions()
+            .into_iter()
+            .find(|session| session.id == id)
+            .ok_or_else(|| format!("Managed session {id} disappeared unexpectedly"))?;
+
+        match session.status {
+            SessionStatus::Starting | SessionStatus::Running => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            SessionStatus::Exited => return Ok(session.exit_code.unwrap_or(0)),
+            SessionStatus::Killed => return Ok(session.exit_code.unwrap_or(130)),
+            SessionStatus::Failed => {
+                return Err(format!(
+                    "Steam session failed{}",
+                    session
+                        .exit_code
+                        .map(|code| format!(" with exit code {code}"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+}
+
+pub fn build_phase1_steam_launch_option(app_id: u32, game_id: &str) -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to locate current linkmm binary: {e}"))?;
+    Ok(format!(
+        "{} --steam-session {app_id} --game-id {}",
+        shell_quote_path(&exe),
+        shell_quote_value(game_id)
+    ))
+}
+
+fn shell_quote_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    if !raw.contains([' ', '\t', '"', '\'']) {
+        return raw.into_owned();
+    }
+    format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn shell_quote_value(value: &str) -> String {
+    if !value.contains([' ', '\t', '"', '\'']) {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 impl Default for RuntimeSessionManager {
     fn default() -> Self {
         Self::new()
@@ -606,11 +765,93 @@ mod tests {
         assert!(logs.iter().any(|l| l.message.contains("err")));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn steam_launches_are_not_managed_sessions() {
+    fn session_waits_for_process_group_descendants() {
         let manager = RuntimeSessionManager::new();
-        let game = Game::new_steam(crate::core::games::GameKind::SkyrimSE, "/tmp/game".into());
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 0.4 & exit 0");
+        let (id, _) = manager
+            .spawn_managed_session(
+                SessionStart {
+                    kind: SessionKind::Game,
+                    game_id: "g".to_string(),
+                    tool_id: None,
+                    launcher_source: GameLauncherSource::NonSteamUmu,
+                    command: cmd,
+                    completion: None,
+                    vfs_mount: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let early = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(early.status, SessionStatus::Running);
+
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let late = manager.sessions().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(late.status, SessionStatus::Exited);
+    }
+
+    #[test]
+    fn steam_phase1_blocks_unlisted_games() {
+        let manager = RuntimeSessionManager::new();
+        let game = Game::new_steam(crate::core::games::GameKind::Fallout4, "/tmp/game".into());
         let err = manager.start_game_session(game).unwrap_err();
-        assert!(err.contains("launch-only"));
+        assert!(err.contains("Phase 1 Steam session support"));
+    }
+
+    #[test]
+    fn resolve_phase1_steam_game_prefers_current_game() {
+        let game = Game::new_steam(crate::core::games::GameKind::SkyrimSE, "/tmp/skyrim".into());
+        let game_id = game.id.clone();
+        let config = AppConfig {
+            current_game_id: Some(game_id),
+            games: vec![game.clone()],
+            ..AppConfig::default()
+        };
+        let resolved = resolve_phase1_steam_game(&config, 489830, None).unwrap();
+        assert_eq!(resolved.id, game.id);
+    }
+
+    #[test]
+    fn resolve_phase1_steam_exe_path_prefers_saved_target_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("SkyrimSE.exe"), b"").unwrap();
+        std::fs::write(tmp.path().join("skse64_loader.exe"), b"").unwrap();
+        let game = Game::new_steam(
+            crate::core::games::GameKind::SkyrimSE,
+            tmp.path().to_path_buf(),
+        );
+        let resolved = resolve_phase1_steam_exe_path(&game, Some("skse64_loader.exe")).unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "skse64_loader.exe");
+    }
+
+    #[test]
+    fn resolve_phase1_steam_game_honors_requested_game_id() {
+        let game_a = Game::new_steam(
+            crate::core::games::GameKind::SkyrimSE,
+            "/tmp/skyrim_a".into(),
+        );
+        let requested_id = game_a.id.clone();
+        let game_b = Game::new_steam(
+            crate::core::games::GameKind::SkyrimSE,
+            "/tmp/skyrim_b".into(),
+        );
+        let config = AppConfig {
+            games: vec![game_a.clone(), game_b],
+            ..AppConfig::default()
+        };
+        let resolved = resolve_phase1_steam_game(&config, 489830, Some(&requested_id)).unwrap();
+        assert_eq!(resolved.id, requested_id);
+    }
+
+    #[test]
+    fn build_phase1_steam_launch_option_includes_game_id() {
+        let launch_option = build_phase1_steam_launch_option(489830, "game-123").unwrap();
+        assert!(launch_option.contains("--steam-session 489830"));
+        assert!(launch_option.contains("--game-id game-123"));
     }
 }

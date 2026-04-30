@@ -220,7 +220,11 @@ fn show_tool_dialog(
     toast_overlay: &adw::ToastOverlay,
 ) {
     let dialog = adw::Dialog::new();
-    dialog.set_title(if tool_id.is_some() { "Edit Tool" } else { "Add Tool" });
+    dialog.set_title(if tool_id.is_some() {
+        "Edit Tool"
+    } else {
+        "Add Tool"
+    });
 
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -517,9 +521,7 @@ fn show_keep_discard_dialog(
 
     let status = adw::StatusPage::builder()
         .title(format!("{} created new files", tool_name))
-        .description(
-            "The tool wrote files to the game Data directory. What should happen to them?",
-        )
+        .description("The tool wrote files to the game Data directory. What should happen to them?")
         .build();
     content.append(&status);
 
@@ -545,7 +547,10 @@ fn show_keep_discard_dialog(
     let tool_name_c = tool_name.clone();
     discard_btn.connect_clicked(move |_| {
         crate::core::io::rm_rf(&scratch_dir_c);
-        toast_overlay_c.add_toast(adw::Toast::new(&format!("{} output discarded", tool_name_c)));
+        toast_overlay_c.add_toast(adw::Toast::new(&format!(
+            "{} output discarded",
+            tool_name_c
+        )));
         dialog_clone.close();
     });
 
@@ -578,11 +583,14 @@ fn show_keep_discard_dialog(
     }
 }
 
-fn create_mod_from_scratch(game: &Game, scratch_dir: &Path, tool_name: &str) -> Result<String, String> {
+fn create_mod_from_scratch(
+    game: &Game,
+    scratch_dir: &Path,
+    tool_name: &str,
+) -> Result<String, String> {
     let mod_dir = crate::core::mods::ModManager::create_mod_directory(game)?;
     let data_dir = mod_dir.join("Data");
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("Failed to create Data dir: {e}"))?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("Failed to create Data dir: {e}"))?;
     crate::core::installer::extract::move_dir_contents(scratch_dir, &data_dir)?;
 
     let mod_name = format!("{} Output", tool_name);

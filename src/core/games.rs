@@ -27,6 +27,10 @@ fn default_launcher_source() -> GameLauncherSource {
 }
 
 impl GameKind {
+    pub fn is_phase1_steam_redirector_target(&self) -> bool {
+        matches!(self, GameKind::SkyrimSE)
+    }
+
     pub fn display_name(&self) -> &str {
         match self {
             GameKind::SkyrimSE => "The Elder Scrolls V: Skyrim Special Edition",
@@ -267,6 +271,22 @@ impl GameKind {
             ],
             GameKind::Fallout3 => &["Fallout3.exe", "FalloutLauncher.exe", "fose_loader.exe"],
             GameKind::Starfield => &["Starfield.exe", "sfse_loader.exe"],
+        }
+    }
+
+    pub fn phase1_steam_launch_candidates(&self) -> &'static [&'static str] {
+        match self {
+            GameKind::SkyrimSE => &["SkyrimSELauncher.exe", "SkyrimSE.exe", "skse64_loader.exe"],
+            _ => &[],
+        }
+    }
+
+    pub fn phase1_steam_target_label(&self, exe_name: &str) -> &'static str {
+        match (self, exe_name) {
+            (GameKind::SkyrimSE, "SkyrimSELauncher.exe") => "Skyrim launcher",
+            (GameKind::SkyrimSE, "SkyrimSE.exe") => "SkyrimSE.exe",
+            (GameKind::SkyrimSE, "skse64_loader.exe") => "SKSE",
+            _ => "Custom target",
         }
     }
 }

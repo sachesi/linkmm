@@ -19,7 +19,9 @@ pub struct ToolConfig {
     pub app_id: u32,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 // ── Per-game settings ─────────────────────────────────────────────────────────
 
@@ -41,6 +43,11 @@ pub struct GameSettings {
     /// External tools configured for this game.
     #[serde(default)]
     pub tools: Vec<ToolConfig>,
+    /// Preferred executable name for Steam redirector sessions.
+    ///
+    /// `None` means use the game's built-in phase-specific default order.
+    #[serde(default)]
+    pub steam_redirect_exe: Option<String>,
 }
 
 impl Default for GameSettings {
@@ -49,6 +56,7 @@ impl Default for GameSettings {
             app_data_dir: None,
             installed_archives: Vec::new(),
             tools: Vec::new(),
+            steam_redirect_exe: None,
         }
     }
 }
@@ -159,6 +167,7 @@ impl AppConfig {
             app_data_dir: self.app_data_dir.clone(),
             installed_archives: self.installed_archives.clone(),
             tools: Vec::new(),
+            steam_redirect_exe: None,
         };
         for game in &self.games {
             self.game_settings

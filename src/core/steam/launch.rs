@@ -3,6 +3,39 @@ use std::path::{Path, PathBuf};
 use super::library::{find_steam_root, is_path_in_flatpak};
 use super::proton::find_proton_for_game;
 
+pub fn build_game_command(
+    exe_path: &PathBuf,
+    app_id: u32,
+) -> Result<std::process::Command, String> {
+    let (proton_path, compatdata_path) = find_proton_for_game(app_id)?;
+    let proton_script = proton_path.join("proton");
+    if !proton_script.exists() {
+        return Err(format!(
+            "Proton script not found at {}",
+            proton_script.display()
+        ));
+    }
+    if !exe_path.exists() {
+        return Err(format!("Executable not found at {}", exe_path.display()));
+    }
+    let steam_root =
+        find_steam_root().ok_or_else(|| "Could not find Steam installation".to_string())?;
+    if is_path_in_flatpak(&proton_path) || is_path_in_flatpak(&compatdata_path) {
+        return Err(
+            "Flatpak Steam requires a Flatpak build of linkmm. Native linkmm only supports native Steam."
+                .to_string(),
+        );
+    }
+    build_native_tool_command(
+        &proton_script,
+        exe_path,
+        "",
+        &steam_root,
+        &compatdata_path,
+        app_id,
+    )
+}
+
 /// Build a tool launch command without spawning (useful for testing or managed sessions).
 pub fn build_tool_command(
     exe_path: &PathBuf,
@@ -12,7 +45,10 @@ pub fn build_tool_command(
     let (proton_path, compatdata_path) = find_proton_for_game(app_id)?;
     let proton_script = proton_path.join("proton");
     if !proton_script.exists() {
-        return Err(format!("Proton script not found at {}", proton_script.display()));
+        return Err(format!(
+            "Proton script not found at {}",
+            proton_script.display()
+        ));
     }
     if !exe_path.exists() {
         return Err(format!("Executable not found at {}", exe_path.display()));
@@ -77,8 +113,14 @@ fn build_flatpak_tool_command(
     let mut command = std::process::Command::new("flatpak");
     command
         .arg("run")
-        .arg(format!("--env=STEAM_COMPAT_CLIENT_INSTALL_PATH={}", steam_root.display()))
-        .arg(format!("--env=STEAM_COMPAT_DATA_PATH={}", compatdata_path.display()))
+        .arg(format!(
+            "--env=STEAM_COMPAT_CLIENT_INSTALL_PATH={}",
+            steam_root.display()
+        ))
+        .arg(format!(
+            "--env=STEAM_COMPAT_DATA_PATH={}",
+            compatdata_path.display()
+        ))
         .arg(format!("--env=SteamAppId={app_id}"))
         .arg(format!("--env=SteamGameId={app_id}"))
         .arg(format!("--env=STEAM_APPID={app_id}"))
@@ -203,7 +245,13 @@ mod tests {
         assert!(args.iter().any(|a| a == "--profile"));
         assert!(args.iter().any(|a| a == "Default Profile"));
         assert!(args.iter().any(|a| a == "out dir"));
-        assert!(args.iter().any(|a| a.starts_with("--env=SteamAppId=489830")));
-        assert!(args.iter().any(|a| a.starts_with("--env=SteamGameId=489830")));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("--env=SteamAppId=489830"))
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("--env=SteamGameId=489830"))
+        );
     }
 }

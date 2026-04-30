@@ -58,7 +58,10 @@ pub(super) fn build_nexus_page(
         .css_classes(["flat", "accent"])
         .build();
     get_key_btn.connect_clicked(|_| {
-        let _ = gtk4::gio::AppInfo::launch_default_for_uri("https://www.nexusmods.com/settings/api-keys", None::<&gtk4::gio::AppLaunchContext>);
+        let _ = gtk4::gio::AppInfo::launch_default_for_uri(
+            "https://www.nexusmods.com/settings/api-keys",
+            None::<&gtk4::gio::AppLaunchContext>,
+        );
     });
     page.append(&get_key_btn);
 

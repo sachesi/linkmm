@@ -544,7 +544,6 @@ pub(super) fn show_move_to_position_dialog_for_mod(
     );
 }
 
-
 fn open_in_file_manager(path: &Path) {
     let file = gio::File::for_path(path);
     let uri = file.uri();

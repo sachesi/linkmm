@@ -12,9 +12,7 @@
         pkgs = import nixpkgs {
           inherit system;
         };
-      in
-      {
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+        linkmm = pkgs.rustPlatform.buildRustPackage {
           pname = "linkmm";
           version = "0.1.0";
           src = ./.;
@@ -40,6 +38,11 @@
             zlib
           ];
 
+          postInstall = ''
+            install -Dm644 ${./io.github.sachesi.linkmm.desktop} \
+              $out/share/applications/io.github.sachesi.linkmm.desktop
+          '';
+
           meta = {
             description = "Link Mod Manager - A mod manager for Bethesda games";
             homepage = "https://github.com/sachesi/linkmm";
@@ -47,6 +50,16 @@
             mainProgram = "linkmm";
           };
         };
+      in
+      {
+        packages.linkmm = linkmm;
+        packages.default = linkmm;
+
+        apps.linkmm = {
+          type = "app";
+          program = "${linkmm}/bin/linkmm";
+        };
+        apps.default = self.apps.${system}.linkmm;
 
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [

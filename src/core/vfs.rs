@@ -1,6 +1,6 @@
 use fuser::{
-    BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyCreate, Request, TimeOrNow,
+    BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEntry, Request, TimeOrNow,
 };
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -8,8 +8,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::core::games::Game;
@@ -34,9 +34,7 @@ enum VfsNodeKind {
         read_path: PathBuf,
     },
     /// A marker that this file has been deleted in the writable overlay.
-    Whiteout {
-        parent: u64,
-    },
+    Whiteout { parent: u64 },
 }
 
 struct VfsNode {
@@ -97,10 +95,16 @@ impl ModUnionFs {
         };
 
         // Root inode = 1 (required by FUSE spec)
-        fs.nodes.insert(1, VfsNode {
-            attr: dir_attr(1, uid, gid, now),
-            kind: VfsNodeKind::Dir { parent: 1, children: HashMap::new() },
-        });
+        fs.nodes.insert(
+            1,
+            VfsNode {
+                attr: dir_attr(1, uid, gid, now),
+                kind: VfsNodeKind::Dir {
+                    parent: 1,
+                    children: HashMap::new(),
+                },
+            },
+        );
 
         // Layer 0: real game Data/ (lowest priority — every mod overrides it)
         if !game_proc_path.as_os_str().is_empty() {
@@ -116,13 +120,17 @@ impl ModUnionFs {
         mods.sort_by_key(|m| m.priority);
         for m in mods {
             let mod_data = m.source_path.join("Data");
-            let root = if mod_data.is_dir() { mod_data } else { m.source_path.clone() };
+            let root = if mod_data.is_dir() {
+                mod_data
+            } else {
+                m.source_path.clone()
+            };
             if !root.is_dir() {
                 continue;
             }
 
             let root_mtime = root.metadata().and_then(|m| m.modified()).unwrap_or(now);
-            
+
             let use_cache = if let Some(meta) = cache.mods.get(&m.id) {
                 meta.root_mtime == root_mtime
             } else {
@@ -136,11 +144,14 @@ impl ModUnionFs {
                 log::debug!("Cache miss for mod {}, scanning {}", m.id, root.display());
                 let nodes = scan_directory_cached(&root);
                 fs.overlay_cached(&nodes, &root, 1, uid, gid, now)?;
-                cache.mods.insert(m.id.clone(), ModMetadata {
-                    mod_id: m.id.clone(),
-                    root_mtime,
-                    nodes,
-                });
+                cache.mods.insert(
+                    m.id.clone(),
+                    ModMetadata {
+                        mod_id: m.id.clone(),
+                        root_mtime,
+                        nodes,
+                    },
+                );
                 cache_updated = true;
             }
         }
@@ -161,7 +172,10 @@ impl ModUnionFs {
             "VFS built: {} inodes for {} enabled mods, writable_upper={}",
             fs.nodes.len(),
             db.mods.iter().filter(|m| m.enabled).count(),
-            fs.writable_upper.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string())
+            fs.writable_upper
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
         );
         Ok(fs)
     }
@@ -186,7 +200,7 @@ impl ModUnionFs {
             }
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            
+
             // Handle whiteouts
             if name_str.starts_with(WHITEOUT_PREFIX) {
                 let target_name = &name_str[WHITEOUT_PREFIX.len()..];
@@ -200,7 +214,9 @@ impl ModUnionFs {
                 continue;
             }
 
-            let Ok(meta) = std::fs::metadata(&src) else { continue };
+            let Ok(meta) = std::fs::metadata(&src) else {
+                continue;
+            };
             let name_lc = name_str.to_lowercase();
             let existing = self.child_ino_ci(parent_ino, &name_lc);
 
@@ -210,10 +226,16 @@ impl ModUnionFs {
                     None => {
                         let ino = self.next_ino;
                         self.next_ino += 1;
-                        self.nodes.insert(ino, VfsNode {
-                            attr: dir_attr(ino, uid, gid, now),
-                            kind: VfsNodeKind::Dir { parent: parent_ino, children: HashMap::new() },
-                        });
+                        self.nodes.insert(
+                            ino,
+                            VfsNode {
+                                attr: dir_attr(ino, uid, gid, now),
+                                kind: VfsNodeKind::Dir {
+                                    parent: parent_ino,
+                                    children: HashMap::new(),
+                                },
+                            },
+                        );
                         self.insert_child(parent_ino, name.clone(), ino);
                         ino
                     }
@@ -228,16 +250,25 @@ impl ModUnionFs {
                             node.attr.size = size;
                             node.attr.mtime = mtime;
                             node.attr.blocks = blocks(size);
-                            node.kind = VfsNodeKind::File { parent: parent_ino, read_path: src };
+                            node.kind = VfsNodeKind::File {
+                                parent: parent_ino,
+                                read_path: src,
+                            };
                         }
                     }
                     None => {
                         let ino = self.next_ino;
                         self.next_ino += 1;
-                        self.nodes.insert(ino, VfsNode {
-                            attr: file_attr(ino, size, mtime, uid, gid, now),
-                            kind: VfsNodeKind::File { parent: parent_ino, read_path: src },
-                        });
+                        self.nodes.insert(
+                            ino,
+                            VfsNode {
+                                attr: file_attr(ino, size, mtime, uid, gid, now),
+                                kind: VfsNodeKind::File {
+                                    parent: parent_ino,
+                                    read_path: src,
+                                },
+                            },
+                        );
                         self.insert_child(parent_ino, name.clone(), ino);
                     }
                 }
@@ -268,10 +299,16 @@ impl ModUnionFs {
                     None => {
                         let ino = self.next_ino;
                         self.next_ino += 1;
-                        self.nodes.insert(ino, VfsNode {
-                            attr: dir_attr(ino, uid, gid, now),
-                            kind: VfsNodeKind::Dir { parent: parent_ino, children: HashMap::new() },
-                        });
+                        self.nodes.insert(
+                            ino,
+                            VfsNode {
+                                attr: dir_attr(ino, uid, gid, now),
+                                kind: VfsNodeKind::Dir {
+                                    parent: parent_ino,
+                                    children: HashMap::new(),
+                                },
+                            },
+                        );
                         self.insert_child(parent_ino, name, ino);
                         ino
                     }
@@ -286,16 +323,25 @@ impl ModUnionFs {
                             vfs_node.attr.size = node.size;
                             vfs_node.attr.mtime = node.mtime;
                             vfs_node.attr.blocks = blocks(node.size);
-                            vfs_node.kind = VfsNodeKind::File { parent: parent_ino, read_path: src };
+                            vfs_node.kind = VfsNodeKind::File {
+                                parent: parent_ino,
+                                read_path: src,
+                            };
                         }
                     }
                     None => {
                         let ino = self.next_ino;
                         self.next_ino += 1;
-                        self.nodes.insert(ino, VfsNode {
-                            attr: file_attr(ino, node.size, node.mtime, uid, gid, now),
-                            kind: VfsNodeKind::File { parent: parent_ino, read_path: src },
-                        });
+                        self.nodes.insert(
+                            ino,
+                            VfsNode {
+                                attr: file_attr(ino, node.size, node.mtime, uid, gid, now),
+                                kind: VfsNodeKind::File {
+                                    parent: parent_ino,
+                                    read_path: src,
+                                },
+                            },
+                        );
                         self.insert_child(parent_ino, name, ino);
                     }
                 }
@@ -307,7 +353,8 @@ impl ModUnionFs {
     fn child_ino_ci(&self, parent: u64, name_lc: &str) -> Option<u64> {
         let node = self.nodes.get(&parent)?;
         if let VfsNodeKind::Dir { children, .. } = &node.kind {
-            children.iter()
+            children
+                .iter()
                 .find(|(k, _)| k.to_string_lossy().to_lowercase() == name_lc)
                 .map(|(_, &ino)| ino)
         } else {
@@ -316,8 +363,10 @@ impl ModUnionFs {
     }
 
     fn insert_child(&mut self, parent: u64, name: OsString, child: u64) {
-        if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
-            self.nodes.get_mut(&parent)
+        if let Some(VfsNode {
+            kind: VfsNodeKind::Dir { children, .. },
+            ..
+        }) = self.nodes.get_mut(&parent)
         {
             children.insert(name, child);
         }
@@ -326,16 +375,25 @@ impl ModUnionFs {
     /// Copy a file from the lower layer to the upper layer (copy-on-write).
     /// Returns the path in the upper layer.
     fn cow_file(&mut self, ino: u64) -> Result<PathBuf, String> {
-        let upper = self.writable_upper.as_ref().ok_or_else(|| "No writable upper layer".to_string())?.clone();
-        
-        let node = self.nodes.get(&ino).ok_or_else(|| format!("Inode {ino} not found"))?;
+        let upper = self
+            .writable_upper
+            .as_ref()
+            .ok_or_else(|| "No writable upper layer".to_string())?
+            .clone();
+
+        let node = self
+            .nodes
+            .get(&ino)
+            .ok_or_else(|| format!("Inode {ino} not found"))?;
         let VfsNodeKind::File { read_path, .. } = &node.kind else {
             return Err("Not a file".to_string());
         };
         let read_path = read_path.clone();
 
         // Build the relative path from the mount root (inode 1) to this file.
-        let rel = self.path_for_ino(ino).ok_or_else(|| format!("Cannot resolve path for inode {ino}"))?;
+        let rel = self
+            .path_for_ino(ino)
+            .ok_or_else(|| format!("Cannot resolve path for inode {ino}"))?;
         let dest = upper.join(&rel);
 
         if dest.exists() {
@@ -348,12 +406,20 @@ impl ModUnionFs {
                 .map_err(|e| format!("Failed to create upper dir {}: {e}", parent.display()))?;
         }
 
-        std::fs::copy(&read_path, &dest)
-            .map_err(|e| format!("Failed to copy {} to {}: {e}", read_path.display(), dest.display()))?;
+        std::fs::copy(&read_path, &dest).map_err(|e| {
+            format!(
+                "Failed to copy {} to {}: {e}",
+                read_path.display(),
+                dest.display()
+            )
+        })?;
 
         // Update node to point to the new writable path
         if let Some(node) = self.nodes.get_mut(&ino) {
-            if let VfsNodeKind::File { ref mut read_path, .. } = node.kind {
+            if let VfsNodeKind::File {
+                ref mut read_path, ..
+            } = node.kind
+            {
                 *read_path = dest.clone();
             }
         }
@@ -374,7 +440,7 @@ impl ModUnionFs {
         };
 
         let mut path = self.path_for_ino(parent)?;
-        
+
         // Find the name of this inode in its parent's children
         let parent_node = self.nodes.get(&parent)?;
         if let VfsNodeKind::Dir { children, .. } = &parent_node.kind {
@@ -642,10 +708,16 @@ impl Filesystem for ModUnionFs {
                 let ino = self.next_ino;
                 self.next_ino += 1;
                 let attr = file_attr(ino, 0, now, uid, gid, now);
-                self.nodes.insert(ino, VfsNode {
-                    attr: attr.clone(),
-                    kind: VfsNodeKind::File { parent, read_path: dest },
-                });
+                self.nodes.insert(
+                    ino,
+                    VfsNode {
+                        attr: attr.clone(),
+                        kind: VfsNodeKind::File {
+                            parent,
+                            read_path: dest,
+                        },
+                    },
+                );
                 self.insert_child(parent, name.to_os_string(), ino);
                 reply.created(&TTL, &attr, 0, 0, 0);
             }
@@ -695,10 +767,16 @@ impl Filesystem for ModUnionFs {
                 let ino = self.next_ino;
                 self.next_ino += 1;
                 let attr = dir_attr(ino, uid, gid, now);
-                self.nodes.insert(ino, VfsNode {
-                    attr: attr.clone(),
-                    kind: VfsNodeKind::Dir { parent, children: HashMap::new() },
-                });
+                self.nodes.insert(
+                    ino,
+                    VfsNode {
+                        attr: attr.clone(),
+                        kind: VfsNodeKind::Dir {
+                            parent,
+                            children: HashMap::new(),
+                        },
+                    },
+                );
                 self.insert_child(parent, name.to_os_string(), ino);
                 reply.entry(&TTL, &attr, 0);
             }
@@ -709,13 +787,7 @@ impl Filesystem for ModUnionFs {
         }
     }
 
-    fn unlink(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        reply: fuser::ReplyEmpty,
-    ) {
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
         if self.session_ended.load(Ordering::SeqCst) {
             reply.error(libc::EIO);
             return;
@@ -744,7 +816,7 @@ impl Filesystem for ModUnionFs {
         };
 
         let dest = parent_path.join(name);
-        
+
         // If the file exists in the upper layer, delete it.
         if dest.exists() {
             if let Err(e) = std::fs::remove_file(&dest) {
@@ -758,15 +830,17 @@ impl Filesystem for ModUnionFs {
         // If it does, we need to create a whiteout marker in the upper layer.
         // If it only existed in the upper layer (newly created), we just remove it from VFS.
         let in_lower = match self.nodes.get(&ino) {
-            Some(VfsNode { kind: VfsNodeKind::File { read_path, .. }, .. }) => {
-                !read_path.starts_with(&upper)
-            }
+            Some(VfsNode {
+                kind: VfsNodeKind::File { read_path, .. },
+                ..
+            }) => !read_path.starts_with(&upper),
             _ => false,
         };
 
         if in_lower {
             // Create whiteout marker file
-            let whiteout_path = parent_path.join(format!("{}{}", WHITEOUT_PREFIX, name.to_string_lossy()));
+            let whiteout_path =
+                parent_path.join(format!("{}{}", WHITEOUT_PREFIX, name.to_string_lossy()));
             if let Some(p) = whiteout_path.parent() {
                 let _ = std::fs::create_dir_all(p);
             }
@@ -782,8 +856,10 @@ impl Filesystem for ModUnionFs {
         } else {
             // Remove from VFS entirely
             self.nodes.remove(&ino);
-            if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
-                self.nodes.get_mut(&parent)
+            if let Some(VfsNode {
+                kind: VfsNodeKind::Dir { children, .. },
+                ..
+            }) = self.nodes.get_mut(&parent)
             {
                 children.retain(|k, _| k.to_string_lossy().to_lowercase() != name_lc);
             }
@@ -822,7 +898,13 @@ impl Filesystem for ModUnionFs {
         };
 
         // If it is a file from lower layer, we must CoW it first so it exists in upper
-        let is_dir = matches!(self.nodes.get(&ino), Some(VfsNode { kind: VfsNodeKind::Dir { .. }, .. }));
+        let is_dir = matches!(
+            self.nodes.get(&ino),
+            Some(VfsNode {
+                kind: VfsNodeKind::Dir { .. },
+                ..
+            })
+        );
         if !is_dir {
             if let Err(e) = self.cow_file(ino) {
                 log::error!("VFS rename cow_file failed: {e}");
@@ -859,7 +941,9 @@ impl Filesystem for ModUnionFs {
                 if let Some(VfsNode { kind, .. }) = self.nodes.get_mut(&ino) {
                     match kind {
                         VfsNodeKind::Dir { parent, .. } => *parent = newparent,
-                        VfsNodeKind::File { parent, read_path, .. } => {
+                        VfsNodeKind::File {
+                            parent, read_path, ..
+                        } => {
                             *parent = newparent;
                             *read_path = new_path;
                         }
@@ -868,19 +952,25 @@ impl Filesystem for ModUnionFs {
                 }
 
                 // Remove from old parent children
-                if let Some(VfsNode { kind: VfsNodeKind::Dir { children, .. }, .. }) =
-                    self.nodes.get_mut(&parent)
+                if let Some(VfsNode {
+                    kind: VfsNodeKind::Dir { children, .. },
+                    ..
+                }) = self.nodes.get_mut(&parent)
                 {
                     children.retain(|k, _| k.to_string_lossy().to_lowercase() != name_lc);
                 }
-                
+
                 // Add to new parent children
                 self.insert_child(newparent, newname.to_os_string(), ino);
-                
+
                 reply.ok();
             }
             Err(e) => {
-                log::error!("VFS rename {} -> {}: {e}", old_path.display(), new_path.display());
+                log::error!(
+                    "VFS rename {} -> {}: {e}",
+                    old_path.display(),
+                    new_path.display()
+                );
                 reply.error(libc::EIO);
             }
         }
@@ -927,8 +1017,16 @@ impl Filesystem for ModUnionFs {
             };
 
             if let Some(new_size) = size {
-                if let Err(e) = std::fs::OpenOptions::new().write(true).open(&dest).and_then(|f| f.set_len(new_size)) {
-                    log::error!("VFS setattr truncate {} to {}: {e}", dest.display(), new_size);
+                if let Err(e) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&dest)
+                    .and_then(|f| f.set_len(new_size))
+                {
+                    log::error!(
+                        "VFS setattr truncate {} to {}: {e}",
+                        dest.display(),
+                        new_size
+                    );
                     reply.error(libc::EIO);
                     return;
                 }
@@ -940,7 +1038,11 @@ impl Filesystem for ModUnionFs {
                     TimeOrNow::SpecificTime(t) => t,
                 };
                 // Note: filetime or similar could be used for more precision, but std::fs::set_modified works too
-                if let Err(e) = std::fs::OpenOptions::new().write(true).open(&dest).and_then(|f| f.set_modified(time)) {
+                if let Err(e) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&dest)
+                    .and_then(|f| f.set_modified(time))
+                {
                     log::warn!("VFS setattr set_modified {}: {e}", dest.display());
                 }
             }
@@ -961,12 +1063,7 @@ impl Filesystem for ModUnionFs {
         }
     }
 
-    fn statfs(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        reply: fuser::ReplyStatfs,
-    ) {
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
         let res = if let Some(upper) = &self.writable_upper {
             let path = std::ffi::CString::new(upper.as_os_str().as_bytes()).unwrap();
@@ -1027,7 +1124,14 @@ fn dir_attr(ino: u64, uid: u32, gid: u32, now: SystemTime) -> FileAttr {
     }
 }
 
-fn file_attr(ino: u64, size: u64, mtime: SystemTime, uid: u32, gid: u32, now: SystemTime) -> FileAttr {
+fn file_attr(
+    ino: u64,
+    size: u64,
+    mtime: SystemTime,
+    uid: u32,
+    gid: u32,
+    now: SystemTime,
+) -> FileAttr {
     FileAttr {
         ino,
         size,
@@ -1092,12 +1196,15 @@ pub fn mount_mod_vfs(game: &Game, db: &ModDatabase) -> Result<MountHandle, Strin
 
     let path_env = std::env::var("PATH").unwrap_or_default();
     log::debug!("VFS Mount Environment PATH: {}", path_env);
-    
+
     let fusermount_check = std::process::Command::new("which")
         .arg("fusermount3")
         .output();
     match fusermount_check {
-        Ok(out) if out.status.success() => log::debug!("VFS found fusermount3 at: {}", String::from_utf8_lossy(&out.stdout).trim()),
+        Ok(out) if out.status.success() => log::debug!(
+            "VFS found fusermount3 at: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
         _ => log::warn!("VFS COULD NOT FIND fusermount3 in PATH!"),
     }
 
@@ -1108,7 +1215,12 @@ pub fn mount_mod_vfs(game: &Game, db: &ModDatabase) -> Result<MountHandle, Strin
         .map_err(|e| format!("Failed to mount mod VFS at {}: {e}", mountpoint.display()))?;
 
     log::info!("Mounted mod VFS at {}", mountpoint.display());
-    Ok(MountHandle { _session: session, mountpoint, writable_upper: None, session_ended: Arc::new(AtomicBool::new(false)) })
+    Ok(MountHandle {
+        _session: session,
+        mountpoint,
+        writable_upper: None,
+        session_ended: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 /// Mount a writable overlay VFS for tool sessions.
@@ -1118,11 +1230,7 @@ pub fn mount_mod_vfs(game: &Game, db: &ModDatabase) -> Result<MountHandle, Strin
 /// where the tool can write new/changed files.
 ///
 /// The mount is automatically torn down when the returned handle is dropped.
-pub fn mount_tool_vfs(
-    game: &Game,
-    db: &ModDatabase,
-    tool_id: &str,
-) -> Result<MountHandle, String> {
+pub fn mount_tool_vfs(game: &Game, db: &ModDatabase, tool_id: &str) -> Result<MountHandle, String> {
     let mountpoint = game.data_path.clone();
 
     if !mountpoint.exists() {
@@ -1156,15 +1264,26 @@ pub fn mount_tool_vfs(
 
     log::info!("Mounting VFS (RW) at {}", mountpoint.display());
     if !mountpoint.exists() {
-        return Err(format!("Mountpoint does not exist: {}", mountpoint.display()));
+        return Err(format!(
+            "Mountpoint does not exist: {}",
+            mountpoint.display()
+        ));
     }
 
     let session = fuser::spawn_mount2(fs, &mountpoint, options)
         .map_err(|e| format!("Failed to mount tool VFS at {}: {e}", mountpoint.display()))?;
 
-
-    log::info!("Mounted tool VFS at {} (writable upper: {})", mountpoint.display(), scratch_dir.display());
-    Ok(MountHandle { _session: session, mountpoint, writable_upper: Some(scratch_dir), session_ended })
+    log::info!(
+        "Mounted tool VFS at {} (writable upper: {})",
+        mountpoint.display(),
+        scratch_dir.display()
+    );
+    Ok(MountHandle {
+        _session: session,
+        mountpoint,
+        writable_upper: Some(scratch_dir),
+        session_ended,
+    })
 }
 
 impl Drop for MountHandle {
@@ -1243,9 +1362,11 @@ mod tests {
 
         // Find the textures dir inode
         let textures_ino = fs.child_ino_ci(1, "textures").expect("textures dir in VFS");
-        let tex_ino = fs.child_ino_ci(textures_ino, "tex.dds").expect("tex.dds in VFS");
+        let tex_ino = fs
+            .child_ino_ci(textures_ino, "tex.dds")
+            .expect("tex.dds in VFS");
         let node = fs.nodes.get(&tex_ino).unwrap();
-        if let VfsNodeKind::File { read_path } = &node.kind {
+        if let VfsNodeKind::File { read_path, .. } = &node.kind {
             let data = std::fs::read(read_path).unwrap();
             assert_eq!(data, b"high", "high-priority mod should win");
         } else {
@@ -1273,7 +1394,13 @@ mod tests {
         let fs = ModUnionFs::build(&game, &db).unwrap();
 
         let meshes_ino = fs.child_ino_ci(1, "meshes").expect("meshes dir");
-        assert!(fs.child_ino_ci(meshes_ino, "a.nif").is_some(), "a.nif from ModA");
-        assert!(fs.child_ino_ci(meshes_ino, "b.nif").is_some(), "b.nif from ModB");
+        assert!(
+            fs.child_ino_ci(meshes_ino, "a.nif").is_some(),
+            "a.nif from ModA"
+        );
+        assert!(
+            fs.child_ino_ci(meshes_ino, "b.nif").is_some(),
+            "b.nif from ModB"
+        );
     }
 }

@@ -12,6 +12,8 @@ use libadwaita::prelude::*;
 use crate::core::config::AppConfig;
 use crate::core::games::{GameLauncherSource, UmuGameConfig};
 use crate::core::nexus::NexusClient;
+use crate::core::runtime::build_phase1_steam_launch_option;
+use crate::core::steam::{clear_launch_options, install_launch_options, read_launch_options};
 use crate::core::umu;
 
 /// Build the inline Preferences page shown as a tab in the main window.
@@ -64,7 +66,10 @@ pub fn build_settings_page(
         .css_classes(["flat", "accent"])
         .build();
     get_key_btn.connect_clicked(|_| {
-        let _ = gtk4::gio::AppInfo::launch_default_for_uri("https://www.nexusmods.com/settings/api-keys", None::<&gtk4::gio::AppLaunchContext>);
+        let _ = gtk4::gio::AppInfo::launch_default_for_uri(
+            "https://www.nexusmods.com/settings/api-keys",
+            None::<&gtk4::gio::AppLaunchContext>,
+        );
     });
 
     let update_link_visibility = {
@@ -208,6 +213,166 @@ pub fn build_settings_page(
     logging_group.add(&info_row);
     logging_group.add(&debug_row);
     content_box.append(&logging_group);
+
+    let current_steam_game = {
+        let cfg = config.borrow();
+        cfg.current_game().cloned().filter(|g| {
+            g.launcher_source == GameLauncherSource::Steam
+                && g.kind.is_phase1_steam_redirector_target()
+        })
+    };
+
+    if let Some(game) = current_steam_game {
+        let steam_group = adw::PreferencesGroup::builder()
+            .title("Steam Redirector")
+            .description(
+                "Phase 1 Steam redirector support is currently limited to Skyrim Special Edition / Anniversary Edition on native Steam.",
+            )
+            .build();
+
+        let app_id = game.steam_instance_app_id().unwrap_or(489830);
+        let launch_option_value = build_phase1_steam_launch_option(app_id, &game.id)
+            .unwrap_or_else(|e| format!("Unable to build launch option: {e}"));
+        let launch_row = adw::ActionRow::builder()
+            .title("Steam Launch Option")
+            .subtitle(&launch_option_value)
+            .build();
+        launch_row.set_tooltip_text(Some(
+            "This launch option is tied to the exact configured game instance shown in linkmm.",
+        ));
+        let copy_btn = gtk4::Button::with_label("Copy");
+        copy_btn.add_css_class("flat");
+        launch_row.add_suffix(&copy_btn);
+        let install_btn = gtk4::Button::with_label("Install in Steam");
+        install_btn.add_css_class("flat");
+        launch_row.add_suffix(&install_btn);
+        let clear_btn = gtk4::Button::with_label("Clear from Steam");
+        clear_btn.add_css_class("flat");
+        launch_row.add_suffix(&clear_btn);
+        let installed_status = match read_launch_options(app_id) {
+            Ok(Some(installed)) if installed == launch_option_value => {
+                "Installed launch option matches this game instance.".to_string()
+            }
+            Ok(Some(_)) => {
+                "Steam currently has a different launch option for this game.".to_string()
+            }
+            Ok(None) => "No Steam launch option is currently installed for this game.".to_string(),
+            Err(e) => format!("Could not read Steam launch option: {e}"),
+        };
+        let installed_row = adw::ActionRow::builder()
+            .title("Installed State")
+            .subtitle(&installed_status)
+            .build();
+        {
+            let subtitle = launch_row
+                .subtitle()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let toast_c = toast_overlay.clone();
+            copy_btn.connect_clicked(move |_| {
+                if let Some(display) = gtk4::gdk::Display::default() {
+                    display.clipboard().set_text(&subtitle);
+                    toast_c.add_toast(adw::Toast::new("Steam launch option copied."));
+                } else {
+                    toast_c.add_toast(adw::Toast::new("Could not access clipboard."));
+                }
+            });
+        }
+        {
+            let launch_option = launch_option_value.clone();
+            let installed_row_c = installed_row.clone();
+            let toast_c = toast_overlay.clone();
+            install_btn.connect_clicked(move |_| {
+                match install_launch_options(app_id, &launch_option) {
+                    Ok(updated) => {
+                        installed_row_c
+                            .set_subtitle("Installed launch option matches this game instance.");
+                        toast_c.add_toast(adw::Toast::new(&format!(
+                            "Installed Steam launch option in {updated} Steam user config(s)."
+                        )));
+                    }
+                    Err(e) => {
+                        toast_c.add_toast(adw::Toast::new(&format!(
+                            "Failed to install Steam launch option: {e}"
+                        )));
+                    }
+                }
+            });
+        }
+        {
+            let installed_row_c = installed_row.clone();
+            let toast_c = toast_overlay.clone();
+            clear_btn.connect_clicked(move |_| match clear_launch_options(app_id) {
+                Ok(updated) => {
+                    installed_row_c.set_subtitle(
+                        "No Steam launch option is currently installed for this game.",
+                    );
+                    toast_c.add_toast(adw::Toast::new(&format!(
+                        "Cleared Steam launch option in {updated} Steam user config(s)."
+                    )));
+                }
+                Err(e) => {
+                    toast_c.add_toast(adw::Toast::new(&format!(
+                        "Failed to clear Steam launch option: {e}"
+                    )));
+                }
+            });
+        }
+        steam_group.add(&launch_row);
+        steam_group.add(&installed_row);
+
+        let target_names = game.kind.phase1_steam_launch_candidates();
+        let mut target_labels = vec!["Automatic".to_string()];
+        for exe in target_names {
+            target_labels.push(game.kind.phase1_steam_target_label(exe).to_string());
+        }
+        let target_label_refs: Vec<&str> = target_labels.iter().map(|s| s.as_str()).collect();
+        let target_model = gtk4::StringList::new(&target_label_refs);
+        let target_row = adw::ComboRow::builder()
+            .title("Steam Launch Target")
+            .subtitle("Choose which executable linkmm starts after mounting the VFS.")
+            .model(&target_model)
+            .build();
+
+        let saved_target = config
+            .borrow()
+            .game_settings_ref(&game.id)
+            .and_then(|settings| settings.steam_redirect_exe.clone());
+        let selected_index = saved_target
+            .as_deref()
+            .and_then(|saved| target_names.iter().position(|name| *name == saved))
+            .map(|idx| idx as u32 + 1)
+            .unwrap_or(0);
+        target_row.set_selected(selected_index);
+        {
+            let config_c = Rc::clone(&config);
+            let game_id = game.id.clone();
+            let toast_c = toast_overlay.clone();
+            target_row.connect_selected_notify(move |row| {
+                let selected = row.selected();
+                let mut cfg = config_c.borrow_mut();
+                let settings = cfg.game_settings_mut(&game_id);
+                settings.steam_redirect_exe = if selected == 0 {
+                    None
+                } else {
+                    target_names
+                        .get((selected - 1) as usize)
+                        .map(|name| (*name).to_string())
+                };
+                cfg.save();
+                toast_c.add_toast(adw::Toast::new("Steam launch target saved."));
+            });
+        }
+        steam_group.add(&target_row);
+
+        let native_only_row = adw::ActionRow::builder()
+            .title("Runtime Support")
+            .subtitle("Native linkmm works only with native Steam. Flatpak Steam needs a Flatpak build of linkmm.")
+            .build();
+        steam_group.add(&native_only_row);
+
+        content_box.append(&steam_group);
+    }
 
     // ── UMU Launcher group ────────────────────────────────────────────────
     // Only shown when the currently active game was set up via UMU (non-Steam).
@@ -465,5 +630,3 @@ pub fn build_settings_page(
 
     toolbar_view.upcast()
 }
-
-

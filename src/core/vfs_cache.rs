@@ -47,12 +47,14 @@ impl VfsMetadataCache {
 
 pub fn scan_directory_cached(path: &Path) -> Vec<CachedNode> {
     let mut nodes = Vec::new();
-    let Ok(entries) = std::fs::read_dir(path) else { return nodes };
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return nodes;
+    };
 
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
         let name = entry.file_name().to_string_lossy().to_string();
-        
+
         let mut node = CachedNode {
             name,
             is_dir: meta.is_dir(),

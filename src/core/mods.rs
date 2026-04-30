@@ -83,7 +83,6 @@ fn default_deployer() -> String {
     "assets".to_string()
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
     pub id: String,

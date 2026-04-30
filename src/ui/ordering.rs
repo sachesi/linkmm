@@ -57,7 +57,7 @@ pub fn move_down_by_id<T: Clone, F: Fn(&T) -> &str>(
     if source + 1 >= ordered.len() {
         return Err(ReorderError::OutOfBoundsTarget);
     }
-    move_to_position_by_index(ordered, source, source + 1, pinned_prefix_len)
+    move_to_position_by_index(ordered, source, source + 2, pinned_prefix_len)
 }
 
 pub fn move_before_by_id<T: Clone, F: Fn(&T) -> &str>(

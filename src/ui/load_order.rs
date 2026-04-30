@@ -311,8 +311,7 @@ fn setup_load_order_dnd(
     let scroll_dir: Rc<Cell<i8>> = Rc::new(Cell::new(0));
     let autoscroll_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
-    let drop_target =
-        gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
+    let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
 
     // ── motion ────────────────────────────────────────────────────────────────
     {
@@ -443,16 +442,12 @@ fn setup_load_order_dnd(
                     // Skip vanilla rows which aren't in dnd_rows; find in dnd_rows
                     let row_pos = rows
                         .iter()
-                        .position(|r| {
-                            r.row.upcast_ref::<glib::Object>().as_ptr() as usize == tptr
-                        });
+                        .position(|r| r.row.upcast_ref::<glib::Object>().as_ptr() as usize == tptr);
                     match row_pos {
                         Some(pos) => {
                             let before = trow
                                 .compute_bounds(&list_box_d)
-                                .map_or(true, |b| {
-                                    listbox_y < (b.y() + b.height() / 2.0) as i32
-                                });
+                                .map_or(true, |b| listbox_y < (b.y() + b.height() / 2.0) as i32);
                             if before { pos } else { pos + 1 }
                         }
                         // Dropped on a vanilla row or unknown row → reject
@@ -502,7 +497,9 @@ fn setup_load_order_dnd(
             glib::idle_add_local_once(move || {
                 adj.set_value(saved_scroll);
                 let adj2 = adj.clone();
-                glib::idle_add_local_once(move || { adj2.set_value(saved_scroll); });
+                glib::idle_add_local_once(move || {
+                    adj2.set_value(saved_scroll);
+                });
             });
 
             let game_c = Rc::clone(&game_d);
@@ -588,8 +585,7 @@ fn build_plugin_row(
         if allow_reorder {
             let drag_source = gtk4::DragSource::new();
             drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
-            let content =
-                gtk4::gdk::ContentProvider::for_value(&plugin.name.to_value());
+            let content = gtk4::gdk::ContentProvider::for_value(&plugin.name.to_value());
             drag_source.set_content(Some(&content));
 
             let row_begin = row.clone();
@@ -663,13 +659,7 @@ fn build_plugin_row(
                 && let Ok(scrolled) = sw.downcast::<gtk4::ScrolledWindow>()
             {
                 refresh_load_order_content(
-                    &list_c,
-                    &scrolled,
-                    &status_c,
-                    &stack_c,
-                    &hint_c,
-                    &game_c,
-                    &search_q,
+                    &list_c, &scrolled, &status_c, &stack_c, &hint_c, &game_c, &search_q,
                 );
             }
         });
@@ -714,24 +704,15 @@ fn build_plugin_row(
                 let mut db = ModDatabase::load(&game_c);
                 db.sync_from_plugins_txt(&game_c);
                 let ordered = db.get_ordered_plugins(&game_c);
-                if let Ok(updated) = ordering::move_up_by_id(
-                    &ordered,
-                    &plugin_name,
-                    pinned_prefix_len,
-                    |p| &p.name,
-                ) {
+                if let Ok(updated) =
+                    ordering::move_up_by_id(&ordered, &plugin_name, pinned_prefix_len, |p| &p.name)
+                {
                     db.set_plugin_order(&updated);
                     db.save(&game_c);
                     let _ = db.write_plugins_txt(&game_c);
                 }
                 refresh_load_order_content(
-                    &list_c,
-                    &scrolled,
-                    &status_c,
-                    &stack_c,
-                    &hint_c,
-                    &game_c,
-                    &search_q,
+                    &list_c, &scrolled, &status_c, &stack_c, &hint_c, &game_c, &search_q,
                 );
             }
         });
@@ -750,24 +731,17 @@ fn build_plugin_row(
                 let mut db = ModDatabase::load(&game_c);
                 db.sync_from_plugins_txt(&game_c);
                 let ordered = db.get_ordered_plugins(&game_c);
-                if let Ok(updated) = ordering::move_down_by_id(
-                    &ordered,
-                    &plugin_name,
-                    pinned_prefix_len,
-                    |p| &p.name,
-                ) {
+                if let Ok(updated) =
+                    ordering::move_down_by_id(&ordered, &plugin_name, pinned_prefix_len, |p| {
+                        &p.name
+                    })
+                {
                     db.set_plugin_order(&updated);
                     db.save(&game_c);
                     let _ = db.write_plugins_txt(&game_c);
                 }
                 refresh_load_order_content(
-                    &list_c,
-                    &scrolled,
-                    &status_c,
-                    &stack_c,
-                    &hint_c,
-                    &game_c,
-                    &search_q,
+                    &list_c, &scrolled, &status_c, &stack_c, &hint_c, &game_c, &search_q,
                 );
             }
         });
@@ -961,7 +935,9 @@ fn show_move_to_position_dialog(
             "Enter the new load order position for \"{plugin_name}\".\nValid range: {min_pos}\u{2013}{total} (positions 1\u{2013}{pinned_prefix_len} are vanilla masters).",
         )
     } else {
-        format!("Enter the new load order position for \"{plugin_name}\".\nValid range: 1\u{2013}{total}.")
+        format!(
+            "Enter the new load order position for \"{plugin_name}\".\nValid range: 1\u{2013}{total}."
+        )
     };
 
     ordering::show_position_dialog(

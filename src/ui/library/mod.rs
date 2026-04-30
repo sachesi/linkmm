@@ -17,7 +17,6 @@ mod mod_row;
 use conflicts::compute_conflict_states;
 use mod_row::{DndRowData, build_mod_row};
 
-
 const CLAMP_MARGIN: f64 = 12.0;
 const SCROLL_EDGE: f64 = 60.0;
 const SCROLL_SPEED: f64 = 12.0;
@@ -247,8 +246,7 @@ fn setup_library_dnd(
     let scroll_dir: Rc<Cell<i8>> = Rc::new(Cell::new(0));
     let autoscroll_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
-    let drop_target =
-        gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
+    let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
 
     // ── motion ────────────────────────────────────────────────────────────────
     {
@@ -377,9 +375,7 @@ fn setup_library_dnd(
                     let tptr = trow.upcast_ref::<glib::Object>().as_ptr() as usize;
                     let row_pos = rows
                         .iter()
-                        .position(|r| {
-                            r.row.upcast_ref::<glib::Object>().as_ptr() as usize == tptr
-                        })
+                        .position(|r| r.row.upcast_ref::<glib::Object>().as_ptr() as usize == tptr)
                         .unwrap_or(total);
                     let before = trow
                         .compute_bounds(&list_box_d)
@@ -419,7 +415,9 @@ fn setup_library_dnd(
             glib::idle_add_local_once(move || {
                 adj.set_value(saved_scroll);
                 let adj2 = adj.clone();
-                glib::idle_add_local_once(move || { adj2.set_value(saved_scroll); });
+                glib::idle_add_local_once(move || {
+                    adj2.set_value(saved_scroll);
+                });
             });
             glib::idle_add_local_once(move || {
                 let mut db = ModDatabase::load(&game_c);
@@ -610,8 +608,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("linkmm-conflict-fallback-test-{unique}"));
+        let root = std::env::temp_dir().join(format!("linkmm-conflict-fallback-test-{unique}"));
         let mod_a = root.join("a");
         let mod_b = root.join("b");
         let mod_c = root.join("c");

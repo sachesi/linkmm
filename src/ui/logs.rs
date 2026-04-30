@@ -92,7 +92,7 @@ pub fn show_log_window(parent: &gtk4::Window, config: Rc<RefCell<AppConfig>>) {
         let value = adj.value();
         let upper = adj.upper();
         let page_size = adj.page_size();
-        
+
         // If we are within 50px of the bottom, snap to bottom on change.
         if (upper - page_size - value) < 50.0 {
             adj.set_value(upper - page_size);

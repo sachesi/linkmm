@@ -111,11 +111,11 @@ fn build_main_window(
         let play_btn_c = play_btn.clone();
         play_btn.connect_clicked(move |_| {
             let manager = global_runtime_manager();
-            
+
             // 1. Check if a session is already running
             let current_game = config_c.borrow().current_game().cloned();
             let Some(g) = current_game else { return };
-            
+
             if let Some(session) = manager.current_game_session(&g.id) {
                 if let Err(e) = manager.stop_session(session.id) {
                     log::error!("Failed stopping game session: {e}");
@@ -224,7 +224,7 @@ fn build_main_window(
                     "Play"
                 });
                 play_btn_t.set_sensitive(true);
-                
+
                 refresh_stats(&config_t.borrow(), &installed_t, &enabled_t);
             }
             glib::ControlFlow::Continue
@@ -500,11 +500,7 @@ fn build_main_window(
         let on_setup_done_a = Rc::clone(&on_setup_done_rc);
         let window_a = window.clone();
         active_game_row.connect_activated(move |_| {
-            show_game_picker(
-                &window_a,
-                Rc::clone(&config_a),
-                Rc::clone(&on_setup_done_a),
-            );
+            show_game_picker(&window_a, Rc::clone(&config_a), Rc::clone(&on_setup_done_a));
         });
     }
 
@@ -584,12 +580,12 @@ fn show_game_picker(
             .title(&game.instance_label())
             .activatable(true)
             .build();
-        
+
         let config_c = Rc::clone(&config);
         let on_game_changed_c = Rc::clone(&on_game_changed);
         let dialog_c = dialog.clone();
         let game_id = game.id.clone();
-        
+
         row.connect_activated(move |_| {
             config_c.borrow_mut().current_game_id = Some(game_id.clone());
             config_c.borrow().save();
@@ -673,7 +669,7 @@ fn show_about_dialog(parent: &gtk4::Window) {
 
 pub fn build_ui(app: &libadwaita::Application) {
     let config = Rc::new(RefCell::new(AppConfig::load_or_default()));
-    
+
     // Background update check for umu-launcher
     {
         let cfg = config.borrow();
@@ -706,7 +702,9 @@ fn build_no_game_page(title: &str, description: &str) -> gtk4::Widget {
 }
 
 pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
-    let window = app.active_window().and_then(|w| w.downcast::<adw::Window>().ok());
+    let window = app
+        .active_window()
+        .and_then(|w| w.downcast::<adw::Window>().ok());
 
     // Pass to the downloads module or appropriate controller
     log::info!("Handling NXM URL: {}", url);
@@ -714,4 +712,3 @@ pub fn handle_nxm_url(app: &libadwaita::Application, url: &str) {
         // Handle in window
     }
 }
-

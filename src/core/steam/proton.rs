@@ -7,10 +7,29 @@ pub(super) fn parse_per_game_proton_config(app_id: u32) -> Option<String> {
     let home = dirs::home_dir()?;
 
     let candidate_config_paths = vec![
-        home.join(".steam").join("steam").join("config").join("config.vdf"),
-        home.join(".local").join("share").join("Steam").join("config").join("config.vdf"),
-        home.join("snap").join("steam").join("common").join(".steam").join("steam").join("config").join("config.vdf"),
-        home.join(".var").join("app").join("com.valvesoftware.Steam").join(".steam").join("steam").join("config").join("config.vdf"),
+        home.join(".steam")
+            .join("steam")
+            .join("config")
+            .join("config.vdf"),
+        home.join(".local")
+            .join("share")
+            .join("Steam")
+            .join("config")
+            .join("config.vdf"),
+        home.join("snap")
+            .join("steam")
+            .join("common")
+            .join(".steam")
+            .join("steam")
+            .join("config")
+            .join("config.vdf"),
+        home.join(".var")
+            .join("app")
+            .join("com.valvesoftware.Steam")
+            .join(".steam")
+            .join("steam")
+            .join("config")
+            .join("config.vdf"),
     ];
 
     for config_path in candidate_config_paths {
@@ -105,7 +124,11 @@ fn find_proton_directories() -> Vec<PathBuf> {
         let roots = vec![
             home.join(".steam").join("steam"),
             home.join(".local").join("share").join("Steam"),
-            home.join(".var").join("app").join("com.valvesoftware.Steam").join(".steam").join("steam"),
+            home.join(".var")
+                .join("app")
+                .join("com.valvesoftware.Steam")
+                .join(".steam")
+                .join("steam"),
         ];
         for root in roots {
             let compat_path = root.join("compatibilitytools.d");
@@ -140,7 +163,8 @@ fn find_proton_by_name(tool_name: &str) -> Option<PathBuf> {
                 if tool_name.contains("proton") && dir_name.to_lowercase().contains("proton") {
                     let tool_lower = tool_name.to_lowercase();
                     let dir_lower = dir_name.to_lowercase();
-                    if tools_match_version(&tool_lower, &dir_lower) && path.join("proton").exists() {
+                    if tools_match_version(&tool_lower, &dir_lower) && path.join("proton").exists()
+                    {
                         log::debug!("Found Proton at: {} (version match)", path.display());
                         return Some(path);
                     }
@@ -212,7 +236,10 @@ pub fn find_proton_for_game(app_id: u32) -> Result<(PathBuf, PathBuf), String> {
     if let Some(ref version) = proton_version {
         log::debug!("Compatdata version file contains: {}", version);
         if let Some(proton_path) = find_proton_by_name(version) {
-            log::info!("Found Proton matching version file: {}", proton_path.display());
+            log::info!(
+                "Found Proton matching version file: {}",
+                proton_path.display()
+            );
             return Ok((proton_path, compatdata_path));
         }
     }
@@ -294,7 +321,10 @@ mod tests {
     fn normalize_proton_name_removes_separators() {
         assert_eq!(normalize_proton_name("Proton-8.0"), "proton80");
         assert_eq!(normalize_proton_name("GE-Proton9-2"), "geproton92");
-        assert_eq!(normalize_proton_name("proton_experimental"), "protonexperimental");
+        assert_eq!(
+            normalize_proton_name("proton_experimental"),
+            "protonexperimental"
+        );
     }
 
     #[test]

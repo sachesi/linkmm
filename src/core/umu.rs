@@ -37,13 +37,11 @@
 //! | `STORE`       | `"none"`                                                     |
 //! | `UMU_LOG`     | `"1"`                                                        |
 
-use std::fs;
+use crate::core::steam::split_launch_arguments;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::rc::Rc;
-use crate::core::config::AppConfig;
-use crate::core::steam::split_launch_arguments;
+use std::sync::mpsc;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -287,8 +285,15 @@ pub fn launch_with_umu(
     store: &str,
     steam_root: Option<&Path>,
 ) -> Result<std::process::Child, String> {
-    let mut command =
-        build_umu_command(exe_path, arguments, steam_app_id, prefix_path, proton_path, store, steam_root)?;
+    let mut command = build_umu_command(
+        exe_path,
+        arguments,
+        steam_app_id,
+        prefix_path,
+        proton_path,
+        store,
+        steam_root,
+    )?;
     command
         .spawn()
         .map_err(|e| format!("Failed to spawn umu-run: {e}"))
@@ -337,7 +342,7 @@ pub fn build_umu_command(
         .env("UMU_LOG", "1")
         .env("STEAM_COMPAT_APP_ID", steam_app_id.to_string())
         .env("SteamAppId", steam_app_id.to_string());
-    
+
     let steam_root_owned = crate::core::steam::library::find_steam_root();
     if let Some(root) = steam_root.or_else(|| steam_root_owned.as_deref()) {
         command.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", root);
