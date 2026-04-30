@@ -599,7 +599,7 @@ fn build_fomod_nav_page(
         });
     }
 
-    // ── Empty step guard (§4f) ────────────────────────────────────────────────
+    // ── Empty step guard ────────────────────────────────────────────────
     let all_groups_empty = step
         .groups
         .iter()
@@ -649,7 +649,7 @@ fn build_fomod_nav_page(
     right_box.set_margin_start(12);
     right_box.set_margin_end(18);
 
-    // ── Validation banner (§4e) ───────────────────────────────────────────────
+    // ── Validation banner ───────────────────────────────────────────────
     let validation_banner = adw::Banner::builder()
         .title("Please make a selection in all required groups to continue")
         .revealed(!step_selection_is_valid(
@@ -683,7 +683,7 @@ fn build_fomod_nav_page(
             continue;
         }
 
-        // §4a: group description instead of title suffix.
+        // group description instead of title suffix.
         let hint = match group.group_type {
             FomodGroupType::SelectExactlyOne => "Select one option",
             FomodGroupType::SelectAtMostOne => "Select at most one option",
@@ -712,7 +712,7 @@ fn build_fomod_nav_page(
             let plugin = &group.plugins[pi];
             let row = adw::ActionRow::builder().title(&plugin.name).build();
 
-            // §4c: CRLF cleanup + 3-line truncation in subtitle.
+            // CRLF cleanup + 3-line truncation in subtitle.
             // `.lines()` handles \r\n, \r, and \n uniformly.
             if let Some(ref d) = plugin.description {
                 let truncated: String = d.lines().take(3).collect::<Vec<_>>().join("\n");

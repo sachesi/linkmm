@@ -1,13 +1,12 @@
 # LinkMM
 
-LinkMM is a modern mod manager for Bethesda games (Skyrim, Fallout, etc.) designed for Linux. It uses a FUSE-based virtual filesystem to provide a "zero-deployment" experience.
+LinkMM is a mod manager for Bethesda games (Skyrim, Fallout, etc.) designed for Linux. It uses a FUSE-based virtual filesystem to provide a "zero-deployment" experience.
 
 ## Key Features
 
-- **FUSE Virtual Filesystem**: Enable/disable mods instantly. No symlinks, no file copying, and no risk of corrupting your game directory.
-- **Proton & UMU Integration**: Seamlessly launch games and Windows-native tools using Steam's Proton or the Unified Moe Union (UMU) launcher.
+- **Proton & UMU Integration**: Launch games and Windows-native tools using Steam's Proton or the Unified Moe Union (UMU) launcher.
 - **Writable Overlay for Tools**: Run tools like BodySlide, Nemesis, or xEdit directly against your modded setup. Changes are captured and can be saved as new mods.
-- **Native GTK4 UI**: A clean, modern interface built with Libadwaita that follows GNOME HIG.
+- **Native GTK4 UI**: A clean interface built with Libadwaita that follows GNOME HIG.
 - **Nexus Mods Integration**: Handle `nxm://` links and manage your Nexus downloads directly.
 
 ## Documentation
@@ -41,3 +40,7 @@ cargo test
 - `src/core/`: The "brains" of the app. Handles VFS, game detection, and process management.
 - `src/ui/`: The user interface components.
 - `docs/`: Technical and user documentation.
+
+---
+
+Built with ❤️ and help from Gemini

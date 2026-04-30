@@ -148,7 +148,6 @@ pub fn build_downloads_page(
     status_card.append(&cancel_btn);
     status_revealer.set_child(Some(&status_card));
     content.append(&status_revealer);
-    // ─────────────────────────────────────────────────────────────────────────
 
     let list_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     list_container.set_vexpand(true);

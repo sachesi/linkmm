@@ -1,6 +1,4 @@
-// ══════════════════════════════════════════════════════════════════════════════
 // Unified Archive Abstraction – Virtual Table of Contents (TOC)
-// ══════════════════════════════════════════════════════════════════════════════
 //
 // Provides a format-agnostic abstraction over zip, 7z, and rar archives.
 //
