@@ -1,5 +1,7 @@
 use crate::core::games::GameKind;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use libc;
 
 pub struct SteamLibrary {
     pub path: PathBuf,
@@ -278,6 +280,14 @@ fn set_launch_options(app_id: u32, launch_options: Option<&str>) -> Result<usize
         );
     }
 
+    if is_steam_running() {
+        return Err(
+            "Steam is currently running. Close Steam before applying launch options — \
+             changes will be silently overwritten when Steam exits."
+                .to_string(),
+        );
+    }
+
     let steam_root =
         find_steam_root().ok_or_else(|| "Could not find Steam installation".to_string())?;
     let userdata_dir = steam_root.join("userdata");
@@ -317,6 +327,24 @@ fn set_launch_options(app_id: u32, launch_options: Option<&str>) -> Result<usize
     }
 
     Ok(updated)
+}
+
+/// Returns true if a native Steam process is currently running.
+///
+/// Steam overwrites localconfig.vdf on exit, so writing launch options while
+/// Steam is running will be silently clobbered.
+pub fn is_steam_running() -> bool {
+    // Native Steam writes its PID to ~/.steam/steam.pid while running.
+    let pid_path = dirs::home_dir().map(|h| h.join(".steam").join("steam.pid"));
+    if let Some(path) = pid_path {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                #[cfg(unix)]
+                return unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+            }
+        }
+    }
+    false
 }
 
 pub fn is_steam_flatpak() -> bool {

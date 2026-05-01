@@ -25,8 +25,9 @@ fn main() {
                     };
                     game_id = Some(value);
                 } else {
-                    eprintln!("Unknown argument for --steam-session: {arg}");
-                    std::process::exit(2);
+                    // Ignore unrecognised trailing args — Steam injects the original
+                    // game command via %command% substitution and we do not use it.
+                    log::debug!("Ignoring Steam passthrough arg: {arg}");
                 }
             }
             let app_id = match app_id_raw.parse::<u32>() {

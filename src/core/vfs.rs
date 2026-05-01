@@ -1191,7 +1191,6 @@ pub fn mount_mod_vfs(game: &Game, db: &ModDatabase) -> Result<MountHandle, Strin
         MountOption::NoDev,
         MountOption::NoSuid,
         MountOption::NoExec,
-        MountOption::CUSTOM("nonempty".to_string()),
     ];
 
     let path_env = std::env::var("PATH").unwrap_or_default();
@@ -1259,7 +1258,6 @@ pub fn mount_tool_vfs(game: &Game, db: &ModDatabase, tool_id: &str) -> Result<Mo
         MountOption::NoDev,
         MountOption::NoSuid,
         MountOption::NoExec,
-        MountOption::CUSTOM("nonempty".to_string()),
     ];
 
     log::info!("Mounting VFS (RW) at {}", mountpoint.display());

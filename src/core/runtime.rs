@@ -14,6 +14,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 const MAX_LOG_LINES: usize = 600;
 
+#[cfg(unix)]
+static STEAM_SESSION_STOP: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn steam_session_term_handler(_: libc::c_int) {
+    STEAM_SESSION_STOP.store(true, Ordering::SeqCst);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionKind {
     Game,
@@ -261,7 +269,6 @@ impl RuntimeSessionManager {
                     .game_settings_ref(&game.id)
                     .and_then(|settings| settings.steam_redirect_exe.clone());
                 let exe_path = resolve_phase1_steam_exe_path(&game, preferred_exe.as_deref())?;
-
                 crate::core::steam::build_game_command(&exe_path, app_id)?
             }
         };
@@ -635,17 +642,98 @@ fn resolve_phase1_steam_game(
     ))
 }
 
+struct SessionLock {
+    path: PathBuf,
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_steam_session_lock(app_id: u32) -> Result<SessionLock, String> {
+    let lock_dir = dirs::runtime_dir()
+        .or_else(dirs::data_local_dir)
+        .ok_or_else(|| "Could not determine runtime directory for session lock".to_string())?
+        .join("linkmm");
+
+    std::fs::create_dir_all(&lock_dir)
+        .map_err(|e| format!("Failed to create session lock directory: {e}"))?;
+
+    let lock_path = lock_dir.join(format!("steam-session-{app_id}.pid"));
+
+    // Clean up stale lock from a prior crash before trying to create.
+    if let Ok(contents) = std::fs::read_to_string(&lock_path) {
+        let stale = contents
+            .trim()
+            .parse::<u32>()
+            .map(|pid| {
+                #[cfg(unix)]
+                {
+                    unsafe { libc::kill(pid as libc::pid_t, 0) != 0 }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = pid;
+                    false
+                }
+            })
+            .unwrap_or(true);
+        if stale {
+            let _ = std::fs::remove_file(&lock_path);
+        }
+    }
+
+    // O_CREAT | O_EXCL — fails if another live instance already holds the lock.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            write!(file, "{}", std::process::id())
+                .map_err(|e| format!("Failed to write session lock: {e}"))?;
+            Ok(SessionLock { path: lock_path })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "Steam session for app {app_id} is already running. \
+             Stop the existing session before launching again."
+        )),
+        Err(e) => Err(format!("Failed to acquire session lock: {e}")),
+    }
+}
+
 pub fn run_phase1_steam_session(
     app_id: u32,
     requested_game_id: Option<&str>,
 ) -> Result<i32, String> {
+    let _lock = acquire_steam_session_lock(app_id)?;
+
     let mut config = AppConfig::load_or_default();
     config.apply_mods_base_dirs();
     let game = resolve_phase1_steam_game(&config, app_id, requested_game_id)?;
     let manager = global_runtime_manager();
     let id = manager.start_game_session(game)?;
 
+    #[cfg(unix)]
+    {
+        STEAM_SESSION_STOP.store(false, Ordering::SeqCst);
+        unsafe {
+            libc::signal(libc::SIGTERM, steam_session_term_handler as libc::sighandler_t);
+            libc::signal(libc::SIGINT, steam_session_term_handler as libc::sighandler_t);
+        }
+    }
+
+    let mut stop_forwarded = false;
     loop {
+        #[cfg(unix)]
+        if !stop_forwarded && STEAM_SESSION_STOP.load(Ordering::SeqCst) {
+            stop_forwarded = true;
+            let _ = manager.stop_session(id);
+        }
+
         let session = manager
             .sessions()
             .into_iter()
